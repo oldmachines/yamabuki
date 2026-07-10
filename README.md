@@ -36,11 +36,13 @@ Early development. Current roadmap position: project skeleton, memory
 system, and 65816 CPU core (validated against
 [SingleStepTests](https://github.com/SingleStepTests/65816) vectors).
 
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
+
 | Milestone | Status |
 |---|---|
-| M0 skeleton, build system, CI | in progress |
-| M1 cartridge/mappers/bus | planned |
-| M2 65816 CPU + test vectors | planned |
+| M0 skeleton, build system, CI | done |
+| M1 cartridge/mappers/bus | done |
+| M2 65816 CPU + test vectors | done |
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | planned |
 | M4 full fast PPU | planned |
 | M5 APU (SPC700 + S-DSP) | planned |
