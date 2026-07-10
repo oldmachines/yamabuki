@@ -465,3 +465,59 @@ test "lower OAM index wins on sprite overlap" {
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[20]); // green (sprite 0)
 }
+
+test "more than 32 sprites on a line sets range-over and drops the extras" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 1;
+    ppu.main_screen = 0x10; // OBJ only
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.obj_size = 0; // 8x8 small -> 1 tile each (stays under the 34-tile limit)
+    ppu.obj_char_base = 0;
+
+    // 32 sprites stacked at x=0 (all in range), then a 33rd at x=100.
+    for (0..33) |i| {
+        ppu.oam[i * 4 + 0] = if (i == 32) 100 else 0; // X
+        ppu.oam[i * 4 + 1] = 0; // Y
+        ppu.oam[i * 4 + 2] = 0; // tile
+        ppu.oam[i * 4 + 3] = 0x20; // pal 0, prio 2
+    }
+    // High table (size/x-sign) stays zero: all small, x < 256.
+    ppu.vram[0] = 0x0080; // tile 0: color 1 at the leftmost pixel
+    ppu.cgram[128 + 1] = 0x03E0; // OBJ pal 0 color 1 = green
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.obj_range_over); // >32 in range
+    try std.testing.expect(!ppu.obj_time_over); // 32 tiles, under the tile cap
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[0]); // the first 32 rendered
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[100]); // the 33rd was dropped
+}
+
+test "more than 34 sprite tiles on a line sets time-over" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 1;
+    ppu.main_screen = 0x10;
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.obj_size = 2; // {8x8, 64x64}; large sprites are 8 tile columns wide
+    ppu.obj_char_base = 0;
+
+    // Five 64-wide sprites = 40 tile columns on the line: over the 34-tile cap
+    // but only 5 sprites, so range-over must stay clear.
+    for (0..5) |i| {
+        ppu.oam[i * 4 + 0] = 0; // X
+        ppu.oam[i * 4 + 1] = 0; // Y
+        ppu.oam[i * 4 + 2] = 0; // tile
+        ppu.oam[i * 4 + 3] = 0x20; // pal 0, prio 2
+        // High table: set this sprite's size bit (bit 1 of its 2-bit field) -> large.
+        ppu.oam[0x200 + (i >> 2)] |= @as(u8, 0b10) << @intCast((i & 3) * 2);
+    }
+    ppu.vram[0] = 0x0080;
+    ppu.cgram[128 + 1] = 0x03E0;
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.obj_time_over); // >34 tiles
+    try std.testing.expect(!ppu.obj_range_over); // only 5 sprites
+}
