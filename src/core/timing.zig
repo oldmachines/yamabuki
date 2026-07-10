@@ -16,10 +16,14 @@ pub const dots_per_line: u32 = 341;
 pub const ntsc_lines_per_frame: u32 = 262;
 pub const pal_lines_per_frame: u32 = 312;
 
+/// Visible scanlines with overscan off / on.
+pub const visible_lines_224: u32 = 224;
+pub const visible_lines_239: u32 = 239;
+
 /// First scanline of vblank when overscan is off (224-line display).
-pub const vblank_line_224: u32 = 225;
+pub const vblank_line_224: u32 = visible_lines_224 + 1;
 /// First scanline of vblank when overscan is on (239-line display).
-pub const vblank_line_239: u32 = 240;
+pub const vblank_line_239: u32 = visible_lines_239 + 1;
 
 /// CPU clock divider relative to master clock for internal operations.
 pub const cpu_internal_divider: u32 = 6;

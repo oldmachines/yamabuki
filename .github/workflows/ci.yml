@@ -76,6 +76,11 @@ jobs:
             git clone --depth 1 https://github.com/PeterLemon/SNES.git test-data/snes-roms
           fi
       - run: zig build test-roms -Doptimize=${{ matrix.optimize }}
+      # Informational only: prints deterministic steps/cycles plus wall-clock FPS.
+      # FPS is machine-dependent and never gated; the deterministic counts are
+      # gated by test-roms above.
+      - if: matrix.optimize == 'ReleaseFast'
+        run: zig build bench -Doptimize=ReleaseFast -- test-data/snes-roms/PPU/Rings/Rings.sfc --frames 120
 
   cross:
     runs-on: ubuntu-latest

@@ -64,6 +64,57 @@ const order_mode1_bg3_front = [_]Entry{
     bg(2, 0),
 };
 
+/// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
+/// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
+const Kind = enum { planar, affine };
+
+/// One BG layer's fixed configuration within a mode: which BG index it is, its
+/// bit depth (kept comptime so the plane decode unrolls), and the palette base
+/// that the mode's layout assigns to it.
+const LayerDesc = struct { bg: u2, bpp: u3, cgram_base: u16 };
+
+/// A background mode as data: the layers to decode, the front-to-back priority
+/// order, and (for mode 1) the alternate order selected by the BG3-priority bit.
+/// Modes with no layers render the backdrop. New modes are added here as data
+/// rather than as new code arms.
+const ModeDesc = struct {
+    layers: []const LayerDesc = &.{},
+    order: []const Entry = &.{},
+    order_bg3_front: ?[]const Entry = null,
+    kind: Kind = .planar,
+};
+
+const backdrop_mode: ModeDesc = .{};
+
+/// Modes 0-7, indexed by `$2105` BGMODE. Modes 2-7 are backdrop-only until M4
+/// fills in their layer descriptors (offset-per-tile, hi-res, Mode 7).
+const mode_table = [8]ModeDesc{
+    .{ // mode 0: four 2bpp layers, each in its own 32-color palette quadrant.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 2, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 2, .cgram_base = 32 },
+            .{ .bg = 2, .bpp = 2, .cgram_base = 64 },
+            .{ .bg = 3, .bpp = 2, .cgram_base = 96 },
+        },
+        .order = &order_mode0,
+    },
+    .{ // mode 1: BG1/BG2 4bpp, BG3 2bpp; BG3 can be pulled to the front.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 2, .bpp = 2, .cgram_base = 0 },
+        },
+        .order = &order_mode1,
+        .order_bg3_front = &order_mode1_bg3_front,
+    },
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+};
+
 pub fn renderLine(ppu: *Ppu, line: u32) void {
     const row = ppu.fb[line * fb_width ..][0..fb_width];
 
@@ -72,35 +123,65 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
         return;
     }
 
-    // Brightness-scaled palette for this line (index 0 is the backdrop).
-    var lpal: [256]u16 = undefined;
-    for (0..256) |i| lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+    // Brightness-scaled palette (index 0 is the backdrop). Rebuilt only when
+    // CGRAM or master brightness changed since the last render; HDMA per-line
+    // INIDISP writes re-dirty it, so mid-frame brightness splits stay correct.
+    if (ppu.lpal_dirty) {
+        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+        ppu.lpal_dirty = false;
+    }
 
     var bgbuf: [4][fb_width]Cell = undefined;
     var objbuf: [fb_width]Cell = undefined;
 
-    const order: []const Entry = switch (ppu.bg_mode) {
-        0 => blk: {
-            fillBg(ppu, 0, 2, 0, line, &bgbuf[0]);
-            fillBg(ppu, 1, 2, 32, line, &bgbuf[1]);
-            fillBg(ppu, 2, 2, 64, line, &bgbuf[2]);
-            fillBg(ppu, 3, 2, 96, line, &bgbuf[3]);
-            break :blk &order_mode0;
-        },
-        1 => blk: {
-            fillBg(ppu, 0, 4, 0, line, &bgbuf[0]);
-            fillBg(ppu, 1, 4, 0, line, &bgbuf[1]);
-            fillBg(ppu, 2, 2, 0, line, &bgbuf[2]);
-            break :blk if (ppu.bg3_priority) &order_mode1_bg3_front else &order_mode1;
-        },
-        else => {
-            @memset(row, lpal[0]);
+    // Runtime-select the mode, then run a body comptime-specialized on its
+    // descriptor so each layer's bit depth stays comptime.
+    inline for (mode_table, 0..) |md, m| {
+        if (ppu.bg_mode == m) {
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, row);
             return;
-        },
-    };
+        }
+    }
+}
 
-    fillObj(ppu, line, &objbuf);
+/// Decode a mode's layers into the line buffers and composite them. `md` is
+/// comptime, so `fillBg` monomorphizes per layer bit depth and modes with no
+/// layers fold to a plain backdrop fill.
+fn renderMode(
+    ppu: *Ppu,
+    line: u32,
+    comptime md: ModeDesc,
+    bgbuf: *[4][fb_width]Cell,
+    objbuf: *[fb_width]Cell,
+    lpal: *const [256]u16,
+    row: []u16,
+) void {
+    if (md.order.len == 0) {
+        @memset(row, lpal[0]);
+        return;
+    }
+    inline for (md.layers) |ld| {
+        fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, line, &bgbuf[ld.bg]);
+    }
+    fillObj(ppu, line, objbuf);
 
+    const order = if (md.order_bg3_front) |alt|
+        (if (ppu.bg3_priority) alt else md.order)
+    else
+        md.order;
+    composite(order, bgbuf, objbuf, lpal, row);
+}
+
+/// Resolve each pixel by walking the priority order front-to-back, taking the
+/// first solid layer at its matching priority (else the backdrop). This is the
+/// single seam M4 extends for the sub-screen, windows, mosaic, and color math.
+fn composite(
+    order: []const Entry,
+    bgbuf: *const [4][fb_width]Cell,
+    objbuf: *const [fb_width]Cell,
+    lpal: *const [256]u16,
+    row: []u16,
+) void {
     for (0..fb_width) |x| {
         var abs: u8 = 0; // backdrop
         for (order) |e| {
@@ -174,6 +255,11 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u3, cgram_base: u16, line: u
     }
 }
 
+/// Hardware per-scanline sprite limits: at most 32 sprites in range and 34
+/// sprite tiles (8-pixel columns) fetched; exceeding either sets an overflow flag.
+const obj_per_line_max = 32;
+const obj_tiles_per_line_max = 34;
+
 /// OBJ size table: {small_w, small_h, large_w, large_h} per OBSEL size (0-7).
 const obj_sizes = [8][4]u8{
     .{ 8, 8, 16, 16 },
@@ -210,7 +296,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         if (dy >= h) continue; // sprite not on this scanline
 
         in_range += 1;
-        if (in_range > 32) {
+        if (in_range > obj_per_line_max) {
             ppu.obj_range_over = true;
             break;
         }
@@ -238,7 +324,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         var overflow = false;
         while (col < cols) : (col += 1) {
             tiles += 1;
-            if (tiles > 34) {
+            if (tiles > obj_tiles_per_line_max) {
                 ppu.obj_time_over = true;
                 overflow = true;
                 break;
@@ -378,4 +464,60 @@ test "lower OAM index wins on sprite overlap" {
 
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[20]); // green (sprite 0)
+}
+
+test "more than 32 sprites on a line sets range-over and drops the extras" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 1;
+    ppu.main_screen = 0x10; // OBJ only
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.obj_size = 0; // 8x8 small -> 1 tile each (stays under the 34-tile limit)
+    ppu.obj_char_base = 0;
+
+    // 32 sprites stacked at x=0 (all in range), then a 33rd at x=100.
+    for (0..33) |i| {
+        ppu.oam[i * 4 + 0] = if (i == 32) 100 else 0; // X
+        ppu.oam[i * 4 + 1] = 0; // Y
+        ppu.oam[i * 4 + 2] = 0; // tile
+        ppu.oam[i * 4 + 3] = 0x20; // pal 0, prio 2
+    }
+    // High table (size/x-sign) stays zero: all small, x < 256.
+    ppu.vram[0] = 0x0080; // tile 0: color 1 at the leftmost pixel
+    ppu.cgram[128 + 1] = 0x03E0; // OBJ pal 0 color 1 = green
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.obj_range_over); // >32 in range
+    try std.testing.expect(!ppu.obj_time_over); // 32 tiles, under the tile cap
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[0]); // the first 32 rendered
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[100]); // the 33rd was dropped
+}
+
+test "more than 34 sprite tiles on a line sets time-over" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 1;
+    ppu.main_screen = 0x10;
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.obj_size = 2; // {8x8, 64x64}; large sprites are 8 tile columns wide
+    ppu.obj_char_base = 0;
+
+    // Five 64-wide sprites = 40 tile columns on the line: over the 34-tile cap
+    // but only 5 sprites, so range-over must stay clear.
+    for (0..5) |i| {
+        ppu.oam[i * 4 + 0] = 0; // X
+        ppu.oam[i * 4 + 1] = 0; // Y
+        ppu.oam[i * 4 + 2] = 0; // tile
+        ppu.oam[i * 4 + 3] = 0x20; // pal 0, prio 2
+        // High table: set this sprite's size bit (bit 1 of its 2-bit field) -> large.
+        ppu.oam[0x200 + (i >> 2)] |= @as(u8, 0b10) << @intCast((i & 3) * 2);
+    }
+    ppu.vram[0] = 0x0080;
+    ppu.cgram[128 + 1] = 0x03E0;
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.obj_time_over); // >34 tiles
+    try std.testing.expect(!ppu.obj_range_over); // only 5 sprites
 }

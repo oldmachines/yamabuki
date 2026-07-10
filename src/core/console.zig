@@ -33,7 +33,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
-        pub const serialize_skip = .{};
+        // `steps` is a diagnostic counter, not machine state.
+        pub const serialize_skip = .{"steps"};
 
         cart: Cartridge,
         bus: Bus,
@@ -48,6 +49,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
         line_start: u64,
         /// Completed-frame counter.
         frame: u64,
+        /// CPU instructions/interrupts retired since reset. A deterministic
+        /// work proxy for perf-regression baselines (paired with bus.clock).
+        steps: u64,
 
         /// Initialize in place from an already-loaded cartridge. `self` must be
         /// at its final (heap) address before calling; it is pinned afterward.
@@ -67,6 +71,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.scanline = 0;
             self.line_start = self.bus.clock;
             self.frame = 0;
+            self.steps = 0;
         }
 
         /// Re-wire the internal self-pointers after deserialization. The ROM
@@ -154,19 +159,19 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // deassert the line before the handler's RTI re-checks it.
                 if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
                 self.cpu.step();
+                self.steps +%= 1;
             }
             self.line_start = line_end;
         }
 
-        /// Render one visible scanline via the PPU. The BG/sprite compositor is
-        /// layered onto the backdrop in M3.4/M3.5.
+        /// Render one visible scanline via the PPU (backdrop + BG/sprite compositor).
         fn renderScanline(self: *Self, line: u32) void {
             self.bus.ppu.renderScanline(line);
         }
 
         /// The visible RGB565 framebuffer for the current display height.
         pub fn framebuffer(self: *const Self) []const u16 {
-            const height: u32 = if (self.overscan) 239 else 224;
+            const height: u32 = if (self.overscan) timing.visible_lines_239 else timing.visible_lines_224;
             return self.bus.ppu.frame(height);
         }
     };
@@ -398,6 +403,164 @@ test "HDMA drives INIDISP per scanline (brightness split mid-frame)" {
 }
 
 const fb_width = @import("ppu/ppu.zig").fb_width;
+
+test "console save-state roundtrips and restores identical machine state" {
+    const serialize = @import("serialize.zig");
+    const alloc = std.testing.allocator;
+
+    // Run console A a few frames so the CPU, WRAM, and scheduler hold live state.
+    const rom_a = try buildNmiRom(alloc);
+    defer alloc.free(rom_a);
+    const a = try alloc.create(FastConsole);
+    defer {
+        a.cart.deinit(alloc);
+        alloc.destroy(a);
+    }
+    a.init(try Cartridge.load(alloc, rom_a));
+    for (0..3) |_| a.runFrame();
+
+    // Serialize A's whole machine state (ROM is skipped; frontend re-supplies it).
+    const size = comptime serialize.byteSize(FastConsole);
+    const buf = try alloc.alloc(u8, size);
+    defer alloc.free(buf);
+    try std.testing.expectEqual(size, serialize.write(FastConsole, a, buf));
+
+    // Restore into a second console built from the same ROM, then re-wire pointers.
+    const rom_b = try buildNmiRom(alloc);
+    defer alloc.free(rom_b);
+    const b = try alloc.create(FastConsole);
+    defer {
+        b.cart.deinit(alloc);
+        alloc.destroy(b);
+    }
+    b.init(try Cartridge.load(alloc, rom_b));
+    _ = try serialize.read(FastConsole, b, buf);
+    b.postLoad();
+
+    // Byte-identical restore: re-serializing B reproduces A's state exactly. This
+    // is what catches a non-deterministic or unrestored field.
+    const buf2 = try alloc.alloc(u8, size);
+    defer alloc.free(buf2);
+    _ = serialize.write(FastConsole, b, buf2);
+    try std.testing.expectEqualSlices(u8, buf, buf2);
+
+    // And the restored machine steps forward identically (proves postLoad rewired
+    // every self-pointer: the CPU's &bus, the bus page table, bus.cart).
+    a.runFrame();
+    b.runFrame();
+    try std.testing.expectEqual(hashFrame(a.framebuffer()), hashFrame(b.framebuffer()));
+    try std.testing.expectEqualSlices(u8, a.bus.wram.data[0..], b.bus.wram.data[0..]);
+    try std.testing.expectEqual(a.frame, b.frame);
+}
+
+test "V-IRQ timer fires once per frame on its scanline and TIMEUP acks it" {
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Reset: enable IRQs, program V-IRQ on line 50, then spin.
+    //   CLI ; LDA #$32 ; STA $4209 (VTIMEL=50) ; LDA #$00 ; STA $420A (VTIMEH)
+    //   LDA #$20 ; STA $4200 (NMITIMEN: V-IRQ, mode 2) ; loop: BRA loop
+    const code = [_]u8{
+        0x58,
+        0xA9,
+        0x32,
+        0x8D,
+        0x09,
+        0x42,
+        0xA9,
+        0x00,
+        0x8D,
+        0x0A,
+        0x42,
+        0xA9,
+        0x20,
+        0x8D,
+        0x00,
+        0x42,
+        0x80,
+        0xFE,
+    };
+    @memcpy(rom[0..code.len], &code);
+    // IRQ handler at $8020: ack TIMEUP (else the level re-triggers), bump $00, RTI.
+    //   LDA $4211 ; INC $00 ; RTI
+    @memcpy(rom[0x20..][0..6], &[_]u8{ 0xAD, 0x11, 0x42, 0xE6, 0x00, 0x40 });
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "VIRQ TEST            ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFE..0x8000], 0x8020, .little); // emulation IRQ/BRK
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little); // reset
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    // Exactly one IRQ per frame: if TIMEUP didn't deassert the level, the handler
+    // would re-enter every instruction and $00 would blow past the frame count.
+    con.runFrame();
+    try std.testing.expectEqual(@as(u8, 1), con.bus.wram.data[0]);
+    con.runFrame();
+    con.runFrame();
+    try std.testing.expectEqual(@as(u8, 3), con.bus.wram.data[0]);
+}
+
+test "HDMA indirect mode drives INIDISP per scanline" {
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Same brightness split as the direct-mode HDMA test, but the table holds
+    // indirect pointers (DMAP bit 6) to the INIDISP values instead of the values.
+    const code = [_]u8{
+        0xA9, 0x00, 0x8D, 0x21, 0x21, // CGADD = 0
+        0xA9, 0xFF, 0x8D, 0x22, 0x21, // color0 low  = $FF
+        0xA9, 0x7F, 0x8D, 0x22, 0x21, // color0 high = $7F (white)
+        0xA9, 0x40, 0x8D, 0x00, 0x43, // DMAP0 = mode 0, A->B, INDIRECT
+        0xA9, 0x00, 0x8D, 0x01, 0x43, // BBAD0 = $00 -> $2100
+        0xA9, 0x60, 0x8D, 0x02, 0x43, // A1T0 low  = $60
+        0xA9, 0x80, 0x8D, 0x03, 0x43, // A1T0 high = $80 (table @ $8060)
+        0xA9, 0x00, 0x8D, 0x04, 0x43, // A1B0 = bank 0 (table bank)
+        0xA9, 0x00, 0x8D, 0x07, 0x43, // DASB0 = bank 0 (indirect data bank)
+        0xA9, 0x01, 0x8D, 0x0C, 0x42, // HDMAEN = channel 0
+        0x80, 0xFE, // loop: BRA loop
+    };
+    @memcpy(rom[0..code.len], &code);
+    // Indirect table @ $8060: {100 lines, ptr $8070}, {124 lines, ptr $8071}, end.
+    const table = [_]u8{ 0x64, 0x70, 0x80, 0x7C, 0x71, 0x80, 0x00 };
+    @memcpy(rom[0x60..][0..table.len], &table);
+    rom[0x70] = 0x0F; // brightness value for the first block
+    rom[0x71] = 0x00; // brightness value for the second block
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "HDMA IND TEST        ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame(); // frame 1 configures HDMA mid-frame; effect lands frame 2
+    con.runFrame();
+
+    const fb = con.framebuffer();
+    try std.testing.expectEqual(@as(u16, 0xFFFF), fb[0 * fb_width]); // white
+    try std.testing.expectEqual(@as(u16, 0xFFFF), fb[50 * fb_width]);
+    try std.testing.expectEqual(@as(u16, 0x0000), fb[150 * fb_width]); // black
+    try std.testing.expectEqual(@as(u16, 0x0000), fb[223 * fb_width]);
+}
 
 test "NMI is suppressed while NMITIMEN bit7 is clear" {
     const alloc = std.testing.allocator;

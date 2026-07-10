@@ -1,7 +1,8 @@
 //! ROM runner: boot each golden ROM headless for a fixed number of frames and
-//! compare the framebuffer hash against the committed value in
-//! `golden_hashes.zon`. Requires the PeterLemon ROMs under
-//! test-data/snes-roms (tools/fetch_test_data.sh).
+//! compare against the committed baseline in `golden_hashes.zon` — the
+//! framebuffer hash (correctness) plus the deterministic `steps`/`cycles` work
+//! counts (perf regression; gated only once baselined, 0 = unset). Requires the
+//! PeterLemon ROMs under test-data/snes-roms (tools/fetch_test_data.sh).
 //!
 //! Options (see build.zig): -Drom-filter=<substr>  -Drom-frames=<n>
 
@@ -38,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
             false;
         if (!skip) {
             run += 1;
-            const ok = runOne(io, gpa, out, dir, entry.path, entry.hash, frames) catch |e| blk: {
+            const ok = runOne(io, gpa, out, dir, entry, frames) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.path, @errorName(e) });
                 break :blk false;
             };
@@ -56,25 +57,32 @@ fn runOne(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     dir: std.Io.Dir,
-    path: []const u8,
-    want: u64,
+    entry: anytype,
     frames: u32,
 ) !bool {
     // The arena frees everything at process exit; the console owns the cart
     // (its page table points into cart.rom), so we must not free it here.
-    const image = try dir.readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024));
+    const image = try dir.readFileAlloc(io, entry.path, gpa, .limited(16 * 1024 * 1024));
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.FastConsole);
     con.init(cart);
-    return runHashed(con, out, path, want, frames);
-}
 
-fn runHashed(con: *core.FastConsole, out: *std.Io.Writer, path: []const u8, want: u64, frames: u32) !bool {
     for (0..frames) |_| con.runFrame();
-    const got = core.console.hashFrame(con.framebuffer());
-    const ok = got == want;
-    try out.print("{s} {s} (got {x:0>16}, want {x:0>16})\n", .{
-        if (ok) "PASS" else "FAIL", path, got, want,
+
+    const got_hash = core.console.hashFrame(con.framebuffer());
+    const got_steps = con.steps;
+    const got_cycles = con.bus.clock;
+
+    // Deterministic perf counts are gated only once baselined (0 = unset).
+    const steps_ok = entry.steps == 0 or entry.steps == got_steps;
+    const cycles_ok = entry.cycles == 0 or entry.cycles == got_cycles;
+    const ok = got_hash == entry.hash and steps_ok and cycles_ok;
+
+    try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n", .{
+        if (ok) "PASS" else "FAIL", entry.path,
+        got_hash,                   entry.hash,
+        got_steps,                  entry.steps,
+        got_cycles,                 entry.cycles,
     });
     return ok;
 }

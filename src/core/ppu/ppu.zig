@@ -2,10 +2,10 @@
 //! and the fast scanline renderer.
 //!
 //! This module owns the PPU register state and the memory ports ($2100-$213F).
-//! The pixel pipeline is split out into `line_render.zig`; here `renderScanline`
-//! only lays down the backdrop, and the BG/sprite compositor is layered on in
-//! milestones M3.4/M3.5. Color is converted to RGB565 at CGRAM-write time so the
-//! renderer and the handheld display path never touch 15-bit BGR.
+//! The pixel pipeline is split out into `line_render.zig`, which `renderScanline`
+//! delegates to for the backdrop + BG/sprite compositor. Color is converted to
+//! RGB565 at CGRAM-write time so the renderer and the handheld display path never
+//! touch 15-bit BGR.
 
 const std = @import("std");
 const line_render = @import("line_render.zig");
@@ -31,9 +31,10 @@ pub const BgLayer = struct {
 };
 
 pub const Ppu = struct {
-    // Derived state: the RGB565 palette is rebuilt from cgram, and the
-    // framebuffer is output, so neither is part of the saved state.
-    pub const serialize_skip = .{ "palette", "fb" };
+    // Derived state: the RGB565 palette and the brightness-scaled line palette
+    // are rebuilt from cgram, and the framebuffer is output, so none is part of
+    // the saved state.
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -46,6 +47,11 @@ pub const Ppu = struct {
     // --- derived outputs (rebuilt, not serialized) ------------------------
     /// cgram converted to RGB565 at write time.
     palette: [256]u16,
+    /// Brightness-scaled RGB565 palette for the current line; rebuilt lazily
+    /// only when CGRAM or master brightness changes (see `lpal_dirty`).
+    lpal: [256]u16,
+    /// Set when `lpal` must be recomputed (CGRAM or INIDISP brightness write).
+    lpal_dirty: bool,
     /// RGB565 framebuffer, row-major, fb_width * fb_height.
     fb: [fb_width * fb_height]u16,
 
@@ -97,6 +103,8 @@ pub const Ppu = struct {
         .cgram = @splat(0),
         .oam = @splat(0),
         .palette = @splat(0),
+        .lpal = @splat(0),
+        .lpal_dirty = true,
         .fb = @splat(0),
         .force_blank = true,
         .brightness = 0,
@@ -126,9 +134,11 @@ pub const Ppu = struct {
         .obj_time_over = false,
     };
 
-    /// Rebuild the RGB565 palette from CGRAM after deserialization.
+    /// Rebuild the RGB565 palette from CGRAM after deserialization. The
+    /// brightness-scaled line palette is marked stale so the next render rebuilds it.
     pub fn postLoad(self: *Ppu) void {
         for (self.cgram, 0..) |c, i| self.palette[i] = bgr15to565(c);
+        self.lpal_dirty = true;
     }
 
     // --- register writes ($2100-$213F) ------------------------------------
@@ -138,6 +148,7 @@ pub const Ppu = struct {
             0x00 => { // INIDISP
                 self.force_blank = value & 0x80 != 0;
                 self.brightness = @truncate(value);
+                self.lpal_dirty = true; // brightness feeds the line palette
             },
             0x01 => { // OBSEL
                 self.obj_size = @truncate(value >> 5);
@@ -290,6 +301,7 @@ pub const Ppu = struct {
             const color = (@as(u16, value & 0x7F) << 8) | self.cgram_latch;
             self.cgram[self.cgram_addr] = color;
             self.palette[self.cgram_addr] = bgr15to565(color);
+            self.lpal_dirty = true; // line palette derives from cgram
             self.cgram_addr +%= 1;
             self.cgram_flip = false;
         }
@@ -338,7 +350,7 @@ pub const Ppu = struct {
     // --- rendering --------------------------------------------------------
 
     /// Render one visible scanline into the framebuffer: force-blank/backdrop
-    /// handling plus the BG (and, from M3.5, sprite) compositor.
+    /// handling plus the BG and sprite compositor.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
         line_render.renderLine(self, line);
@@ -350,23 +362,27 @@ pub const Ppu = struct {
     }
 };
 
-/// 15-bit BGR (SNES CGRAM) → RGB565.
-fn bgr15to565(c: u16) u16 {
-    const r5: u16 = c & 0x1F;
-    const g5: u16 = (c >> 5) & 0x1F;
-    const b5: u16 = (c >> 10) & 0x1F;
+/// Pack 5-bit R/G/B channels into RGB565, widening green to 6 bits. Shared by
+/// every BGR→565 conversion so the pack layout lives in one place (color math
+/// in M4 becomes a third caller).
+fn pack565(r5: u16, g5: u16, b5: u16) u16 {
     const g6: u16 = (g5 << 1) | (g5 >> 4);
     return (r5 << 11) | (g6 << 5) | b5;
+}
+
+/// 15-bit BGR (SNES CGRAM) → RGB565.
+fn bgr15to565(c: u16) u16 {
+    return pack565(c & 0x1F, (c >> 5) & 0x1F, (c >> 10) & 0x1F);
 }
 
 /// Apply INIDISP master brightness (0-15) to a 15-bit BGR color and pack to 565.
 pub fn scaleBrightness(c: u16, bright: u4) u16 {
     const num: u16 = bright;
-    const r5: u16 = ((c & 0x1F) * num) / 15;
-    const g5: u16 = (((c >> 5) & 0x1F) * num) / 15;
-    const b5: u16 = (((c >> 10) & 0x1F) * num) / 15;
-    const g6: u16 = (g5 << 1) | (g5 >> 4);
-    return (r5 << 11) | (g6 << 5) | b5;
+    return pack565(
+        ((c & 0x1F) * num) / 15,
+        (((c >> 5) & 0x1F) * num) / 15,
+        (((c >> 10) & 0x1F) * num) / 15,
+    );
 }
 
 // --- tests ---------------------------------------------------------------
