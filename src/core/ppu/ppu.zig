@@ -31,9 +31,10 @@ pub const BgLayer = struct {
 };
 
 pub const Ppu = struct {
-    // Derived state: the RGB565 palette is rebuilt from cgram, and the
-    // framebuffer is output, so neither is part of the saved state.
-    pub const serialize_skip = .{ "palette", "fb" };
+    // Derived state: the RGB565 palette and the brightness-scaled line palette
+    // are rebuilt from cgram, and the framebuffer is output, so none is part of
+    // the saved state.
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -46,6 +47,11 @@ pub const Ppu = struct {
     // --- derived outputs (rebuilt, not serialized) ------------------------
     /// cgram converted to RGB565 at write time.
     palette: [256]u16,
+    /// Brightness-scaled RGB565 palette for the current line; rebuilt lazily
+    /// only when CGRAM or master brightness changes (see `lpal_dirty`).
+    lpal: [256]u16,
+    /// Set when `lpal` must be recomputed (CGRAM or INIDISP brightness write).
+    lpal_dirty: bool,
     /// RGB565 framebuffer, row-major, fb_width * fb_height.
     fb: [fb_width * fb_height]u16,
 
@@ -97,6 +103,8 @@ pub const Ppu = struct {
         .cgram = @splat(0),
         .oam = @splat(0),
         .palette = @splat(0),
+        .lpal = @splat(0),
+        .lpal_dirty = true,
         .fb = @splat(0),
         .force_blank = true,
         .brightness = 0,
@@ -126,9 +134,11 @@ pub const Ppu = struct {
         .obj_time_over = false,
     };
 
-    /// Rebuild the RGB565 palette from CGRAM after deserialization.
+    /// Rebuild the RGB565 palette from CGRAM after deserialization. The
+    /// brightness-scaled line palette is marked stale so the next render rebuilds it.
     pub fn postLoad(self: *Ppu) void {
         for (self.cgram, 0..) |c, i| self.palette[i] = bgr15to565(c);
+        self.lpal_dirty = true;
     }
 
     // --- register writes ($2100-$213F) ------------------------------------
@@ -138,6 +148,7 @@ pub const Ppu = struct {
             0x00 => { // INIDISP
                 self.force_blank = value & 0x80 != 0;
                 self.brightness = @truncate(value);
+                self.lpal_dirty = true; // brightness feeds the line palette
             },
             0x01 => { // OBSEL
                 self.obj_size = @truncate(value >> 5);
@@ -290,6 +301,7 @@ pub const Ppu = struct {
             const color = (@as(u16, value & 0x7F) << 8) | self.cgram_latch;
             self.cgram[self.cgram_addr] = color;
             self.palette[self.cgram_addr] = bgr15to565(color);
+            self.lpal_dirty = true; // line palette derives from cgram
             self.cgram_addr +%= 1;
             self.cgram_flip = false;
         }

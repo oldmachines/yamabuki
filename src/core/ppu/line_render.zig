@@ -123,9 +123,13 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
         return;
     }
 
-    // Brightness-scaled palette for this line (index 0 is the backdrop).
-    var lpal: [256]u16 = undefined;
-    for (0..256) |i| lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+    // Brightness-scaled palette (index 0 is the backdrop). Rebuilt only when
+    // CGRAM or master brightness changed since the last render; HDMA per-line
+    // INIDISP writes re-dirty it, so mid-frame brightness splits stay correct.
+    if (ppu.lpal_dirty) {
+        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+        ppu.lpal_dirty = false;
+    }
 
     var bgbuf: [4][fb_width]Cell = undefined;
     var objbuf: [fb_width]Cell = undefined;
@@ -134,7 +138,7 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     // descriptor so each layer's bit depth stays comptime.
     inline for (mode_table, 0..) |md, m| {
         if (ppu.bg_mode == m) {
-            renderMode(ppu, line, md, &bgbuf, &objbuf, &lpal, row);
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, row);
             return;
         }
     }
