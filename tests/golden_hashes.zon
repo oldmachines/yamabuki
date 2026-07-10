@@ -1,0 +1,20 @@
+// Golden framebuffer hashes for the ROM runner (`zig build test-roms`).
+//
+// Each hash is the FNV-1a of the RGB565 framebuffer after `frames` frames of a
+// PeterLemon/SNES test ROM (fetched into test-data/snes-roms by
+// tools/fetch_test_data.sh — the ROMs themselves are never committed). Hashes
+// were minted after visually inspecting the .ppm output and are deterministic
+// across Debug/ReleaseFast and target architectures.
+//
+// This set covers the M3 fast renderer: BG mode 0 (2bpp layers, text) and
+// sprite-over-BG compositing. Mode-1 4bpp and modes 2-7 ROMs join as those
+// paths land (M4).
+.{
+    .frames = 16,
+    .roms = .{
+        .{ .path = "HelloWorld/HelloWorld.sfc", .hash = 0x14ecd91531a2ca4c },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .hash = 0x3ad32cfefc54c6be },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG3Map2BPP32x328PAL/8x8BG3Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25 },
+        .{ .path = "PPU/Rings/Rings.sfc", .hash = 0x20dc65b09f98c115 },
+    },
+}

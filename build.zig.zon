@@ -9,6 +9,8 @@
         "build.zig.zon",
         "src",
         "tests",
+        "bench",
+        "docs",
         "README.md",
     },
 }

@@ -175,6 +175,18 @@ pub fn Console(comptime cfg: CoreConfig) type {
 /// The default shipped core.
 pub const FastConsole = Console(.{ .accuracy = .fast });
 
+/// FNV-1a hash of an RGB565 framebuffer, used by the ROM runner and benchmark
+/// to compare output against committed golden values.
+pub fn hashFrame(fb: []const u16) u64 {
+    const prime: u64 = 0x100000001b3;
+    var h: u64 = 0xcbf29ce484222325;
+    for (fb) |px| {
+        h = (h ^ @as(u64, px & 0xFF)) *% prime;
+        h = (h ^ @as(u64, px >> 8)) *% prime;
+    }
+    return h;
+}
+
 // --- tests ---------------------------------------------------------------
 
 test {

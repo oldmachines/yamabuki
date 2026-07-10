@@ -27,14 +27,24 @@ zig build                        # headless runner + libretro core
 zig build test                   # unit tests
 tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignored)
 zig build test-sst               # run 65816 SingleStepTests vectors
+zig build test-roms              # render PeterLemon ROMs, check golden hashes
+zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
+```
+
+Run a ROM headless and dump a frame to inspect:
+
+```sh
+zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 16 --ppm out.ppm
 ```
 
 ## Status
 
-Early development. Current roadmap position: project skeleton, memory
-system, and 65816 CPU core (validated against
-[SingleStepTests](https://github.com/SingleStepTests/65816) vectors).
+Early development. The console boots ROMs and renders: scheduler with NMI/IRQ,
+DMA/HDMA, and a fast scanline renderer for BG modes 0/1 + sprites. PeterLemon
+BG/text/sprite ROMs render and are locked against golden framebuffer hashes;
+the 65816 core is validated against
+[SingleStepTests](https://github.com/SingleStepTests/65816) vectors.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -43,7 +53,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M0 skeleton, build system, CI | done |
 | M1 cartridge/mappers/bus | done |
 | M2 65816 CPU + test vectors | done |
-| M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | planned |
+| M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
 | M4 full fast PPU | planned |
 | M5 APU (SPC700 + S-DSP) | planned |
 | M6 save states + libretro core | planned |

@@ -79,4 +79,47 @@ pub fn build(b: *std.Build) void {
     run_sst.setCwd(b.path("."));
     const sst_step = b.step("test-sst", "Run SingleStepTests 65816 vectors (needs test-data/)");
     sst_step.dependOn(&run_sst.step);
+
+    // ROM runner: render PeterLemon ROMs and compare framebuffer hashes to the
+    // committed golden values. Requires test-data/snes-roms.
+    const rom_filter = b.option([]const u8, "rom-filter", "Run only ROMs whose path contains this substring");
+    const rom_frames = b.option(u32, "rom-frames", "Frames per ROM (0 = use golden_hashes.zon default)") orelse 0;
+    const rom_opts = b.addOptions();
+    rom_opts.addOption(?[]const u8, "filter", rom_filter);
+    rom_opts.addOption(u32, "frames", rom_frames);
+
+    const rom_runner = b.addExecutable(.{
+        .name = "rom-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rom_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "rom_options", .module = rom_opts.createModule() },
+            },
+        }),
+    });
+    const run_roms = b.addRunArtifact(rom_runner);
+    run_roms.setCwd(b.path("."));
+    const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
+    roms_step.dependOn(&run_roms.step);
+
+    // Headless FPS benchmark.
+    const bench = b.addExecutable(.{
+        .name = "yamabuki-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.setCwd(b.path("."));
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run the headless FPS benchmark (pass -- <rom> [--frames N])");
+    bench_step.dependOn(&run_bench.step);
 }
