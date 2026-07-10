@@ -398,6 +398,55 @@ test "HDMA drives INIDISP per scanline (brightness split mid-frame)" {
 
 const fb_width = @import("ppu/ppu.zig").fb_width;
 
+test "console save-state roundtrips and restores identical machine state" {
+    const serialize = @import("serialize.zig");
+    const alloc = std.testing.allocator;
+
+    // Run console A a few frames so the CPU, WRAM, and scheduler hold live state.
+    const rom_a = try buildNmiRom(alloc);
+    defer alloc.free(rom_a);
+    const a = try alloc.create(FastConsole);
+    defer {
+        a.cart.deinit(alloc);
+        alloc.destroy(a);
+    }
+    a.init(try Cartridge.load(alloc, rom_a));
+    for (0..3) |_| a.runFrame();
+
+    // Serialize A's whole machine state (ROM is skipped; frontend re-supplies it).
+    const size = comptime serialize.byteSize(FastConsole);
+    const buf = try alloc.alloc(u8, size);
+    defer alloc.free(buf);
+    try std.testing.expectEqual(size, serialize.write(FastConsole, a, buf));
+
+    // Restore into a second console built from the same ROM, then re-wire pointers.
+    const rom_b = try buildNmiRom(alloc);
+    defer alloc.free(rom_b);
+    const b = try alloc.create(FastConsole);
+    defer {
+        b.cart.deinit(alloc);
+        alloc.destroy(b);
+    }
+    b.init(try Cartridge.load(alloc, rom_b));
+    _ = try serialize.read(FastConsole, b, buf);
+    b.postLoad();
+
+    // Byte-identical restore: re-serializing B reproduces A's state exactly. This
+    // is what catches a non-deterministic or unrestored field.
+    const buf2 = try alloc.alloc(u8, size);
+    defer alloc.free(buf2);
+    _ = serialize.write(FastConsole, b, buf2);
+    try std.testing.expectEqualSlices(u8, buf, buf2);
+
+    // And the restored machine steps forward identically (proves postLoad rewired
+    // every self-pointer: the CPU's &bus, the bus page table, bus.cart).
+    a.runFrame();
+    b.runFrame();
+    try std.testing.expectEqual(hashFrame(a.framebuffer()), hashFrame(b.framebuffer()));
+    try std.testing.expectEqualSlices(u8, a.bus.wram.data[0..], b.bus.wram.data[0..]);
+    try std.testing.expectEqual(a.frame, b.frame);
+}
+
 test "NMI is suppressed while NMITIMEN bit7 is clear" {
     const alloc = std.testing.allocator;
     const rom = try alloc.alloc(u8, 0x8000);
