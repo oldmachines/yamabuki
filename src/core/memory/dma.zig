@@ -14,6 +14,13 @@
 
 const std = @import("std");
 
+/// GDMA timing: a fixed per-DMA setup, a per-active-channel overhead, and a
+/// per-byte transfer cost, all in master cycles. These replace the bus
+/// accessors' per-access charge for the duration of the transfer.
+const dma_setup_cycles: u64 = 8;
+const dma_channel_overhead: u64 = 8;
+const dma_cycles_per_byte: u64 = 8;
+
 /// B-bus register offsets written per transfer unit, indexed by DMAP mode
 /// (bits 2-0). The pattern repeats to cover the whole byte count.
 const unit_offsets = [8][]const u8{
@@ -92,11 +99,11 @@ pub const Dma = struct {
     pub fn startGpDma(self: *Dma, bus: anytype, mask: u8) void {
         if (mask == 0) return;
         const start = bus.clock;
-        var cost: u64 = 8; // whole-DMA setup
+        var cost: u64 = dma_setup_cycles;
         for (0..8) |i| {
             if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
-            cost += 8; // per-channel overhead
-            cost += 8 * @as(u64, self.transferGpChannel(bus, i));
+            cost += dma_channel_overhead;
+            cost += dma_cycles_per_byte * @as(u64, self.transferGpChannel(bus, i));
         }
         // Replace the bus accessors' per-access charge with the fixed DMA cost.
         bus.clock = start + cost;

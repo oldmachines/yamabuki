@@ -2,10 +2,10 @@
 //! and the fast scanline renderer.
 //!
 //! This module owns the PPU register state and the memory ports ($2100-$213F).
-//! The pixel pipeline is split out into `line_render.zig`; here `renderScanline`
-//! only lays down the backdrop, and the BG/sprite compositor is layered on in
-//! milestones M3.4/M3.5. Color is converted to RGB565 at CGRAM-write time so the
-//! renderer and the handheld display path never touch 15-bit BGR.
+//! The pixel pipeline is split out into `line_render.zig`, which `renderScanline`
+//! delegates to for the backdrop + BG/sprite compositor. Color is converted to
+//! RGB565 at CGRAM-write time so the renderer and the handheld display path never
+//! touch 15-bit BGR.
 
 const std = @import("std");
 const line_render = @import("line_render.zig");
@@ -350,7 +350,7 @@ pub const Ppu = struct {
     // --- rendering --------------------------------------------------------
 
     /// Render one visible scanline into the framebuffer: force-blank/backdrop
-    /// handling plus the BG (and, from M3.5, sprite) compositor.
+    /// handling plus the BG and sprite compositor.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
         line_render.renderLine(self, line);
@@ -362,23 +362,27 @@ pub const Ppu = struct {
     }
 };
 
-/// 15-bit BGR (SNES CGRAM) → RGB565.
-fn bgr15to565(c: u16) u16 {
-    const r5: u16 = c & 0x1F;
-    const g5: u16 = (c >> 5) & 0x1F;
-    const b5: u16 = (c >> 10) & 0x1F;
+/// Pack 5-bit R/G/B channels into RGB565, widening green to 6 bits. Shared by
+/// every BGR→565 conversion so the pack layout lives in one place (color math
+/// in M4 becomes a third caller).
+fn pack565(r5: u16, g5: u16, b5: u16) u16 {
     const g6: u16 = (g5 << 1) | (g5 >> 4);
     return (r5 << 11) | (g6 << 5) | b5;
+}
+
+/// 15-bit BGR (SNES CGRAM) → RGB565.
+fn bgr15to565(c: u16) u16 {
+    return pack565(c & 0x1F, (c >> 5) & 0x1F, (c >> 10) & 0x1F);
 }
 
 /// Apply INIDISP master brightness (0-15) to a 15-bit BGR color and pack to 565.
 pub fn scaleBrightness(c: u16, bright: u4) u16 {
     const num: u16 = bright;
-    const r5: u16 = ((c & 0x1F) * num) / 15;
-    const g5: u16 = (((c >> 5) & 0x1F) * num) / 15;
-    const b5: u16 = (((c >> 10) & 0x1F) * num) / 15;
-    const g6: u16 = (g5 << 1) | (g5 >> 4);
-    return (r5 << 11) | (g6 << 5) | b5;
+    return pack565(
+        ((c & 0x1F) * num) / 15,
+        (((c >> 5) & 0x1F) * num) / 15,
+        (((c >> 10) & 0x1F) * num) / 15,
+    );
 }
 
 // --- tests ---------------------------------------------------------------

@@ -255,6 +255,11 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u3, cgram_base: u16, line: u
     }
 }
 
+/// Hardware per-scanline sprite limits: at most 32 sprites in range and 34
+/// sprite tiles (8-pixel columns) fetched; exceeding either sets an overflow flag.
+const obj_per_line_max = 32;
+const obj_tiles_per_line_max = 34;
+
 /// OBJ size table: {small_w, small_h, large_w, large_h} per OBSEL size (0-7).
 const obj_sizes = [8][4]u8{
     .{ 8, 8, 16, 16 },
@@ -291,7 +296,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         if (dy >= h) continue; // sprite not on this scanline
 
         in_range += 1;
-        if (in_range > 32) {
+        if (in_range > obj_per_line_max) {
             ppu.obj_range_over = true;
             break;
         }
@@ -319,7 +324,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         var overflow = false;
         while (col < cols) : (col += 1) {
             tiles += 1;
-            if (tiles > 34) {
+            if (tiles > obj_tiles_per_line_max) {
                 ppu.obj_time_over = true;
                 overflow = true;
                 break;

@@ -158,15 +158,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.line_start = line_end;
         }
 
-        /// Render one visible scanline via the PPU. The BG/sprite compositor is
-        /// layered onto the backdrop in M3.4/M3.5.
+        /// Render one visible scanline via the PPU (backdrop + BG/sprite compositor).
         fn renderScanline(self: *Self, line: u32) void {
             self.bus.ppu.renderScanline(line);
         }
 
         /// The visible RGB565 framebuffer for the current display height.
         pub fn framebuffer(self: *const Self) []const u16 {
-            const height: u32 = if (self.overscan) 239 else 224;
+            const height: u32 = if (self.overscan) timing.visible_lines_239 else timing.visible_lines_224;
             return self.bus.ppu.frame(height);
         }
     };
