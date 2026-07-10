@@ -12,6 +12,8 @@ pub const bus = @import("memory/bus.zig");
 pub const wram = @import("memory/wram.zig");
 pub const math_unit = @import("memory/math_unit.zig");
 pub const mappers = @import("memory/mappers.zig");
+pub const wdc65816 = @import("cpu/wdc65816.zig");
+pub const cpu_ops = @import("cpu/ops.zig");
 
 pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;
