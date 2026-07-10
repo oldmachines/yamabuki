@@ -5,6 +5,16 @@
 //! module and drive it through `Console`.
 
 pub const timing = @import("timing.zig");
+pub const serialize = @import("serialize.zig");
+pub const header = @import("cart/header.zig");
+pub const cartridge = @import("cart/cartridge.zig");
+pub const bus = @import("memory/bus.zig");
+pub const wram = @import("memory/wram.zig");
+pub const math_unit = @import("memory/math_unit.zig");
+pub const mappers = @import("memory/mappers.zig");
+
+pub const Cartridge = cartridge.Cartridge;
+pub const Bus = bus.Bus;
 
 pub const version = "0.1.0";
 
