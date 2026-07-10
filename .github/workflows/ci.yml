@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig fmt --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        optimize: [Debug, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test -Doptimize=${{ matrix.optimize }}
+
+  sst:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        optimize: [Debug, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Resolve test-vector revision
+        id: sst-rev
+        run: echo "rev=$(git ls-remote https://github.com/SingleStepTests/65816.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: test-data/sst-65816
+          key: sst-65816-${{ steps.sst-rev.outputs.rev }}
+      - name: Fetch 65816 vectors
+        run: |
+          if [ ! -d test-data/sst-65816/.git ]; then
+            mkdir -p test-data
+            git clone --depth 1 https://github.com/SingleStepTests/65816.git test-data/sst-65816
+          fi
+      - run: zig build test-sst -Doptimize=${{ matrix.optimize }} -Dsst-sample=500
+
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - aarch64-linux-musl
+          - arm-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}

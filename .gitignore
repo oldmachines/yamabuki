@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+test-data/
+vendor/
+*.ppm
+*.sfc
+*.smc
