@@ -14,9 +14,13 @@ pub const math_unit = @import("memory/math_unit.zig");
 pub const mappers = @import("memory/mappers.zig");
 pub const wdc65816 = @import("cpu/wdc65816.zig");
 pub const cpu_ops = @import("cpu/ops.zig");
+pub const cpu_io = @import("memory/cpu_io.zig");
+pub const console = @import("console.zig");
 
 pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;
+pub const Console = console.Console;
+pub const FastConsole = console.FastConsole;
 
 pub const version = "0.1.0";
 

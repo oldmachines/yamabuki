@@ -10,6 +10,7 @@ const std = @import("std");
 const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
+const CpuIo = @import("cpu_io.zig").CpuIo;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -40,6 +41,7 @@ pub const Bus = struct {
     fastrom: bool,
     wram: Wram,
     math: MathUnit,
+    cpuio: CpuIo,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`), and `cart` must outlive the bus.
@@ -50,6 +52,7 @@ pub const Bus = struct {
         self.fastrom = false;
         self.wram = .init;
         self.math = .init;
+        self.cpuio = .init;
         self.remap();
     }
 
@@ -107,6 +110,9 @@ pub const Bus = struct {
 
         const v: u8 = switch (a16) {
             0x2180 => self.wram.portRead(),
+            0x4210 => self.cpuio.readRdnmi(self.mdr),
+            0x4211 => self.cpuio.readTimeup(self.mdr),
+            0x4212 => self.cpuio.readHvbjoy(self.mdr),
             0x4214 => @truncate(self.math.rddiv),
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
@@ -139,11 +145,17 @@ pub const Bus = struct {
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),
             0x2183 => self.wram.setPortAddrHigh(value),
+            0x4200 => self.cpuio.nmitimen = value,
+            0x4201 => self.cpuio.wrio = value,
             0x4202 => self.math.wrmpya = value,
             0x4203 => self.math.writeMultiplicand(value),
             0x4204 => self.math.dividend = (self.math.dividend & 0xFF00) | value,
             0x4205 => self.math.dividend = (self.math.dividend & 0x00FF) | (@as(u16, value) << 8),
             0x4206 => self.math.writeDivisor(value),
+            0x4207 => self.cpuio.setHtimeLow(value),
+            0x4208 => self.cpuio.setHtimeHigh(value),
+            0x4209 => self.cpuio.setVtimeLow(value),
+            0x420A => self.cpuio.setVtimeHigh(value),
             0x420D => {
                 const enable = (value & 1) != 0;
                 if (enable != self.fastrom) {
