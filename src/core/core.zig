@@ -17,6 +17,7 @@ pub const wdc65816 = @import("cpu/wdc65816.zig");
 pub const cpu_ops = @import("cpu/ops.zig");
 pub const cpu_io = @import("memory/cpu_io.zig");
 pub const ppu = @import("ppu/ppu.zig");
+pub const line_render = @import("ppu/line_render.zig");
 pub const console = @import("console.zig");
 
 pub const Cartridge = cartridge.Cartridge;

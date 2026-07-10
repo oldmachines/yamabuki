@@ -8,6 +8,7 @@
 //! renderer and the handheld display path never touch 15-bit BGR.
 
 const std = @import("std");
+const line_render = @import("line_render.zig");
 
 /// Visible framebuffer dimensions. Width is 256 (hi-res 512 is M4); height is
 /// the maximum (overscan) — 224-line output uses the first 224 rows.
@@ -326,17 +327,11 @@ pub const Ppu = struct {
 
     // --- rendering --------------------------------------------------------
 
-    /// Render one visible scanline into the framebuffer. For M3.2 this lays
-    /// down only the backdrop (CGRAM color 0) with master-brightness applied;
-    /// the BG and sprite layers composite over it from M3.4.
+    /// Render one visible scanline into the framebuffer: force-blank/backdrop
+    /// handling plus the BG (and, from M3.5, sprite) compositor.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
-        const row = self.fb[line * fb_width ..][0..fb_width];
-        const color: u16 = if (self.force_blank or self.brightness == 0)
-            0
-        else
-            scaleBrightness(self.cgram[0], self.brightness);
-        @memset(row, color);
+        line_render.renderLine(self, line);
     }
 
     /// Visible framebuffer for the current display height.
@@ -355,7 +350,7 @@ fn bgr15to565(c: u16) u16 {
 }
 
 /// Apply INIDISP master brightness (0-15) to a 15-bit BGR color and pack to 565.
-fn scaleBrightness(c: u16, bright: u4) u16 {
+pub fn scaleBrightness(c: u16, bright: u4) u16 {
     const num: u16 = bright;
     const r5: u16 = ((c & 0x1F) * num) / 15;
     const g5: u16 = (((c >> 5) & 0x1F) * num) / 15;
