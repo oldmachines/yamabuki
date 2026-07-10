@@ -31,5 +31,9 @@
         .{ .path = "PPU/BGMAP/8x8/8BPP/64x32/8x8BGMap8BPP64x32.sfc", .hash = 0xce39d1f87fb4187e, .steps = 149934, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 146646, .cycles = 5717932 },
         .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x0aee22f7096e9c25, .steps = 158610, .cycles = 5717918 },
+        // M4.2: mode-3 scene. NB: this demo's mosaic level is input-driven, so it
+        // renders with mosaic off headless; the mosaic quantization itself is
+        // covered by the inline unit test, not this hash.
+        .{ .path = "PPU/Mosaic/Mode3/MosaicMode3.sfc", .hash = 0x530d2729b590abaf, .steps = 140836, .cycles = 5717922 },
     },
 }
