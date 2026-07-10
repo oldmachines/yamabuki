@@ -88,6 +88,10 @@ pub const Ppu = struct {
     scroll_latch: u8,
     scroll_latch_h: u8,
 
+    // --- sprite evaluation status ($213E) ---------------------------------
+    obj_range_over: bool, // >32 sprites on a line
+    obj_time_over: bool, // >34 sprite tiles on a line
+
     pub const init: Ppu = .{
         .vram = @splat(0),
         .cgram = @splat(0),
@@ -118,6 +122,8 @@ pub const Ppu = struct {
         .oam_latch = 0,
         .scroll_latch = 0,
         .scroll_latch_h = 0,
+        .obj_range_over = false,
+        .obj_time_over = false,
     };
 
     /// Rebuild the RGB565 palette from CGRAM after deserialization.
@@ -135,7 +141,8 @@ pub const Ppu = struct {
             },
             0x01 => { // OBSEL
                 self.obj_size = @truncate(value >> 5);
-                self.obj_char_gap = @as(u16, value & 0x18) << 9; // (bits 3-4) * 0x1000 words
+                // Second name table sits at base + (nameselect+1) * 0x1000 words.
+                self.obj_char_gap = (@as(u16, (value >> 3) & 3) + 1) << 12;
                 self.obj_char_base = @as(u16, value & 0x07) << 13; // (bits 0-2) * 0x2000 words
             },
             0x02 => self.oam_reload = (self.oam_reload & 0x100) | value, // OAMADDL
@@ -207,6 +214,9 @@ pub const Ppu = struct {
             0x39 => self.readVramLow(), // VMDATALREAD
             0x3A => self.readVramHigh(), // VMDATAHREAD
             0x3B => self.readCgram(mdr), // CGDATAREAD
+            0x3E => (if (self.obj_time_over) @as(u8, 0x80) else 0) |
+                (if (self.obj_range_over) @as(u8, 0x40) else 0) |
+                (mdr & 0x30) | 0x01, // STAT77: overflow flags + PPU1 version 1
             else => mdr, // open bus (write-only / not-yet-modeled)
         };
     }
