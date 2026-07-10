@@ -73,6 +73,21 @@ pub const Ppu = struct {
     main_screen: u8, // $212C TM
     sub_screen: u8, // $212D TS
 
+    // --- windows ($2123-$212B, $212E/$212F) -------------------------------
+    // Per-layer select nibble: bit0 W1 invert, bit1 W1 enable, bit2 W2 invert,
+    // bit3 W2 enable. BG1/BG3/OBJ low nibble, BG2/BG4/color high nibble.
+    w12sel: u8, // $2123 BG1/BG2
+    w34sel: u8, // $2124 BG3/BG4
+    wobjsel: u8, // $2125 OBJ/color-window
+    wh0: u8, // $2126 window 1 left
+    wh1: u8, // $2127 window 1 right
+    wh2: u8, // $2128 window 2 left
+    wh3: u8, // $2129 window 2 right
+    wbglog: u8, // $212A 2 bits/BG: 0=OR 1=AND 2=XOR 3=XNOR
+    wobjlog: u8, // $212B OBJ bits0-1, color bits2-3
+    tmw: u8, // $212E main-screen window masking (bit0 BG1 .. bit4 OBJ)
+    tsw: u8, // $212F sub-screen window masking (color math, M4.5)
+
     // --- VRAM access port -------------------------------------------------
     vram_addr: u16, // $2116/$2117 word address
     vram_inc_high: bool, // $2115 bit7: increment on high-byte write
@@ -117,6 +132,17 @@ pub const Ppu = struct {
         .obj_size = 0,
         .main_screen = 0,
         .sub_screen = 0,
+        .w12sel = 0,
+        .w34sel = 0,
+        .wobjsel = 0,
+        .wh0 = 0,
+        .wh1 = 0,
+        .wh2 = 0,
+        .wh3 = 0,
+        .wbglog = 0,
+        .wobjlog = 0,
+        .tmw = 0,
+        .tsw = 0,
         .vram_addr = 0,
         .vram_inc_high = true,
         .vram_inc_step = 1,
@@ -210,9 +236,20 @@ pub const Ppu = struct {
                 self.cgram_flip = false;
             },
             0x22 => self.writeCgram(value), // CGDATA
+            0x23 => self.w12sel = value, // W12SEL
+            0x24 => self.w34sel = value, // W34SEL
+            0x25 => self.wobjsel = value, // WOBJSEL
+            0x26 => self.wh0 = value, // WH0 (window 1 left)
+            0x27 => self.wh1 = value, // WH1 (window 1 right)
+            0x28 => self.wh2 = value, // WH2 (window 2 left)
+            0x29 => self.wh3 = value, // WH3 (window 2 right)
+            0x2A => self.wbglog = value, // WBGLOG
+            0x2B => self.wobjlog = value, // WOBJLOG
             0x2C => self.main_screen = value, // TM
             0x2D => self.sub_screen = value, // TS
-            // Mode 7, windows, color math, SETINI: latched in later milestones.
+            0x2E => self.tmw = value, // TMW (main-screen window mask)
+            0x2F => self.tsw = value, // TSW (sub-screen window mask)
+            // Mode 7, color math, SETINI: latched in later milestones.
             else => {},
         }
     }
@@ -422,6 +459,22 @@ test "oam sequential write via data port" {
     try std.testing.expectEqual(@as(u8, 0xAA), ppu.oam[0]);
     try std.testing.expectEqual(@as(u8, 0xBB), ppu.oam[1]);
     try std.testing.expectEqual(@as(u10, 2), ppu.oam_addr);
+}
+
+test "window registers latch" {
+    var ppu: Ppu = .init;
+    ppu.writeReg(0x2123, 0x03); // W12SEL: BG1 W1 enable+invert
+    ppu.writeReg(0x2126, 40); // WH0 window 1 left
+    ppu.writeReg(0x2127, 200); // WH1 window 1 right
+    ppu.writeReg(0x212A, 0x02); // WBGLOG: BG1 = XOR
+    ppu.writeReg(0x212E, 0x11); // TMW: BG1 + OBJ
+    ppu.writeReg(0x212F, 0x01); // TSW: BG1
+    try std.testing.expectEqual(@as(u8, 0x03), ppu.w12sel);
+    try std.testing.expectEqual(@as(u8, 40), ppu.wh0);
+    try std.testing.expectEqual(@as(u8, 200), ppu.wh1);
+    try std.testing.expectEqual(@as(u8, 0x02), ppu.wbglog);
+    try std.testing.expectEqual(@as(u8, 0x11), ppu.tmw);
+    try std.testing.expectEqual(@as(u8, 0x01), ppu.tsw);
 }
 
 test "backdrop render fills the scanline" {

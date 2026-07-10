@@ -54,7 +54,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M1 cartridge/mappers/bus | done |
 | M2 65816 CPU + test vectors | done |
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
-| M4 full fast PPU | in progress (BG modes 2/3/4, 8bpp, mosaic, offset-per-tile) |
+| M4 full fast PPU | in progress (BG modes 2/3/4, 8bpp, mosaic, offset-per-tile, windows) |
 | M5 APU (SPC700 + S-DSP) | planned |
 | M6 save states + libretro core | planned |
 | M7 SDL3 desktop frontend | planned |
