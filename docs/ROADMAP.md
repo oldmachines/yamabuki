@@ -168,7 +168,7 @@ serialize/unserialize.
 | M1 | Cart loading, header detection, mappers, page-table bus + open bus, WRAM, CPU math regs, serialize scaffolding | Unit tests | **Done** |
 | M2 | Full 65816 core (256 ops × 4 comptime variants, E-mode, interrupts, block moves) | SST 65816: 100% register/memory (5.12M cases) | **Done** |
 | M3 | Scheduler, NMI/IRQ, GDMA/HDMA, PPU registers, fast renderer modes 0/1 + sprites | PeterLemon ROMs render; golden hashes; `.ppm` eyeballed | **Done** |
-| M4 | Full fast PPU (modes 2–7, offset-per-tile, windows, color math, mosaic, hi-res) | PeterLemon PPU suite hashes | In progress — M4.1 planar modes 2/3/4 + 8bpp and M4.2 mosaic done; offset-per-tile, windows, color math, Mode 7, hi-res queued |
+| M4 | Full fast PPU (modes 2–7, offset-per-tile, windows, color math, mosaic, hi-res) | PeterLemon PPU suite hashes | In progress — M4.1 planar modes 2/3/4 + 8bpp, M4.2 mosaic, M4.3 offset-per-tile (modes 2/4) done; windows, color math, Mode 7, hi-res queued |
 | M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | Planned |
 | M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Planned |
 | M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Planned |
