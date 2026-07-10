@@ -405,6 +405,9 @@ test "HDMA drives INIDISP per scanline (brightness split mid-frame)" {
 const fb_width = @import("ppu/ppu.zig").fb_width;
 
 test "console save-state roundtrips and restores identical machine state" {
+    // Serializing the whole machine unrolls (comptime) over every PPU/CPU/bus
+    // field; the default 1000-branch budget is too small and grows each milestone.
+    @setEvalBranchQuota(20000);
     const serialize = @import("serialize.zig");
     const alloc = std.testing.allocator;
 
