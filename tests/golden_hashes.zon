@@ -35,5 +35,9 @@
         // renders with mosaic off headless; the mosaic quantization itself is
         // covered by the inline unit test, not this hash.
         .{ .path = "PPU/Mosaic/Mode3/MosaicMode3.sfc", .hash = 0x530d2729b590abaf, .steps = 140836, .cycles = 5717922 },
+        // M4.4: multi-window layer clipping (TMW carves the BG into regions,
+        // backdrop showing through). WindowHDMA uses the color-math spotlight and
+        // is deferred to the color-math slice (renders full without it).
+        .{ .path = "PPU/Window/WindowMultiHDMA/WindowMultiHDMA.sfc", .hash = 0x5b00df0115ff4a61, .steps = 146300, .cycles = 5717930 },
     },
 }
