@@ -242,11 +242,20 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, line: u
     const words_per_tile: u16 = @as(u16, bpp) * 4;
     const pal_size: u16 = @as(u16, 1) << bpp;
 
-    const sy: u16 = @intCast((line + layer.vofs) & (bg_h - 1));
+    // Mosaic ($2106): each block shows the color at its top-left *screen* pixel,
+    // so quantize the screen coordinates (grid is screen-aligned, not scrolled).
+    // Size (block = size+1) is shared; the enable bit is per BG (bit 4+index).
+    const msize: u32 = (@as(u32, ppu.mosaic) & 0x0F) + 1;
+    const mosaic_on = msize > 1 and (ppu.mosaic >> @intCast(4 + bg_index)) & 1 != 0;
+
+    const my: u32 = if (mosaic_on) line - line % msize else line;
+    const sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
     const tile_row = sy / tile_px;
 
     for (0..fb_width) |x| {
-        const sx: u16 = @intCast((@as(u32, @intCast(x)) + layer.hofs) & (bg_w - 1));
+        const xi: u32 = @intCast(x);
+        const mx: u32 = if (mosaic_on) xi - xi % msize else xi;
+        const sx: u16 = @intCast((mx + layer.hofs) & (bg_w - 1));
         const tile_col = sx / tile_px;
 
         var screen: u16 = 0;
@@ -437,6 +446,33 @@ test "mode 3 renders an 8bpp BG1 pixel and ignores the tilemap palette group" {
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]); // cgram[1], not cgram[1793]
     try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
+}
+
+test "mosaic quantizes BG pixels into blocks" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    ppu.vram[0x400] = 0x0000; // tile 0
+    ppu.vram[0] = 0x4080; // 2bpp row: px0 -> color 1, px1 -> color 2
+    ppu.cgram[1] = 0x001F; // color 1
+    ppu.cgram[2] = 0x03E0; // color 2 (distinct)
+    ppu.writeReg(0x2106, 0x11); // MOSAIC: size 2 (block=2), BG1 enabled
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    // Each 2-pixel block shows its top-left sample, so pixel 1 takes pixel 0's
+    // color — the color-2 pixel at x=1 is dropped.
+    try std.testing.expectEqual(ppu.fb[0], ppu.fb[1]);
+    try std.testing.expectEqual(ppu.fb[2], ppu.fb[3]);
+    try std.testing.expect(ppu.fb[0] != ppu.fb[2]); // adjacent blocks still differ
+
+    // With mosaic off, pixel 1 shows its own (color-2) value again.
+    ppu.writeReg(0x2106, 0x00);
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.fb[1] != ppu.fb[0]);
 }
 
 test "higher priority tile wins the composite" {
