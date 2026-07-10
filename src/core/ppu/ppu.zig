@@ -88,6 +88,18 @@ pub const Ppu = struct {
     tmw: u8, // $212E main-screen window masking (bit0 BG1 .. bit4 OBJ)
     tsw: u8, // $212F sub-screen window masking (color math, M4.5)
 
+    // --- Mode 7 ($211A-$2120, $2134-$2136 read) ---------------------------
+    m7sel: u8, // $211A: bit0 H-flip, bit1 V-flip, bits6-7 out-of-area
+    m7a: i16, // $211B matrix A (signed 8.8)
+    m7b: i16, // $211C matrix B
+    m7c: i16, // $211D matrix C
+    m7d: i16, // $211E matrix D
+    m7x: i16, // $211F center X (13-bit signed)
+    m7y: i16, // $2120 center Y (13-bit signed)
+    m7hofs: i16, // $210D mode-7 H scroll (13-bit signed)
+    m7vofs: i16, // $210E mode-7 V scroll (13-bit signed)
+    m7_latch: u8, // shared write-twice latch for the mode-7 registers
+
     // --- VRAM access port -------------------------------------------------
     vram_addr: u16, // $2116/$2117 word address
     vram_inc_high: bool, // $2115 bit7: increment on high-byte write
@@ -143,6 +155,16 @@ pub const Ppu = struct {
         .wobjlog = 0,
         .tmw = 0,
         .tsw = 0,
+        .m7sel = 0,
+        .m7a = 0,
+        .m7b = 0,
+        .m7c = 0,
+        .m7d = 0,
+        .m7x = 0,
+        .m7y = 0,
+        .m7hofs = 0,
+        .m7vofs = 0,
+        .m7_latch = 0,
         .vram_addr = 0,
         .vram_inc_high = true,
         .vram_inc_step = 1,
@@ -210,14 +232,27 @@ pub const Ppu = struct {
                 self.bg[2].char_base = @as(u16, value & 0x0F) << 12;
                 self.bg[3].char_base = @as(u16, value >> 4) << 12;
             },
-            0x0D => self.writeHofs(0, value), // BG1HOFS
-            0x0E => self.writeVofs(0, value), // BG1VOFS
+            0x0D => { // BG1HOFS + M7HOFS (each has its own write latch)
+                self.writeHofs(0, value);
+                self.m7hofs = self.m7ScrollWrite(value);
+            },
+            0x0E => { // BG1VOFS + M7VOFS
+                self.writeVofs(0, value);
+                self.m7vofs = self.m7ScrollWrite(value);
+            },
             0x0F => self.writeHofs(1, value),
             0x10 => self.writeVofs(1, value),
             0x11 => self.writeHofs(2, value),
             0x12 => self.writeVofs(2, value),
             0x13 => self.writeHofs(3, value),
             0x14 => self.writeVofs(3, value),
+            0x1A => self.m7sel = value, // M7SEL
+            0x1B => self.m7a = self.m7MatrixWrite(value), // M7A
+            0x1C => self.m7b = self.m7MatrixWrite(value), // M7B
+            0x1D => self.m7c = self.m7MatrixWrite(value), // M7C
+            0x1E => self.m7d = self.m7MatrixWrite(value), // M7D
+            0x1F => self.m7x = self.m7ScrollWrite(value), // M7X (13-bit)
+            0x20 => self.m7y = self.m7ScrollWrite(value), // M7Y (13-bit)
             0x15 => { // VMAIN
                 self.vram_inc_high = value & 0x80 != 0;
                 self.vram_remap = @truncate(value >> 2);
@@ -258,6 +293,9 @@ pub const Ppu = struct {
 
     pub fn readReg(self: *Ppu, addr: u16, mdr: u8) u8 {
         return switch (addr & 0xFF) {
+            0x34 => @truncate(@as(u32, @bitCast(self.m7Multiply()))), // MPYL
+            0x35 => @truncate(@as(u32, @bitCast(self.m7Multiply())) >> 8), // MPYM
+            0x36 => @truncate(@as(u32, @bitCast(self.m7Multiply())) >> 16), // MPYH
             0x38 => self.readOam(), // OAMDATAREAD
             0x39 => self.readVramLow(), // VMDATALREAD
             0x3A => self.readVramHigh(), // VMDATAHREAD
@@ -282,6 +320,27 @@ pub const Ppu = struct {
     fn writeVofs(self: *Ppu, i: usize, value: u8) void {
         self.bg[i].vofs = (@as(u16, value) << 8) | self.scroll_latch;
         self.scroll_latch = value;
+    }
+
+    // --- Mode 7 register write-twice (shared latch) -----------------------
+
+    /// Matrix registers M7A-M7D: 16-bit, low byte then high byte.
+    fn m7MatrixWrite(self: *Ppu, value: u8) i16 {
+        const v = (@as(u16, value) << 8) | self.m7_latch;
+        self.m7_latch = value;
+        return @bitCast(v);
+    }
+
+    /// Center/scroll registers M7X/M7Y/M7HOFS/M7VOFS: 13-bit signed.
+    fn m7ScrollWrite(self: *Ppu, value: u8) i16 {
+        const v = ((@as(u16, value) << 8) | self.m7_latch) & 0x1FFF;
+        self.m7_latch = value;
+        return @bitCast(if (v & 0x1000 != 0) v | 0xE000 else v);
+    }
+
+    /// The 24-bit signed product M7A * (M7B high byte) exposed at $2134-$2136.
+    fn m7Multiply(self: *const Ppu) i32 {
+        return @as(i32, self.m7a) * @as(i32, self.m7b >> 8);
     }
 
     // --- VRAM port --------------------------------------------------------
@@ -475,6 +534,29 @@ test "window registers latch" {
     try std.testing.expectEqual(@as(u8, 0x02), ppu.wbglog);
     try std.testing.expectEqual(@as(u8, 0x11), ppu.tmw);
     try std.testing.expectEqual(@as(u8, 0x01), ppu.tsw);
+}
+
+test "mode 7 matrix write-twice, 13-bit center, and multiply" {
+    var ppu: Ppu = .init;
+    ppu.writeReg(0x211B, 0x00); // M7A low
+    ppu.writeReg(0x211B, 0x01); // M7A high -> 0x0100 (1.0)
+    try std.testing.expectEqual(@as(i16, 0x0100), ppu.m7a);
+
+    ppu.writeReg(0x211F, 0xFF); // M7X low
+    ppu.writeReg(0x211F, 0x1F); // M7X high -> 0x1FFF, 13-bit signed -> -1
+    try std.testing.expectEqual(@as(i16, -1), ppu.m7x);
+
+    ppu.writeReg(0x211C, 0x00); // M7B low
+    ppu.writeReg(0x211C, 0x03); // M7B high -> 0x0300 (high byte 3)
+    // MPY = M7A * (M7B high byte) = 0x100 * 3 = 0x300.
+    try std.testing.expectEqual(@as(u8, 0x00), ppu.readReg(0x2134, 0));
+    try std.testing.expectEqual(@as(u8, 0x03), ppu.readReg(0x2135, 0));
+    try std.testing.expectEqual(@as(u8, 0x00), ppu.readReg(0x2136, 0));
+
+    // $210D writes both BG1HOFS and the 13-bit M7HOFS.
+    ppu.writeReg(0x210D, 0xFF);
+    ppu.writeReg(0x210D, 0x1F);
+    try std.testing.expectEqual(@as(i16, -1), ppu.m7hofs);
 }
 
 test "backdrop render fills the scanline" {
