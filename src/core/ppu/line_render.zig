@@ -63,6 +63,12 @@ const order_mode1_bg3_front = [_]Entry{
     obj(0),
     bg(2, 0),
 };
+// Modes 2-5 share a two-BG priority order (mode 1's, without the BG3 entries).
+const order_2bg = [_]Entry{
+    obj(3), bg(0, 1), bg(1, 1),
+    obj(2), bg(0, 0), bg(1, 0),
+    obj(1), obj(0),
+};
 
 /// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
 /// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
@@ -71,7 +77,7 @@ const Kind = enum { planar, affine };
 /// One BG layer's fixed configuration within a mode: which BG index it is, its
 /// bit depth (kept comptime so the plane decode unrolls), and the palette base
 /// that the mode's layout assigns to it.
-const LayerDesc = struct { bg: u2, bpp: u3, cgram_base: u16 };
+const LayerDesc = struct { bg: u2, bpp: u4, cgram_base: u16 };
 
 /// A background mode as data: the layers to decode, the front-to-back priority
 /// order, and (for mode 1) the alternate order selected by the BG3-priority bit.
@@ -86,8 +92,10 @@ const ModeDesc = struct {
 
 const backdrop_mode: ModeDesc = .{};
 
-/// Modes 0-7, indexed by `$2105` BGMODE. Modes 2-7 are backdrop-only until M4
-/// fills in their layer descriptors (offset-per-tile, hi-res, Mode 7).
+/// Modes 0-7, indexed by `$2105` BGMODE. Modes 5/6 (hi-res) and 7 (affine) are
+/// backdrop-only until later M4 slices fill in their descriptors. Modes 2 and 4
+/// are rendered here as plain planar layers; their offset-per-tile behavior
+/// (which needs BG3's map) arrives in the offset-per-tile slice.
 const mode_table = [8]ModeDesc{
     .{ // mode 0: four 2bpp layers, each in its own 32-color palette quadrant.
         .layers = &.{
@@ -107,12 +115,30 @@ const mode_table = [8]ModeDesc{
         .order = &order_mode1,
         .order_bg3_front = &order_mode1_bg3_front,
     },
-    backdrop_mode,
-    backdrop_mode,
-    backdrop_mode,
-    backdrop_mode,
-    backdrop_mode,
-    backdrop_mode,
+    .{ // mode 2: BG1/BG2 4bpp (offset-per-tile deferred).
+        .layers = &.{
+            .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 4, .cgram_base = 0 },
+        },
+        .order = &order_2bg,
+    },
+    .{ // mode 3: BG1 8bpp, BG2 4bpp.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 8, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 4, .cgram_base = 0 },
+        },
+        .order = &order_2bg,
+    },
+    .{ // mode 4: BG1 8bpp, BG2 2bpp (offset-per-tile deferred).
+        .layers = &.{
+            .{ .bg = 0, .bpp = 8, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 2, .cgram_base = 0 },
+        },
+        .order = &order_2bg,
+    },
+    backdrop_mode, // mode 5: hi-res (later slice)
+    backdrop_mode, // mode 6: hi-res + offset-per-tile (later slice)
+    backdrop_mode, // mode 7: affine (later slice)
 };
 
 pub fn renderLine(ppu: *Ppu, line: u32) void {
@@ -201,7 +227,7 @@ fn clearLine(buf: *[fb_width]Cell) void {
 
 /// Decode one BG layer's contribution to the scanline. `comptime bpp` folds the
 /// bitplane math; `cgram_base` is the mode-dependent palette offset for this BG.
-fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u3, cgram_base: u16, line: u32, buf: *[fb_width]Cell) void {
+fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, line: u32, buf: *[fb_width]Cell) void {
     if (ppu.main_screen & (@as(u8, 1) << @intCast(bg_index)) == 0) {
         clearLine(buf);
         return;
@@ -214,7 +240,7 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u3, cgram_base: u16, line: u
     const bg_w: u16 = width_tiles * tile_px;
     const bg_h: u16 = height_tiles * tile_px;
     const words_per_tile: u16 = @as(u16, bpp) * 4;
-    const pal_size: u8 = 1 << bpp;
+    const pal_size: u16 = @as(u16, 1) << bpp;
 
     const sy: u16 = @intCast((line + layer.vofs) & (bg_h - 1));
     const tile_row = sy / tile_px;
@@ -248,10 +274,13 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u3, cgram_base: u16, line: u
         }
 
         const color = decodePlanar(ppu, bpp, layer.char_base +% tile_num *% words_per_tile +% py, @intCast(px));
+        // 8bpp backgrounds index all 256 CGRAM entries directly; the tilemap's
+        // palette-group bits are ignored. Lower depths select a sub-palette.
+        const abs: u16 = if (bpp == 8) cgram_base + color else cgram_base + pal_group * pal_size + color;
         buf[x] = if (color == 0)
             .{}
         else
-            .{ .abs = @intCast(cgram_base + pal_group * pal_size + color), .prio = prio, .solid = true };
+            .{ .abs = @intCast(abs), .prio = prio, .solid = true };
     }
 }
 
@@ -351,9 +380,9 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
     }
 }
 
-/// Decode one planar pixel (2bpp or 4bpp) at bit position `px` (0 = leftmost)
-/// from the tile row word(s) starting at `char_addr`.
-inline fn decodePlanar(ppu: *Ppu, comptime bpp: u3, char_addr: u16, px: u3) u8 {
+/// Decode one planar pixel (2bpp, 4bpp, or 8bpp) at bit position `px`
+/// (0 = leftmost) from the tile row word(s) starting at `char_addr`.
+inline fn decodePlanar(ppu: *Ppu, comptime bpp: u4, char_addr: u16, px: u3) u8 {
     const bit: u4 = @intCast(7 - @as(u4, px));
     var color: u8 = 0;
     inline for (0..bpp / 2) |pair| {
@@ -387,6 +416,26 @@ test "mode 0 renders a single BG1 tile pixel" {
 
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]);
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
+}
+
+test "mode 3 renders an 8bpp BG1 pixel and ignores the tilemap palette group" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 3;
+    ppu.main_screen = 0x01; // BG1 only
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    // Tilemap entry with a non-zero palette group (0x1C00 = group 7): an 8bpp BG
+    // must ignore it, so the color index is the raw 8-bit pixel value. If it were
+    // wrongly applied, abs = 7*256+1 would overflow the u8 index and panic.
+    ppu.vram[0x400] = 0x1C00;
+    ppu.vram[0] = 0x0080; // plane 0 leftmost bit -> pixel value 1
+    ppu.cgram[1] = 0x7C00; // blue
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]); // cgram[1], not cgram[1793]
     try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
 }
 
