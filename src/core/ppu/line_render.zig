@@ -156,7 +156,8 @@ const mode_table = [8]ModeDesc{
 };
 
 pub fn renderLine(ppu: *Ppu, line: u32) void {
-    const row = ppu.fb[line * fb_width ..][0..fb_width];
+    const width = ppu.fb_line_width;
+    const row = ppu.fb[line * width ..][0..width];
 
     if (ppu.force_blank) {
         @memset(row, 0);
@@ -171,6 +172,11 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
         ppu.lpal_dirty = false;
     }
 
+    // Content composes at 256 pixels; on a 512-stride frame (a mixed-width
+    // frame whose earlier lines were hi-res) it is pixel-doubled into the row.
+    var tmp: [fb_width]u16 = undefined;
+    const dest: []u16 = if (width == fb_width) row else &tmp;
+
     var bgbuf: [4][fb_width]Cell = undefined;
     var objbuf: [fb_width]Cell = undefined;
 
@@ -178,7 +184,13 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     // descriptor so each layer's bit depth stays comptime.
     inline for (mode_table, 0..) |md, m| {
         if (ppu.bg_mode == m) {
-            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, row);
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, dest);
+            if (width != fb_width) {
+                for (0..fb_width) |x| {
+                    row[2 * x] = tmp[x];
+                    row[2 * x + 1] = tmp[x];
+                }
+            }
             return;
         }
     }

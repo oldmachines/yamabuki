@@ -172,6 +172,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
             const height: u32 = if (self.bus.ppu.overscan()) timing.visible_lines_239 else timing.visible_lines_224;
             return self.bus.ppu.frame(height);
         }
+
+        /// Pixel width of the last rendered frame (256, or 512 for hi-res).
+        pub fn frameWidth(self: *const Self) u32 {
+            return self.bus.ppu.fb_line_width;
+        }
     };
 }
 

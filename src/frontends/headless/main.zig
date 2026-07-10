@@ -47,14 +47,15 @@ pub fn main(init: std.process.Init) !void {
     for (0..args.frames) |_| con.runFrame();
 
     const fb = con.framebuffer();
+    const width = con.frameWidth();
     const hash = core.console.hashFrame(fb);
     try out.print("{s}: {} frames, {}x{}, hash={x:0>16}\n", .{
-        args.rom, args.frames, core.ppu.fb_width, fb.len / core.ppu.fb_width, hash,
+        args.rom, args.frames, width, fb.len / width, hash,
     });
     try out.flush();
 
     if (args.ppm) |path| {
-        try writePpm(io, path, fb, core.ppu.fb_width, @intCast(fb.len / core.ppu.fb_width));
+        try writePpm(io, path, fb, width, @intCast(fb.len / width));
         try out.print("wrote {s}\n", .{path});
         try out.flush();
     }

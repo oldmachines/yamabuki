@@ -32,6 +32,9 @@ fn IntBacking(comptime T: type) type {
 }
 
 pub fn byteSize(comptime T: type) usize {
+    // The recursive walk over Console's whole field tree runs long at comptime;
+    // raise the quota here once so every caller inherits it.
+    @setEvalBranchQuota(100_000);
     comptime var total: usize = 0;
     switch (@typeInfo(T)) {
         .int => total = intByteSize(T),
