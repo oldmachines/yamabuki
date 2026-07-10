@@ -64,6 +64,57 @@ const order_mode1_bg3_front = [_]Entry{
     bg(2, 0),
 };
 
+/// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
+/// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
+const Kind = enum { planar, affine };
+
+/// One BG layer's fixed configuration within a mode: which BG index it is, its
+/// bit depth (kept comptime so the plane decode unrolls), and the palette base
+/// that the mode's layout assigns to it.
+const LayerDesc = struct { bg: u2, bpp: u3, cgram_base: u16 };
+
+/// A background mode as data: the layers to decode, the front-to-back priority
+/// order, and (for mode 1) the alternate order selected by the BG3-priority bit.
+/// Modes with no layers render the backdrop. New modes are added here as data
+/// rather than as new code arms.
+const ModeDesc = struct {
+    layers: []const LayerDesc = &.{},
+    order: []const Entry = &.{},
+    order_bg3_front: ?[]const Entry = null,
+    kind: Kind = .planar,
+};
+
+const backdrop_mode: ModeDesc = .{};
+
+/// Modes 0-7, indexed by `$2105` BGMODE. Modes 2-7 are backdrop-only until M4
+/// fills in their layer descriptors (offset-per-tile, hi-res, Mode 7).
+const mode_table = [8]ModeDesc{
+    .{ // mode 0: four 2bpp layers, each in its own 32-color palette quadrant.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 2, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 2, .cgram_base = 32 },
+            .{ .bg = 2, .bpp = 2, .cgram_base = 64 },
+            .{ .bg = 3, .bpp = 2, .cgram_base = 96 },
+        },
+        .order = &order_mode0,
+    },
+    .{ // mode 1: BG1/BG2 4bpp, BG3 2bpp; BG3 can be pulled to the front.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 2, .bpp = 2, .cgram_base = 0 },
+        },
+        .order = &order_mode1,
+        .order_bg3_front = &order_mode1_bg3_front,
+    },
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+    backdrop_mode,
+};
+
 pub fn renderLine(ppu: *Ppu, line: u32) void {
     const row = ppu.fb[line * fb_width ..][0..fb_width];
 
@@ -79,28 +130,54 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     var bgbuf: [4][fb_width]Cell = undefined;
     var objbuf: [fb_width]Cell = undefined;
 
-    const order: []const Entry = switch (ppu.bg_mode) {
-        0 => blk: {
-            fillBg(ppu, 0, 2, 0, line, &bgbuf[0]);
-            fillBg(ppu, 1, 2, 32, line, &bgbuf[1]);
-            fillBg(ppu, 2, 2, 64, line, &bgbuf[2]);
-            fillBg(ppu, 3, 2, 96, line, &bgbuf[3]);
-            break :blk &order_mode0;
-        },
-        1 => blk: {
-            fillBg(ppu, 0, 4, 0, line, &bgbuf[0]);
-            fillBg(ppu, 1, 4, 0, line, &bgbuf[1]);
-            fillBg(ppu, 2, 2, 0, line, &bgbuf[2]);
-            break :blk if (ppu.bg3_priority) &order_mode1_bg3_front else &order_mode1;
-        },
-        else => {
-            @memset(row, lpal[0]);
+    // Runtime-select the mode, then run a body comptime-specialized on its
+    // descriptor so each layer's bit depth stays comptime.
+    inline for (mode_table, 0..) |md, m| {
+        if (ppu.bg_mode == m) {
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &lpal, row);
             return;
-        },
-    };
+        }
+    }
+}
 
-    fillObj(ppu, line, &objbuf);
+/// Decode a mode's layers into the line buffers and composite them. `md` is
+/// comptime, so `fillBg` monomorphizes per layer bit depth and modes with no
+/// layers fold to a plain backdrop fill.
+fn renderMode(
+    ppu: *Ppu,
+    line: u32,
+    comptime md: ModeDesc,
+    bgbuf: *[4][fb_width]Cell,
+    objbuf: *[fb_width]Cell,
+    lpal: *const [256]u16,
+    row: []u16,
+) void {
+    if (md.order.len == 0) {
+        @memset(row, lpal[0]);
+        return;
+    }
+    inline for (md.layers) |ld| {
+        fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, line, &bgbuf[ld.bg]);
+    }
+    fillObj(ppu, line, objbuf);
 
+    const order = if (md.order_bg3_front) |alt|
+        (if (ppu.bg3_priority) alt else md.order)
+    else
+        md.order;
+    composite(order, bgbuf, objbuf, lpal, row);
+}
+
+/// Resolve each pixel by walking the priority order front-to-back, taking the
+/// first solid layer at its matching priority (else the backdrop). This is the
+/// single seam M4 extends for the sub-screen, windows, mosaic, and color math.
+fn composite(
+    order: []const Entry,
+    bgbuf: *const [4][fb_width]Cell,
+    objbuf: *const [fb_width]Cell,
+    lpal: *const [256]u16,
+    row: []u16,
+) void {
     for (0..fb_width) |x| {
         var abs: u8 = 0; // backdrop
         for (order) |e| {
