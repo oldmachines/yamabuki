@@ -184,16 +184,49 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     // descriptor so each layer's bit depth stays comptime.
     inline for (mode_table, 0..) |md, m| {
         if (ppu.bg_mode == m) {
-            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, dest);
-            if (width != fb_width) {
-                for (0..fb_width) |x| {
-                    row[2 * x] = tmp[x];
-                    row[2 * x + 1] = tmp[x];
+            if (width != fb_width and ppu.hiresActive()) {
+                // A genuine hi-res line: sub/main interleave at 512.
+                renderModeHires(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, row);
+            } else {
+                renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, dest);
+                if (width != fb_width) {
+                    // A 256-wide line on a promoted frame: pixel-double it.
+                    for (0..fb_width) |x| {
+                        row[2 * x] = tmp[x];
+                        row[2 * x + 1] = tmp[x];
+                    }
                 }
             }
             return;
         }
     }
+}
+
+/// Decode a mode's BG layers and the OBJ layer into the line buffers.
+fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width]Cell, objbuf: *[fb_width]Cell) void {
+    if (md.kind == .affine) {
+        fillMode7(ppu, line, &bgbuf[0]);
+    } else {
+        inline for (md.layers) |ld| {
+            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
+        }
+    }
+    fillObj(ppu, line, objbuf);
+}
+
+/// The mode's priority order, honoring the mode-1 BG3-priority alternate.
+inline fn selectOrder(ppu: *const Ppu, comptime md: ModeDesc) []const Entry {
+    return if (md.order_bg3_front) |alt|
+        (if (ppu.bg3_priority) alt else md.order)
+    else
+        md.order;
+}
+
+/// Color math runs when any layer has its CGADSUB enable bit set or CGWSEL
+/// clips the main screen to black; otherwise the direct lpal path is taken
+/// and none of the math state is read.
+inline fn mathActive(ppu: *const Ppu) bool {
+    return ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
 }
 
 /// Decode a mode's layers into the line buffers and composite them. `md` is
@@ -212,35 +245,60 @@ fn renderMode(
         @memset(row, lpal[0]);
         return;
     }
-    if (md.kind == .affine) {
-        fillMode7(ppu, line, &bgbuf[0]);
-    } else {
-        inline for (md.layers) |ld| {
-            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
-        }
-    }
-    fillObj(ppu, line, objbuf);
-
-    const order = if (md.order_bg3_front) |alt|
-        (if (ppu.bg3_priority) alt else md.order)
-    else
-        md.order;
-
-    // Color math runs when any layer has its CGADSUB enable bit set or CGWSEL
-    // clips the main screen to black; otherwise the direct lpal path below is
-    // taken and none of the math state is read.
-    const math_active = ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
+    fillLayers(ppu, line, md, bgbuf, objbuf);
+    const order = selectOrder(ppu, md);
+    const math = mathActive(ppu);
 
     // Windows matter when a layer is masked on the main screen ($212E TMW) or
     // color math is active (sub-screen masks + the color window). Otherwise the
     // compositor short-circuits and the mask is never read.
     var winmask: [6][fb_width]bool = undefined;
-    if (ppu.tmw != 0 or math_active) computeWindows(ppu, &winmask);
+    if (ppu.tmw != 0 or math) computeWindows(ppu, &winmask);
 
-    if (math_active) {
+    if (math) {
         compositeMath(ppu, order, bgbuf, objbuf, row, &winmask);
     } else {
         composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, ppu.main_screen);
+    }
+}
+
+/// Pseudo-hires (SETINI bit3): compose the sub and main screens separately at
+/// 256 pixels and interleave them into the 512-wide row — even output pixels
+/// show the sub screen, odd the main screen (the hardware's half-dot order).
+/// The main screen keeps its color-math path; the sub screen composes plainly
+/// with its own TS enables and TSW window masks.
+fn renderModeHires(
+    ppu: *Ppu,
+    line: u32,
+    comptime md: ModeDesc,
+    bgbuf: *[4][fb_width]Cell,
+    objbuf: *[fb_width]Cell,
+    lpal: *const [256]u16,
+    row: []u16,
+) void {
+    if (md.order.len == 0) {
+        @memset(row, lpal[0]);
+        return;
+    }
+    fillLayers(ppu, line, md, bgbuf, objbuf);
+    const order = selectOrder(ppu, md);
+    const math = mathActive(ppu);
+
+    var winmask: [6][fb_width]bool = undefined;
+    if ((ppu.tmw | ppu.tsw) != 0 or math) computeWindows(ppu, &winmask);
+
+    var main_row: [fb_width]u16 = undefined;
+    var sub_row: [fb_width]u16 = undefined;
+    if (math) {
+        compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask);
+    } else {
+        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, ppu.main_screen);
+    }
+    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, ppu.sub_screen);
+
+    for (0..fb_width) |x| {
+        row[2 * x] = sub_row[x];
+        row[2 * x + 1] = main_row[x];
     }
 }
 
@@ -1012,6 +1070,30 @@ test "backdrop color math adds the fixed color to empty pixels" {
 
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[0]); // black + green
+}
+
+test "pseudo-hires interleaves the sub and main screens" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // main: BG1
+    ppu.sub_screen = 0x02; // sub: BG2
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
+    ppu.bg[1] = .{ .map_base = 0x500, .char_base = 0x100 };
+    ppu.vram[0] = 0x00FF; // BG1 tile: solid color 1
+    ppu.vram[0x100] = 0x00FF; // BG2 tile: solid color 1
+    ppu.cgram[1] = 0x001F; // BG1 red
+    ppu.cgram[33] = 0x03E0; // BG2 (mode-0 base 32) green
+    ppu.writeReg(0x2133, 0x08); // SETINI: pseudo-hires
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(ppu_mod.fb_width_max, ppu.fb_line_width);
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[0]); // even: sub (green)
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[1]); // odd: main (red)
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[510]);
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[511]);
 }
 
 test "higher priority tile wins the composite" {
