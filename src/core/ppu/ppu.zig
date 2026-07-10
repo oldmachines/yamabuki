@@ -88,6 +88,16 @@ pub const Ppu = struct {
     tmw: u8, // $212E main-screen window masking (bit0 BG1 .. bit4 OBJ)
     tsw: u8, // $212F sub-screen window masking (color math, M4.5)
 
+    // --- color math ($2130-$2132) ------------------------------------------
+    // CGWSEL: bit0 direct color (not yet modeled), bit1 addend = sub screen
+    // (else fixed color), bits4-5 prevent-math region, bits6-7 clip-to-black
+    // region. Region encoding: 0=never, 1=outside color window, 2=inside, 3=always.
+    cgwsel: u8, // $2130
+    // CGADSUB: bits0-5 per-layer enable (BG1-4, OBJ, backdrop), bit6 half, bit7 subtract.
+    cgadsub: u8, // $2131
+    // COLDATA accumulated into a 15-bit BGR fixed color (bits5-7 select channels).
+    fixed_color: u16, // $2132
+
     // --- Mode 7 ($211A-$2120, $2134-$2136 read) ---------------------------
     m7sel: u8, // $211A: bit0 H-flip, bit1 V-flip, bits6-7 out-of-area
     m7a: i16, // $211B matrix A (signed 8.8)
@@ -155,6 +165,9 @@ pub const Ppu = struct {
         .wobjlog = 0,
         .tmw = 0,
         .tsw = 0,
+        .cgwsel = 0,
+        .cgadsub = 0,
+        .fixed_color = 0,
         .m7sel = 0,
         .m7a = 0,
         .m7b = 0,
@@ -284,7 +297,15 @@ pub const Ppu = struct {
             0x2D => self.sub_screen = value, // TS
             0x2E => self.tmw = value, // TMW (main-screen window mask)
             0x2F => self.tsw = value, // TSW (sub-screen window mask)
-            // Mode 7, color math, SETINI: latched in later milestones.
+            0x30 => self.cgwsel = value, // CGWSEL
+            0x31 => self.cgadsub = value, // CGADSUB
+            0x32 => { // COLDATA: set the selected channels of the fixed color
+                const intensity: u16 = value & 0x1F;
+                if (value & 0x20 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x001F)) | intensity;
+                if (value & 0x40 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x03E0)) | (intensity << 5);
+                if (value & 0x80 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x7C00)) | (intensity << 10);
+            },
+            // SETINI: latched in later milestones.
             else => {},
         }
     }
@@ -557,6 +578,21 @@ test "mode 7 matrix write-twice, 13-bit center, and multiply" {
     ppu.writeReg(0x210D, 0xFF);
     ppu.writeReg(0x210D, 0x1F);
     try std.testing.expectEqual(@as(i16, -1), ppu.m7hofs);
+}
+
+test "color math registers latch and COLDATA accumulates channels" {
+    var ppu: Ppu = .init;
+    ppu.writeReg(0x2130, 0x02); // CGWSEL: addend = sub screen
+    ppu.writeReg(0x2131, 0xE1); // CGADSUB: subtract, half, BG1
+    try std.testing.expectEqual(@as(u8, 0x02), ppu.cgwsel);
+    try std.testing.expectEqual(@as(u8, 0xE1), ppu.cgadsub);
+
+    ppu.writeReg(0x2132, 0x7F); // red+green = 31
+    try std.testing.expectEqual(@as(u16, 0x03FF), ppu.fixed_color);
+    ppu.writeReg(0x2132, 0x90); // blue = 16, red/green untouched
+    try std.testing.expectEqual(@as(u16, 0x43FF), ppu.fixed_color);
+    ppu.writeReg(0x2132, 0x20); // red = 0, green/blue untouched
+    try std.testing.expectEqual(@as(u16, 0x43E0), ppu.fixed_color);
 }
 
 test "backdrop render fills the scanline" {

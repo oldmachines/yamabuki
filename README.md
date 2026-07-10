@@ -41,7 +41,8 @@ zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 16 --ppm out.ppm
 ## Status
 
 Early development. The console boots ROMs and renders: scheduler with NMI/IRQ,
-DMA/HDMA, and a fast scanline renderer for BG modes 0-4 (2/4/8bpp) + sprites.
+DMA/HDMA, and a fast scanline renderer for BG modes 0-4 and 7 (2/4/8bpp +
+affine) with sprites, windows, and color math.
 PeterLemon BG/text/sprite ROMs render and are locked against golden framebuffer
 hashes; the 65816 core is validated against
 [SingleStepTests](https://github.com/SingleStepTests/65816) vectors.
@@ -54,7 +55,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M1 cartridge/mappers/bus | done |
 | M2 65816 CPU + test vectors | done |
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
-| M4 full fast PPU | in progress (BG modes 2/3/4, 8bpp, mosaic, offset-per-tile, windows, Mode 7) |
+| M4 full fast PPU | in progress (BG modes 2/3/4, 8bpp, mosaic, offset-per-tile, windows, Mode 7, color math) |
 | M5 APU (SPC700 + S-DSP) | planned |
 | M6 save states + libretro core | planned |
 | M7 SDL3 desktop frontend | planned |

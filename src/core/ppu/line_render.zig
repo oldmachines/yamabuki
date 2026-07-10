@@ -1,17 +1,18 @@
-//! Fast scanline compositor for BG modes 0 and 1, with sprites.
+//! Fast scanline compositor for BG modes 0-4 and 7, with sprites, windows,
+//! and color math.
 //!
 //! Each enabled background layer and the sprite (OBJ) layer are decoded into
 //! per-pixel line buffers (palette index + priority), then composited
 //! front-to-back by the mode's priority order and written out as RGB565. Tile
-//! decoding is comptime-specialized on bit depth so the 2bpp/4bpp planes fold to
-//! straight-line shifts with no per-pixel branching on depth.
+//! decoding is comptime-specialized on bit depth so the 2bpp/4bpp/8bpp planes
+//! fold to straight-line shifts with no per-pixel branching on depth.
 //!
 //! Sprites are evaluated per line with the real 32-sprites and 34-tiles limits;
 //! lower OAM index wins on overlap, and each sprite's OBJ priority (0-3) places
 //! it in the composite order relative to the BG layers.
 //!
-//! Modes 2-7 (offset-per-tile, mode 7, hi-res) arrive in later milestones;
-//! unsupported modes fall back to the backdrop.
+//! Modes 5/6 (hi-res) arrive in a later slice; unsupported modes fall back to
+//! the backdrop.
 
 const std = @import("std");
 const ppu_mod = @import("ppu.zig");
@@ -213,26 +214,39 @@ fn renderMode(
     else
         md.order;
 
-    // Windows only matter when a layer is masked on the main screen ($212E TMW).
-    // When TMW is zero the compositor short-circuits and the mask is never read.
-    var winmask: [5][fb_width]bool = undefined;
-    if (ppu.tmw != 0) computeWindows(ppu, &winmask);
-    composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw);
+    // Color math runs when any layer has its CGADSUB enable bit set or CGWSEL
+    // clips the main screen to black; otherwise the direct lpal path below is
+    // taken and none of the math state is read.
+    const math_active = ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
+
+    // Windows matter when a layer is masked on the main screen ($212E TMW) or
+    // color math is active (sub-screen masks + the color window). Otherwise the
+    // compositor short-circuits and the mask is never read.
+    var winmask: [6][fb_width]bool = undefined;
+    if (ppu.tmw != 0 or math_active) computeWindows(ppu, &winmask);
+
+    if (math_active) {
+        compositeMath(ppu, order, bgbuf, objbuf, row, &winmask);
+    } else {
+        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, ppu.main_screen);
+    }
 }
 
-/// Compute, per layer (0-3 = BG1-4, 4 = OBJ), whether each screen pixel lies in
-/// that layer's combined window region. Window 1 is [WH0,WH1], window 2 is
-/// [WH2,WH3]; each can be enabled and inverted, and the two combine by the
-/// layer's logic op (OR/AND/XOR/XNOR). A layer with no enabled window is never
-/// masked. Recomputed per line, so HDMA'd window edges take effect per scanline.
-fn computeWindows(ppu: *const Ppu, mask: *[5][fb_width]bool) void {
-    for (0..5) |layer| {
+/// Compute, per layer (0-3 = BG1-4, 4 = OBJ, 5 = color window), whether each
+/// screen pixel lies in that layer's combined window region. Window 1 is
+/// [WH0,WH1], window 2 is [WH2,WH3]; each can be enabled and inverted, and the
+/// two combine by the layer's logic op (OR/AND/XOR/XNOR). A layer with no
+/// enabled window is never masked. Recomputed per line, so HDMA'd window edges
+/// take effect per scanline.
+fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
+    for (0..6) |layer| {
         const sel: u8 = switch (layer) {
             0 => ppu.w12sel & 0x0F,
             1 => ppu.w12sel >> 4,
             2 => ppu.w34sel & 0x0F,
             3 => ppu.w34sel >> 4,
-            else => ppu.wobjsel & 0x0F,
+            4 => ppu.wobjsel & 0x0F,
+            else => ppu.wobjsel >> 4,
         };
         const w1_inv = sel & 0x01 != 0;
         const w1_en = sel & 0x02 != 0;
@@ -240,7 +254,8 @@ fn computeWindows(ppu: *const Ppu, mask: *[5][fb_width]bool) void {
         const w2_en = sel & 0x08 != 0;
         const logic: u2 = switch (layer) {
             0...3 => @truncate(ppu.wbglog >> @intCast(layer * 2)),
-            else => @truncate(ppu.wobjlog),
+            4 => @truncate(ppu.wobjlog),
+            else => @truncate(ppu.wobjlog >> 2),
         };
 
         for (0..fb_width) |x| {
@@ -266,33 +281,128 @@ fn computeWindows(ppu: *const Ppu, mask: *[5][fb_width]bool) void {
     }
 }
 
-/// Resolve each pixel by walking the priority order front-to-back, taking the
-/// first solid layer at its matching priority (else the backdrop). This is the
-/// single seam M4 extends for the sub-screen, windows, mosaic, and color math.
+/// A resolved screen pixel: its CGRAM index and the layer that produced it
+/// (0-3 = BG1-4, 4 = OBJ, 5 = backdrop). The layer drives per-layer color math.
+const Resolved = struct { abs: u8, layer: u3 };
+
+/// Walk the priority order front-to-back for one pixel, taking the first solid
+/// layer at its matching priority (else the backdrop). `screens` is the TM or
+/// TS enable mask, so the same walk resolves the main and the sub screen; `tw`
+/// is the matching window mask register (TMW/TSW).
+inline fn resolvePixel(
+    order: []const Entry,
+    bgbuf: *const [4][fb_width]Cell,
+    objbuf: *const [fb_width]Cell,
+    x: usize,
+    screens: u8,
+    winmask: *const [6][fb_width]bool,
+    tw: u8,
+) Resolved {
+    for (order) |e| {
+        const layer: u3 = if (e.src == .bg) e.idx else 4;
+        if (screens & (@as(u8, 1) << layer) == 0) continue;
+        // A layer masked by its window is skipped here, so a lower-priority
+        // layer or the backdrop shows through. `tw` short-circuits, so
+        // `winmask` is untouched when windows are off.
+        if (tw & (@as(u8, 1) << layer) != 0 and winmask[layer][x]) continue;
+        const cell = if (e.src == .bg) bgbuf[e.idx][x] else objbuf[x];
+        if (cell.solid and cell.prio == e.prio) return .{ .abs = cell.abs, .layer = layer };
+    }
+    return .{ .abs = 0, .layer = 5 };
+}
+
+/// Composite the main screen without color math: resolve each pixel and write
+/// the brightness-scaled palette entry. This is the hot path for the common
+/// no-math case; `compositeMath` below is the slower blending variant.
 fn composite(
     order: []const Entry,
     bgbuf: *const [4][fb_width]Cell,
     objbuf: *const [fb_width]Cell,
     lpal: *const [256]u16,
     row: []u16,
-    winmask: *const [5][fb_width]bool,
+    winmask: *const [6][fb_width]bool,
     tmw: u8,
+    screens: u8,
 ) void {
     for (0..fb_width) |x| {
-        var abs: u8 = 0; // backdrop
-        for (order) |e| {
-            // A layer masked by its main-screen window is skipped here, so a
-            // lower-priority layer or the backdrop shows through. `tmw`
-            // short-circuits, so `winmask` is untouched when windows are off.
-            const layer: usize = if (e.src == .bg) e.idx else 4;
-            if (tmw & (@as(u8, 1) << @intCast(layer)) != 0 and winmask[layer][x]) continue;
-            const cell = if (e.src == .bg) bgbuf[e.idx][x] else objbuf[x];
-            if (cell.solid and cell.prio == e.prio) {
-                abs = cell.abs;
-                break;
+        row[x] = lpal[resolvePixel(order, bgbuf, objbuf, x, screens, winmask, tmw).abs];
+    }
+}
+
+/// Whether a CGWSEL region field applies at a pixel: 0=never, 1=outside the
+/// color window, 2=inside it, 3=always.
+inline fn regionActive(region: u2, in_window: bool) bool {
+    return switch (region) {
+        0 => false,
+        1 => !in_window,
+        2 => in_window,
+        3 => true,
+    };
+}
+
+/// Add or subtract two 15-bit BGR colors per channel. Subtraction floors each
+/// channel at 0 *before* halving; addition halves before the clamp to 31
+/// (matching hardware order of operations).
+fn colorMath(main: u16, addend: u16, subtract: bool, half: bool) u16 {
+    var out: u16 = 0;
+    inline for (.{ 0, 5, 10 }) |shift| {
+        const m: i32 = (main >> shift) & 0x1F;
+        const a: i32 = (addend >> shift) & 0x1F;
+        var r: i32 = if (subtract) m - a else m + a;
+        if (r < 0) r = 0;
+        if (half) r >>= 1;
+        if (r > 31) r = 31;
+        out |= @as(u16, @intCast(r)) << shift;
+    }
+    return out;
+}
+
+/// Composite the main screen with color math ($2130-$2132): each main-screen
+/// pixel whose source layer is enabled in CGADSUB is blended with the sub
+/// screen's pixel (or the fixed color when the sub screen is disabled or
+/// transparent). CGWSEL's color-window regions can clip the main pixel to
+/// black (the spotlight effect) or prevent the math per pixel. Math operates
+/// on raw 15-bit BGR, so master brightness is applied after blending.
+fn compositeMath(
+    ppu: *const Ppu,
+    order: []const Entry,
+    bgbuf: *const [4][fb_width]Cell,
+    objbuf: *const [fb_width]Cell,
+    row: []u16,
+    winmask: *const [6][fb_width]bool,
+) void {
+    const half_en = ppu.cgadsub & 0x40 != 0;
+    const subtract = ppu.cgadsub & 0x80 != 0;
+    const sub_addend = ppu.cgwsel & 0x02 != 0;
+    const clip_region: u2 = @truncate(ppu.cgwsel >> 6);
+    const prevent_region: u2 = @truncate(ppu.cgwsel >> 4);
+
+    for (0..fb_width) |x| {
+        const main = resolvePixel(order, bgbuf, objbuf, x, ppu.main_screen, winmask, ppu.tmw);
+        const in_cw = winmask[5][x];
+        const clipped = regionActive(clip_region, in_cw);
+        var color: u16 = if (clipped) 0 else ppu.cgram[main.abs];
+
+        // The main pixel's layer selects participation (bit5 = backdrop); OBJ
+        // pixels join only from palettes 4-7 (CGRAM 192-255).
+        var do_math = ppu.cgadsub & (@as(u8, 1) << main.layer) != 0;
+        if (main.layer == 4 and main.abs < 192) do_math = false;
+        if (do_math and regionActive(prevent_region, in_cw)) do_math = false;
+
+        if (do_math) {
+            var addend: u16 = ppu.fixed_color;
+            var half = half_en and !clipped;
+            if (sub_addend) {
+                const sub = resolvePixel(order, bgbuf, objbuf, x, ppu.sub_screen, winmask, ppu.tsw);
+                if (sub.layer != 5) {
+                    addend = ppu.cgram[sub.abs];
+                } else {
+                    half = false; // fixed-color fallback never halves
+                }
             }
+            color = colorMath(color, addend, subtract, half);
         }
-        row[x] = lpal[abs];
+        row[x] = ppu_mod.scaleBrightness(color, ppu.brightness);
     }
 }
 
@@ -303,7 +413,9 @@ fn clearLine(buf: *[fb_width]Cell) void {
 /// Decode one BG layer's contribution to the scanline. `comptime bpp` folds the
 /// bitplane math; `cgram_base` is the mode-dependent palette offset for this BG.
 fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, line: u32, buf: *[fb_width]Cell) void {
-    if (ppu.main_screen & (@as(u8, 1) << @intCast(bg_index)) == 0) {
+    // Decode when the layer is on either screen; the compositor's TM/TS enable
+    // mask decides which resolve pass actually sees it.
+    if ((ppu.main_screen | ppu.sub_screen) & (@as(u8, 1) << @intCast(bg_index)) == 0) {
         clearLine(buf);
         return;
     }
@@ -389,8 +501,8 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 /// tilemap and 8bpp character data are byte-interleaved in VRAM (tilemap = low
 /// bytes, char = high bytes). M7SEL selects screen flip and out-of-area handling.
 fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
-    if (ppu.main_screen & 0x01 == 0) {
-        clearLine(buf); // BG1 disabled on the main screen
+    if ((ppu.main_screen | ppu.sub_screen) & 0x01 == 0) {
+        clearLine(buf); // BG1 disabled on both screens
         return;
     }
 
@@ -513,7 +625,7 @@ const obj_sizes = [8][4]u8{
 /// honoring the 32-sprite and 34-tile-per-line hardware limits.
 fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
     clearLine(buf);
-    if (ppu.main_screen & 0x10 == 0) return; // OBJ layer disabled on main screen
+    if ((ppu.main_screen | ppu.sub_screen) & 0x10 == 0) return; // OBJ off on both screens
 
     const sz = obj_sizes[ppu.obj_size];
     var in_range: u32 = 0;
@@ -765,6 +877,129 @@ test "window masks a BG layer inside its region (and inverts)" {
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0), ppu.fb[0]); // now outside is masked
     try std.testing.expect(ppu.fb[100] != 0); // now inside shows BG1
+}
+
+test "color math adds the fixed color (halved) and subtract floors at zero" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
+    ppu.vram[0] = 0x00FF; // tile 0 row 0: solid color 1
+    ppu.cgram[1] = 0x001F; // red 31
+    ppu.writeReg(0x2132, 0x9E); // fixed color: blue 30
+    ppu.writeReg(0x2131, 0x41); // CGADSUB: half + BG1 (addend = fixed color)
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    // (31,0,0) + (0,0,30), halved -> (15,0,15).
+    try std.testing.expectEqual(@as(u16, 0x780F), ppu.fb[0]);
+
+    // Subtract mode: red 31 minus blue 30 floors blue at 0 -> pure red.
+    ppu.writeReg(0x2131, 0x81); // CGADSUB: subtract + BG1, no half
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]);
+}
+
+test "color math blends the sub screen, falling back unhalved to the fixed color" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // main: BG1
+    ppu.sub_screen = 0x02; // sub: BG2
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
+    ppu.bg[1] = .{ .map_base = 0x500, .char_base = 0x100 };
+    ppu.vram[0] = 0x00FF; // BG1 tile: solid color 1 across the row
+    ppu.vram[0x100] = 0x0080; // BG2 tile: color 1 at x=0 only, transparent after
+    ppu.cgram[1] = 0x001F; // BG1 red 31
+    ppu.cgram[33] = 0x03E0; // BG2 (mode-0 base 32) green 31
+    ppu.writeReg(0x2130, 0x02); // CGWSEL: addend = sub screen
+    ppu.writeReg(0x2131, 0x41); // CGADSUB: half + BG1
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    // x=0: (red + green)/2 -> (15,15,0).
+    try std.testing.expectEqual(@as(u16, 0x7BC0), ppu.fb[0]);
+    // x=1: sub screen transparent -> fixed color (0) addend, half skipped.
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[1]);
+}
+
+test "color window clips the main screen to black and prevents math" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
+    ppu.vram[0] = 0x00FF; // solid color 1
+    ppu.cgram[1] = 0x001F; // red 31
+    ppu.writeReg(0x2125, 0x20); // WOBJSEL: color window = window 1
+    ppu.writeReg(0x2126, 40); // WH0
+    ppu.writeReg(0x2127, 200); // WH1
+    ppu.postLoad();
+
+    // Spotlight: clip to black outside the color window (region 1); no CGADSUB
+    // enables, so the clip alone activates the math path.
+    ppu.writeReg(0x2130, 0x40);
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[0]); // outside -> black
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[100]); // inside -> normal
+
+    // Prevent math inside the color window (region 2): the fixed green is
+    // added only outside it.
+    ppu.writeReg(0x2130, 0x20);
+    ppu.writeReg(0x2131, 0x01); // CGADSUB: add BG1
+    ppu.writeReg(0x2132, 0x5F); // fixed color: green 31
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0xFFE0), ppu.fb[0]); // outside: red+green
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[100]); // inside: unblended
+}
+
+test "OBJ color math applies only to sprite palettes 4-7" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 1;
+    ppu.main_screen = 0x10; // OBJ only
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.obj_size = 0;
+    ppu.obj_char_base = 0;
+
+    // Sprite 0 (palette 0) at x=10, sprite 1 (palette 4) at x=30.
+    ppu.oam[0] = 10;
+    ppu.oam[1] = 0;
+    ppu.oam[2] = 0;
+    ppu.oam[3] = 0x20; // pal 0, prio 2
+    ppu.oam[4] = 30;
+    ppu.oam[5] = 0;
+    ppu.oam[6] = 0;
+    ppu.oam[7] = 0x28; // pal 4, prio 2
+    ppu.oam[0x200] = 0;
+
+    ppu.vram[0] = 0x0080; // tile 0: color 1 at its leftmost pixel
+    ppu.cgram[128 + 1] = 0x03E0; // pal 0 color 1: green 31 (exempt, CGRAM < 192)
+    ppu.cgram[128 + 64 + 1] = 0x03E0; // pal 4 color 1: green 31 (participates)
+    ppu.writeReg(0x2131, 0x50); // CGADSUB: half + OBJ (fixed addend = 0)
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[10]); // pal 0: untouched
+    try std.testing.expectEqual(@as(u16, 0x03C0), ppu.fb[30]); // pal 4: halved green
+}
+
+test "backdrop color math adds the fixed color to empty pixels" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1 enabled but fully transparent (VRAM zeroed)
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.writeReg(0x2131, 0x20); // CGADSUB: backdrop enable
+    ppu.writeReg(0x2132, 0x5F); // fixed color: green 31
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[0]); // black + green
 }
 
 test "higher priority tile wins the composite" {

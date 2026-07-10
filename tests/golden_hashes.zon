@@ -45,5 +45,17 @@
         .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x404029d62e6f8c7f, .steps = 150704, .cycles = 5717918 },
         .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0x441ae11b855be25a, .steps = 138337, .cycles = 5717904 },
         .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0x72489634a8ee621d, .steps = 158867, .cycles = 5717910 },
+        // M4.5: HDMA-driven register goldens. WindowHDMA (deferred from M4.4)
+        // is an *inverted* window with HDMA'd WH0/WH1 edges over a green
+        // backdrop — its first band is the empty-window [1,0] edge case; the
+        // M4.4 note that it needed color math was a misdiagnosis (per source it
+        // is TMW-only, and it rendered identically before this slice).
+        // Mode7HDMA drives the M7 matrix per scanline (perspective ground
+        // plane); WaveHDMA sine-displaces BG1HOFS per line. No PeterLemon ROM
+        // exercises CGADSUB color math directly (the Blend/HiColor ones need
+        // pseudo-hires, M4.7), so blending itself is guarded by unit tests.
+        .{ .path = "PPU/Window/WindowHDMA/WindowHDMA.sfc", .hash = 0x7bafda0faf223f57, .steps = 146450, .cycles = 5717916 },
+        .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0x9a19f3d335633fd5, .steps = 148721, .cycles = 5717908 },
+        .{ .path = "PPU/HDMA/WaveHDMA/WaveHDMA.sfc", .hash = 0x6d5ebfbf9af5178d, .steps = 137718, .cycles = 5717924 },
     },
 }
