@@ -69,6 +69,8 @@ const order_2bg = [_]Entry{
     obj(2), bg(0, 0), bg(1, 0),
     obj(1), obj(0),
 };
+// Mode 7: a single BG1 plane below all sprites (no per-tile priority; EXTBG later).
+const order_mode7 = [_]Entry{ obj(3), obj(2), obj(1), obj(0), bg(0, 0) };
 
 /// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
 /// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
@@ -146,7 +148,10 @@ const mode_table = [8]ModeDesc{
     },
     backdrop_mode, // mode 5: hi-res (later slice)
     backdrop_mode, // mode 6: hi-res + offset-per-tile (later slice)
-    backdrop_mode, // mode 7: affine (later slice)
+    .{ // mode 7: single affine BG1 (see fillMode7).
+        .order = &order_mode7,
+        .kind = .affine,
+    },
 };
 
 pub fn renderLine(ppu: *Ppu, line: u32) void {
@@ -194,8 +199,12 @@ fn renderMode(
         @memset(row, lpal[0]);
         return;
     }
-    inline for (md.layers) |ld| {
-        fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
+    if (md.kind == .affine) {
+        fillMode7(ppu, line, &bgbuf[0]);
+    } else {
+        inline for (md.layers) |ld| {
+            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
+        }
     }
     fillObj(ppu, line, objbuf);
 
@@ -371,6 +380,69 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
             .{}
         else
             .{ .abs = @intCast(abs), .prio = prio, .solid = true };
+    }
+}
+
+/// Render one Mode 7 scanline: a single affine-transformed 8bpp plane. Each
+/// screen pixel maps through the [A B; C D] matrix around center (M7X,M7Y) with
+/// scroll (M7HOFS,M7VOFS) to a texel in the 1024x1024 (128-tile) field, whose
+/// tilemap and 8bpp character data are byte-interleaved in VRAM (tilemap = low
+/// bytes, char = high bytes). M7SEL selects screen flip and out-of-area handling.
+fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
+    if (ppu.main_screen & 0x01 == 0) {
+        clearLine(buf); // BG1 disabled on the main screen
+        return;
+    }
+
+    const a: i32 = ppu.m7a;
+    const b: i32 = ppu.m7b;
+    const c: i32 = ppu.m7c;
+    const d: i32 = ppu.m7d;
+    const cx: i32 = ppu.m7x;
+    const cy: i32 = ppu.m7y;
+    const hofs: i32 = ppu.m7hofs;
+    const vofs: i32 = ppu.m7vofs;
+
+    const hflip = ppu.m7sel & 0x01 != 0;
+    const vflip = ppu.m7sel & 0x02 != 0;
+    const over: u2 = @truncate(ppu.m7sel >> 6);
+
+    const sy: i32 = if (vflip) 255 - @as(i32, @intCast(line)) else @intCast(line);
+    // Row-constant terms; the per-pixel part adds A*Sx (Tx) and C*Sx (Ty).
+    const hc = hofs - cx;
+    const vc = sy + vofs - cy;
+    const ox = a * hc + b * vc;
+    const oy = c * hc + d * vc;
+
+    for (0..fb_width) |x| {
+        const sx: i32 = if (hflip) 255 - @as(i32, @intCast(x)) else @intCast(x);
+        var tx = ((ox + a * sx) >> 8) + cx;
+        var ty = ((oy + c * sx) >> 8) + cy;
+
+        var force_tile0 = false;
+        if (tx < 0 or tx > 1023 or ty < 0 or ty > 1023) {
+            switch (over) {
+                0, 1 => { // wrap the field
+                    tx &= 1023;
+                    ty &= 1023;
+                },
+                2 => { // outside is transparent
+                    buf[x] = .{};
+                    continue;
+                },
+                3 => { // outside repeats character 0
+                    tx &= 1023;
+                    ty &= 1023;
+                    force_tile0 = true;
+                },
+            }
+        }
+
+        const utx: u16 = @intCast(tx);
+        const uty: u16 = @intCast(ty);
+        const tile: u16 = if (force_tile0) 0 else ppu.vram[(uty >> 3) * 128 + (utx >> 3)] & 0xFF;
+        const pixel: u8 = @intCast(ppu.vram[tile * 64 + (uty & 7) * 8 + (utx & 7)] >> 8);
+        buf[x] = if (pixel == 0) .{} else .{ .abs = pixel, .prio = 0, .solid = true };
     }
 }
 
@@ -632,6 +704,37 @@ test "offset-per-tile shifts a BG1 column from BG3's offset map" {
     ppu.vram[0x1000] = 0x0000;
     ppu.renderScanline(0);
     try std.testing.expectEqual(ppu.fb[0], ppu.fb[8]);
+}
+
+test "mode 7 samples the affine field with identity and out-of-area transparency" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 7;
+    ppu.main_screen = 0x01; // BG1
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.m7a = 0x0100; // identity matrix (1.0, 0; 0, 1.0)
+    ppu.m7d = 0x0100;
+
+    // VRAM is byte-interleaved: low byte = tilemap entry, high byte = 8bpp pixel.
+    ppu.vram[0] = 0x0500; // tilemap[0]=tile 0; tile 0 pixel (0,0) = color 5
+    ppu.vram[2] = 0x0600; // tile 0 pixel (2,0) = color 6
+    ppu.cgram[5] = 0x001F;
+    ppu.cgram[6] = 0x03E0;
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    // Identity: screen (x,0) samples texel (x,0).
+    try std.testing.expect(ppu.fb[0] != 0); // texel (0,0) = color 5
+    try std.testing.expect(ppu.fb[2] != 0); // texel (2,0) = color 6
+    try std.testing.expect(ppu.fb[0] != ppu.fb[2]); // distinct texels
+    try std.testing.expectEqual(@as(u16, 0), ppu.fb[1]); // texel (1,0) = color 0 -> backdrop
+
+    // Push the sample outside the 1024-texel field with M7SEL out-of-area = 2
+    // (transparent): the whole line becomes backdrop.
+    ppu.m7sel = 0x80; // bit7 set, bit6 clear -> over mode 2
+    ppu.m7hofs = 2000;
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0), ppu.fb[0]);
 }
 
 test "window masks a BG layer inside its region (and inverts)" {
