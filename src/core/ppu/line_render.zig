@@ -203,7 +203,58 @@ fn renderMode(
         (if (ppu.bg3_priority) alt else md.order)
     else
         md.order;
-    composite(order, bgbuf, objbuf, lpal, row);
+
+    // Windows only matter when a layer is masked on the main screen ($212E TMW).
+    // When TMW is zero the compositor short-circuits and the mask is never read.
+    var winmask: [5][fb_width]bool = undefined;
+    if (ppu.tmw != 0) computeWindows(ppu, &winmask);
+    composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw);
+}
+
+/// Compute, per layer (0-3 = BG1-4, 4 = OBJ), whether each screen pixel lies in
+/// that layer's combined window region. Window 1 is [WH0,WH1], window 2 is
+/// [WH2,WH3]; each can be enabled and inverted, and the two combine by the
+/// layer's logic op (OR/AND/XOR/XNOR). A layer with no enabled window is never
+/// masked. Recomputed per line, so HDMA'd window edges take effect per scanline.
+fn computeWindows(ppu: *const Ppu, mask: *[5][fb_width]bool) void {
+    for (0..5) |layer| {
+        const sel: u8 = switch (layer) {
+            0 => ppu.w12sel & 0x0F,
+            1 => ppu.w12sel >> 4,
+            2 => ppu.w34sel & 0x0F,
+            3 => ppu.w34sel >> 4,
+            else => ppu.wobjsel & 0x0F,
+        };
+        const w1_inv = sel & 0x01 != 0;
+        const w1_en = sel & 0x02 != 0;
+        const w2_inv = sel & 0x04 != 0;
+        const w2_en = sel & 0x08 != 0;
+        const logic: u2 = switch (layer) {
+            0...3 => @truncate(ppu.wbglog >> @intCast(layer * 2)),
+            else => @truncate(ppu.wobjlog),
+        };
+
+        for (0..fb_width) |x| {
+            const xi: u8 = @intCast(x);
+            var a = xi >= ppu.wh0 and xi <= ppu.wh1;
+            if (w1_inv) a = !a;
+            var b = xi >= ppu.wh2 and xi <= ppu.wh3;
+            if (w2_inv) b = !b;
+            mask[layer][x] = if (w1_en and w2_en)
+                switch (logic) {
+                    0 => a or b,
+                    1 => a and b,
+                    2 => a != b, // XOR
+                    3 => a == b, // XNOR
+                }
+            else if (w1_en)
+                a
+            else if (w2_en)
+                b
+            else
+                false;
+        }
+    }
 }
 
 /// Resolve each pixel by walking the priority order front-to-back, taking the
@@ -215,10 +266,17 @@ fn composite(
     objbuf: *const [fb_width]Cell,
     lpal: *const [256]u16,
     row: []u16,
+    winmask: *const [5][fb_width]bool,
+    tmw: u8,
 ) void {
     for (0..fb_width) |x| {
         var abs: u8 = 0; // backdrop
         for (order) |e| {
+            // A layer masked by its main-screen window is skipped here, so a
+            // lower-priority layer or the backdrop shows through. `tmw`
+            // short-circuits, so `winmask` is untouched when windows are off.
+            const layer: usize = if (e.src == .bg) e.idx else 4;
+            if (tmw & (@as(u8, 1) << @intCast(layer)) != 0 and winmask[layer][x]) continue;
             const cell = if (e.src == .bg) bgbuf[e.idx][x] else objbuf[x];
             if (cell.solid and cell.prio == e.prio) {
                 abs = cell.abs;
@@ -574,6 +632,36 @@ test "offset-per-tile shifts a BG1 column from BG3's offset map" {
     ppu.vram[0x1000] = 0x0000;
     ppu.renderScanline(0);
     try std.testing.expectEqual(ppu.fb[0], ppu.fb[8]);
+}
+
+test "window masks a BG layer inside its region (and inverts)" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
+    ppu.vram[0] = 0x00FF; // tile 0 solid color 1 across the row
+    ppu.cgram[0] = 0x0000; // backdrop black
+    ppu.cgram[1] = 0x001F;
+
+    // Window 1 = [40,200], enabled for BG1, masking BG1 on the main screen.
+    ppu.writeReg(0x2123, 0x02); // W12SEL: BG1 W1 enable
+    ppu.writeReg(0x2126, 40); // WH0
+    ppu.writeReg(0x2127, 200); // WH1
+    ppu.writeReg(0x212E, 0x01); // TMW: BG1
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expect(ppu.fb[0] != 0); // outside window: BG1 shows
+    try std.testing.expectEqual(@as(u16, 0), ppu.fb[100]); // inside: masked -> backdrop
+    try std.testing.expect(ppu.fb[220] != 0); // outside: BG1 shows
+
+    // Inverting window 1 flips the masked region.
+    ppu.writeReg(0x2123, 0x03); // W12SEL: BG1 W1 enable + invert
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0), ppu.fb[0]); // now outside is masked
+    try std.testing.expect(ppu.fb[100] != 0); // now inside shows BG1
 }
 
 test "higher priority tile wins the composite" {
