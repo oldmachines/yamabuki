@@ -11,6 +11,7 @@ const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
 const CpuIo = @import("cpu_io.zig").CpuIo;
+const Dma = @import("dma.zig").Dma;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
@@ -44,6 +45,7 @@ pub const Bus = struct {
     math: MathUnit,
     cpuio: CpuIo,
     ppu: Ppu,
+    dma: Dma,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`), and `cart` must outlive the bus.
@@ -56,6 +58,7 @@ pub const Bus = struct {
         self.math = .init;
         self.cpuio = .init;
         self.ppu = .init;
+        self.dma = .init;
         self.remap();
     }
 
@@ -122,6 +125,7 @@ pub const Bus = struct {
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
             0x4217 => @truncate(self.math.rdmpy >> 8),
+            0x4300...0x437F => self.dma.readReg(a16),
             else => {
                 if (mappers.smallSramPtr(self, addr)) |p| {
                     self.mdr = p.*;
@@ -162,6 +166,9 @@ pub const Bus = struct {
             0x4208 => self.cpuio.setHtimeHigh(value),
             0x4209 => self.cpuio.setVtimeLow(value),
             0x420A => self.cpuio.setVtimeHigh(value),
+            0x420B => self.dma.startGpDma(self, value),
+            0x420C => self.dma.hdmaen = value,
+            0x4300...0x437F => self.dma.writeReg(a16, value),
             0x420D => {
                 const enable = (value & 1) != 0;
                 if (enable != self.fastrom) {

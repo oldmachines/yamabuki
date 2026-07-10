@@ -121,6 +121,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 io.irq_flag = true;
             }
 
+            // HDMA: reload the tables at the top of the frame, then inject one
+            // transfer per visible line before the line is drawn so per-line
+            // register effects (scroll, gradients) apply to this scanline.
+            if (line == 0) self.bus.dma.hdmaInit(&self.bus);
+            if (line < self.vblankLine()) self.bus.dma.hdmaRunLine(&self.bus);
+
             self.runLineCpu();
 
             // Fast mode renders the whole visible scanline at line end.
@@ -265,6 +271,121 @@ test "ROM-programmed backdrop appears in the framebuffer" {
     try std.testing.expectEqual(@as(u16, 0x001F), fb[0]); // pure blue 565
     try std.testing.expectEqual(@as(u16, 0x001F), fb[fb.len - 1]);
 }
+
+test "GDMA copies a palette from ROM into CGRAM" {
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Reset code: point channel 0 at the palette table in ROM and GDMA it into
+    // CGRAM ($2122, mode 0 = single register), 4 bytes (2 colors), then spin.
+    //   LDA #$00 ; STA $2121            ; CGADD = 0
+    //   LDA #$00 ; STA $4300            ; DMAP: A->B, increment, mode 0
+    //   LDA #$22 ; STA $4301            ; BBAD -> $2122
+    //   LDA #$40 ; STA $4302            ; A1T low  = $8040
+    //   LDA #$80 ; STA $4303            ; A1T high
+    //   LDA #$00 ; STA $4304            ; A1B  = bank 0
+    //   LDA #$04 ; STA $4305            ; DAS low = 4
+    //   LDA #$00 ; STA $4306            ; DAS high
+    //   LDA #$01 ; STA $420B            ; trigger GDMA on channel 0
+    //   LDA #$0F ; STA $2100            ; full brightness
+    //   loop: BRA loop
+    const code = [_]u8{
+        0xA9, 0x00, 0x8D, 0x21, 0x21,
+        0xA9, 0x00, 0x8D, 0x00, 0x43,
+        0xA9, 0x22, 0x8D, 0x01, 0x43,
+        0xA9, 0x40, 0x8D, 0x02, 0x43,
+        0xA9, 0x80, 0x8D, 0x03, 0x43,
+        0xA9, 0x00, 0x8D, 0x04, 0x43,
+        0xA9, 0x04, 0x8D, 0x05, 0x43,
+        0xA9, 0x00, 0x8D, 0x06, 0x43,
+        0xA9, 0x01, 0x8D, 0x0B, 0x42,
+        0xA9, 0x0F, 0x8D, 0x00, 0x21,
+        0x80, 0xFE,
+    };
+    @memcpy(rom[0..code.len], &code);
+    // Palette table at ROM $8040 (file 0x0040, clear of the code): color0 =
+    // black, color1 = green. green 15-bit BGR = $03E0 -> low $E0, high $03.
+    rom[0x40] = 0x00;
+    rom[0x41] = 0x00;
+    rom[0x42] = 0xE0;
+    rom[0x43] = 0x03;
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "GDMA TEST            ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+
+    // CGRAM was filled by DMA: color 1 = green.
+    try std.testing.expectEqual(@as(u16, 0x03E0), con.bus.ppu.cgram[1]);
+    try std.testing.expectEqual(@as(u16, 0x07E0), con.bus.ppu.palette[1]); // green 565
+}
+
+test "HDMA drives INIDISP per scanline (brightness split mid-frame)" {
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Set a white backdrop, program HDMA channel 0 to write INIDISP ($2100)
+    // from a table, enable HDMA, then spin.
+    const code = [_]u8{
+        0xA9, 0x00, 0x8D, 0x21, 0x21, // CGADD = 0
+        0xA9, 0xFF, 0x8D, 0x22, 0x21, // color0 low  = $FF
+        0xA9, 0x7F, 0x8D, 0x22, 0x21, // color0 high = $7F  (white)
+        0xA9, 0x00, 0x8D, 0x00, 0x43, // DMAP0 = mode 0, A->B, direct
+        0xA9, 0x00, 0x8D, 0x01, 0x43, // BBAD0 = $00 -> $2100
+        0xA9, 0x60, 0x8D, 0x02, 0x43, // A1T0 low  = $60
+        0xA9, 0x80, 0x8D, 0x03, 0x43, // A1T0 high = $80  (table @ $8060)
+        0xA9, 0x00, 0x8D, 0x04, 0x43, // A1B0 = bank 0
+        0xA9, 0x01, 0x8D, 0x0C, 0x42, // HDMAEN = channel 0
+        0x80, 0xFE, // loop: BRA loop
+    };
+    @memcpy(rom[0..code.len], &code);
+    // HDMA table @ $8060 (non-repeat blocks): 100 lines at brightness $0F,
+    // then 124 lines at $00, then terminator.
+    const table = [_]u8{ 0x64, 0x0F, 0x7C, 0x00, 0x00 };
+    @memcpy(rom[0x60..][0..table.len], &table);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "HDMA TEST            ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+    // Frame 1: the CPU configures and enables HDMA during active display, which
+    // is past this frame's line-0 init — so it takes effect from frame 2 on,
+    // exactly as on hardware.
+    con.runFrame();
+    con.runFrame();
+
+    const fb = con.framebuffer();
+    // Lines 0-99: full brightness white; lines 100+: black.
+    try std.testing.expectEqual(@as(u16, 0xFFFF), fb[0 * fb_width]);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), fb[50 * fb_width]);
+    try std.testing.expectEqual(@as(u16, 0x0000), fb[150 * fb_width]);
+    try std.testing.expectEqual(@as(u16, 0x0000), fb[223 * fb_width]);
+}
+
+const fb_width = @import("ppu/ppu.zig").fb_width;
 
 test "NMI is suppressed while NMITIMEN bit7 is clear" {
     const alloc = std.testing.allocator;
