@@ -33,7 +33,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
-        pub const serialize_skip = .{};
+        // `steps` is a diagnostic counter, not machine state.
+        pub const serialize_skip = .{"steps"};
 
         cart: Cartridge,
         bus: Bus,
@@ -48,6 +49,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
         line_start: u64,
         /// Completed-frame counter.
         frame: u64,
+        /// CPU instructions/interrupts retired since reset. A deterministic
+        /// work proxy for perf-regression baselines (paired with bus.clock).
+        steps: u64,
 
         /// Initialize in place from an already-loaded cartridge. `self` must be
         /// at its final (heap) address before calling; it is pinned afterward.
@@ -67,6 +71,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.scanline = 0;
             self.line_start = self.bus.clock;
             self.frame = 0;
+            self.steps = 0;
         }
 
         /// Re-wire the internal self-pointers after deserialization. The ROM
@@ -154,6 +159,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // deassert the line before the handler's RTI re-checks it.
                 if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
                 self.cpu.step();
+                self.steps +%= 1;
             }
             self.line_start = line_end;
         }

@@ -50,9 +50,12 @@ pub fn main(init: std.process.Init) !void {
 
     const secs = @as(f64, @floatFromInt(ns)) / 1e9;
     const fps = @as(f64, @floatFromInt(frames)) / secs;
+    // `fps`/`ms` are wall-clock (machine-dependent, informational); `steps` and
+    // `cycles` are deterministic per-run work counts suitable for regression.
     try out.print(
-        "{{\"rom\":\"{s}\",\"frames\":{},\"ms\":{d:.2},\"fps\":{d:.1},\"sink\":{}}}\n",
-        .{ rom_path, frames, secs * 1000.0, fps, sink & 1 },
+        "{{\"rom\":\"{s}\",\"frames\":{},\"ms\":{d:.2},\"fps\":{d:.1}," ++
+            "\"steps\":{},\"cycles\":{},\"sink\":{}}}\n",
+        .{ rom_path, frames, secs * 1000.0, fps, con.steps, con.bus.clock, sink & 1 },
     );
     try out.flush();
 }
