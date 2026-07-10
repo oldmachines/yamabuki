@@ -11,6 +11,7 @@ const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
 const CpuIo = @import("cpu_io.zig").CpuIo;
+const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -42,6 +43,7 @@ pub const Bus = struct {
     wram: Wram,
     math: MathUnit,
     cpuio: CpuIo,
+    ppu: Ppu,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`), and `cart` must outlive the bus.
@@ -53,6 +55,7 @@ pub const Bus = struct {
         self.wram = .init;
         self.math = .init;
         self.cpuio = .init;
+        self.ppu = .init;
         self.remap();
     }
 
@@ -64,6 +67,7 @@ pub const Bus = struct {
     /// Called after deserialization to rebuild derived state.
     pub fn postLoad(self: *Bus) void {
         self.remap();
+        self.ppu.postLoad();
     }
 
     /// One CPU internal cycle (no bus access).
@@ -109,6 +113,7 @@ pub const Bus = struct {
         }
 
         const v: u8 = switch (a16) {
+            0x2134...0x213F => self.ppu.readReg(a16, self.mdr),
             0x2180 => self.wram.portRead(),
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
@@ -141,6 +146,7 @@ pub const Bus = struct {
         }
 
         switch (a16) {
+            0x2100...0x2133 => self.ppu.writeReg(a16, value),
             0x2180 => self.wram.portWrite(value),
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),

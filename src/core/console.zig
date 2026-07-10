@@ -152,11 +152,16 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.line_start = line_end;
         }
 
-        /// Placeholder scanline renderer. Real pixel output arrives with the
-        /// PPU register file (M3.2) and the fast BG/sprite renderer (M3.4/3.5).
+        /// Render one visible scanline via the PPU. The BG/sprite compositor is
+        /// layered onto the backdrop in M3.4/M3.5.
         fn renderScanline(self: *Self, line: u32) void {
-            _ = self;
-            _ = line;
+            self.bus.ppu.renderScanline(line);
+        }
+
+        /// The visible RGB565 framebuffer for the current display height.
+        pub fn framebuffer(self: *const Self) []const u16 {
+            const height: u32 = if (self.overscan) 239 else 224;
+            return self.bus.ppu.frame(height);
         }
     };
 }
@@ -222,6 +227,43 @@ test "scheduler delivers a vblank NMI and runFrame terminates" {
 
     con.runFrame();
     try std.testing.expectEqual(@as(u8, 2), con.bus.wram.data[0]);
+}
+
+test "ROM-programmed backdrop appears in the framebuffer" {
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Reset code: CGADD=0; write color0 = blue ($7C00); INIDISP full; spin.
+    const code = [_]u8{
+        0xA9, 0x00, 0x8D, 0x21, 0x21, // LDA #$00 ; STA $2121 (CGADD=0)
+        0xA9, 0x00, 0x8D, 0x22, 0x21, // LDA #$00 ; STA $2122 (color low)
+        0xA9, 0x7C, 0x8D, 0x22, 0x21, // LDA #$7C ; STA $2122 (color high)
+        0xA9, 0x0F, 0x8D, 0x00, 0x21, // LDA #$0F ; STA $2100 (brightness 15)
+        0x80, 0xFE, // loop: BRA loop
+    };
+    @memcpy(rom[0..code.len], &code);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "BACKDROP TEST        ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+
+    const fb = con.framebuffer();
+    try std.testing.expectEqual(@as(usize, 256 * 224), fb.len);
+    try std.testing.expectEqual(@as(u16, 0x001F), fb[0]); // pure blue 565
+    try std.testing.expectEqual(@as(u16, 0x001F), fb[fb.len - 1]);
 }
 
 test "NMI is suppressed while NMITIMEN bit7 is clear" {
