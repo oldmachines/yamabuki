@@ -6,9 +6,9 @@
 // were minted after visually inspecting the .ppm output and are deterministic
 // across Debug/ReleaseFast and target architectures.
 //
-// This set covers the M3 fast renderer: BG mode 0 (2bpp layers, text) and
-// sprite-over-BG compositing. Mode-1 4bpp and modes 2-7 ROMs join as those
-// paths land (M4).
+// This set covers the M3 fast renderer (BG mode 0 2bpp + sprites) and, from
+// M4.1, the planar BG modes with 4bpp and 8bpp depth (modes 2/3/4). Windows,
+// color math, mosaic, hi-res, and Mode 7 ROMs join as those slices land.
 //
 // `steps` (CPU instructions/interrupts retired) and `cycles` (master cycles
 // elapsed) are deterministic per-run work counts — a perf-regression baseline
@@ -22,5 +22,14 @@
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .hash = 0x3ad32cfefc54c6be, .steps = 154307, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG3Map2BPP32x328PAL/8x8BG3Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
         .{ .path = "PPU/Rings/Rings.sfc", .hash = 0x20dc65b09f98c115, .steps = 152248, .cycles = 5717906 },
+        // M4.1: BG2/BG4 2bpp (mode 0 layer coverage), 4bpp (mode 1/2), 8bpp (modes 3/4).
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG2Map2BPP32x328PAL/8x8BG2Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG4Map2BPP32x328PAL/8x8BG4Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .hash = 0xca039a735b43ef3e, .steps = 149835, .cycles = 5717904 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/32x32/8x8BGMap8BPP32x32.sfc", .hash = 0xd74dbf7e9e3fcfbc, .steps = 154031, .cycles = 5717908 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/32x64/8x8BGMap8BPP32x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 151667, .cycles = 5717914 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x32/8x8BGMap8BPP64x32.sfc", .hash = 0xce39d1f87fb4187e, .steps = 149934, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 146646, .cycles = 5717932 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x0aee22f7096e9c25, .steps = 158610, .cycles = 5717918 },
     },
 }
