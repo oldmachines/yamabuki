@@ -39,5 +39,11 @@
         // backdrop showing through). WindowHDMA uses the color-math spotlight and
         // is deferred to the color-math slice (renders full without it).
         .{ .path = "PPU/Window/WindowMultiHDMA/WindowMultiHDMA.sfc", .hash = 0x5b00df0115ff4a61, .steps = 146300, .cycles = 5717930 },
+        // M4.6: Mode 7 affine plane. RotZoom (rotate+zoom) and Perspective
+        // (per-scanline HDMA matrix) exercise the transform; StarWars boots to its
+        // intro at frame 16 (the crawl is later) and locks that render.
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x404029d62e6f8c7f, .steps = 150704, .cycles = 5717918 },
+        .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0x441ae11b855be25a, .steps = 138337, .cycles = 5717904 },
+        .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0x72489634a8ee621d, .steps = 158867, .cycles = 5717910 },
     },
 }
