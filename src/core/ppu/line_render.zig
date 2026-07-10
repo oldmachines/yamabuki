@@ -74,6 +74,11 @@ const order_2bg = [_]Entry{
 /// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
 const Kind = enum { planar, affine };
 
+/// Offset-per-tile behavior for a mode's BG1/BG2 layers. `.hv` (modes 2/6) reads
+/// separate horizontal and vertical offset entries from BG3's tilemap; `.single`
+/// (mode 4) reads one entry whose bit 15 selects H vs V.
+const OptMode = enum { none, hv, single };
+
 /// One BG layer's fixed configuration within a mode: which BG index it is, its
 /// bit depth (kept comptime so the plane decode unrolls), and the palette base
 /// that the mode's layout assigns to it.
@@ -88,6 +93,7 @@ const ModeDesc = struct {
     order: []const Entry = &.{},
     order_bg3_front: ?[]const Entry = null,
     kind: Kind = .planar,
+    opt: OptMode = .none,
 };
 
 const backdrop_mode: ModeDesc = .{};
@@ -115,12 +121,13 @@ const mode_table = [8]ModeDesc{
         .order = &order_mode1,
         .order_bg3_front = &order_mode1_bg3_front,
     },
-    .{ // mode 2: BG1/BG2 4bpp (offset-per-tile deferred).
+    .{ // mode 2: BG1/BG2 4bpp with offset-per-tile (BG3 supplies H+V offsets).
         .layers = &.{
             .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
             .{ .bg = 1, .bpp = 4, .cgram_base = 0 },
         },
         .order = &order_2bg,
+        .opt = .hv,
     },
     .{ // mode 3: BG1 8bpp, BG2 4bpp.
         .layers = &.{
@@ -129,12 +136,13 @@ const mode_table = [8]ModeDesc{
         },
         .order = &order_2bg,
     },
-    .{ // mode 4: BG1 8bpp, BG2 2bpp (offset-per-tile deferred).
+    .{ // mode 4: BG1 8bpp, BG2 2bpp with single-value offset-per-tile.
         .layers = &.{
             .{ .bg = 0, .bpp = 8, .cgram_base = 0 },
             .{ .bg = 1, .bpp = 2, .cgram_base = 0 },
         },
         .order = &order_2bg,
+        .opt = .single,
     },
     backdrop_mode, // mode 5: hi-res (later slice)
     backdrop_mode, // mode 6: hi-res + offset-per-tile (later slice)
@@ -187,7 +195,7 @@ fn renderMode(
         return;
     }
     inline for (md.layers) |ld| {
-        fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, line, &bgbuf[ld.bg]);
+        fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
     }
     fillObj(ppu, line, objbuf);
 
@@ -227,7 +235,7 @@ fn clearLine(buf: *[fb_width]Cell) void {
 
 /// Decode one BG layer's contribution to the scanline. `comptime bpp` folds the
 /// bitplane math; `cgram_base` is the mode-dependent palette offset for this BG.
-fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, line: u32, buf: *[fb_width]Cell) void {
+fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, line: u32, buf: *[fb_width]Cell) void {
     if (ppu.main_screen & (@as(u8, 1) << @intCast(bg_index)) == 0) {
         clearLine(buf);
         return;
@@ -249,13 +257,28 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, line: u
     const mosaic_on = msize > 1 and (ppu.mosaic >> @intCast(4 + bg_index)) & 1 != 0;
 
     const my: u32 = if (mosaic_on) line - line % msize else line;
-    const sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
-    const tile_row = sy / tile_px;
+    // Without offset-per-tile the vertical scroll (and tile row) is constant.
+    const base_sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
+    const base_tile_row = base_sy / tile_px;
 
     for (0..fb_width) |x| {
         const xi: u32 = @intCast(x);
         const mx: u32 = if (mosaic_on) xi - xi % msize else xi;
-        const sx: u16 = @intCast((mx + layer.hofs) & (bg_w - 1));
+
+        // Offset-per-tile (modes 2/4/6): BG3's map replaces this column's scroll.
+        const scroll = if (opt == .none)
+            .{ .h = layer.hofs, .sy = base_sy, .tile_row = base_tile_row }
+        else blk: {
+            var eff_hofs = layer.hofs;
+            var eff_vofs = layer.vofs;
+            offsetPerTile(ppu, bg_index, opt, layer.hofs, @intCast(mx), &eff_hofs, &eff_vofs);
+            const oy: u16 = @intCast((my + eff_vofs) & (bg_h - 1));
+            break :blk .{ .h = eff_hofs, .sy = oy, .tile_row = oy / tile_px };
+        };
+        const sy = scroll.sy;
+        const tile_row = scroll.tile_row;
+
+        const sx: u16 = @intCast((mx + scroll.h) & (bg_w - 1));
         const tile_col = sx / tile_px;
 
         var screen: u16 = 0;
@@ -290,6 +313,52 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, line: u
             .{}
         else
             .{ .abs = @intCast(abs), .prio = prio, .solid = true };
+    }
+}
+
+/// Look up the offset-per-tile scroll for the column containing screen pixel
+/// `screen_x`, replacing `eff_h`/`eff_v` in place. BG3's tilemap is the offset
+/// source: a horizontal entry (row = BG3VOFS/8, column steps from BG3HOFS/8) and,
+/// for `.hv` modes, a vertical entry one row below. Entry bit 13 enables the
+/// override for BG1, bit 14 for BG2; bits 0-9 are the offset value. The leftmost
+/// visible tile keeps the base scroll (offset-map entry 0 targets the 2nd column).
+/// Offset maps are 32 tiles wide by convention; wider BG3 maps aren't modeled.
+fn offsetPerTile(
+    ppu: *Ppu,
+    bg_index: usize,
+    comptime opt: OptMode,
+    base_h: u16,
+    screen_x: u16,
+    eff_h: *u16,
+    eff_v: *u16,
+) void {
+    const offset_x: u16 = screen_x + (base_h & 7);
+    if (offset_x < 8) return; // leftmost tile: no offset
+    const col_index: u16 = (offset_x >> 3) - 1; // entry 0 -> second column
+
+    const bg3 = ppu.bg[2];
+    const valid: u16 = if (bg_index == 0) 0x2000 else 0x4000; // bit13 BG1 / bit14 BG2
+
+    const h_col: u16 = ((bg3.hofs >> 3) + col_index) & 0x1F;
+    const h_row: u16 = (bg3.vofs >> 3) & 0x1F;
+    const h_addr: u16 = (bg3.map_base + h_row * 32 + h_col) & 0x7FFF;
+    const h_entry = ppu.vram[h_addr];
+
+    switch (opt) {
+        .single => { // mode 4: one entry, bit 15 selects vertical vs horizontal
+            if (h_entry & valid != 0) {
+                if (h_entry & 0x8000 != 0)
+                    eff_v.* = h_entry & 0x3FF
+                else
+                    eff_h.* = (h_entry & 0x3F8) | (base_h & 7);
+            }
+        },
+        .hv => { // modes 2/6: separate H entry and a V entry one row below
+            if (h_entry & valid != 0) eff_h.* = (h_entry & 0x3F8) | (base_h & 7);
+            const v_entry = ppu.vram[(h_addr + 32) & 0x7FFF];
+            if (v_entry & valid != 0) eff_v.* = v_entry & 0x3FF;
+        },
+        .none => comptime unreachable,
     }
 }
 
@@ -473,6 +542,38 @@ test "mosaic quantizes BG pixels into blocks" {
     ppu.writeReg(0x2106, 0x00);
     ppu.renderScanline(0);
     try std.testing.expect(ppu.fb[1] != ppu.fb[0]);
+}
+
+test "offset-per-tile shifts a BG1 column from BG3's offset map" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 2; // BG1/BG2 4bpp with H+V offset-per-tile
+    ppu.main_screen = 0x01; // BG1 only
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 }; // BG1 4bpp
+    ppu.bg[2] = .{ .map_base = 0x1000 }; // BG3 = offset source (scroll 0)
+
+    // Two solid 4bpp tiles: tile 0 = color 1, tile 1 = color 2.
+    ppu.vram[0] = 0x00FF; // tile 0 row 0: plane0 all set -> color 1
+    ppu.vram[16] = 0xFF00; // tile 1 row 0: plane1 all set -> color 2
+    // BG1 map row 0: columns 0,1 -> tile 0; column 2 -> tile 1.
+    ppu.vram[0x402] = 0x0001;
+    ppu.cgram[1] = 0x001F;
+    ppu.cgram[2] = 0x7C00;
+
+    // Offset-map entry 0 targets the *second* visible column (col 1). Value 8 (one
+    // tile) with the BG1 valid bit (0x2000) shifts col 1's sample to tile 1.
+    ppu.vram[0x1000] = 0x2008;
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(ppu.fb[16], ppu.fb[8]); // col 1 now shows tile 1 (color 2)
+    try std.testing.expect(ppu.fb[8] != ppu.fb[0]); // ...and differs from the un-offset col 0
+
+    // Clearing the offset entry restores col 1 to its native tile 0 (color 1).
+    ppu.vram[0x1000] = 0x0000;
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(ppu.fb[0], ppu.fb[8]);
 }
 
 test "higher priority tile wins the composite" {
