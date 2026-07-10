@@ -88,6 +88,11 @@ pub const Ppu = struct {
     tmw: u8, // $212E main-screen window masking (bit0 BG1 .. bit4 OBJ)
     tsw: u8, // $212F sub-screen window masking (color math, M4.5)
 
+    // --- display config ($2133) --------------------------------------------
+    // SETINI: bit0 screen interlace, bit1 OBJ interlace, bit2 overscan (239
+    // visible lines), bit3 pseudo-hires, bit6 EXTBG, bit7 external sync.
+    setini: u8,
+
     // --- color math ($2130-$2132) ------------------------------------------
     // CGWSEL: bit0 direct color (not yet modeled), bit1 addend = sub screen
     // (else fixed color), bits4-5 prevent-math region, bits6-7 clip-to-black
@@ -165,6 +170,7 @@ pub const Ppu = struct {
         .wobjlog = 0,
         .tmw = 0,
         .tsw = 0,
+        .setini = 0,
         .cgwsel = 0,
         .cgadsub = 0,
         .fixed_color = 0,
@@ -305,7 +311,7 @@ pub const Ppu = struct {
                 if (value & 0x40 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x03E0)) | (intensity << 5);
                 if (value & 0x80 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x7C00)) | (intensity << 10);
             },
-            // SETINI: latched in later milestones.
+            0x33 => self.setini = value, // SETINI
             else => {},
         }
     }
@@ -473,6 +479,11 @@ pub const Ppu = struct {
         line_render.renderLine(self, line);
     }
 
+    /// SETINI bit2: 239 visible lines instead of 224.
+    pub fn overscan(self: *const Ppu) bool {
+        return self.setini & 0x04 != 0;
+    }
+
     /// Visible framebuffer for the current display height.
     pub fn frame(self: *const Ppu, height: u32) []const u16 {
         return self.fb[0 .. fb_width * height];
@@ -593,6 +604,16 @@ test "color math registers latch and COLDATA accumulates channels" {
     try std.testing.expectEqual(@as(u16, 0x43FF), ppu.fixed_color);
     ppu.writeReg(0x2132, 0x20); // red = 0, green/blue untouched
     try std.testing.expectEqual(@as(u16, 0x43E0), ppu.fixed_color);
+}
+
+test "setini latches and drives overscan" {
+    var ppu: Ppu = .init;
+    try std.testing.expect(!ppu.overscan());
+    ppu.writeReg(0x2133, 0x04); // SETINI: overscan
+    try std.testing.expect(ppu.overscan());
+    ppu.writeReg(0x2133, 0x48); // SETINI: EXTBG + pseudo-hires
+    try std.testing.expectEqual(@as(u8, 0x48), ppu.setini);
+    try std.testing.expect(!ppu.overscan());
 }
 
 test "backdrop render fills the scanline" {
