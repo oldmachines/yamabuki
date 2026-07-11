@@ -103,6 +103,65 @@ jobs:
       - if: matrix.optimize == 'ReleaseFast'
         run: zig build bench -Doptimize=ReleaseFast -- test-data/snes-roms/PPU/Rings/Rings.sfc --frames 120
 
+  sdl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # SDL3 shared library, built once from source (ubuntu doesn't package
+      # SDL3 yet) and cached. Only the dummy video/audio drivers are needed.
+      - uses: actions/cache@v4
+        id: sdl3-cache
+        with:
+          path: sdl3-lib
+          key: sdl3-release-3.2.16-${{ runner.os }}
+      - name: Build SDL3
+        if: steps.sdl3-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch release-3.2.16 https://github.com/libsdl-org/SDL.git sdl3-src
+          # SDL_UNIX_CONSOLE_BUILD: the runner has no X11/Wayland dev headers
+          # and doesn't need them — the smoke test uses the dummy drivers.
+          cmake -S sdl3-src -B sdl3-src/build -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DSDL_UNIX_CONSOLE_BUILD=ON
+          cmake --build sdl3-src/build -j"$(nproc)"
+          mkdir -p sdl3-lib && cp -P sdl3-src/build/libSDL3.so* sdl3-lib/
+      - name: Resolve ROM revision
+        id: rom-rev
+        run: echo "rev=$(git ls-remote https://github.com/PeterLemon/SNES.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: test-data/snes-roms
+          key: snes-roms-${{ steps.rom-rev.outputs.rev }}
+      - name: Fetch test ROMs
+        run: |
+          if [ ! -d test-data/snes-roms/.git ]; then
+            mkdir -p test-data
+            git clone --depth 1 https://github.com/PeterLemon/SNES.git test-data/snes-roms
+          fi
+      - run: zig build -Doptimize=ReleaseFast
+      # End-to-end smoke under SDL's dummy drivers: the SDL frontend must
+      # reproduce the same golden video/audio hashes as the headless path
+      # (values mirror tests/golden_hashes.zon).
+      - name: SDL frontend smoke test
+        run: |
+          out=$(LD_LIBRARY_PATH="$PWD/sdl3-lib" SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            ./zig-out/bin/yamabuki-sdl test-data/snes-roms/SPC700/Axel-F/Axel-F.sfc --frames 60 --scale 1)
+          echo "$out"
+          echo "$out" | grep -q "hash=045b5aaabee52325, audio=e2fbd615d2d54f15"
+      # Without SDL installed the frontend must fail with a friendly error,
+      # not a crash.
+      - name: Missing-SDL error path
+        run: |
+          set +e
+          msg=$(./zig-out/bin/yamabuki-sdl test-data/snes-roms/SPC700/Axel-F/Axel-F.sfc --frames 1 2>&1)
+          code=$?
+          echo "$msg"
+          [ $code -eq 1 ] || exit 1
+          echo "$msg" | grep -q "SDL3 runtime not found"
+
   cross:
     runs-on: ubuntu-latest
     strategy:

@@ -23,7 +23,7 @@ Requires Zig 0.16.0 (pinned in `.zigversion`; `tools/install_zig.sh`
 installs it from PyPI if ziglang.org is unreachable).
 
 ```sh
-zig build                        # headless runner + libretro core
+zig build                        # headless runner + libretro core + SDL3 desktop app
 zig build test                   # unit tests
 tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignored)
 zig build test-sst               # run 65816 SingleStepTests vectors
@@ -40,6 +40,17 @@ Run a ROM headless and dump a frame (and its audio) to inspect:
 ```sh
 zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 60 --ppm out.ppm --wav out.wav
 ```
+
+Or play it in a window (needs the SDL3 runtime library, `libSDL3.so.0` —
+the build has no SDL dependency, the library is dlopen'd):
+
+```sh
+./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N]
+```
+
+Keyboard follows the RetroArch defaults — arrows = d-pad, `Z`=B, `X`=A,
+`A`=Y, `S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
+save/load state, `F1` reset, hold `Tab` to fast-forward, `Esc` to quit.
 
 ## Status
 
@@ -68,7 +79,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M4 full fast PPU | done (all BG modes, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res/pseudo-hires) |
 | M5 APU (SPC700 + S-DSP) | done (BRR voices, gaussian, ADSR/GAIN, noise, pitch mod, echo; 32 kHz stereo + audio-hash goldens) |
 | M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
-| M7 SDL3 desktop frontend | planned |
+| M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
 | M8 accurate mode (dot renderer, cycle timing) | planned |
 | M9 enhancement chips (DSP-1, SA-1, Super FX, Cx4) | planned |
 | M10 ARM performance tuning | planned |

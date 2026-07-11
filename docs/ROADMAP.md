@@ -36,7 +36,7 @@ src/core/
 src/frontends/
     headless/main.zig    # run N frames, dump .ppm, print framebuffer hash
     libretro/api.zig core.zig    # hand-ported libretro ABI, callconv(.c) exports, zero deps
-    sdl/main.zig         # SDL3 desktop app (lazy dependency)
+    sdl/main.zig         # SDL3 desktop app (sdl3.zig: dlopen'd ABI port)
 tests/  sst_65816.zig sst_spc700.zig rom_runner.zig
 bench/  bench.zig        # headless FPS benchmark
 ```
@@ -138,10 +138,17 @@ serialize/unserialize.
   drives the exported surface like a frontend and locks it to the same golden
   hashes as the direct console path (core options like `yamabuki_accuracy`
   arrive with the accurate core, M8).
-- **SDL3 desktop** — via the castholm/SDL Zig package (statically built by Zig
-  for clean cross-compilation), wired as a *lazy* dependency so its absence never
-  breaks `zig build`. Adds fast-forward, frame-advance, save-state hotkeys, and
-  layer toggles.
+- **SDL3 desktop** — `sdl3.zig` hand-ports the needed SDL3 ABI subset (same
+  pattern as libretro's `api.zig`) and dlopens `libSDL3.so.0` at runtime, so
+  `zig build` needs no SDL headers, packages, or libraries and the binary
+  cross-compiles everywhere; machines without SDL3 get a friendly error.
+  Native RGB565 streamed into a texture (recreated on hi-res/overscan
+  switches), 32 kHz audio through an SDL audio stream, RetroArch-default
+  keyboard mapping, save/load-state hotkeys (F5/F9), reset (F1), hold-Tab
+  fast-forward, and NTSC-rate pacing independent of display refresh.
+  `--frames N` prints the same video/audio hashes as the headless runner —
+  CI smoke-tests the whole frontend under SDL's dummy drivers against the
+  golden hashes. Frame-advance and layer toggles are deferred (M10 polish).
 - **headless** — runs N frames, dumps `.ppm`, and prints a framebuffer hash;
   the primary development and CI verification tool.
 
@@ -188,7 +195,7 @@ serialize/unserialize.
 | M4 | Full fast PPU (modes 2–7, offset-per-tile, windows, color math, mosaic, hi-res) | PeterLemon PPU suite hashes | Done — planar modes + 8bpp, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res modes 5/6 + pseudo-hires (512-wide frames). Deferred to M8 accurate core: direct color, interlaced 448-line fields, beam-racing CGRAM tricks |
 | M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | Done — SPC700 core (SST 256k vectors, 0 failed, 0 cycle mismatches), ARAM/timers/ports, HLE boot, lazy catch-up; S-DSP with BRR + gaussian, ADSR/GAIN, noise, pitch mod, echo, signed phase-exact mixing; 32 kHz stereo ring + `readAudio()`; 8 music-ROM audio-hash goldens |
 | M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Done — joypad input ($4016 serial + auto-read), versioned save-state container, full libretro implementation; `test-libretro` harness proves golden video/audio parity, live input, and mid-run state replay through the retro_* surface (live RetroArch smoke test pending on a desktop) |
-| M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Planned |
+| M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Done — dlopen'd hand-ported SDL3 ABI (no build-time deps), streamed RGB565 + 32 kHz audio, keyboard input, F5/F9 save states, Tab fast-forward, NTSC pacing; CI smoke test reproduces golden hashes under dummy drivers; all 4 targets cross-compile (live desktop play still worth a manual spin) |
 | M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Planned |
 | M9 | Enhancement chips: DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Super FX → Cx4 (HLE) | Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | Planned |
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | Planned |
