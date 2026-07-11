@@ -629,13 +629,13 @@ pub fn dispatch(smp: anytype) void {
 
         // --- MUL / DIV / decimal / nibble swap ---
         0xCF => { // MUL YA: N/Z from the high byte (Y)
-            for (0..7) |_| smp.idle();
+            for (0..8) |_| smp.idle();
             const prod = @as(u16, smp.regs.y) * smp.regs.a;
             smp.setYa(prod);
             smp.setNZ8(smp.regs.y);
         },
         0x9E => { // DIV YA,X (hardware overflow quirk per SST)
-            for (0..10) |_| smp.idle();
+            for (0..11) |_| smp.idle();
             const y_a: u32 = smp.ya();
             const x: u32 = smp.regs.x;
             smp.putFlag(Flags.h, (smp.regs.y & 0x0F) >= (smp.regs.x & 0x0F));
@@ -670,7 +670,7 @@ pub fn dispatch(smp: anytype) void {
             smp.setNZ8(smp.regs.a);
         },
         0x9F => { // XCN A
-            for (0..3) |_| smp.idle();
+            for (0..4) |_| smp.idle();
             smp.regs.a = smp.regs.a >> 4 | smp.regs.a << 4;
             smp.setNZ8(smp.regs.a);
         },
@@ -890,9 +890,8 @@ pub fn dispatch(smp: anytype) void {
         },
 
         // --- halt ---
-        0xEF, 0xFF => { // SLEEP / STOP
-            smp.idle();
-            smp.idle();
+        0xEF, 0xFF => { // SLEEP / STOP (idle count matches the SST halt trace)
+            for (0..6) |_| smp.idle();
             smp.state = .stopped;
         },
     }

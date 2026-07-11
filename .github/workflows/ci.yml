@@ -51,6 +51,20 @@ jobs:
             git clone --depth 1 https://github.com/SingleStepTests/65816.git test-data/sst-65816
           fi
       - run: zig build test-sst -Doptimize=${{ matrix.optimize }} -Dsst-sample=500
+      - name: Resolve SPC700 test-vector revision
+        id: sst-spc-rev
+        run: echo "rev=$(git ls-remote https://github.com/SingleStepTests/spc700.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: test-data/sst-spc700
+          key: sst-spc700-${{ steps.sst-spc-rev.outputs.rev }}
+      - name: Fetch SPC700 vectors
+        run: |
+          if [ ! -d test-data/sst-spc700/.git ]; then
+            mkdir -p test-data
+            git clone --depth 1 https://github.com/SingleStepTests/spc700.git test-data/sst-spc700
+          fi
+      - run: zig build test-sst-spc700 -Doptimize=${{ matrix.optimize }} -Dsst-sample=500
 
   roms:
     runs-on: ubuntu-latest
