@@ -11,13 +11,15 @@ const core = @import("snes_core");
 const options = @import("rom_options");
 
 /// One golden ROM. Optional gates default to 0 = "not baselined, ungated";
-/// `frames` 0 means the suite default applies.
+/// `frames` 0 means the suite default applies. `audio` is the FNV-1a of the
+/// whole 32 kHz stereo stream over the run (phase-sensitive by design).
 const Entry = struct {
     path: []const u8,
     hash: u64,
     steps: u64 = 0,
     cycles: u64 = 0,
     frames: u32 = 0,
+    audio: u64 = 0,
 };
 
 const Golden = struct {
@@ -85,7 +87,17 @@ fn runOne(
     const con = try gpa.create(core.FastConsole);
     con.init(cart);
 
-    for (0..frames) |_| con.runFrame();
+    // The audio ring holds ~15 video frames, so drain and hash every frame.
+    var got_audio = core.console.audio_hash_init;
+    var drain: [4096]i16 = undefined;
+    for (0..frames) |_| {
+        con.runFrame();
+        while (true) {
+            const n = con.readAudio(&drain);
+            if (n == 0) break;
+            got_audio = core.console.hashAudio(got_audio, drain[0..n]);
+        }
+    }
 
     const got_hash = core.console.hashFrame(con.framebuffer());
     const got_steps = con.steps;
@@ -94,13 +106,15 @@ fn runOne(
     // Deterministic perf counts are gated only once baselined (0 = unset).
     const steps_ok = entry.steps == 0 or entry.steps == got_steps;
     const cycles_ok = entry.cycles == 0 or entry.cycles == got_cycles;
-    const ok = got_hash == entry.hash and steps_ok and cycles_ok;
+    const audio_ok = entry.audio == 0 or entry.audio == got_audio;
+    const ok = got_hash == entry.hash and steps_ok and cycles_ok and audio_ok;
 
-    try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n", .{
+    try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n    audio  got {x:0>16} want {x:0>16}\n", .{
         if (ok) "PASS" else "FAIL", entry.path,
         got_hash,                   entry.hash,
         got_steps,                  entry.steps,
         got_cycles,                 entry.cycles,
+        got_audio,                  entry.audio,
     });
     return ok;
 }

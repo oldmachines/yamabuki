@@ -206,6 +206,23 @@ pub fn hashFrame(fb: []const u16) u64 {
     return h;
 }
 
+/// Streaming FNV-1a over interleaved audio samples — chunk boundaries don't
+/// affect the result, so per-frame drains hash identically to one big drain.
+/// Byte-order-exact and phase-sensitive: a single inverted sample changes it.
+pub fn hashAudio(h: u64, samples: []const i16) u64 {
+    const prime: u64 = 0x100000001b3;
+    var acc = h;
+    for (samples) |s| {
+        const u: u16 = @bitCast(s);
+        acc = (acc ^ @as(u64, u & 0xFF)) *% prime;
+        acc = (acc ^ @as(u64, u >> 8)) *% prime;
+    }
+    return acc;
+}
+
+/// Initial value for `hashAudio` accumulation.
+pub const audio_hash_init: u64 = 0xcbf29ce484222325;
+
 // --- tests ---------------------------------------------------------------
 
 test {
