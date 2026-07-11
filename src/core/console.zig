@@ -181,6 +181,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
         pub fn frameWidth(self: *const Self) u32 {
             return self.bus.ppu.fb_line_width;
         }
+
+        /// Drain buffered S-DSP output into `dst` as interleaved stereo i16
+        /// at 32 kHz (`timing.dsp_sample_hz`); returns i16 values copied.
+        /// One video frame produces ~532 stereo frames.
+        pub fn readAudio(self: *Self, dst: []i16) usize {
+            return self.bus.apu.readAudio(dst);
+        }
     };
 }
 

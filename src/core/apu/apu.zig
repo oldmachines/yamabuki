@@ -1,5 +1,6 @@
-//! S-APU: 64 KiB ARAM, the SPC700 core, the three timers, the CPU mailbox
-//! ports ($2140-$2143 ↔ $F4-$F7), and an HLE boot handshake.
+//! S-APU: 64 KiB ARAM, the SPC700 core, the S-DSP (one stereo sample per 32
+//! SPC cycles into an output ring), the three timers, the CPU mailbox ports
+//! ($2140-$2143 ↔ $F4-$F7), and an HLE boot handshake.
 //!
 //! The APU runs on its own 1.024 MHz clock and is caught up to the main
 //! bus's master clock lazily: on every CPU access to the mailbox ports and
@@ -16,6 +17,7 @@
 
 const std = @import("std");
 const spc700 = @import("spc700.zig");
+const dsp_mod = @import("dsp.zig");
 const timing = @import("../timing.zig");
 
 /// Exact clock ratio: 1,024,000 SPC cycles per 21,477,272 master cycles,
@@ -23,11 +25,23 @@ const timing = @import("../timing.zig");
 const spc_num: u64 = 128_000;
 const spc_den: u64 = 2_684_659;
 
+/// SPC cycles per S-DSP output sample (1.024 MHz / 32 kHz).
+const cycles_per_sample: u64 = 32;
+
+/// Ring capacity in stereo frames (power of two; ~15 video frames of slack
+/// before the oldest unread audio is overwritten).
+const audio_capacity: u32 = 8192;
+
 const BootState = enum(u8) { ready, transfer, done };
 
 pub const Apu = struct {
+    // The audio ring is transient output (like the framebuffer), not
+    // machine state: a loaded save state resumes with an empty ring.
+    pub const serialize_skip = .{ "audio", "audio_head", "audio_tail" };
+
     aram: [0x10000]u8,
     smp: spc700.Smp(Apu),
+    dsp: dsp_mod.Dsp,
 
     // Mailbox ports: `cpu_in` is written by the main CPU and read by the SMP
     // at $F4-$F7; `cpu_out` is the reverse direction.
@@ -48,9 +62,14 @@ pub const Apu = struct {
     t_counter: [3]u8,
     divider: u8,
 
-    // $F2/$F3 DSP register file (inert storage until the S-DSP lands, M5b).
+    // $F2 DSP address latch ($F3 reads/writes go through `dsp`).
     dsp_addr: u8,
-    dsp_regs: [128]u8,
+
+    // Interleaved stereo output ring; head/read and tail/write are monotonic
+    // frame counters (index = counter % capacity).
+    audio: [audio_capacity * 2]i16,
+    audio_head: u32,
+    audio_tail: u32,
 
     // Catch-up scheduling state.
     spc_clock: u64,
@@ -69,6 +88,7 @@ pub const Apu = struct {
         self.* = .{
             .aram = @splat(0),
             .smp = undefined,
+            .dsp = .init,
             .cpu_in = @splat(0),
             .cpu_out = .{ 0xAA, 0xBB, 0, 0 }, // boot-ready handshake values
             .test_reg = 0,
@@ -79,7 +99,9 @@ pub const Apu = struct {
             .t_counter = @splat(0),
             .divider = 0,
             .dsp_addr = 0,
-            .dsp_regs = @splat(0),
+            .audio = @splat(0),
+            .audio_head = 0,
+            .audio_tail = 0,
             .spc_clock = 0,
             .spc_target = 0,
             .master_last = 0,
@@ -166,10 +188,43 @@ pub const Apu = struct {
         self.master_acc %= spc_den;
 
         if (self.boot != .done) {
+            // The SPC has no program yet, but the DSP samples from power-on:
+            // emit one sample per 32-cycle grid point the jump skips over, so
+            // the stream stays exactly spc_clock/32 samples long.
+            var next = (self.spc_clock | (cycles_per_sample - 1)) + 1;
+            while (next <= self.spc_target) : (next += cycles_per_sample) self.dspSample();
             self.spc_clock = self.spc_target;
             return;
         }
         while (self.spc_clock < self.spc_target) self.smp.step();
+    }
+
+    // --- audio output ------------------------------------------------------
+
+    /// Run the DSP for one 32 kHz sample and push it into the output ring;
+    /// when the ring is full the oldest unread frame is overwritten.
+    fn dspSample(self: *Apu) void {
+        const s = self.dsp.sample(&self.aram);
+        const idx = (self.audio_tail % audio_capacity) * 2;
+        self.audio[idx] = s[0];
+        self.audio[idx + 1] = s[1];
+        self.audio_tail +%= 1;
+        if (self.audio_tail -% self.audio_head > audio_capacity)
+            self.audio_head = self.audio_tail -% audio_capacity;
+    }
+
+    /// Drain buffered audio into `dst` as interleaved stereo i16 at 32 kHz.
+    /// Returns the number of i16 values copied (always even).
+    pub fn readAudio(self: *Apu, dst: []i16) usize {
+        var n: usize = 0;
+        while (self.audio_head != self.audio_tail and n + 2 <= dst.len) {
+            const idx = (self.audio_head % audio_capacity) * 2;
+            dst[n] = self.audio[idx];
+            dst[n + 1] = self.audio[idx + 1];
+            n += 2;
+            self.audio_head +%= 1;
+        }
+        return n;
     }
 
     // --- SMP bus (the SPC700's read8/write8/idle contract) ----------------
@@ -193,9 +248,11 @@ pub const Apu = struct {
         self.tick();
     }
 
-    /// One SPC cycle: advance the clock and the timer prescalers.
+    /// One SPC cycle: advance the clock, the DSP sample grid, and the timer
+    /// prescalers.
     inline fn tick(self: *Apu) void {
         self.spc_clock += 1;
+        if (self.spc_clock % cycles_per_sample == 0) self.dspSample();
         self.divider +%= 1;
         if (self.divider & 15 == 0) {
             self.tickTimer(2);
@@ -220,7 +277,7 @@ pub const Apu = struct {
     fn ioRead(self: *Apu, low: u4) u8 {
         return switch (low) {
             0x2 => self.dsp_addr,
-            0x3 => self.dsp_regs[self.dsp_addr & 0x7F],
+            0x3 => self.dsp.read(@truncate(self.dsp_addr & 0x7F)),
             0x4, 0x5, 0x6, 0x7 => self.cpu_in[low - 4],
             0x8, 0x9 => self.aux[low - 8],
             0xD, 0xE, 0xF => blk: {
@@ -258,7 +315,7 @@ pub const Apu = struct {
             0x2 => self.dsp_addr = value,
             0x3 => {
                 // The upper half of the DSP map is read-only mirrors.
-                if (self.dsp_addr < 0x80) self.dsp_regs[self.dsp_addr] = value;
+                if (self.dsp_addr < 0x80) self.dsp.write(@truncate(self.dsp_addr), value);
             },
             0x4, 0x5, 0x6, 0x7 => self.cpu_out[low - 4] = value,
             0x8, 0x9 => self.aux[low - 8] = value,
@@ -328,6 +385,89 @@ test "timers divide the SPC clock and counters clear on read" {
     while (apu.spc_clock < 1100) apu.idle();
     try std.testing.expectEqual(@as(u8, 2), apu.read8(0xFD));
     try std.testing.expectEqual(@as(u8, 0), apu.read8(0xFD)); // cleared
+}
+
+test "DSP samples on the 32-cycle grid before and after boot" {
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    // Pre-boot: one master-clock frame elapses with no SPC program; the DSP
+    // still emits exactly spc_clock/32 (silent) stereo frames.
+    apu.catchUp(357_368); // 262 lines * 1364 cycles
+    const expected = apu.spc_clock / 32;
+    var buf: [2048]i16 = undefined;
+    var total: usize = 0;
+    var nonzero = false;
+    while (true) {
+        const n = apu.readAudio(&buf);
+        if (n == 0) break;
+        total += n;
+        for (buf[0..n]) |s| nonzero = nonzero or (s != 0);
+    }
+    try std.testing.expectEqual(expected, total / 2);
+    try std.testing.expect(!nonzero); // FLG resets to mute
+
+    // Boot a spin program; the grid continues seamlessly across handover.
+    const program = [_]u8{ 0x2F, 0xFE }; // BRA -2
+    uploadAndRun(apu, 0x0200, &program);
+    apu.catchUp(2 * 357_368);
+    const expected2 = apu.spc_clock / 32 - expected;
+    total = 0;
+    while (true) {
+        const n = apu.readAudio(&buf);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqual(expected2, total / 2);
+}
+
+test "SPC $F2/$F3 traffic reaches the DSP and produces audio" {
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    // A looping constant BRR sample at $1000, directory page $03.
+    const dir: u16 = 0x0300;
+    std.mem.writeInt(u16, apu.aram[dir..][0..2], 0x1000, .little);
+    std.mem.writeInt(u16, apu.aram[dir + 2 ..][0..2], 0x1000, .little);
+    apu.aram[0x1000] = 0xC3; // shift 12, filter 0, end+loop
+    @memset(apu.aram[0x1001..0x1009], 0x44);
+
+    // Drive the DSP register file the way an SPC driver would ($F2 addr,
+    // $F3 data), through the SMP-side bus interface.
+    const writes = [_][2]u8{
+        .{ 0x5D, 0x03 }, // DIR
+        .{ 0x04, 0x00 }, // V0 SRCN
+        .{ 0x02, 0x00 }, // V0 pitch 0x1000
+        .{ 0x03, 0x10 },
+        .{ 0x05, 0x00 }, // ADSR off -> GAIN
+        .{ 0x07, 0x7F }, // GAIN direct max
+        .{ 0x00, 0x50 }, // VOLL
+        .{ 0x01, 0x50 }, // VOLR
+        .{ 0x0C, 0x7F }, // MVOL
+        .{ 0x1C, 0x7F },
+        .{ 0x6C, 0x20 }, // FLG: unmute, echo writes off
+        .{ 0x4C, 0x01 }, // KON voice 0
+    };
+    for (writes) |w| {
+        apu.write8(0xF2, w[0]);
+        apu.write8(0xF3, w[1]);
+    }
+    // Readback goes through the live register file.
+    apu.write8(0xF2, 0x0C);
+    try std.testing.expectEqual(@as(u8, 0x7F), apu.read8(0xF3));
+
+    // Run ~1024 SPC cycles (32 samples) and expect audible output.
+    for (0..1024) |_| apu.idle();
+    var buf: [4096]i16 = undefined;
+    const n = apu.readAudio(&buf);
+    try std.testing.expect(n >= 32);
+    var peak: i16 = 0;
+    for (buf[0..n]) |s| peak = @max(peak, s);
+    try std.testing.expect(peak > 1000);
 }
 
 test "mailbox ports carry both directions once booted" {
