@@ -369,6 +369,29 @@ test "math unit via bus" {
     try std.testing.expectEqual(@as(u16, 100), @as(u16, qlo) | (@as(u16, qhi) << 8));
 }
 
+test "dma a-bus cannot touch dma registers or retrigger itself" {
+    var tc = try TestConsole.create(0x20, 3);
+    defer tc.destroy();
+    // Channel 0: B->A ($21FF open bus -> fixed A-bus address), 4 bytes,
+    // with the A side aimed at $420B — the GDMA trigger itself. The A-bus
+    // block must drop those writes or the transfer recurses without bound.
+    tc.bus.write8(0x00_4300, 0x88); // DMAP: B->A, fixed A-bus
+    tc.bus.write8(0x00_4301, 0xFF); // BBAD: $21FF
+    tc.bus.write8(0x00_4302, 0x0B); // A1T = $420B
+    tc.bus.write8(0x00_4303, 0x42);
+    tc.bus.write8(0x00_4305, 4); // DAS = 4
+    tc.bus.write8(0x00_420B, 0x01); // must terminate, not recurse
+    try std.testing.expectEqual(@as(u16, 0), tc.bus.dma.channels[0].count);
+
+    // Same, aimed at the channel's own DMAP register: the blocked write
+    // must leave the live control byte untouched.
+    tc.bus.write8(0x00_4302, 0x00); // A1T = $4300
+    tc.bus.write8(0x00_4303, 0x43);
+    tc.bus.write8(0x00_4305, 4);
+    tc.bus.write8(0x00_420B, 0x01);
+    try std.testing.expectEqual(@as(u8, 0x88), tc.bus.dma.channels[0].control);
+}
+
 test "bus state serialize roundtrip rebuilds pages" {
     const serialize = @import("../serialize.zig");
     var tc = try TestConsole.create(0x20, 3);

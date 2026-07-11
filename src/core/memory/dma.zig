@@ -109,6 +109,28 @@ pub const Dma = struct {
         bus.clock = start + cost;
     }
 
+    /// Hardware forbids the DMA unit's A-bus side from touching the B-bus
+    /// window, the DMA register file, or the DMA trigger registers: such
+    /// reads return open bus and such writes are dropped. Enforcing it also
+    /// means a descriptor pointed at $420B cannot retrigger GDMA from inside
+    /// the running transfer (which would recurse without bound).
+    fn aBusValid(addr: u24) bool {
+        const bank: u8 = @truncate(addr >> 16);
+        if (bank & 0x7F >= 0x40) return true; // not a system bank
+        return switch (@as(u16, @truncate(addr))) {
+            0x2100...0x21FF, 0x420B, 0x420C, 0x4300...0x437F => false,
+            else => true,
+        };
+    }
+
+    fn aRead(bus: anytype, addr: u24) u8 {
+        return if (aBusValid(addr)) bus.read8(addr) else bus.mdr;
+    }
+
+    fn aWrite(bus: anytype, addr: u24, value: u8) void {
+        if (aBusValid(addr)) bus.write8(addr, value);
+    }
+
     /// Transfer one channel; returns the number of bytes moved.
     fn transferGpChannel(self: *Dma, bus: anytype, i: usize) u32 {
         const ch = &self.channels[i];
@@ -124,9 +146,9 @@ pub const Dma = struct {
             const b: u24 = 0x2100 | @as(u24, ch.b_addr +% off);
             const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             if (b_to_a) {
-                bus.write8(a, bus.read8(b));
+                aWrite(bus, a, bus.read8(b));
             } else {
-                bus.write8(b, bus.read8(a));
+                bus.write8(b, aRead(bus, a));
             }
             switch (adjust) {
                 0 => ch.a_addr +%= 1, // increment
@@ -184,9 +206,9 @@ pub const Dma = struct {
             else
                 (@as(u24, ch.a_bank) << 16) | ch.table_addr;
             if (b_to_a) {
-                bus.write8(a, bus.read8(b));
+                aWrite(bus, a, bus.read8(b));
             } else {
-                bus.write8(b, bus.read8(a));
+                bus.write8(b, aRead(bus, a));
             }
             if (indirect) ch.count +%= 1 else ch.table_addr +%= 1;
         }
@@ -197,7 +219,7 @@ pub const Dma = struct {
         _ = self;
         const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.table_addr;
         ch.table_addr +%= 1;
-        return bus.read8(a);
+        return aRead(bus, a);
     }
 
     /// Read the 2-byte indirect address that follows a line-counter byte.
