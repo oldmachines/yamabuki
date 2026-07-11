@@ -34,20 +34,25 @@ zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
 ```
 
-Run a ROM headless and dump a frame to inspect:
+Run a ROM headless and dump a frame (and its audio) to inspect:
 
 ```sh
-zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 16 --ppm out.ppm
+zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 60 --ppm out.ppm --wav out.wav
 ```
 
 ## Status
 
-Early development. The console boots ROMs and renders: scheduler with NMI/IRQ,
-DMA/HDMA, and a fast scanline renderer covering all 8 BG modes (2/4/8bpp
-planar, affine Mode 7 + EXTBG, hi-res 512-wide modes 5/6 and pseudo-hires)
-with sprites, windows, and color math.
+Early development. The console boots ROMs, renders, and plays sound: scheduler
+with NMI/IRQ, DMA/HDMA, a fast scanline renderer covering all 8 BG modes
+(2/4/8bpp planar, affine Mode 7 + EXTBG, hi-res 512-wide modes 5/6 and
+pseudo-hires) with sprites, windows, and color math, and the full APU — SPC700
+plus the S-DSP (8 BRR voices, gaussian interpolation, ADSR/GAIN envelopes,
+noise, pitch modulation, echo) emitting 32 kHz stereo with signed, phase-exact
+mixing, so Dolby Surround games decode correctly
+([`docs/AUDIO_SURROUND.md`](docs/AUDIO_SURROUND.md)).
 PeterLemon BG/text/sprite ROMs render and are locked against golden framebuffer
-hashes; the 65816 and SPC700 cores are validated against
+hashes, music demo ROMs against golden audio-stream hashes; the 65816 and
+SPC700 cores are validated against
 [SingleStepTests](https://github.com/SingleStepTests) vectors, and the SPC700
 CPU-test ROMs run end-to-end on the audio CPU through an HLE boot handshake.
 
@@ -60,7 +65,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M2 65816 CPU + test vectors | done |
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
 | M4 full fast PPU | done (all BG modes, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res/pseudo-hires) |
-| M5 APU (SPC700 + S-DSP) | in progress (SPC700 core + integration done; S-DSP next) |
+| M5 APU (SPC700 + S-DSP) | done (BRR voices, gaussian, ADSR/GAIN, noise, pitch mod, echo; 32 kHz stereo + audio-hash goldens) |
 | M6 save states + libretro core | planned |
 | M7 SDL3 desktop frontend | planned |
 | M8 accurate mode (dot renderer, cycle timing) | planned |

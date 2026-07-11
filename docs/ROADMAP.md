@@ -152,8 +152,10 @@ serialize/unserialize.
   (CI); the full run is local/nightly. Cycle-*position* parity is a separate
   metric tied to the accurate-mode milestone (M8).
 - **Integration ROMs.** `tests/rom_runner.zig` runs a homebrew test ROM
-  (PeterLemon/krom) headless for N frames, FNV-1a hashes the RGB565 framebuffer,
-  and compares against committed golden hashes minted after manual `.ppm`
+  (PeterLemon/krom) headless for N frames, FNV-1a hashes the RGB565 framebuffer
+  — and, once M5b landed, the whole 32 kHz stereo stream (optional `.audio`
+  gate; phase-sensitive, so a lost sign inversion fails it) — and compares
+  against committed golden hashes minted after manual `.ppm`/`--wav`
   inspection. The same loop doubles as the benchmark.
 - **Unit tests** live inline per module: header detection, mapper shapes, open
   bus, DMA readback, multiply/divide registers, BRR decode, envelopes, and
@@ -180,7 +182,7 @@ serialize/unserialize.
 | M2 | Full 65816 core (256 ops × 4 comptime variants, E-mode, interrupts, block moves) | SST 65816: 100% register/memory (5.12M cases) | **Done** |
 | M3 | Scheduler, NMI/IRQ, GDMA/HDMA, PPU registers, fast renderer modes 0/1 + sprites | PeterLemon ROMs render; golden hashes; `.ppm` eyeballed | **Done** |
 | M4 | Full fast PPU (modes 2–7, offset-per-tile, windows, color math, mosaic, hi-res) | PeterLemon PPU suite hashes | Done — planar modes + 8bpp, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res modes 5/6 + pseudo-hires (512-wide frames). Deferred to M8 accurate core: direct color, interlaced 448-line fields, beam-racing CGRAM tricks |
-| M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | In progress — SPC700 core (SST 256k vectors, 0 failed, 0 cycle mismatches), ARAM/timers/ports, HLE boot, lazy catch-up done; S-DSP (M5b) next |
+| M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | Done — SPC700 core (SST 256k vectors, 0 failed, 0 cycle mismatches), ARAM/timers/ports, HLE boot, lazy catch-up; S-DSP with BRR + gaussian, ADSR/GAIN, noise, pitch mod, echo, signed phase-exact mixing; 32 kHz stereo ring + `readAudio()`; 8 music-ROM audio-hash goldens |
 | M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Planned |
 | M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Planned |
 | M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Planned |
