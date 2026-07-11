@@ -112,9 +112,11 @@ pub fn build(b: *std.Build) void {
     // committed golden values. Requires test-data/snes-roms.
     const rom_filter = b.option([]const u8, "rom-filter", "Run only ROMs whose path contains this substring");
     const rom_frames = b.option(u32, "rom-frames", "Frames per ROM (0 = use golden_hashes.zon default)") orelse 0;
+    const rom_accurate = b.option(bool, "rom-accurate", "Run the golden ROMs on the accurate core") orelse false;
     const rom_opts = b.addOptions();
     rom_opts.addOption(?[]const u8, "filter", rom_filter);
     rom_opts.addOption(u32, "frames", rom_frames);
+    rom_opts.addOption(bool, "accurate", rom_accurate);
 
     const rom_runner = b.addExecutable(.{
         .name = "rom-runner",

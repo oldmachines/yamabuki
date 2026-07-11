@@ -48,6 +48,13 @@ pub const Bus = struct {
     cpuio: CpuIo,
     joy: Joypad,
     ppu: Ppu,
+    /// Accurate-core beam state: when enabled, a $21xx write first renders
+    /// the current scanline up to the beam's pixel so the write lands
+    /// mid-line. The console updates line/line_start each scanline; a
+    /// sentinel line (maxInt) disables catch-up during vblank.
+    beam_enabled: bool,
+    beam_line: u32,
+    beam_line_start: u64,
     dma: Dma,
     apu: Apu,
 
@@ -64,6 +71,9 @@ pub const Bus = struct {
         self.cpuio = .init;
         self.joy = .init;
         self.ppu = .init;
+        self.beam_enabled = false;
+        self.beam_line = std.math.maxInt(u32);
+        self.beam_line_start = 0;
         self.dma = .init;
         self.apu.init();
         self.remap();
@@ -84,6 +94,15 @@ pub const Bus = struct {
                 @field(self, f.name).postLoad();
             }
         }
+    }
+
+    /// Accurate core: render the current scanline up to the pixel the beam
+    /// has reached, so the $21xx write being dispatched splits the line.
+    /// Output pixel x corresponds to dot 22+x; one dot is 4 master cycles.
+    fn beamCatchUp(self: *Bus) void {
+        const dot = (self.clock -% self.beam_line_start) / timing.cycles_per_dot;
+        const x = dot -| timing.render_start_dot;
+        self.ppu.renderUpTo(self.beam_line, @intCast(@min(x, 256)));
     }
 
     /// One CPU internal cycle (no bus access).
@@ -167,7 +186,10 @@ pub const Bus = struct {
         }
 
         switch (a16) {
-            0x2100...0x2133 => self.ppu.writeReg(a16, value),
+            0x2100...0x2133 => {
+                if (self.beam_enabled) self.beamCatchUp();
+                self.ppu.writeReg(a16, value);
+            },
             0x2140...0x217F => self.apu.cpuWrite(self.clock, @truncate(a16 & 3), value),
             0x2180 => self.wram.portWrite(value),
             0x2181 => self.wram.setPortAddrLow(value),

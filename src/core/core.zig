@@ -29,6 +29,9 @@ pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;
 pub const Console = console.Console;
 pub const FastConsole = console.FastConsole;
+pub const AccurateConsole = console.AccurateConsole;
+pub const AnyConsole = console.AnyConsole;
+pub const Accuracy = console.Accuracy;
 
 pub const version = "0.1.0";
 

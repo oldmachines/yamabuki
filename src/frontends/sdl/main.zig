@@ -1,6 +1,6 @@
 //! SDL3 desktop frontend: the development-and-play UI.
 //!
-//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio]
+//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]
 //!
 //! Controls (RetroArch keyboard defaults):
 //!   arrows = d-pad   Z = B   X = A   A = Y   S = X   Q = L   W = R
@@ -44,6 +44,7 @@ const Args = struct {
     scale: u32 = 3,
     frames: u32 = 0, // 0 = run until quit
     audio: bool = true,
+    accuracy: core.Accuracy = .fast,
 };
 
 const Keymap = struct { code: u32, mask: u16 };
@@ -76,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = parseArgs(init) catch {
-        try err.print("usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio]\n", .{});
+        try err.print("usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n", .{});
         try err.flush();
         std.process.exit(2);
     };
@@ -101,9 +102,9 @@ pub fn main(init: std.process.Init) !void {
         try err.flush();
         std.process.exit(1);
     };
-    const con = try gpa.create(core.FastConsole);
-    con.init(cart);
-    const state_buf = try gpa.alloc(u8, core.FastConsole.state_size);
+    const con = try gpa.create(core.AnyConsole);
+    con.init(args.accuracy, cart);
+    const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{args.rom});
 
     // --- SDL ----------------------------------------------------------------
@@ -180,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
                     if (key.scancode == sdl3.scancode.tab) fast_forward = key.down;
                     if (key.down and !key.repeat) switch (key.scancode) {
                         sdl3.scancode.escape => running = false,
-                        sdl3.scancode.f1 => con.init(con.cart),
+                        sdl3.scancode.f1 => con.repower(),
                         sdl3.scancode.f5 => {
                             _ = con.saveState(state_buf);
                             if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
@@ -278,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
-fn loadStateFile(io: std.Io, con: *core.FastConsole, path: []const u8, buf: []u8) !void {
+fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8) !void {
     const data = try std.Io.Dir.cwd().readFile(io, path, buf);
     try con.loadState(data);
 }
@@ -298,6 +299,8 @@ fn parseArgs(init: std.process.Init) !Args {
             args.frames = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--no-audio")) {
             args.audio = false;
+        } else if (std.mem.eql(u8, a, "--accurate")) {
+            args.accuracy = .accurate;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;

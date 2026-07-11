@@ -26,7 +26,7 @@ const Cpu = @import("cpu/wdc65816.zig").Cpu;
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 1;
+pub const state_version: u32 = 2;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -67,6 +67,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         pub fn init(self: *Self, cart: Cartridge) void {
             self.cart = cart;
             self.bus.init(&self.cart);
+            self.bus.beam_enabled = cfg.accuracy == .accurate;
             self.cpu = Cpu(Bus).init(&self.bus);
             self.region = .ntsc;
             self.reset();
@@ -132,9 +133,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (io.nmitimen & 0x01 != 0) self.bus.joy.autoRead();
             }
 
-            // Evaluate the H/V-IRQ timer for this scanline (line granularity;
-            // exact dot placement is deferred to the accurate core, M8).
-            if (self.irqMatchesLine(line)) {
+            // Evaluate the H/V-IRQ timer for this scanline. The fast core
+            // latches it at line granularity; the accurate core fires it at
+            // the programmed dot inside runLineCpuAccurate.
+            if (cfg.accuracy == .fast and self.irqMatchesLine(line)) {
                 io.irq_flag = true;
             }
 
@@ -144,16 +146,22 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (line == 0) self.bus.dma.hdmaInit(&self.bus);
             if (line < self.vblankLine()) self.bus.dma.hdmaRunLine(&self.bus);
 
-            self.runLineCpu();
+            if (cfg.accuracy == .fast) self.runLineCpu() else self.runLineCpuAccurate(line);
 
             // Keep the APU within one scanline of the main CPU (port accesses
             // catch it up mid-line as needed).
             self.bus.apu.catchUp(self.bus.clock);
 
-            // Fast mode renders the whole visible scanline at line end.
-            if (cfg.accuracy == .fast) {
-                if (line < self.vblankLine()) self.renderScanline(line);
+            // Fast mode renders the whole visible scanline at line end; the
+            // accurate core renders whatever the beam didn't already emit.
+            if (line < self.vblankLine()) {
+                if (cfg.accuracy == .fast) self.renderScanline(line) else self.bus.ppu.finishScanline(line);
             }
+
+            // Between lines the beam is in blanking: HDMA's per-line $21xx
+            // writes (which run before the next line's CPU slice) must apply
+            // for the *coming* line, not race the finished one.
+            if (cfg.accuracy == .accurate) self.bus.beam_line = std.math.maxInt(u32);
         }
 
         /// Does the programmed IRQ timer fire on this scanline?
@@ -173,6 +181,28 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // Keep the CPU's level-sensitive IRQ input in sync with the
                 // timer flag: reading $4211 (TIMEUP) clears irq_flag, which must
                 // deassert the line before the handler's RTI re-checks it.
+                if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
+                self.cpu.step();
+                self.steps +%= 1;
+            }
+            self.line_start = line_end;
+        }
+
+        /// Accurate-mode line loop: beam bookkeeping for the bus's mid-line
+        /// $21xx catch-up rendering, and the H-IRQ latched when the beam
+        /// reaches HTIME's dot rather than at the top of the line.
+        fn runLineCpuAccurate(self: *Self, line: u32) void {
+            const io = &self.bus.cpuio;
+            self.bus.beam_line = if (line < self.vblankLine()) line else std.math.maxInt(u32);
+            self.bus.beam_line_start = self.line_start;
+
+            const fire_at = irqFireClock(io.irqMode(), io.htime, self.irqMatchesLine(line), self.line_start);
+
+            const line_end = self.line_start +% timing.cycles_per_line;
+            while (self.bus.clock < line_end) {
+                if (fire_at) |t| {
+                    if (self.bus.clock >= t) io.irq_flag = true;
+                }
                 if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
                 self.cpu.step();
                 self.steps +%= 1;
@@ -255,8 +285,122 @@ pub fn Console(comptime cfg: CoreConfig) type {
     };
 }
 
+/// The master-clock time at which this line's IRQ latches, if any (accurate
+/// core). H- and H+V-IRQ (modes 1/3) fire when the beam reaches HTIME's dot;
+/// V-only IRQ (mode 2) fires at the start of the line. An HTIME beyond the
+/// line's 341 dots never fires — its clock lies past the line end.
+fn irqFireClock(mode: u2, htime: u16, matches_line: bool, line_start: u64) ?u64 {
+    if (!matches_line) return null;
+    return switch (mode) {
+        1, 3 => line_start +% @as(u64, htime) * timing.cycles_per_dot,
+        else => line_start,
+    };
+}
+
 /// The default shipped core.
 pub const FastConsole = Console(.{ .accuracy = .fast });
+
+/// The opt-in accurate core: piecewise beam-position rendering (mid-scanline
+/// $21xx writes split the line) and dot-placed H-IRQs.
+pub const AccurateConsole = Console(.{ .accuracy = .accurate });
+
+/// Runtime accuracy selection: a tagged union over the two comptime
+/// instantiations, dispatched at frame/API granularity so the hot paths stay
+/// monomorphized. Same pinning rule as the consoles themselves: heap-allocate,
+/// init in place, never move.
+pub const AnyConsole = union(Accuracy) {
+    fast: FastConsole,
+    accurate: AccurateConsole,
+
+    /// Both instantiations serialize the same field set, so their state sizes
+    /// agree; the header's accuracy byte is what tells their states apart
+    /// (loadState rejects a state from the other core).
+    pub const state_size = FastConsole.state_size;
+    comptime {
+        std.debug.assert(FastConsole.state_size == AccurateConsole.state_size);
+    }
+
+    pub fn init(self: *AnyConsole, level: Accuracy, cart: Cartridge) void {
+        switch (level) {
+            .fast => {
+                self.* = .{ .fast = undefined };
+                self.fast.init(cart);
+            },
+            .accurate => {
+                self.* = .{ .accurate = undefined };
+                self.accurate.init(cart);
+            },
+        }
+    }
+
+    /// Re-power in place, preserving the cartridge (and its battery SRAM).
+    pub fn repower(self: *AnyConsole) void {
+        switch (self.*) {
+            inline else => |*c| {
+                const cart = c.cart;
+                c.init(cart);
+            },
+        }
+    }
+
+    pub fn accuracy(self: *const AnyConsole) Accuracy {
+        return std.meta.activeTag(self.*);
+    }
+
+    pub fn cartridge(self: *AnyConsole) *Cartridge {
+        switch (self.*) {
+            inline else => |*c| return &c.cart,
+        }
+    }
+
+    pub fn systemRam(self: *AnyConsole) []u8 {
+        switch (self.*) {
+            inline else => |*c| return &c.bus.wram.data,
+        }
+    }
+
+    pub fn runFrame(self: *AnyConsole) void {
+        switch (self.*) {
+            inline else => |*c| c.runFrame(),
+        }
+    }
+
+    pub fn framebuffer(self: *const AnyConsole) []const u16 {
+        switch (self.*) {
+            inline else => |*c| return c.framebuffer(),
+        }
+    }
+
+    pub fn frameWidth(self: *const AnyConsole) u32 {
+        switch (self.*) {
+            inline else => |*c| return c.frameWidth(),
+        }
+    }
+
+    pub fn readAudio(self: *AnyConsole, dst: []i16) usize {
+        switch (self.*) {
+            inline else => |*c| return c.readAudio(dst),
+        }
+    }
+
+    pub fn setButtons(self: *AnyConsole, port: u1, buttons: u16) void {
+        switch (self.*) {
+            inline else => |*c| c.setButtons(port, buttons),
+        }
+    }
+
+    pub fn saveState(self: *const AnyConsole, out: []u8) usize {
+        switch (self.*) {
+            inline else => |*c| return c.saveState(out),
+        }
+    }
+
+    pub fn loadState(self: *AnyConsole, in: []const u8) StateError!void {
+        switch (self.*) {
+            inline else => |*c| return c.loadState(in),
+        }
+    }
+};
 
 /// FNV-1a hash of an RGB565 framebuffer, used by the ROM runner and benchmark
 /// to compare output against committed golden values.
@@ -733,4 +877,118 @@ test "NMI is suppressed while NMITIMEN bit7 is clear" {
     try std.testing.expect(con.bus.cpuio.nmi_flag);
     // Reading RDNMI clears it.
     try std.testing.expectEqual(@as(u8, 0x82), con.bus.cpuio.readRdnmi(0));
+}
+
+test "irqFireClock places H-IRQ at HTIME's dot" {
+    try std.testing.expectEqual(@as(?u64, null), irqFireClock(1, 100, false, 1000));
+    try std.testing.expectEqual(@as(?u64, 1000 + 400), irqFireClock(1, 100, true, 1000));
+    try std.testing.expectEqual(@as(?u64, 1000), irqFireClock(2, 100, true, 1000));
+    try std.testing.expectEqual(@as(?u64, 1000 + 4 * 339), irqFireClock(3, 339, true, 1000));
+}
+
+/// Build the minimal spin-loop test ROM shared by the accuracy tests.
+fn buildSpinRom(alloc: std.mem.Allocator) ![]u8 {
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    // Reset code: backdrop = red, full brightness, spin.
+    const code = [_]u8{
+        0xA9, 0x00, 0x8D, 0x21, 0x21, // CGADD = 0
+        0xA9, 0x1F, 0x8D, 0x22, 0x21, // color 0 low = $1F (red)
+        0xA9, 0x00, 0x8D, 0x22, 0x21, // color 0 high = $00
+        0xA9, 0x0F, 0x8D, 0x00, 0x21, // INIDISP: full brightness
+        0x80, 0xFE, // loop: BRA loop
+    };
+    @memcpy(rom[0..code.len], &code);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "ACCURACY TEST        ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+    return rom;
+}
+
+test "accurate core matches the fast core when nothing races the beam" {
+    const alloc = std.testing.allocator;
+    const rom = try buildSpinRom(alloc);
+    defer alloc.free(rom);
+
+    const fast = try alloc.create(FastConsole);
+    defer {
+        fast.cart.deinit(alloc);
+        alloc.destroy(fast);
+    }
+    fast.init(try Cartridge.load(alloc, rom));
+
+    const accurate = try alloc.create(AccurateConsole);
+    defer {
+        accurate.cart.deinit(alloc);
+        alloc.destroy(accurate);
+    }
+    accurate.init(try Cartridge.load(alloc, rom));
+
+    for (0..2) |_| {
+        fast.runFrame();
+        accurate.runFrame();
+    }
+    try std.testing.expectEqual(fast.steps, accurate.steps);
+    try std.testing.expectEqual(fast.bus.clock, accurate.bus.clock);
+    try std.testing.expectEqual(hashFrame(fast.framebuffer()), hashFrame(accurate.framebuffer()));
+}
+
+test "accurate core: a $21xx write mid-line lands at the beam position" {
+    const alloc = std.testing.allocator;
+    const rom = try buildSpinRom(alloc);
+    defer alloc.free(rom);
+
+    const con = try alloc.create(AccurateConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(try Cartridge.load(alloc, rom));
+    con.runFrame(); // program has set the backdrop red
+
+    // Simulate the beam being 100 pixels into line 50, then write the
+    // backdrop color through the real bus path ($2121/$2122).
+    con.bus.beam_line = 50;
+    con.bus.beam_line_start = con.bus.clock;
+    con.bus.clock += (timing.render_start_dot + 100) * timing.cycles_per_dot;
+    con.bus.write8(0x002121, 0x00);
+    con.bus.write8(0x002122, 0x00);
+    con.bus.write8(0x002122, 0x7C); // color 0 = blue
+    con.bus.ppu.finishScanline(50);
+
+    const row = con.bus.ppu.fb[50 * 256 ..];
+    try std.testing.expectEqual(@as(u16, 0xF800), row[0]); // red before the write
+    try std.testing.expectEqual(@as(u16, 0xF800), row[99]);
+    try std.testing.expectEqual(@as(u16, 0x001F), row[120]); // blue after it
+    try std.testing.expectEqual(@as(u16, 0x001F), row[255]);
+}
+
+test "save states are tied to the accuracy that wrote them" {
+    const alloc = std.testing.allocator;
+    const rom = try buildSpinRom(alloc);
+    defer alloc.free(rom);
+
+    const a = try alloc.create(AnyConsole);
+    defer {
+        a.cartridge().deinit(alloc);
+        alloc.destroy(a);
+    }
+    a.init(.fast, try Cartridge.load(alloc, rom));
+    a.runFrame();
+
+    const buf = try alloc.alloc(u8, AnyConsole.state_size);
+    defer alloc.free(buf);
+    _ = a.saveState(buf);
+
+    const b = try alloc.create(AnyConsole);
+    defer {
+        b.cartridge().deinit(alloc);
+        alloc.destroy(b);
+    }
+    b.init(.accurate, try Cartridge.load(alloc, rom));
+    try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }

@@ -61,6 +61,10 @@ pub const Ppu = struct {
     /// Current frame's row width/stride. Reset to 256 at line 0; the first
     /// hi-res line promotes the frame (and the rows already rendered) to 512.
     fb_line_width: u32,
+    /// Accurate core only: pixels [0, beam_x) of the scanline currently being
+    /// drawn are already rendered (piecewise, at register-write boundaries).
+    /// Always 0 in the fast core and between lines.
+    beam_x: u32,
 
     // --- display control --------------------------------------------------
     force_blank: bool, // $2100 bit7
@@ -156,6 +160,7 @@ pub const Ppu = struct {
         .lpal_dirty = true,
         .fb = @splat(0),
         .fb_line_width = fb_width,
+        .beam_x = 0,
         .force_blank = true,
         .brightness = 0,
         .bg_mode = 0,
@@ -500,6 +505,34 @@ pub const Ppu = struct {
         line_render.renderLine(self, line);
     }
 
+    /// Accurate core: render pixels [beam_x, x) of `line` with the current
+    /// register state, so the register write about to happen lands mid-line
+    /// (CGRAM gradients, mid-line scroll/brightness splits). Hi-res lines are
+    /// rendered whole at line end — mid-line splits and the 512-wide
+    /// interleave don't compose, and no known raster trick needs both.
+    pub fn renderUpTo(self: *Ppu, line: u32, x: u32) void {
+        if (line >= fb_height) return;
+        if (self.hiresActive() and !self.force_blank) return;
+        const limit = @min(x, fb_width);
+        if (limit <= self.beam_x) return;
+        // First span of a new frame: reset the stride like renderScanline.
+        if (line == 0 and self.beam_x == 0) self.fb_line_width = fb_width;
+        line_render.renderSpan(self, line, self.beam_x, limit);
+        self.beam_x = limit;
+    }
+
+    /// Accurate core: finish the scanline at line end. A line nothing raced
+    /// (or a hi-res line, or a line whose mode switched to hi-res mid-way)
+    /// takes the whole-line path and is bit-identical to the fast core.
+    pub fn finishScanline(self: *Ppu, line: u32) void {
+        const partial = self.beam_x;
+        self.beam_x = 0;
+        if (line >= fb_height) return;
+        if (partial == 0 or (self.hiresActive() and !self.force_blank))
+            return self.renderScanline(line);
+        line_render.renderSpan(self, line, partial, fb_width);
+    }
+
     /// Switch the frame to the 512-wide stride mid-frame: pixel-double the
     /// `lines` rows already rendered at 256, repacking in place from the last
     /// row backwards (destination offsets never precede their source).
@@ -670,6 +703,34 @@ test "backdrop render fills the scanline" {
     ppu.writeReg(0x2100, 0x80);
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0), ppu.fb[0]);
+}
+
+test "accurate beam: mid-line CGRAM write splits the scanline" {
+    var ppu: Ppu = .init;
+    ppu.writeReg(0x2121, 0);
+    ppu.writeReg(0x2122, 0x1F); // color 0 = red (BGR15)
+    ppu.writeReg(0x2122, 0x00);
+    ppu.writeReg(0x2100, 0x0F); // full brightness
+
+    // The beam has emitted 128 pixels of line 10 when the program rewrites
+    // the backdrop color.
+    ppu.renderUpTo(10, 128);
+    ppu.writeReg(0x2121, 0);
+    ppu.writeReg(0x2122, 0x00);
+    ppu.writeReg(0x2122, 0x7C); // color 0 = blue
+    ppu.finishScanline(10);
+
+    const row = ppu.fb[10 * fb_width ..];
+    try std.testing.expectEqual(@as(u16, 0xF800), row[0]); // red 565
+    try std.testing.expectEqual(@as(u16, 0xF800), row[127]);
+    try std.testing.expectEqual(@as(u16, 0x001F), row[128]); // blue 565
+    try std.testing.expectEqual(@as(u16, 0x001F), row[255]);
+    try std.testing.expectEqual(@as(u32, 0), ppu.beam_x);
+
+    // A line nothing raced takes the whole-line path.
+    ppu.finishScanline(11);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[11 * fb_width]);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[11 * fb_width + 255]);
 }
 
 test "mid-frame hi-res switch promotes rendered lines to 512" {

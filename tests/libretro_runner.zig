@@ -12,6 +12,9 @@
 //!   3. retro_serialize at mid-run, run on, retro_unserialize, run again:
 //!      the replayed segment must reproduce the same final frame (proves
 //!      save states restore mid-game, the M6 gate).
+//!   4. Reload with the yamabuki_accuracy core option set to "accurate":
+//!      the accurate core must reproduce the same golden hashes through the
+//!      whole retro_* surface (proves the option reaches the machine).
 //!
 //! Requires test-data/snes-roms (tools/fetch_test_data.sh).
 
@@ -34,13 +37,33 @@ const rotzoom_hash: u64 = 0x8ba211f2fc899f95;
 var last_frame_hash: u64 = 0;
 var audio_hash: u64 = core.console.audio_hash_init;
 var retro_buttons: u16 = 0; // bit N = RETRO_DEVICE_ID_JOYPAD_N held (port 0)
+var announced_accuracy_option = false;
+var want_accurate = false; // frontend-side value of yamabuki_accuracy
 
 fn envCb(cmd: c_uint, data: ?*anyopaque) callconv(.c) bool {
-    if (cmd == api.env_set_pixel_format) {
-        const fmt: *c_uint = @ptrCast(@alignCast(data.?));
-        return fmt.* == api.pixel_format_rgb565;
+    switch (cmd) {
+        api.env_set_pixel_format => {
+            const fmt: *c_uint = @ptrCast(@alignCast(data.?));
+            return fmt.* == api.pixel_format_rgb565;
+        },
+        api.env_set_variables => {
+            const vars: [*]const api.Variable = @ptrCast(@alignCast(data.?));
+            var i: usize = 0;
+            while (vars[i].key) |key| : (i += 1) {
+                if (std.mem.eql(u8, std.mem.span(key), "yamabuki_accuracy"))
+                    announced_accuracy_option = true;
+            }
+            return true;
+        },
+        api.env_get_variable => {
+            const v: *api.Variable = @ptrCast(@alignCast(data.?));
+            const key = v.key orelse return false;
+            if (!std.mem.eql(u8, std.mem.span(key), "yamabuki_accuracy")) return false;
+            v.value = if (want_accurate) "accurate" else "fast";
+            return true;
+        },
+        else => return false,
     }
-    return false;
 }
 
 fn videoCb(data: ?*const anyopaque, width: c_uint, height: c_uint, pitch: usize) callconv(.c) void {
@@ -109,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
     lr.retro_init();
 
     try check(out, lr.retro_api_version() == 1, "api version 1", &failed);
+    try check(out, announced_accuracy_option, "yamabuki_accuracy core option announced", &failed);
 
     // --- 1. Axel-F: video + audio through the callback plumbing ------------
     {
@@ -163,6 +187,19 @@ pub fn main(init: std.process.Init) !void {
         // A corrupted header must be rejected without killing the session.
         state[0] ^= 0xFF;
         try check(out, !lr.retro_unserialize(state.ptr, state.len), "corrupt state rejected", &failed);
+        lr.retro_unload_game();
+    }
+
+    // --- 4. The accuracy core option reaches the machine --------------------
+    {
+        const image = try dir.readFileAlloc(io, "SPC700/Axel-F/Axel-F.sfc", gpa, .limited(16 * 1024 * 1024));
+        want_accurate = true;
+        try check(out, loadGame(image), "load Axel-F with yamabuki_accuracy=accurate", &failed);
+        audio_hash = core.console.audio_hash_init;
+        for (0..axelf_frames) |_| lr.retro_run();
+        try check(out, last_frame_hash == axelf_hash, "accurate-core video hash matches golden", &failed);
+        try check(out, audio_hash == axelf_audio, "accurate-core audio hash matches golden", &failed);
+        want_accurate = false;
         lr.retro_unload_game();
     }
 

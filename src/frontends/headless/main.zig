@@ -3,6 +3,7 @@
 //! whole audio stream as a WAV, both for eyeballing.
 //!
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
+//!                     [--accurate]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
 //! output to inspect, and the printed hashes are what `zig build test-roms`
@@ -16,6 +17,7 @@ const Args = struct {
     frames: u32 = 1,
     ppm: ?[]const u8 = null,
     wav: ?[]const u8 = null,
+    accuracy: core.Accuracy = .fast,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -27,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = parseArgs(init) catch {
-        try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm]\n", .{});
+        try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]\n", .{});
         try out.flush();
         std.process.exit(2);
     };
@@ -44,8 +46,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const con = try gpa.create(core.FastConsole);
-    con.init(cart);
+    const con = try gpa.create(core.AnyConsole);
+    con.init(args.accuracy, cart);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -91,6 +93,7 @@ fn parseArgs(init: std.process.Init) !Args {
     var frames: u32 = 1;
     var ppm: ?[]const u8 = null;
     var wav: ?[]const u8 = null;
+    var accuracy: core.Accuracy = .fast;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--frames")) {
             const v = it.next() orelse return error.MissingValue;
@@ -99,11 +102,13 @@ fn parseArgs(init: std.process.Init) !Args {
             ppm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wav")) {
             wav = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--accurate")) {
+            accuracy = .accurate;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
-    return .{ .rom = rom orelse return error.NoRom, .frames = frames, .ppm = ppm, .wav = wav };
+    return .{ .rom = rom orelse return error.NoRom, .frames = frames, .ppm = ppm, .wav = wav, .accuracy = accuracy };
 }
 
 /// Write interleaved stereo i16 samples as a 32 kHz PCM WAV.
