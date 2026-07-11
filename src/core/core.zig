@@ -23,6 +23,7 @@ pub const apu = @import("apu/apu.zig");
 pub const cpu_io = @import("memory/cpu_io.zig");
 pub const ppu = @import("ppu/ppu.zig");
 pub const line_render = @import("ppu/line_render.zig");
+pub const gsu = @import("chips/gsu.zig");
 pub const console = @import("console.zig");
 
 pub const Cartridge = cartridge.Cartridge;
