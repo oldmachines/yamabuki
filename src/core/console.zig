@@ -26,7 +26,7 @@ const Cpu = @import("cpu/wdc65816.zig").Cpu;
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 3;
+pub const state_version: u32 = 4;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };

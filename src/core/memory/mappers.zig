@@ -72,6 +72,16 @@ fn mapLoRom(bus: *Bus) void {
             };
         }
 
+        // DSP-1 boards on carts up to 1 MiB decode the coprocessor's DR/SR
+        // ports in banks $30-$3F/$B0-$BF instead of the ROM mirror; unmap so
+        // accesses fall to the slow path (bus.dsp1Port). Larger boards put
+        // the ports at $60-$6F/$0000-$7FFF, which is already unmapped.
+        if (cart.chip == .dsp and cart.rom.len <= 0x10_0000 and
+            (bank & 0x7F) >= 0x30 and (bank & 0x7F) <= 0x3F)
+        {
+            for (4..8) |i| bus.pages[pageIndex(b, @intCast(i))] = .unmapped;
+        }
+
         // Banks $70-$7D / $F0-$FF, $0000-$7FFF: SRAM. Super FX carts map
         // their shared work RAM differently (below).
         if (cart.chip != .superfx and
