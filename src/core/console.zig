@@ -16,9 +16,20 @@
 
 const std = @import("std");
 const timing = @import("timing.zig");
+const serialize = @import("serialize.zig");
 const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
+
+/// Save-state container magic ("YMBK") and format version. The version bumps
+/// whenever the serialized field layout changes (there is no migration —
+/// states are tied to the core revision that wrote them, standard for
+/// in-development emulators).
+pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
+pub const state_version: u32 = 1;
+pub const state_header_size: usize = 16;
+
+pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
 
 pub const Accuracy = enum { fast, accurate };
 
@@ -197,6 +208,49 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// and by manual $4016 strobes.
         pub fn setButtons(self: *Self, port: u1, buttons: u16) void {
             self.bus.joy.buttons[port] = buttons;
+        }
+
+        // --- save states ---------------------------------------------------
+
+        /// Exact byte size of a save state (header + payload). Comptime-known
+        /// and stable for the whole session — what libretro's
+        /// retro_serialize_size must report.
+        pub const state_size: usize = blk: {
+            @setEvalBranchQuota(100_000);
+            break :blk state_header_size + serialize.byteSize(Self);
+        };
+
+        /// Serialize the whole machine into `out` (>= `state_size` bytes)
+        /// behind a versioned header. The ROM image is not saved; loading
+        /// requires a console built from the same ROM.
+        pub fn saveState(self: *const Self, out: []u8) usize {
+            std.debug.assert(out.len >= state_size);
+            const payload_size: u32 = @intCast(state_size - state_header_size);
+            @memcpy(out[0..4], &state_magic);
+            std.mem.writeInt(u32, out[4..8], state_version, .little);
+            std.mem.writeInt(u32, out[8..12], payload_size, .little);
+            out[12] = @intFromEnum(cfg.accuracy);
+            @memset(out[13..16], 0);
+            _ = serialize.write(Self, self, out[state_header_size..]);
+            return state_size;
+        }
+
+        /// Restore a state written by `saveState` (same core version and
+        /// accuracy). Header validation happens before any machine state is
+        /// touched; a payload that fails mid-read (Corrupt) leaves partial
+        /// state, which frontends treat as fatal (reload the game).
+        pub fn loadState(self: *Self, in: []const u8) StateError!void {
+            if (in.len < state_header_size) return error.WrongSize;
+            if (!std.mem.eql(u8, in[0..4], &state_magic)) return error.BadMagic;
+            if (std.mem.readInt(u32, in[4..8], .little) != state_version)
+                return error.UnsupportedVersion;
+            const payload = in[state_header_size..];
+            if (std.mem.readInt(u32, in[8..12], .little) != payload.len or
+                payload.len != state_size - state_header_size)
+                return error.WrongSize;
+            if (in[12] != @intFromEnum(cfg.accuracy)) return error.Corrupt;
+            _ = serialize.read(Self, self, payload) catch return error.Corrupt;
+            self.postLoad();
         }
     };
 }
@@ -449,7 +503,6 @@ test "console save-state roundtrips and restores identical machine state" {
     // Serializing the whole machine unrolls (comptime) over every PPU/CPU/bus
     // field; the default 1000-branch budget is too small and grows each milestone.
     @setEvalBranchQuota(20000);
-    const serialize = @import("serialize.zig");
     const alloc = std.testing.allocator;
 
     // Run console A a few frames so the CPU, WRAM, and scheduler hold live state.
@@ -495,6 +548,49 @@ test "console save-state roundtrips and restores identical machine state" {
     try std.testing.expectEqual(hashFrame(a.framebuffer()), hashFrame(b.framebuffer()));
     try std.testing.expectEqualSlices(u8, a.bus.wram.data[0..], b.bus.wram.data[0..]);
     try std.testing.expectEqual(a.frame, b.frame);
+}
+
+test "versioned save state roundtrips and rejects bad headers" {
+    const alloc = std.testing.allocator;
+    const rom = try buildNmiRom(alloc);
+    defer alloc.free(rom);
+    const a = try alloc.create(FastConsole);
+    defer {
+        a.cart.deinit(alloc);
+        alloc.destroy(a);
+    }
+    a.init(try Cartridge.load(alloc, rom));
+    for (0..3) |_| a.runFrame();
+
+    const buf = try alloc.alloc(u8, FastConsole.state_size);
+    defer alloc.free(buf);
+    try std.testing.expectEqual(FastConsole.state_size, a.saveState(buf));
+
+    // Restore into a fresh console from the same ROM; both step identically.
+    const rom_b = try buildNmiRom(alloc);
+    defer alloc.free(rom_b);
+    const b = try alloc.create(FastConsole);
+    defer {
+        b.cart.deinit(alloc);
+        alloc.destroy(b);
+    }
+    b.init(try Cartridge.load(alloc, rom_b));
+    try b.loadState(buf);
+    a.runFrame();
+    b.runFrame();
+    try std.testing.expectEqual(hashFrame(a.framebuffer()), hashFrame(b.framebuffer()));
+    try std.testing.expectEqual(a.frame, b.frame);
+
+    // Header validation: magic, version, size, accuracy tag.
+    buf[0] = 'X';
+    try std.testing.expectError(error.BadMagic, b.loadState(buf));
+    buf[0] = 'Y';
+    buf[4] = 0xFF;
+    try std.testing.expectError(error.UnsupportedVersion, b.loadState(buf));
+    buf[4] = @truncate(state_version);
+    try std.testing.expectError(error.WrongSize, b.loadState(buf[0 .. buf.len - 1]));
+    buf[12] = 0xEE;
+    try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }
 
 test "V-IRQ timer fires once per frame on its scanline and TIMEUP acks it" {
