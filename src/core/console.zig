@@ -26,7 +26,7 @@ const Cpu = @import("cpu/wdc65816.zig").Cpu;
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 2;
+pub const state_version: u32 = 3;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -118,6 +118,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
             const line = self.scanline;
             const io = &self.bus.cpuio;
 
+            // Beam position for the $2137 H/V counter latch (both cores).
+            self.bus.hv_line = line;
+            self.bus.hv_line_start = self.line_start;
+
             if (line == 0) {
                 // New frame: leave vblank, clear the vblank NMI flag.
                 io.in_vblank = false;
@@ -149,8 +153,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (cfg.accuracy == .fast) self.runLineCpu() else self.runLineCpuAccurate(line);
 
             // Keep the APU within one scanline of the main CPU (port accesses
-            // catch it up mid-line as needed).
+            // catch it up mid-line as needed). The Super FX follows the same
+            // scheme: MMIO accesses catch it up mid-line, the line end here.
             self.bus.apu.catchUp(self.bus.clock);
+            if (self.bus.cart.chip == .superfx) self.bus.gsu.catchUp(self.bus.clock);
 
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
@@ -180,8 +186,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
             while (self.bus.clock < line_end) {
                 // Keep the CPU's level-sensitive IRQ input in sync with the
                 // timer flag: reading $4211 (TIMEUP) clears irq_flag, which must
-                // deassert the line before the handler's RTI re-checks it.
-                if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
+                // deassert the line before the handler's RTI re-checks it. The
+                // Super FX's STOP interrupt (acked by reading SFR) ORs in.
+                const irq = io.irq_flag or self.bus.gsu.irq_line;
+                if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.cpu.step();
                 self.steps +%= 1;
             }
@@ -203,7 +211,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (fire_at) |t| {
                     if (self.bus.clock >= t) io.irq_flag = true;
                 }
-                if (io.irq_flag != self.cpu.irq_line) self.cpu.setIrqLine(io.irq_flag);
+                const irq = io.irq_flag or self.bus.gsu.irq_line;
+                if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.cpu.step();
                 self.steps +%= 1;
             }
