@@ -24,6 +24,10 @@ const Entry = struct {
     cycles: u64 = 0,
     frames: u32 = 0,
     audio: u64 = 0,
+    /// Expected hash on the accurate core when it legitimately differs from
+    /// the fast core (mid-scanline races, e.g. a VRAM refresh DMA overrunning
+    /// into active display). 0 = same image on both cores.
+    hash_accurate: u64 = 0,
 };
 
 const Golden = struct {
@@ -117,11 +121,12 @@ fn runOne(
     const steps_ok = options.accurate or entry.steps == 0 or entry.steps == got_steps;
     const cycles_ok = options.accurate or entry.cycles == 0 or entry.cycles == got_cycles;
     const audio_ok = entry.audio == 0 or entry.audio == got_audio;
-    const ok = got_hash == entry.hash and steps_ok and cycles_ok and audio_ok;
+    const want_hash = if (options.accurate and entry.hash_accurate != 0) entry.hash_accurate else entry.hash;
+    const ok = got_hash == want_hash and steps_ok and cycles_ok and audio_ok;
 
     try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n    audio  got {x:0>16} want {x:0>16}\n", .{
         if (ok) "PASS" else "FAIL", entry.path,
-        got_hash,                   entry.hash,
+        got_hash,                   want_hash,
         got_steps,                  entry.steps,
         got_cycles,                 entry.cycles,
         got_audio,                  entry.audio,
