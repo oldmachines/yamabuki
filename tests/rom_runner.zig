@@ -10,7 +10,22 @@ const std = @import("std");
 const core = @import("snes_core");
 const options = @import("rom_options");
 
-const golden = @import("golden_hashes.zon");
+/// One golden ROM. Optional gates default to 0 = "not baselined, ungated";
+/// `frames` 0 means the suite default applies.
+const Entry = struct {
+    path: []const u8,
+    hash: u64,
+    steps: u64 = 0,
+    cycles: u64 = 0,
+    frames: u32 = 0,
+};
+
+const Golden = struct {
+    frames: u32,
+    roms: []const Entry,
+};
+
+const golden: Golden = @import("golden_hashes.zon");
 const rom_root = "test-data/snes-roms";
 
 pub fn main(init: std.process.Init) !void {
@@ -32,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var run: u32 = 0;
     var failed: u32 = 0;
 
-    inline for (golden.roms) |entry| {
+    for (golden.roms) |entry| {
         const skip = if (options.filter) |f|
             std.mem.indexOf(u8, entry.path, f) == null
         else
@@ -41,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
             run += 1;
             // A per-ROM `.frames` overrides the suite default (SPC700 test
             // ROMs need time to hand results back from the audio CPU).
-            const entry_frames: u32 = if (@hasField(@TypeOf(entry), "frames")) entry.frames else frames;
+            const entry_frames: u32 = if (entry.frames != 0) entry.frames else frames;
             const ok = runOne(io, gpa, out, dir, entry, entry_frames) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.path, @errorName(e) });
                 break :blk false;
@@ -60,7 +75,7 @@ fn runOne(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     dir: std.Io.Dir,
-    entry: anytype,
+    entry: Entry,
     frames: u32,
 ) !bool {
     // The arena frees everything at process exit; the console owns the cart
