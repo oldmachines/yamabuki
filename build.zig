@@ -147,6 +147,30 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the deterministic fuzz harness (PPU + console + save/load invariant)");
     fuzz_step.dependOn(&run_fuzz.step);
 
+    // libretro harness: drives the core's exported retro_* entry points the
+    // way a frontend would and checks them against the golden expectations.
+    const libretro_runner = b.addExecutable(.{
+        .name = "libretro-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/libretro_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "libretro", .module = b.createModule(.{
+                    .root_source_file = b.path("src/frontends/libretro/core.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "snes_core", .module = core_mod }},
+                }) },
+            },
+        }),
+    });
+    const run_libretro = b.addRunArtifact(libretro_runner);
+    run_libretro.setCwd(b.path("."));
+    const libretro_step = b.step("test-libretro", "Drive the libretro core against golden ROMs (needs test-data/)");
+    libretro_step.dependOn(&run_libretro.step);
+
     // Headless FPS benchmark.
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",
