@@ -94,6 +94,9 @@ jobs:
             git clone --depth 1 https://github.com/PeterLemon/SNES.git test-data/snes-roms
           fi
       - run: zig build test-roms -Doptimize=${{ matrix.optimize }}
+      # Frontend parity: the libretro entry points must reproduce the same
+      # golden video/audio hashes and replay save states deterministically.
+      - run: zig build test-libretro -Doptimize=${{ matrix.optimize }}
       # Informational only: prints deterministic steps/cycles plus wall-clock FPS.
       # FPS is machine-dependent and never gated; the deterministic counts are
       # gated by test-roms above.
