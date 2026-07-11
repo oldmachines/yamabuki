@@ -27,6 +27,7 @@ zig build                        # headless runner + libretro core
 zig build test                   # unit tests
 tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignored)
 zig build test-sst               # run 65816 SingleStepTests vectors
+zig build test-sst-spc700        # run SPC700 SingleStepTests vectors
 zig build test-roms              # render PeterLemon ROMs, check golden hashes
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
@@ -45,8 +46,9 @@ DMA/HDMA, and a fast scanline renderer covering all 8 BG modes (2/4/8bpp
 planar, affine Mode 7 + EXTBG, hi-res 512-wide modes 5/6 and pseudo-hires)
 with sprites, windows, and color math.
 PeterLemon BG/text/sprite ROMs render and are locked against golden framebuffer
-hashes; the 65816 core is validated against
-[SingleStepTests](https://github.com/SingleStepTests/65816) vectors.
+hashes; the 65816 and SPC700 cores are validated against
+[SingleStepTests](https://github.com/SingleStepTests) vectors, and the SPC700
+CPU-test ROMs run end-to-end on the audio CPU through an HLE boot handshake.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -57,7 +59,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M2 65816 CPU + test vectors | done |
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
 | M4 full fast PPU | done (all BG modes, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res/pseudo-hires) |
-| M5 APU (SPC700 + S-DSP) | planned |
+| M5 APU (SPC700 + S-DSP) | in progress (SPC700 core + integration done; S-DSP next) |
 | M6 save states + libretro core | planned |
 | M7 SDL3 desktop frontend | planned |
 | M8 accurate mode (dot renderer, cycle timing) | planned |

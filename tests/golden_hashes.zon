@@ -78,5 +78,21 @@
         .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x109a188a73e19540, .steps = 155006, .cycles = 5717912 },
         .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0xf2e09c4f161ff725, .steps = 153077, .cycles = 5717924 },
         .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0x0070e006af27c4ed, .steps = 147948, .cycles = 5717928 },
+        // M5: SPC700 end-to-end. The CPUTest ROMs upload an SPC program via
+        // the HLE boot handshake, run opcode self-tests on the audio CPU, and
+        // hand results back through the mailbox ports — at 180 frames each
+        // shows a verified PASS screen (the suites keep cycling sub-tests
+        // beyond that; 180 is a deterministic mid-suite checkpoint). Axel-F's
+        // display is black BY DESIGN (audio-only demo; the CPU side is
+        // upload-then-spin) — its hash/steps guard the boot + driver-upload
+        // path until M5b adds audio hashing.
+        .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0x420e94634463f1b1, .steps = 2959431, .cycles = 64326262, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/AND/SPC700AND.sfc", .hash = 0x76fd9f2391509961, .steps = 2959433, .cycles = 64326260, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x6137701a5b5fe4dd, .steps = 2960932, .cycles = 64326274, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/EOR/SPC700EOR.sfc", .hash = 0x28ee6457ca7887e5, .steps = 2959433, .cycles = 64326260, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0x82d485c6a584a90d, .steps = 2960932, .cycles = 64326274, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/ORA/SPC700ORA.sfc", .hash = 0xc3c1b3812f314f75, .steps = 2959435, .cycles = 64326270, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x563dc88db83a4ab9, .steps = 2959431, .cycles = 64326284, .frames = 180 },
+        .{ .path = "SPC700/Axel-F/Axel-F.sfc", .hash = 0x045b5aaabee52325, .steps = 820223, .cycles = 21442096, .frames = 60 },
     },
 }

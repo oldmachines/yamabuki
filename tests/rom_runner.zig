@@ -39,7 +39,10 @@ pub fn main(init: std.process.Init) !void {
             false;
         if (!skip) {
             run += 1;
-            const ok = runOne(io, gpa, out, dir, entry, frames) catch |e| blk: {
+            // A per-ROM `.frames` overrides the suite default (SPC700 test
+            // ROMs need time to hand results back from the audio CPU).
+            const entry_frames: u32 = if (@hasField(@TypeOf(entry), "frames")) entry.frames else frames;
+            const ok = runOne(io, gpa, out, dir, entry, entry_frames) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.path, @errorName(e) });
                 break :blk false;
             };
@@ -47,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("\nrom-runner: {} ROMs, {} failed ({} frames each)\n", .{ run, failed, frames });
+    try out.print("\nrom-runner: {} ROMs, {} failed ({} frames default)\n", .{ run, failed, frames });
     try out.flush();
     if (failed > 0) std.process.exit(1);
 }

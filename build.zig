@@ -80,6 +80,24 @@ pub fn build(b: *std.Build) void {
     const sst_step = b.step("test-sst", "Run SingleStepTests 65816 vectors (needs test-data/)");
     sst_step.dependOn(&run_sst.step);
 
+    // SingleStepTests harness for the SPC700 (APU CPU), same options.
+    const sst_spc700 = b.addExecutable(.{
+        .name = "sst-spc700",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sst_spc700.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "sst_options", .module = sst_opts.createModule() },
+            },
+        }),
+    });
+    const run_sst_spc = b.addRunArtifact(sst_spc700);
+    run_sst_spc.setCwd(b.path("."));
+    const sst_spc_step = b.step("test-sst-spc700", "Run SingleStepTests SPC700 vectors (needs test-data/)");
+    sst_spc_step.dependOn(&run_sst_spc.step);
+
     // ROM runner: render PeterLemon ROMs and compare framebuffer hashes to the
     // committed golden values. Requires test-data/snes-roms.
     const rom_filter = b.option([]const u8, "rom-filter", "Run only ROMs whose path contains this substring");
