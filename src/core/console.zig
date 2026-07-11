@@ -116,6 +116,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 io.in_vblank = true;
                 io.nmi_flag = true;
                 if (io.nmiEnabled()) self.cpu.setNmi();
+                // Auto-joypad read (instant in the fast core; the busy bit
+                // in HVBJOY therefore never reads 1).
+                if (io.nmitimen & 0x01 != 0) self.bus.joy.autoRead();
             }
 
             // Evaluate the H/V-IRQ timer for this scanline (line granularity;
@@ -187,6 +190,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// One video frame produces ~532 stereo frames.
         pub fn readAudio(self: *Self, dst: []i16) usize {
             return self.bus.apu.readAudio(dst);
+        }
+
+        /// Push controller state for `port` (0/1); bit layout in
+        /// `joypad.Button`. Latched by the auto-joypad read at each vblank
+        /// and by manual $4016 strobes.
+        pub fn setButtons(self: *Self, port: u1, buttons: u16) void {
+            self.bus.joy.buttons[port] = buttons;
         }
     };
 }

@@ -11,6 +11,7 @@ const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
 const CpuIo = @import("cpu_io.zig").CpuIo;
+const Joypad = @import("joypad.zig").Joypad;
 const Dma = @import("dma.zig").Dma;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Apu = @import("../apu/apu.zig").Apu;
@@ -45,6 +46,7 @@ pub const Bus = struct {
     wram: Wram,
     math: MathUnit,
     cpuio: CpuIo,
+    joy: Joypad,
     ppu: Ppu,
     dma: Dma,
     apu: Apu,
@@ -60,6 +62,7 @@ pub const Bus = struct {
         self.wram = .init;
         self.math = .init;
         self.cpuio = .init;
+        self.joy = .init;
         self.ppu = .init;
         self.dma = .init;
         self.apu.init();
@@ -129,6 +132,8 @@ pub const Bus = struct {
             0x2134...0x213F => self.ppu.readReg(a16, self.mdr),
             0x2140...0x217F => self.apu.cpuRead(self.clock, @truncate(a16 & 3)),
             0x2180 => self.wram.portRead(),
+            0x4016 => self.joy.readSerial(0, self.mdr),
+            0x4017 => self.joy.readSerial(1, self.mdr),
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
             0x4212 => self.cpuio.readHvbjoy(self.mdr),
@@ -136,6 +141,7 @@ pub const Bus = struct {
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
             0x4217 => @truncate(self.math.rdmpy >> 8),
+            0x4218...0x421F => self.joy.readAuto(@truncate(a16 & 7)),
             0x4300...0x437F => self.dma.readReg(a16),
             else => {
                 if (mappers.smallSramPtr(self, addr)) |p| {
@@ -167,6 +173,7 @@ pub const Bus = struct {
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),
             0x2183 => self.wram.setPortAddrHigh(value),
+            0x4016 => self.joy.writeStrobe(value),
             0x4200 => self.cpuio.nmitimen = value,
             0x4201 => self.cpuio.wrio = value,
             0x4202 => self.math.wrmpya = value,

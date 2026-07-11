@@ -42,8 +42,11 @@
         // M4.6: Mode 7 affine plane. RotZoom (rotate+zoom) and Perspective
         // (per-scanline HDMA matrix) exercise the transform; StarWars boots to its
         // intro at frame 16 (the crawl is later) and locks that render.
-        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x404029d62e6f8c7f, .steps = 150704, .cycles = 5717918 },
-        .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0x441ae11b855be25a, .steps = 138337, .cycles = 5717904 },
+        // RotZoom/Perspective/Mode7HDMA were re-minted in M6: they poll the
+        // joypad, which used to read open-bus garbage (phantom presses) and
+        // now correctly reads a neutral pad. `.ppm`s re-eyeballed.
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x8ba211f2fc899f95, .steps = 150702, .cycles = 5717926 },
+        .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0xca6c36e8a6140b02, .steps = 138331, .cycles = 5717928 },
         .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0x72489634a8ee621d, .steps = 158867, .cycles = 5717910 },
         // M4.5: HDMA-driven register goldens. WindowHDMA (deferred from M4.4)
         // is an *inverted* window with HDMA'd WH0/WH1 edges over a green
@@ -55,7 +58,7 @@
         // exercises CGADSUB color math directly (the Blend/HiColor ones need
         // pseudo-hires, M4.7), so blending itself is guarded by unit tests.
         .{ .path = "PPU/Window/WindowHDMA/WindowHDMA.sfc", .hash = 0x7bafda0faf223f57, .steps = 146450, .cycles = 5717916 },
-        .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0x9a19f3d335633fd5, .steps = 148721, .cycles = 5717908 },
+        .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0xbb802b13b82f8f0e, .steps = 148719, .cycles = 5717916 },
         .{ .path = "PPU/HDMA/WaveHDMA/WaveHDMA.sfc", .hash = 0x6d5ebfbf9af5178d, .steps = 137718, .cycles = 5717924 },
         // M4.7: the Blend/HiColor set is the real CGADSUB exercise (M4.5's
         // survey missed that these blend at 256 wide, no pseudo-hires): BG1 on
