@@ -155,6 +155,14 @@ serialize/unserialize.
 - **Unit tests** live inline per module: header detection, mapper shapes, open
   bus, DMA readback, multiply/divide registers, BRR decode, envelopes, and
   serialize roundtrip byte-identity.
+- **Deterministic fuzz** (`zig build fuzz`, `tests/fuzz.zig`): seeded random
+  PPU register/memory states rendered as full frames, then random bus traffic
+  (PPU/APU ports, CPU I/O, live DMA/HDMA triggers) against a running console,
+  with a periodic serialize→restore→step roundtrip that must stay
+  byte-identical. Runs in Debug so every index/overflow safety check is armed;
+  a fixed default seed keeps CI reproducible and any failure replays with
+  `-Dfuzz-seed`. Its first outing found two renderer overflow traps, a DMA
+  self-retrigger stack overflow, and an APU catch-up hang.
 - **CI**: format check → unit tests + sampled SST (Debug *and* ReleaseFast, to
   catch UB) → cross-compile matrix (`x86_64-linux-gnu`, `aarch64-linux-gnu`,
   `aarch64-linux-musl`, `arm-linux-musleabihf`) → headless FPS benchmark vs a

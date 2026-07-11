@@ -13,8 +13,8 @@
 //!
 //! The run is fully deterministic: a fixed default seed makes CI reproducible,
 //! and any failure is reproduced by re-running with the printed seed
-//! (`-Dfuzz-seed=0x...`). Crash-freedom and roundtrip equality are the gates;
-//! the printed state hashes are informational.
+//! (`-Dfuzz-seed=<n>`, decimal). Crash-freedom and roundtrip equality are the
+//! gates; the printed state hashes are informational.
 //!
 //! Options (see build.zig): -Dfuzz-iters=<n>  -Dfuzz-seed=<n>
 
@@ -38,7 +38,8 @@ pub fn main(init: std.process.Init) !void {
     const iters: u32 = if (options.iters != 0) options.iters else default_iters;
     // Print the seed up front (and flush) so a safety-check panic further down
     // still leaves the reproduction recipe on screen.
-    try out.print("fuzz: seed 0x{x}, {} iterations per stage\n", .{ options.seed, iters });
+    // Decimal, because that's the form -Dfuzz-seed accepts back.
+    try out.print("fuzz: seed {}, {} iterations per stage\n", .{ options.seed, iters });
     try out.flush();
 
     const ppu_hash = try fuzzPpu(gpa, iters);
@@ -171,7 +172,7 @@ fn fuzzConsole(gpa: std.mem.Allocator, out: *std.Io.Writer, iters: u32) !u64 {
                 core.console.hashFrame(shadow.framebuffer());
             if (!fb_ok or !std.mem.eql(u8, buf_a, buf_b)) {
                 try out.print(
-                    "FAIL save/load roundtrip diverged at iteration {} (seed 0x{x}): fb {s}, state {s}\n",
+                    "FAIL save/load roundtrip diverged at iteration {} (seed {}): fb {s}, state {s}\n",
                     .{ iter, options.seed, if (fb_ok) "ok" else "DIFFERS", if (std.mem.eql(u8, buf_a, buf_b)) "ok" else "DIFFERS" },
                 );
                 try out.flush();
