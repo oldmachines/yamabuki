@@ -25,7 +25,14 @@ const gpa = std.heap.page_allocator;
 /// Loaded-game state: the console is heap-pinned (it is self-referential and
 /// must never move). Cartridge.load copies the ROM into its own padded
 /// allocation, so libretro's transient data pointer is safe to load from.
-var console: ?*core.FastConsole = null;
+var console: ?*core.AnyConsole = null;
+
+/// Core options announced to the frontend (null-key terminated); read back
+/// at load time.
+var core_variables = [_]api.Variable{
+    .{ .key = "yamabuki_accuracy", .value = "Emulation accuracy (loaded-game restart); fast|accurate" },
+    .{ .key = null, .value = null },
+};
 
 /// retro joypad id -> SNES button mask, indexed by RETRO_DEVICE_ID_JOYPAD_*.
 const button_map = [12]u16{
@@ -49,6 +56,7 @@ pub export fn retro_api_version() c_uint {
 
 pub export fn retro_set_environment(cb: api.EnvironmentFn) void {
     cb_env = cb;
+    _ = cb(api.env_set_variables, &core_variables);
 }
 
 pub export fn retro_set_video_refresh(cb: api.VideoRefreshFn) void {
@@ -110,8 +118,7 @@ pub export fn retro_reset() void {
     // Re-power the machine in place; the cartridge (including battery SRAM)
     // is owned by the console and survives the re-init.
     const con = console orelse return;
-    const cart = con.cart;
-    con.init(cart);
+    con.repower();
 }
 
 pub export fn retro_run() void {
@@ -147,14 +154,14 @@ pub export fn retro_run() void {
 }
 
 pub export fn retro_serialize_size() usize {
-    return core.FastConsole.state_size;
+    return core.AnyConsole.state_size;
 }
 
 pub export fn retro_serialize(data: ?*anyopaque, size: usize) bool {
     const con = console orelse return false;
-    if (size < core.FastConsole.state_size) return false;
+    if (size < core.AnyConsole.state_size) return false;
     const out: [*]u8 = @ptrCast(data orelse return false);
-    _ = con.saveState(out[0..core.FastConsole.state_size]);
+    _ = con.saveState(out[0..core.AnyConsole.state_size]);
     return true;
 }
 
@@ -184,20 +191,31 @@ pub export fn retro_load_game(game: ?*const api.GameInfo) bool {
         if (!env(api.env_set_pixel_format, &fmt)) return false;
     }
 
+    // The yamabuki_accuracy core option picks the console instantiation.
+    var accuracy: core.Accuracy = .fast;
+    if (cb_env) |env| {
+        var v: api.Variable = .{ .key = "yamabuki_accuracy", .value = null };
+        if (env(api.env_get_variable, &v)) {
+            if (v.value) |val| {
+                if (std.mem.eql(u8, std.mem.span(val), "accurate")) accuracy = .accurate;
+            }
+        }
+    }
+
     unloadGame();
     var cart = core.Cartridge.load(gpa, data[0..info.size]) catch return false;
-    const con = gpa.create(core.FastConsole) catch {
+    const con = gpa.create(core.AnyConsole) catch {
         cart.deinit(gpa);
         return false;
     };
-    con.init(cart);
+    con.init(accuracy, cart);
     console = con;
     return true;
 }
 
 fn unloadGame() void {
     if (console) |con| {
-        con.cart.deinit(gpa);
+        con.cartridge().deinit(gpa);
         gpa.destroy(con);
         console = null;
     }
@@ -220,18 +238,20 @@ pub export fn retro_load_game_special(game_type: c_uint, info: ?[*]const api.Gam
 
 pub export fn retro_get_memory_data(id: c_uint) ?*anyopaque {
     const con = console orelse return null;
+    const cart = con.cartridge();
     return switch (id) {
-        api.memory_save_ram => if (con.cart.hasSram()) @ptrCast(&con.cart.sram) else null,
-        api.memory_system_ram => @ptrCast(&con.bus.wram.data),
+        api.memory_save_ram => if (cart.hasSram()) @ptrCast(&cart.sram) else null,
+        api.memory_system_ram => @ptrCast(con.systemRam().ptr),
         else => null,
     };
 }
 
 pub export fn retro_get_memory_size(id: c_uint) usize {
     const con = console orelse return 0;
+    const cart = con.cartridge();
     return switch (id) {
-        api.memory_save_ram => if (con.cart.hasSram()) con.cart.sram_mask + 1 else 0,
-        api.memory_system_ram => con.bus.wram.data.len,
+        api.memory_save_ram => if (cart.hasSram()) cart.sram_mask + 1 else 0,
+        api.memory_system_ram => con.systemRam().len,
         else => 0,
     };
 }

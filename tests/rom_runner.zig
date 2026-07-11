@@ -5,6 +5,10 @@
 //! PeterLemon ROMs under test-data/snes-roms (tools/fetch_test_data.sh).
 //!
 //! Options (see build.zig): -Drom-filter=<substr>  -Drom-frames=<n>
+//! -Drom-accurate runs the suite on the accurate core: hashes must still
+//! match (a line nothing races renders identically), but steps/cycles are
+//! reported unGated — dot-placed IRQs legitimately reorder instruction
+//! interleaving on IRQ-driven ROMs.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -84,8 +88,8 @@ fn runOne(
     // (its page table points into cart.rom), so we must not free it here.
     const image = try dir.readFileAlloc(io, entry.path, gpa, .limited(16 * 1024 * 1024));
     const cart = try core.Cartridge.load(gpa, image);
-    const con = try gpa.create(core.FastConsole);
-    con.init(cart);
+    const con = try gpa.create(core.AnyConsole);
+    con.init(if (options.accurate) .accurate else .fast, cart);
 
     // The audio ring holds ~15 video frames, so drain and hash every frame.
     var got_audio = core.console.audio_hash_init;
@@ -100,12 +104,18 @@ fn runOne(
     }
 
     const got_hash = core.console.hashFrame(con.framebuffer());
-    const got_steps = con.steps;
-    const got_cycles = con.bus.clock;
+    const got_steps = switch (con.*) {
+        inline else => |*c| c.steps,
+    };
+    const got_cycles = switch (con.*) {
+        inline else => |*c| c.bus.clock,
+    };
 
-    // Deterministic perf counts are gated only once baselined (0 = unset).
-    const steps_ok = entry.steps == 0 or entry.steps == got_steps;
-    const cycles_ok = entry.cycles == 0 or entry.cycles == got_cycles;
+    // Deterministic perf counts are gated only once baselined (0 = unset)
+    // and only on the fast core (the accurate core's IRQ dot placement
+    // shifts instruction interleaving on IRQ-driven ROMs).
+    const steps_ok = options.accurate or entry.steps == 0 or entry.steps == got_steps;
+    const cycles_ok = options.accurate or entry.cycles == 0 or entry.cycles == got_cycles;
     const audio_ok = entry.audio == 0 or entry.audio == got_audio;
     const ok = got_hash == entry.hash and steps_ok and cycles_ok and audio_ok;
 
