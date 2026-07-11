@@ -131,9 +131,13 @@ serialize/unserialize.
 ### Frontends
 
 - **libretro** — `api.zig` hand-ports the stable ABI subset (no C headers) and
-  `core.zig` exports the `retro_*` functions with `callconv(.c)`: RGB565,
-  audio-sample-batch, joypad, core options (`yamabuki_accuracy`, overscan). Zero
-  external dependencies.
+  `core.zig` exports the `retro_*` functions with `callconv(.c)`: RGB565 frames
+  handed over with zero conversion, audio-sample-batch at 32 kHz, both joypads,
+  serialize/unserialize via the versioned save-state container, SRAM/WRAM via
+  `retro_get_memory_*`. Zero external dependencies. `zig build test-libretro`
+  drives the exported surface like a frontend and locks it to the same golden
+  hashes as the direct console path (core options like `yamabuki_accuracy`
+  arrive with the accurate core, M8).
 - **SDL3 desktop** — via the castholm/SDL Zig package (statically built by Zig
   for clean cross-compilation), wired as a *lazy* dependency so its absence never
   breaks `zig build`. Adds fast-forward, frame-advance, save-state hotkeys, and
@@ -183,7 +187,7 @@ serialize/unserialize.
 | M3 | Scheduler, NMI/IRQ, GDMA/HDMA, PPU registers, fast renderer modes 0/1 + sprites | PeterLemon ROMs render; golden hashes; `.ppm` eyeballed | **Done** |
 | M4 | Full fast PPU (modes 2–7, offset-per-tile, windows, color math, mosaic, hi-res) | PeterLemon PPU suite hashes | Done — planar modes + 8bpp, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res modes 5/6 + pseudo-hires (512-wide frames). Deferred to M8 accurate core: direct color, interlaced 448-line fields, beam-racing CGRAM tricks |
 | M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | Done — SPC700 core (SST 256k vectors, 0 failed, 0 cycle mismatches), ARAM/timers/ports, HLE boot, lazy catch-up; S-DSP with BRR + gaussian, ADSR/GAIN, noise, pitch mod, echo, signed phase-exact mixing; 32 kHz stereo ring + `readAudio()`; 8 music-ROM audio-hash goldens |
-| M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Planned |
+| M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Done — joypad input ($4016 serial + auto-read), versioned save-state container, full libretro implementation; `test-libretro` harness proves golden video/audio parity, live input, and mid-run state replay through the retro_* surface (live RetroArch smoke test pending on a desktop) |
 | M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Planned |
 | M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Planned |
 | M9 | Enhancement chips: DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Super FX → Cx4 (HLE) | Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | Planned |

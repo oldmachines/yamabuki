@@ -29,6 +29,7 @@ tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignore
 zig build test-sst               # run 65816 SingleStepTests vectors
 zig build test-sst-spc700        # run SPC700 SingleStepTests vectors
 zig build test-roms              # render PeterLemon ROMs, check golden hashes
+zig build test-libretro          # drive the libretro core against the same goldens
 zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
@@ -66,7 +67,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
 | M4 full fast PPU | done (all BG modes, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res/pseudo-hires) |
 | M5 APU (SPC700 + S-DSP) | done (BRR voices, gaussian, ADSR/GAIN, noise, pitch mod, echo; 32 kHz stereo + audio-hash goldens) |
-| M6 save states + libretro core | planned |
+| M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
 | M7 SDL3 desktop frontend | planned |
 | M8 accurate mode (dot renderer, cycle timing) | planned |
 | M9 enhancement chips (DSP-1, SA-1, Super FX, Cx4) | planned |
