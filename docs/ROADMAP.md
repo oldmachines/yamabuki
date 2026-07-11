@@ -161,7 +161,9 @@ serialize/unserialize.
   ~3 GB) and are **never committed** — `tools/fetch_test_data.sh` shallow-clones
   them into a gitignored dir, and CI caches them. `-Dsst-sample=N` runs a sample
   (CI); the full run is local/nightly. Cycle-*position* parity is a separate
-  metric tied to the accurate-mode milestone (M8).
+  metric tied to the accurate-mode milestone (M8) — closed in M8: the 65816
+  harness now compares the executed bus-event sequence per cycle (VDA/VPA
+  deciding real access vs internal) and gates count and position at zero.
 - **Integration ROMs.** `tests/rom_runner.zig` runs a homebrew test ROM
   (PeterLemon/krom) headless for N frames, FNV-1a hashes the RGB565 framebuffer
   — and, once M5b landed, the whole 32 kHz stereo stream (optional `.audio`
@@ -196,7 +198,7 @@ serialize/unserialize.
 | M5 | APU: SPC700 + S-DSP + lazy sync | SST spc700 100%; commercial games boot (handshake gate) | Done — SPC700 core (SST 256k vectors, 0 failed, 0 cycle mismatches), ARAM/timers/ports, HLE boot, lazy catch-up; S-DSP with BRR + gaussian, ADSR/GAIN, noise, pitch mod, echo, signed phase-exact mixing; 32 kHz stereo ring + `readAudio()`; 8 music-ROM audio-hash goldens |
 | M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Done — joypad input ($4016 serial + auto-read), versioned save-state container, full libretro implementation; `test-libretro` harness proves golden video/audio parity, live input, and mid-run state replay through the retro_* surface (live RetroArch smoke test pending on a desktop) |
 | M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Done — dlopen'd hand-ported SDL3 ABI (no build-time deps), streamed RGB565 + 32 kHz audio, keyboard input, F5/F9 save states, Tab fast-forward, NTSC pacing; CI smoke test reproduces golden hashes under dummy drivers; all 4 targets cross-compile (live desktop play still worth a manual spin) |
-| M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Planned |
+| M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Done — 65816 at full SST cycle parity (count + per-cycle bus position, 5.12M cases, hard-gated); AccurateConsole renders piecewise at the beam position ($21xx mid-scanline writes split the line; HDMA stays blanking-period), H-IRQs fire at HTIME's dot; runtime selection via AnyConsole, `--accurate` (headless/SDL), `yamabuki_accuracy` (libretro), accuracy-tagged save states; all 42 goldens pass on the accurate core in CI. Hardware fetch-pipeline modeling (sprite-eval timing, mid-line hi-res splits) deferred to demand |
 | M9 | Enhancement chips: DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Super FX → Cx4 (HLE) | Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | Planned |
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | Planned |
 

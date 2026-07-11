@@ -29,6 +29,7 @@ tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignore
 zig build test-sst               # run 65816 SingleStepTests vectors
 zig build test-sst-spc700        # run SPC700 SingleStepTests vectors
 zig build test-roms              # render PeterLemon ROMs, check golden hashes
+zig build test-roms -Drom-accurate  # same goldens on the accurate core
 zig build test-libretro          # drive the libretro core against the same goldens
 zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
@@ -65,8 +66,12 @@ mixing, so Dolby Surround games decode correctly
 PeterLemon BG/text/sprite ROMs render and are locked against golden framebuffer
 hashes, music demo ROMs against golden audio-stream hashes; the 65816 and
 SPC700 cores are validated against
-[SingleStepTests](https://github.com/SingleStepTests) vectors, and the SPC700
-CPU-test ROMs run end-to-end on the audio CPU through an HLE boot handshake.
+[SingleStepTests](https://github.com/SingleStepTests) vectors — the 65816 at
+full cycle parity (count and per-cycle bus position over all 5.12M cases) —
+and the SPC700 CPU-test ROMs run end-to-end on the audio CPU through an HLE
+boot handshake. An opt-in accurate core (`--accurate`, or the
+`yamabuki_accuracy` libretro option) renders piecewise at the beam position,
+so mid-scanline register writes split the line the way hardware does.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -80,6 +85,6 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M5 APU (SPC700 + S-DSP) | done (BRR voices, gaussian, ADSR/GAIN, noise, pitch mod, echo; 32 kHz stereo + audio-hash goldens) |
 | M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
 | M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
-| M8 accurate mode (dot renderer, cycle timing) | planned |
+| M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
 | M9 enhancement chips (DSP-1, SA-1, Super FX, Cx4) | planned |
 | M10 ARM performance tuning | planned |

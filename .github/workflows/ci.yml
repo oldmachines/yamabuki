@@ -94,6 +94,10 @@ jobs:
             git clone --depth 1 https://github.com/PeterLemon/SNES.git test-data/snes-roms
           fi
       - run: zig build test-roms -Doptimize=${{ matrix.optimize }}
+      # The accurate core must reproduce every golden hash: a line nothing
+      # races mid-scanline renders bit-identically to the fast core.
+      - if: matrix.optimize == 'ReleaseFast'
+        run: zig build test-roms -Doptimize=ReleaseFast -Drom-accurate
       # Frontend parity: the libretro entry points must reproduce the same
       # golden video/audio hashes and replay save states deterministically.
       - run: zig build test-libretro -Doptimize=${{ matrix.optimize }}
