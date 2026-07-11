@@ -154,7 +154,12 @@ pub const Apu = struct {
     /// run the SPC700 until it reaches the new target. Until the HLE boot
     /// hands over control the SMP has no program, so time simply elapses.
     pub fn catchUp(self: *Apu, master_clock: u64) void {
-        const delta = master_clock -% self.master_last;
+        // Saturating: GDMA rolls the bus clock back when it swaps the
+        // accessors' per-access charges for its fixed cost, and a DMA to the
+        // mailbox ports has then already shown us the pre-rollback clock.
+        // Treat that as speculative run-ahead — a zero delta here — and
+        // resync once master time passes the rollback point again.
+        const delta = master_clock -| self.master_last;
         self.master_last = master_clock;
         self.master_acc += delta * spc_num;
         self.spc_target += self.master_acc / spc_den;
