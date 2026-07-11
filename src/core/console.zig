@@ -132,6 +132,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
             self.runLineCpu();
 
+            // Keep the APU within one scanline of the main CPU (port accesses
+            // catch it up mid-line as needed).
+            self.bus.apu.catchUp(self.bus.clock);
+
             // Fast mode renders the whole visible scanline at line end.
             if (cfg.accuracy == .fast) {
                 if (line < self.vblankLine()) self.renderScanline(line);

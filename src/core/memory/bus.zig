@@ -13,6 +13,7 @@ const MathUnit = @import("math_unit.zig").MathUnit;
 const CpuIo = @import("cpu_io.zig").CpuIo;
 const Dma = @import("dma.zig").Dma;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
+const Apu = @import("../apu/apu.zig").Apu;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -46,9 +47,11 @@ pub const Bus = struct {
     cpuio: CpuIo,
     ppu: Ppu,
     dma: Dma,
+    apu: Apu,
 
     /// Initialize in place. `self` must be at its final address (the page
-    /// table points into `self.wram`), and `cart` must outlive the bus.
+    /// table points into `self.wram`, and the APU's SPC700 points back at
+    /// the APU), and `cart` must outlive the bus.
     pub fn init(self: *Bus, cart: *Cartridge) void {
         self.cart = cart;
         self.clock = 0;
@@ -59,6 +62,7 @@ pub const Bus = struct {
         self.cpuio = .init;
         self.ppu = .init;
         self.dma = .init;
+        self.apu.init();
         self.remap();
     }
 
@@ -71,6 +75,7 @@ pub const Bus = struct {
     pub fn postLoad(self: *Bus) void {
         self.remap();
         self.ppu.postLoad();
+        self.apu.postLoad();
     }
 
     /// One CPU internal cycle (no bus access).
@@ -117,6 +122,7 @@ pub const Bus = struct {
 
         const v: u8 = switch (a16) {
             0x2134...0x213F => self.ppu.readReg(a16, self.mdr),
+            0x2140...0x217F => self.apu.cpuRead(self.clock, @truncate(a16 & 3)),
             0x2180 => self.wram.portRead(),
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
@@ -151,6 +157,7 @@ pub const Bus = struct {
 
         switch (a16) {
             0x2100...0x2133 => self.ppu.writeReg(a16, value),
+            0x2140...0x217F => self.apu.cpuWrite(self.clock, @truncate(a16 & 3), value),
             0x2180 => self.wram.portWrite(value),
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),
@@ -178,7 +185,6 @@ pub const Bus = struct {
             },
             else => {
                 if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
-                // other registers land with the PPU (M3) and APU (M5)
             },
         }
     }
