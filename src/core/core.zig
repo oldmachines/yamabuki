@@ -17,6 +17,7 @@ pub const wdc65816 = @import("cpu/wdc65816.zig");
 pub const cpu_ops = @import("cpu/ops.zig");
 pub const spc700 = @import("apu/spc700.zig");
 pub const spc700_ops = @import("apu/ops.zig");
+pub const dsp = @import("apu/dsp.zig");
 pub const apu = @import("apu/apu.zig");
 pub const cpu_io = @import("memory/cpu_io.zig");
 pub const ppu = @import("ppu/ppu.zig");

@@ -82,10 +82,7 @@
         // the HLE boot handshake, run opcode self-tests on the audio CPU, and
         // hand results back through the mailbox ports — at 180 frames each
         // shows a verified PASS screen (the suites keep cycling sub-tests
-        // beyond that; 180 is a deterministic mid-suite checkpoint). Axel-F's
-        // display is black BY DESIGN (audio-only demo; the CPU side is
-        // upload-then-spin) — its hash/steps guard the boot + driver-upload
-        // path until M5b adds audio hashing.
+        // beyond that; 180 is a deterministic mid-suite checkpoint).
         .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0x420e94634463f1b1, .steps = 2959431, .cycles = 64326262, .frames = 180 },
         .{ .path = "CPUTest/SPC700/AND/SPC700AND.sfc", .hash = 0x76fd9f2391509961, .steps = 2959433, .cycles = 64326260, .frames = 180 },
         .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x6137701a5b5fe4dd, .steps = 2960932, .cycles = 64326274, .frames = 180 },
@@ -93,6 +90,21 @@
         .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0x82d485c6a584a90d, .steps = 2960932, .cycles = 64326274, .frames = 180 },
         .{ .path = "CPUTest/SPC700/ORA/SPC700ORA.sfc", .hash = 0xc3c1b3812f314f75, .steps = 2959435, .cycles = 64326270, .frames = 180 },
         .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x563dc88db83a4ab9, .steps = 2959431, .cycles = 64326284, .frames = 180 },
-        .{ .path = "SPC700/Axel-F/Axel-F.sfc", .hash = 0x045b5aaabee52325, .steps = 820223, .cycles = 21442096, .frames = 60 },
+        // M5b: the S-DSP. These SPC700 demo ROMs render a black screen by
+        // design (audio-only; the CPU side uploads a driver then spins) — the
+        // shared framebuffer hash guards the boot path, and `audio` locks the
+        // FNV of the whole 32 kHz stereo stream. Together they exercise BRR
+        // decode + gaussian interpolation (PlayBRRSample, SpeechSynth), the
+        // noise LFSR (PlayNoise), pitch modulation (PitchMod), and full music
+        // drivers with envelopes/echo (Axel-F, Twinkle, FFVIIPrelude,
+        // ItaloTest). Audio hashes are identical across Debug/ReleaseFast.
+        .{ .path = "SPC700/Axel-F/Axel-F.sfc", .hash = 0x045b5aaabee52325, .steps = 820223, .cycles = 21442096, .frames = 60, .audio = 0xe2fbd615d2d54f15 },
+        .{ .path = "SPC700/Twinkle/Twinkle.sfc", .hash = 0x045b5aaabee52325, .steps = 827094, .cycles = 21442110, .frames = 60, .audio = 0x89372e2a36d5a179 },
+        .{ .path = "SPC700/PlayBRRSample/PlayBRRSample.sfc", .hash = 0x045b5aaabee52325, .steps = 826808, .cycles = 21442118, .frames = 60, .audio = 0x9055e343ae029d45 },
+        .{ .path = "SPC700/PlayNoise/PlayNoise.sfc", .hash = 0x045b5aaabee52325, .steps = 827579, .cycles = 21442110, .frames = 60, .audio = 0xfe7dd7c9fb55a8dd },
+        .{ .path = "SPC700/PitchMod/PitchMod.sfc", .hash = 0x045b5aaabee52325, .steps = 826513, .cycles = 21442110, .frames = 60, .audio = 0x547d966e83d08911 },
+        .{ .path = "SPC700/SpeechSynth/SpeechSynth.sfc", .hash = 0x045b5aaabee52325, .steps = 817604, .cycles = 21442104, .frames = 60, .audio = 0xb77345d8c1f5609d },
+        .{ .path = "SPC700/FFVIIPrelude/FFVIIPrelude.sfc", .hash = 0x045b5aaabee52325, .steps = 820014, .cycles = 21442108, .frames = 60, .audio = 0x0f8608c69ae09dcd },
+        .{ .path = "SPC700/ItaloTest/ItaloTest.sfc", .hash = 0x045b5aaabee52325, .steps = 822557, .cycles = 21442098, .frames = 60, .audio = 0x813406a382940732 },
     },
 }

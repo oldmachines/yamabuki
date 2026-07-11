@@ -71,11 +71,16 @@ pub const Bus = struct {
         mappers.buildPages(self);
     }
 
-    /// Called after deserialization to rebuild derived state.
+    /// Called after deserialization to rebuild derived state: the page table,
+    /// then every component that declares its own postLoad hook (discovered
+    /// at comptime, so new components can't be forgotten here).
     pub fn postLoad(self: *Bus) void {
         self.remap();
-        self.ppu.postLoad();
-        self.apu.postLoad();
+        inline for (@typeInfo(Bus).@"struct".fields) |f| {
+            if (comptime @typeInfo(f.type) == .@"struct" and @hasDecl(f.type, "postLoad")) {
+                @field(self, f.name).postLoad();
+            }
+        }
     }
 
     /// One CPU internal cycle (no bus access).

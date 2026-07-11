@@ -10,7 +10,24 @@ const std = @import("std");
 const core = @import("snes_core");
 const options = @import("rom_options");
 
-const golden = @import("golden_hashes.zon");
+/// One golden ROM. Optional gates default to 0 = "not baselined, ungated";
+/// `frames` 0 means the suite default applies. `audio` is the FNV-1a of the
+/// whole 32 kHz stereo stream over the run (phase-sensitive by design).
+const Entry = struct {
+    path: []const u8,
+    hash: u64,
+    steps: u64 = 0,
+    cycles: u64 = 0,
+    frames: u32 = 0,
+    audio: u64 = 0,
+};
+
+const Golden = struct {
+    frames: u32,
+    roms: []const Entry,
+};
+
+const golden: Golden = @import("golden_hashes.zon");
 const rom_root = "test-data/snes-roms";
 
 pub fn main(init: std.process.Init) !void {
@@ -32,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     var run: u32 = 0;
     var failed: u32 = 0;
 
-    inline for (golden.roms) |entry| {
+    for (golden.roms) |entry| {
         const skip = if (options.filter) |f|
             std.mem.indexOf(u8, entry.path, f) == null
         else
@@ -41,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
             run += 1;
             // A per-ROM `.frames` overrides the suite default (SPC700 test
             // ROMs need time to hand results back from the audio CPU).
-            const entry_frames: u32 = if (@hasField(@TypeOf(entry), "frames")) entry.frames else frames;
+            const entry_frames: u32 = if (entry.frames != 0) entry.frames else frames;
             const ok = runOne(io, gpa, out, dir, entry, entry_frames) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.path, @errorName(e) });
                 break :blk false;
@@ -60,7 +77,7 @@ fn runOne(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     dir: std.Io.Dir,
-    entry: anytype,
+    entry: Entry,
     frames: u32,
 ) !bool {
     // The arena frees everything at process exit; the console owns the cart
@@ -70,7 +87,17 @@ fn runOne(
     const con = try gpa.create(core.FastConsole);
     con.init(cart);
 
-    for (0..frames) |_| con.runFrame();
+    // The audio ring holds ~15 video frames, so drain and hash every frame.
+    var got_audio = core.console.audio_hash_init;
+    var drain: [4096]i16 = undefined;
+    for (0..frames) |_| {
+        con.runFrame();
+        while (true) {
+            const n = con.readAudio(&drain);
+            if (n == 0) break;
+            got_audio = core.console.hashAudio(got_audio, drain[0..n]);
+        }
+    }
 
     const got_hash = core.console.hashFrame(con.framebuffer());
     const got_steps = con.steps;
@@ -79,13 +106,15 @@ fn runOne(
     // Deterministic perf counts are gated only once baselined (0 = unset).
     const steps_ok = entry.steps == 0 or entry.steps == got_steps;
     const cycles_ok = entry.cycles == 0 or entry.cycles == got_cycles;
-    const ok = got_hash == entry.hash and steps_ok and cycles_ok;
+    const audio_ok = entry.audio == 0 or entry.audio == got_audio;
+    const ok = got_hash == entry.hash and steps_ok and cycles_ok and audio_ok;
 
-    try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n", .{
+    try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n    audio  got {x:0>16} want {x:0>16}\n", .{
         if (ok) "PASS" else "FAIL", entry.path,
         got_hash,                   entry.hash,
         got_steps,                  entry.steps,
         got_cycles,                 entry.cycles,
+        got_audio,                  entry.audio,
     });
     return ok;
 }
