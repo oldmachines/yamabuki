@@ -107,7 +107,10 @@ decoding, 8 voices, ADSR/gain envelopes, gaussian interpolation, echo, and
 noise, emitting 32 kHz stereo into a preallocated ring buffer drained each
 frame. Execution is **fully decoupled with lazy catch-up**: any CPU access to
 `$2140–43` first steps the APU to "now" — exact for the port handshake, and the
-biggest performance lever after CPU dispatch.
+biggest performance lever after CPU dispatch. All DSP volumes and FIR
+coefficients mix as signed values — that phase fidelity is what carries the
+Dolby Surround matrix some games encode (see
+[`AUDIO_SURROUND.md`](AUDIO_SURROUND.md)).
 
 ### DMA / HDMA
 
