@@ -121,8 +121,11 @@ jobs:
         if: steps.sdl3-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch release-3.2.16 https://github.com/libsdl-org/SDL.git sdl3-src
+          # SDL_UNIX_CONSOLE_BUILD: the runner has no X11/Wayland dev headers
+          # and doesn't need them — the smoke test uses the dummy drivers.
           cmake -S sdl3-src -B sdl3-src/build -DCMAKE_BUILD_TYPE=Release \
-            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DSDL_UNIX_CONSOLE_BUILD=ON
           cmake --build sdl3-src/build -j"$(nproc)"
           mkdir -p sdl3-lib && cp -P sdl3-src/build/libSDL3.so* sdl3-lib/
       - name: Resolve ROM revision
