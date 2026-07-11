@@ -151,6 +151,16 @@ pub const Ppu = struct {
     obj_range_over: bool, // >32 sprites on a line
     obj_time_over: bool, // >34 sprite tiles on a line
 
+    // --- H/V counter latch ($2137, $213C/$213D, $213F) ---------------------
+    // $2137 (SLHV) latches the beam counters, computed by the bus from the
+    // master clock. Each counter reads low byte then bit 8, with per-register
+    // toggles that $213F (STAT78) resets.
+    latch_h: u16,
+    latch_v: u16,
+    counters_latched: bool,
+    ophct_second: bool,
+    opvct_second: bool,
+
     pub const init: Ppu = .{
         .vram = @splat(0),
         .cgram = @splat(0),
@@ -212,6 +222,11 @@ pub const Ppu = struct {
         .scroll_latch_h = 0,
         .obj_range_over = false,
         .obj_time_over = false,
+        .latch_h = 0,
+        .latch_v = 0,
+        .counters_latched = false,
+        .ophct_second = false,
+        .opvct_second = false,
     };
 
     /// Rebuild the RGB565 palette from CGRAM after deserialization. The
@@ -346,6 +361,37 @@ pub const Ppu = struct {
                 (mdr & 0x30) | 0x01, // STAT77: overflow flags + PPU1 version 1
             else => mdr, // open bus (write-only / not-yet-modeled)
         };
+    }
+
+    // --- H/V counter latch --------------------------------------------------
+
+    /// $2137 SLHV: capture the beam position (the bus supplies it from the
+    /// master clock; H in dots 0-339, V in lines).
+    pub fn latchCounters(self: *Ppu, h: u16, v: u16) void {
+        self.latch_h = h;
+        self.latch_v = v;
+        self.counters_latched = true;
+    }
+
+    /// $213C OPHCT / $213D OPVCT: 9-bit, low byte then bit 8 (upper bits of
+    /// the second read are PPU2 open bus).
+    pub fn readCounterLatch(self: *Ppu, addr: u16, mdr: u8) u8 {
+        const vertical = addr & 1 != 0;
+        const value = if (vertical) self.latch_v else self.latch_h;
+        const second = if (vertical) &self.opvct_second else &self.ophct_second;
+        defer second.* = !second.*;
+        if (second.*) return (mdr & 0xFE) | @as(u8, @truncate(value >> 8)) & 1;
+        return @truncate(value);
+    }
+
+    /// $213F STAT78: resets the counter-read toggles and the latch flag.
+    /// Bit6 = counters latched, bit4 = NTSC, bits0-3 = PPU2 version.
+    pub fn readStat78(self: *Ppu, mdr: u8) u8 {
+        const v = (if (self.counters_latched) @as(u8, 0x40) else 0) | (mdr & 0x20) | 0x03;
+        self.counters_latched = false;
+        self.ophct_second = false;
+        self.opvct_second = false;
+        return v;
     }
 
     // --- scroll ($210D-$2114): the shared write-twice latch ----------------

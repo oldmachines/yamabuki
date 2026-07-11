@@ -56,7 +56,14 @@ pub const Cartridge = struct {
             .header = header,
             .chip = identifyChip(header),
         };
-        const sram_bytes = @min(header.sramBytes(), max_sram);
+        var sram_bytes: u32 = @min(header.sramBytes(), max_sram);
+        if (cart.chip == .superfx) {
+            // Super FX carts declare their shared work RAM in the extended
+            // header's expansion-RAM byte ($xxBD, log2 KiB); it lives in the
+            // sram array (banks $70-$71) and is serialized with it.
+            const exp = image[header.offset - 3];
+            sram_bytes = if (exp >= 1 and exp <= 7) @as(u32, 1024) << @as(u5, @intCast(exp)) else 0x1_0000;
+        }
         if (sram_bytes > 0) cart.sram_mask = sram_bytes - 1;
         return cart;
     }

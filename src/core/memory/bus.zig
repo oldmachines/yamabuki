@@ -15,6 +15,7 @@ const Joypad = @import("joypad.zig").Joypad;
 const Dma = @import("dma.zig").Dma;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Apu = @import("../apu/apu.zig").Apu;
+const Gsu = @import("../chips/gsu.zig").Gsu;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -55,8 +56,16 @@ pub const Bus = struct {
     beam_enabled: bool,
     beam_line: u32,
     beam_line_start: u64,
+    /// Beam position for the $2137 H/V counter latch, updated by the console
+    /// every scanline in both cores (unlike beam_line, which is accurate-only
+    /// and blanked between lines).
+    hv_line: u32,
+    hv_line_start: u64,
     dma: Dma,
     apu: Apu,
+    /// Super FX coprocessor; inert (never caught up or addressed) unless the
+    /// cartridge chip is `.superfx`.
+    gsu: Gsu,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`, and the APU's SPC700 points back at
@@ -74,9 +83,19 @@ pub const Bus = struct {
         self.beam_enabled = false;
         self.beam_line = std.math.maxInt(u32);
         self.beam_line_start = 0;
+        self.hv_line = 0;
+        self.hv_line_start = 0;
         self.dma = .init;
         self.apu.init();
+        self.gsu = .init;
+        self.attachGsu();
         self.remap();
+    }
+
+    /// Wire the GSU to the cartridge's ROM and work RAM (after init or load).
+    fn attachGsu(self: *Bus) void {
+        if (self.cart.chip != .superfx) return;
+        self.gsu.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
     }
 
     /// Rebuild the page table (after init, deserialize, or MEMSEL change).
@@ -89,6 +108,7 @@ pub const Bus = struct {
     /// at comptime, so new components can't be forgotten here).
     pub fn postLoad(self: *Bus) void {
         self.remap();
+        self.attachGsu();
         inline for (@typeInfo(Bus).@"struct".fields) |f| {
             if (comptime @typeInfo(f.type) == .@"struct" and @hasDecl(f.type, "postLoad")) {
                 @field(self, f.name).postLoad();
@@ -148,8 +168,21 @@ pub const Bus = struct {
         }
 
         const v: u8 = switch (a16) {
-            0x2134...0x213F => self.ppu.readReg(a16, self.mdr),
+            // $2137 SLHV latches the beam counters; the dot position falls
+            // out of the master clock and the console-maintained line start.
+            0x2137 => blk: {
+                const dot: u16 = @intCast((self.clock -% self.hv_line_start) / timing.cycles_per_dot % 341);
+                self.ppu.latchCounters(dot, @intCast(self.hv_line & 0x1FF));
+                break :blk self.mdr;
+            },
+            0x213C, 0x213D => self.ppu.readCounterLatch(a16, self.mdr),
+            0x213F => self.ppu.readStat78(self.mdr),
+            0x2134...0x2136, 0x2138...0x213B, 0x213E => self.ppu.readReg(a16, self.mdr),
             0x2140...0x217F => self.apu.cpuRead(self.clock, @truncate(a16 & 3)),
+            0x3000...0x33FF => if (self.cart.chip == .superfx)
+                self.gsu.mmioRead(self.clock, a16, self.mdr)
+            else
+                self.mdr,
             0x2180 => self.wram.portRead(),
             0x4016 => self.joy.readSerial(0, self.mdr),
             0x4017 => self.joy.readSerial(1, self.mdr),
@@ -191,6 +224,8 @@ pub const Bus = struct {
                 self.ppu.writeReg(a16, value);
             },
             0x2140...0x217F => self.apu.cpuWrite(self.clock, @truncate(a16 & 3), value),
+            0x3000...0x33FF => if (self.cart.chip == .superfx)
+                self.gsu.mmioWrite(self.clock, a16, value),
             0x2180 => self.wram.portWrite(value),
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),

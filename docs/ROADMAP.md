@@ -32,7 +32,7 @@ src/core/
     cart/   cartridge.zig header.zig
     ppu/    ppu.zig line_render.zig dot_render.zig sprites.zig window.zig colormath.zig mode7.zig
     apu/    apu.zig spc700.zig sdsp.zig ipl.zig
-    chips/  dsp1.zig sa1.zig superfx.zig cx4.zig    # enhancement chips (M9)
+    chips/  gsu.zig          # Super FX; dsp1/sa1/cx4 to follow (M9)
 src/frontends/
     headless/main.zig    # run N frames, dump .ppm, print framebuffer hash
     libretro/api.zig core.zig    # hand-ported libretro ABI, callconv(.c) exports, zero deps
@@ -98,6 +98,14 @@ CGRAM-write time — handheld-native, no post-pass). Mode 7 is a fixed-point
 matrix walk; hi-res uses a 512-wide buffer only when active. The accurate dot
 renderer (M8) reuses the same register state and decoders with a real per-dot
 fetch pipeline so mid-scanline register writes render correctly.
+
+Known deviation (both cores): the renderer maps BG line N to screen row N,
+while hardware starts the visible picture at V=1 — with VOFS=0 the real PPU
+shows BG line y+1 on screen row y, so the whole picture sits one line higher
+on hardware (spotted comparing the M9 GSU plot demos against krom's reference
+captures, which match pixel-for-pixel once shifted). Fixing it is a deliberate
+follow-up slice: it re-mints every golden hash at once and needs the OBJ Y+1
+and HDMA application-line quirks decided together.
 
 ### APU
 
@@ -199,7 +207,7 @@ serialize/unserialize.
 | M6 | Save states finalized + libretro core | RetroArch plays; serialize roundtrip mid-game | Done — joypad input ($4016 serial + auto-read), versioned save-state container, full libretro implementation; `test-libretro` harness proves golden video/audio parity, live input, and mid-run state replay through the retro_* surface (live RetroArch smoke test pending on a desktop) |
 | M7 | SDL3 desktop frontend | Plays on desktop; aarch64 binary cross-compiles | Done — dlopen'd hand-ported SDL3 ABI (no build-time deps), streamed RGB565 + 32 kHz audio, keyboard input, F5/F9 save states, Tab fast-forward, NTSC pacing; CI smoke test reproduces golden hashes under dummy drivers; all 4 targets cross-compile (live desktop play still worth a manual spin) |
 | M8 | Accurate mode: dot renderer, per-access timing, SST cycle parity | Raster-effect games correct in accurate mode | Done — 65816 at full SST cycle parity (count + per-cycle bus position, 5.12M cases, hard-gated); AccurateConsole renders piecewise at the beam position ($21xx mid-scanline writes split the line; HDMA stays blanking-period), H-IRQs fire at HTIME's dot; runtime selection via AnyConsole, `--accurate` (headless/SDL), `yamabuki_accuracy` (libretro), accuracy-tagged save states; all 42 goldens pass on the accurate core in CI. Hardware fetch-pipeline modeling (sprite-eval timing, mid-line hi-res splits) deferred to demand |
-| M9 | Enhancement chips: DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Super FX → Cx4 (HLE) | Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | Planned |
+| M9 | Enhancement chips: Super FX → DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Cx4 (HLE) | krom CHIP suite golden-gated; Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | In progress — **Super FX (GSU) done**: full instruction set with the hardware's one-byte prefetch pipeline (delay slots and R15 semantics emerge from it), 512-byte code cache (16-byte line fills, SNES cache injection), ROM buffer, PLOT/RPIX pixel cache with column-major char addressing (2/4/8bpp × 128/160/192/OBJ heights, dither, transparency), catch-up scheduling off the master clock, STOP IRQ into the CPU line, save-stated. Gated by 58 golden ROMs: 31 GSUTest opcode screens (hardware-verified PASS/FAIL checks) + 27 plot demos matching krom's captures pixel-for-pixel modulo the global one-line display offset (see PPU notes). Ordered first because it is the only chip with test-ROM coverage; DSP-1/SA-1/Cx4 next. Fast-core simplifications: synchronous ROM/RAM buffers (SFR "R" flag always reads 0), no RON/RAN arbitration stalls or SNES-side ROM lock during GO |
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | Planned |
 
 ## Performance engineering

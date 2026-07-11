@@ -72,8 +72,11 @@ fn mapLoRom(bus: *Bus) void {
             };
         }
 
-        // Banks $70-$7D / $F0-$FF, $0000-$7FFF: SRAM.
-        if ((bank & 0x7F) >= 0x70 and cart.hasSram() and cart.sram_mask >= page_size - 1) {
+        // Banks $70-$7D / $F0-$FF, $0000-$7FFF: SRAM. Super FX carts map
+        // their shared work RAM differently (below).
+        if (cart.chip != .superfx and
+            (bank & 0x7F) >= 0x70 and cart.hasSram() and cart.sram_mask >= page_size - 1)
+        {
             for (0..4) |i| {
                 const offset = ((bank & 0x0F) * 0x8000 + @as(u32, @intCast(i)) * page_size) & cart.sram_mask;
                 bus.pages[pageIndex(b, @intCast(i))] = .{
@@ -82,6 +85,40 @@ fn mapLoRom(bus: *Bus) void {
                     .speed = timing.speed_slow,
                 };
             }
+        }
+    }
+    if (cart.chip == .superfx) mapGsuRam(bus);
+}
+
+/// Super FX work RAM (in cart.sram): banks $70-$71 (and $F0-$F1) map the
+/// full 64 KiB each, and $6000-$7FFF of every system bank mirrors the first
+/// 8 KiB. Reads and writes go straight to the array — the fast core does not
+/// model the RON/RAN bus arbitration (the GSU is caught up before any of its
+/// MMIO is touched, which is how well-behaved software orders its accesses).
+fn mapGsuRam(bus: *Bus) void {
+    const cart = bus.cart;
+    if (!cart.hasSram()) return;
+    const ram: [*]u8 = &cart.sram;
+
+    var bank: u32 = 0;
+    while (bank < 0x100) : (bank += 1) {
+        const b: u8 = @intCast(bank);
+        if ((bank & 0x7F) == 0x70 or (bank & 0x7F) == 0x71) {
+            for (0..8) |i| {
+                const offset = ((bank & 1) * 0x1_0000 + @as(u32, @intCast(i)) * page_size) & cart.sram_mask;
+                bus.pages[pageIndex(b, @intCast(i))] = .{
+                    .read = ram + offset,
+                    .write = ram + offset,
+                    .speed = timing.speed_slow,
+                };
+            }
+        }
+        if (bus_mod.isSystemBank(b)) {
+            bus.pages[pageIndex(b, 3)] = .{
+                .read = ram,
+                .write = ram,
+                .speed = timing.speed_slow,
+            };
         }
     }
 }
