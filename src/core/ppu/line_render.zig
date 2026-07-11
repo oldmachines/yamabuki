@@ -18,6 +18,7 @@ const std = @import("std");
 const ppu_mod = @import("ppu.zig");
 const Ppu = ppu_mod.Ppu;
 const fb_width = ppu_mod.fb_width;
+const fb_width_max = ppu_mod.fb_width_max;
 
 /// One decoded pixel on the current scanline.
 const Cell = struct {
@@ -70,6 +71,8 @@ const order_2bg = [_]Entry{
     obj(2), bg(0, 0), bg(1, 0),
     obj(1), obj(0),
 };
+// Mode 6: BG1 only, interleaved with the OBJ priorities.
+const order_mode6 = [_]Entry{ obj(3), bg(0, 1), obj(2), obj(1), bg(0, 0), obj(0) };
 // Mode 7: a single BG1 plane below all sprites (no per-tile priority; EXTBG later).
 const order_mode7 = [_]Entry{ obj(3), obj(2), obj(1), obj(0), bg(0, 0) };
 
@@ -97,14 +100,15 @@ const ModeDesc = struct {
     order_bg3_front: ?[]const Entry = null,
     kind: Kind = .planar,
     opt: OptMode = .none,
+    /// Modes 5/6: BG tiles are 16 pixels wide and the layer plane is 512 wide;
+    /// the sub screen shows the even half-dots, the main screen the odd ones.
+    hires: bool = false,
 };
 
 const backdrop_mode: ModeDesc = .{};
 
-/// Modes 0-7, indexed by `$2105` BGMODE. Modes 5/6 (hi-res) and 7 (affine) are
-/// backdrop-only until later M4 slices fill in their descriptors. Modes 2 and 4
-/// are rendered here as plain planar layers; their offset-per-tile behavior
-/// (which needs BG3's map) arrives in the offset-per-tile slice.
+/// Modes 0-7, indexed by `$2105` BGMODE. Modes 5/6 render hi-res (512-wide
+/// planes interleaving the sub and main screens); mode 7 is the affine plane.
 const mode_table = [8]ModeDesc{
     .{ // mode 0: four 2bpp layers, each in its own 32-color palette quadrant.
         .layers = &.{
@@ -147,8 +151,22 @@ const mode_table = [8]ModeDesc{
         .order = &order_2bg,
         .opt = .single,
     },
-    backdrop_mode, // mode 5: hi-res (later slice)
-    backdrop_mode, // mode 6: hi-res + offset-per-tile (later slice)
+    .{ // mode 5: hi-res BG1 4bpp, BG2 2bpp (16-wide tiles, 512-wide plane).
+        .layers = &.{
+            .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
+            .{ .bg = 1, .bpp = 2, .cgram_base = 0 },
+        },
+        .order = &order_2bg,
+        .hires = true,
+    },
+    .{ // mode 6: hi-res BG1 4bpp with H+V offset-per-tile.
+        .layers = &.{
+            .{ .bg = 0, .bpp = 4, .cgram_base = 0 },
+        },
+        .order = &order_mode6,
+        .opt = .hv,
+        .hires = true,
+    },
     .{ // mode 7: single affine BG1 (see fillMode7).
         .order = &order_mode7,
         .kind = .affine,
@@ -177,7 +195,7 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     var tmp: [fb_width]u16 = undefined;
     const dest: []u16 = if (width == fb_width) row else &tmp;
 
-    var bgbuf: [4][fb_width]Cell = undefined;
+    var bgbuf: [4][fb_width_max]Cell = undefined;
     var objbuf: [fb_width]Cell = undefined;
 
     // Runtime-select the mode, then run a body comptime-specialized on its
@@ -203,12 +221,12 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
 }
 
 /// Decode a mode's BG layers and the OBJ layer into the line buffers.
-fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width]Cell, objbuf: *[fb_width]Cell) void {
+fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width_max]Cell, objbuf: *[fb_width]Cell) void {
     if (md.kind == .affine) {
         fillMode7(ppu, line, &bgbuf[0]);
     } else {
         inline for (md.layers) |ld| {
-            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, line, &bgbuf[ld.bg]);
+            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, md.hires, line, &bgbuf[ld.bg]);
         }
     }
     fillObj(ppu, line, objbuf);
@@ -236,7 +254,7 @@ fn renderMode(
     ppu: *Ppu,
     line: u32,
     comptime md: ModeDesc,
-    bgbuf: *[4][fb_width]Cell,
+    bgbuf: *[4][fb_width_max]Cell,
     objbuf: *[fb_width]Cell,
     lpal: *const [256]u16,
     row: []u16,
@@ -256,22 +274,24 @@ fn renderMode(
     if (ppu.tmw != 0 or math) computeWindows(ppu, &winmask);
 
     if (math) {
-        compositeMath(ppu, order, bgbuf, objbuf, row, &winmask);
+        compositeMath(ppu, order, bgbuf, objbuf, row, &winmask, .full, .full);
     } else {
-        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, ppu.main_screen);
+        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, ppu.main_screen, .full);
     }
 }
 
-/// Pseudo-hires (SETINI bit3): compose the sub and main screens separately at
-/// 256 pixels and interleave them into the 512-wide row — even output pixels
-/// show the sub screen, odd the main screen (the hardware's half-dot order).
-/// The main screen keeps its color-math path; the sub screen composes plainly
-/// with its own TS enables and TSW window masks.
+/// Hi-res line: compose the sub and main screens separately at 256 pixels and
+/// interleave them into the 512-wide row — even output pixels show the sub
+/// screen, odd the main screen (the hardware's half-dot order). In pseudo-hires
+/// (SETINI bit3, normal modes) both screens sample the 256-wide layer buffers;
+/// in modes 5/6 the BG plane itself is 512 wide and the sub/main screens sample
+/// its even/odd columns. The main screen keeps its color-math path; the sub
+/// screen composes plainly with its own TS enables and TSW window masks.
 fn renderModeHires(
     ppu: *Ppu,
     line: u32,
     comptime md: ModeDesc,
-    bgbuf: *[4][fb_width]Cell,
+    bgbuf: *[4][fb_width_max]Cell,
     objbuf: *[fb_width]Cell,
     lpal: *const [256]u16,
     row: []u16,
@@ -287,14 +307,17 @@ fn renderModeHires(
     var winmask: [6][fb_width]bool = undefined;
     if ((ppu.tmw | ppu.tsw) != 0 or math) computeWindows(ppu, &winmask);
 
+    const main_hd: HalfDot = comptime if (md.hires) .odd else .full;
+    const sub_hd: HalfDot = comptime if (md.hires) .even else .full;
+
     var main_row: [fb_width]u16 = undefined;
     var sub_row: [fb_width]u16 = undefined;
     if (math) {
-        compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask);
+        compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask, main_hd, sub_hd);
     } else {
-        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, ppu.main_screen);
+        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, ppu.main_screen, main_hd);
     }
-    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, ppu.sub_screen);
+    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, ppu.sub_screen, sub_hd);
 
     for (0..fb_width) |x| {
         row[2 * x] = sub_row[x];
@@ -355,14 +378,29 @@ fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
 /// (0-3 = BG1-4, 4 = OBJ, 5 = backdrop). The layer drives per-layer color math.
 const Resolved = struct { abs: u8, layer: u3 };
 
+/// Which half-dot of a hi-res BG plane a screen resolves: `.full` samples the
+/// BG buffer at the screen pixel (normal modes), `.even`/`.odd` sample the
+/// 512-wide plane of modes 5/6 (sub screen = even, main screen = odd).
+const HalfDot = enum { full, even, odd };
+
+inline fn bgX(comptime hd: HalfDot, x: usize) usize {
+    return switch (hd) {
+        .full => x,
+        .even => 2 * x,
+        .odd => 2 * x + 1,
+    };
+}
+
 /// Walk the priority order front-to-back for one pixel, taking the first solid
 /// layer at its matching priority (else the backdrop). `screens` is the TM or
 /// TS enable mask, so the same walk resolves the main and the sub screen; `tw`
-/// is the matching window mask register (TMW/TSW).
+/// is the matching window mask register (TMW/TSW). `x` is the 256-basis screen
+/// pixel (windows and sprites live there); `hd` picks the BG sample column.
 inline fn resolvePixel(
     order: []const Entry,
-    bgbuf: *const [4][fb_width]Cell,
+    bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width]Cell,
+    comptime hd: HalfDot,
     x: usize,
     screens: u8,
     winmask: *const [6][fb_width]bool,
@@ -375,27 +413,28 @@ inline fn resolvePixel(
         // layer or the backdrop shows through. `tw` short-circuits, so
         // `winmask` is untouched when windows are off.
         if (tw & (@as(u8, 1) << layer) != 0 and winmask[layer][x]) continue;
-        const cell = if (e.src == .bg) bgbuf[e.idx][x] else objbuf[x];
+        const cell = if (e.src == .bg) bgbuf[e.idx][bgX(hd, x)] else objbuf[x];
         if (cell.solid and cell.prio == e.prio) return .{ .abs = cell.abs, .layer = layer };
     }
     return .{ .abs = 0, .layer = 5 };
 }
 
-/// Composite the main screen without color math: resolve each pixel and write
-/// the brightness-scaled palette entry. This is the hot path for the common
+/// Composite a screen without color math: resolve each pixel and write the
+/// brightness-scaled palette entry. This is the hot path for the common
 /// no-math case; `compositeMath` below is the slower blending variant.
 fn composite(
     order: []const Entry,
-    bgbuf: *const [4][fb_width]Cell,
+    bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width]Cell,
     lpal: *const [256]u16,
     row: []u16,
     winmask: *const [6][fb_width]bool,
     tmw: u8,
     screens: u8,
+    comptime hd: HalfDot,
 ) void {
     for (0..fb_width) |x| {
-        row[x] = lpal[resolvePixel(order, bgbuf, objbuf, x, screens, winmask, tmw).abs];
+        row[x] = lpal[resolvePixel(order, bgbuf, objbuf, hd, x, screens, winmask, tmw).abs];
     }
 }
 
@@ -436,10 +475,12 @@ fn colorMath(main: u16, addend: u16, subtract: bool, half: bool) u16 {
 fn compositeMath(
     ppu: *const Ppu,
     order: []const Entry,
-    bgbuf: *const [4][fb_width]Cell,
+    bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width]Cell,
     row: []u16,
     winmask: *const [6][fb_width]bool,
+    comptime main_hd: HalfDot,
+    comptime sub_hd: HalfDot,
 ) void {
     const half_en = ppu.cgadsub & 0x40 != 0;
     const subtract = ppu.cgadsub & 0x80 != 0;
@@ -448,7 +489,7 @@ fn compositeMath(
     const prevent_region: u2 = @truncate(ppu.cgwsel >> 4);
 
     for (0..fb_width) |x| {
-        const main = resolvePixel(order, bgbuf, objbuf, x, ppu.main_screen, winmask, ppu.tmw);
+        const main = resolvePixel(order, bgbuf, objbuf, main_hd, x, ppu.main_screen, winmask, ppu.tmw);
         const in_cw = winmask[5][x];
         const clipped = regionActive(clip_region, in_cw);
         var color: u16 = if (clipped) 0 else ppu.cgram[main.abs];
@@ -463,7 +504,7 @@ fn compositeMath(
             var addend: u16 = ppu.fixed_color;
             var half = half_en and !clipped;
             if (sub_addend) {
-                const sub = resolvePixel(order, bgbuf, objbuf, x, ppu.sub_screen, winmask, ppu.tsw);
+                const sub = resolvePixel(order, bgbuf, objbuf, sub_hd, x, ppu.sub_screen, winmask, ppu.tsw);
                 if (sub.layer != 5) {
                     addend = ppu.cgram[sub.abs];
                 } else {
@@ -476,13 +517,13 @@ fn compositeMath(
     }
 }
 
-fn clearLine(buf: *[fb_width]Cell) void {
+fn clearLine(buf: []Cell) void {
     for (buf) |*c| c.* = .{};
 }
 
 /// Decode one BG layer's contribution to the scanline. `comptime bpp` folds the
 /// bitplane math; `cgram_base` is the mode-dependent palette offset for this BG.
-fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, line: u32, buf: *[fb_width]Cell) void {
+fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, comptime hires: bool, line: u32, buf: *[fb_width_max]Cell) void {
     // Decode when the layer is on either screen; the compositor's TM/TS enable
     // mask decides which resolve pass actually sees it.
     if ((ppu.main_screen | ppu.sub_screen) & (@as(u8, 1) << @intCast(bg_index)) == 0) {
@@ -491,11 +532,14 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     }
 
     const layer = ppu.bg[bg_index];
-    const tile_px: u16 = if (layer.tile16) 16 else 8;
+    // Modes 5/6: tiles are always 16 wide (the plane spans 512 half-dots);
+    // BGMODE's size bit still selects the tile height.
+    const tile_ph: u16 = if (layer.tile16) 16 else 8;
+    const tile_pw: u16 = if (hires) 16 else tile_ph;
     const width_tiles: u16 = if (layer.map_size & 1 != 0) 64 else 32;
     const height_tiles: u16 = if (layer.map_size & 2 != 0) 64 else 32;
-    const bg_w: u16 = width_tiles * tile_px;
-    const bg_h: u16 = height_tiles * tile_px;
+    const bg_w: u16 = width_tiles * tile_pw;
+    const bg_h: u16 = height_tiles * tile_ph;
     const words_per_tile: u16 = @as(u16, bpp) * 4;
     const pal_size: u16 = @as(u16, 1) << bpp;
 
@@ -508,9 +552,10 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     const my: u32 = if (mosaic_on) line - line % msize else line;
     // Without offset-per-tile the vertical scroll (and tile row) is constant.
     const base_sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
-    const base_tile_row = base_sy / tile_px;
+    const base_tile_row = base_sy / tile_ph;
 
-    for (0..fb_width) |x| {
+    const out_w = if (hires) fb_width_max else fb_width;
+    for (0..out_w) |x| {
         const xi: u32 = @intCast(x);
         const mx: u32 = if (mosaic_on) xi - xi % msize else xi;
 
@@ -520,15 +565,18 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
         else blk: {
             var eff_hofs = layer.hofs;
             var eff_vofs = layer.vofs;
-            offsetPerTile(ppu, bg_index, opt, layer.hofs, @intCast(mx), &eff_hofs, &eff_vofs);
+            // In hi-res mode 6 the offset column granularity stays one map
+            // tile, which is 8 output pixels on the 256 basis.
+            const col_x: u16 = @intCast(if (hires) mx >> 1 else mx);
+            offsetPerTile(ppu, bg_index, opt, layer.hofs, col_x, &eff_hofs, &eff_vofs);
             const oy: u16 = @intCast((my + eff_vofs) & (bg_h - 1));
-            break :blk .{ .h = eff_hofs, .sy = oy, .tile_row = oy / tile_px };
+            break :blk .{ .h = eff_hofs, .sy = oy, .tile_row = oy / tile_ph };
         };
         const sy = scroll.sy;
         const tile_row = scroll.tile_row;
 
         const sx: u16 = @intCast((mx + scroll.h) & (bg_w - 1));
-        const tile_col = sx / tile_px;
+        const tile_col = sx / tile_pw;
 
         var screen: u16 = 0;
         if (tile_col & 0x20 != 0) screen += 1;
@@ -543,14 +591,16 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
         const xflip = entry & 0x4000 != 0;
         const yflip = entry & 0x8000 != 0;
 
-        var px: u16 = sx % tile_px;
-        var py: u16 = sy % tile_px;
-        if (xflip) px = tile_px - 1 - px;
-        if (yflip) py = tile_px - 1 - py;
-        if (layer.tile16) {
+        var px: u16 = sx % tile_pw;
+        var py: u16 = sy % tile_ph;
+        if (xflip) px = tile_pw - 1 - px;
+        if (yflip) py = tile_ph - 1 - py;
+        if (tile_pw == 16) {
             if (px >= 8) tile_num += 1;
-            if (py >= 8) tile_num += 16;
             px &= 7;
+        }
+        if (tile_ph == 16) {
+            if (py >= 8) tile_num += 16;
             py &= 7;
         }
 
@@ -570,7 +620,7 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 /// scroll (M7HOFS,M7VOFS) to a texel in the 1024x1024 (128-tile) field, whose
 /// tilemap and 8bpp character data are byte-interleaved in VRAM (tilemap = low
 /// bytes, char = high bytes). M7SEL selects screen flip and out-of-area handling.
-fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
+fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width_max]Cell) void {
     if ((ppu.main_screen | ppu.sub_screen) & 0x01 == 0) {
         clearLine(buf); // BG1 disabled on both screens
         return;
@@ -1094,6 +1144,30 @@ test "pseudo-hires interleaves the sub and main screens" {
     try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[1]); // odd: main (red)
     try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[510]);
     try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[511]);
+}
+
+test "mode 5 renders a 16-wide hi-res tile across sub/main half-dots" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 5;
+    ppu.main_screen = 0x01; // BG1 on both screens: output = the 512-wide plane
+    ppu.sub_screen = 0x01;
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 }; // BG1 4bpp, map all tile 0
+    // Tile 0 (left half of every 16-wide tile): color 1 at its first pixel.
+    ppu.vram[0] = 0x0080;
+    ppu.cgram[1] = 0x001F; // red
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(ppu_mod.fb_width_max, ppu.fb_line_width);
+    // Plane x=0 (tile 0 px0) -> output half-dot 0 via the sub screen.
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]);
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]); // plane x=1 empty
+    // Plane x=8..15 comes from tile 1 (zeroed VRAM) -> transparent.
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[8]);
+    // The next 16-wide map column repeats tile 0: plane x=16 -> red again.
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[16]);
 }
 
 test "higher priority tile wins the composite" {
