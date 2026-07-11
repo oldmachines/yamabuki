@@ -41,8 +41,6 @@ pub fn Console(comptime cfg: CoreConfig) type {
         cpu: Cpu(Bus),
 
         region: timing.Region,
-        /// Overscan on → 239 visible lines, off → 224.
-        overscan: bool,
         /// Current scanline within the frame (0-based).
         scanline: u32,
         /// bus.clock at the start of the current scanline.
@@ -60,7 +58,6 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.init(&self.cart);
             self.cpu = Cpu(Bus).init(&self.bus);
             self.region = .ntsc;
-            self.overscan = false;
             self.reset();
         }
 
@@ -90,8 +87,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
         }
 
         /// First scanline of vertical blank (one past the last visible line).
+        /// Overscan (SETINI bit2) extends the visible frame to 239 lines.
         pub fn vblankLine(self: *const Self) u32 {
-            return if (self.overscan) timing.vblank_line_239 else timing.vblank_line_224;
+            return if (self.bus.ppu.overscan()) timing.vblank_line_239 else timing.vblank_line_224;
         }
 
         /// Run the emulation for exactly one video frame.
@@ -171,8 +169,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         /// The visible RGB565 framebuffer for the current display height.
         pub fn framebuffer(self: *const Self) []const u16 {
-            const height: u32 = if (self.overscan) timing.visible_lines_239 else timing.visible_lines_224;
+            const height: u32 = if (self.bus.ppu.overscan()) timing.visible_lines_239 else timing.visible_lines_224;
             return self.bus.ppu.frame(height);
+        }
+
+        /// Pixel width of the last rendered frame (256, or 512 for hi-res).
+        pub fn frameWidth(self: *const Self) u32 {
+            return self.bus.ppu.fb_line_width;
         }
     };
 }

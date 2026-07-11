@@ -57,5 +57,26 @@
         .{ .path = "PPU/Window/WindowHDMA/WindowHDMA.sfc", .hash = 0x7bafda0faf223f57, .steps = 146450, .cycles = 5717916 },
         .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0x9a19f3d335633fd5, .steps = 148721, .cycles = 5717908 },
         .{ .path = "PPU/HDMA/WaveHDMA/WaveHDMA.sfc", .hash = 0x6d5ebfbf9af5178d, .steps = 137718, .cycles = 5717924 },
+        // M4.7: the Blend/HiColor set is the real CGADSUB exercise (M4.5's
+        // survey missed that these blend at 256 wide, no pseudo-hires): BG1 on
+        // the main screen, BG2 on the sub screen, added per pixel for hundreds
+        // of apparent colors. The HDMA/HiColor*PerTileRow ROMs stay unminted:
+        // they race the beam (H-IRQ + latched V-counter + mid-scanline CGRAM
+        // DMA) and need the accurate core's sub-line timing (M8).
+        .{ .path = "PPU/Blend/HiColor/HiColor575Myst/HiColor575Myst.sfc", .hash = 0x648efce3a804de22, .steps = 140944, .cycles = 5717918 },
+        .{ .path = "PPU/Blend/HiColor/HiColor3840/HiColor3840.sfc", .hash = 0xd7598be40b7f8ce5, .steps = 143917, .cycles = 5717904 },
+        .{ .path = "PPU/Blend/HiColor/HiColor1241DLair/HiColor1241DLair.sfc", .hash = 0xffee96ffe902ac1a, .steps = 140284, .cycles = 5717924 },
+        // M4.7: mode 5 hi-res (512-wide, 16-wide tiles). InterlaceFont locks a
+        // crisp hi-res font sheet; InterlaceRPG a full 512-wide scene.
+        // MosaicMode5's mosaic level is input-driven (renders mosaic-off
+        // headless, same as MosaicMode3) and shows the same moogle image as
+        // InterlaceMoogle — identical hashes are expected. The
+        // Interlace{Myst,Simpsons}HDMA ROMs stay unminted: they need true
+        // interlaced 448-line field rendering (the HDMA'd tile base assumes
+        // field-interleaved rows), which the 224-line fast core doesn't model.
+        .{ .path = "PPU/Mosaic/Mode5/MosaicMode5.sfc", .hash = 0xf2e09c4f161ff725, .steps = 153077, .cycles = 5717918 },
+        .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x109a188a73e19540, .steps = 155006, .cycles = 5717912 },
+        .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0xf2e09c4f161ff725, .steps = 153077, .cycles = 5717924 },
+        .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0x0070e006af27c4ed, .steps = 147948, .cycles = 5717928 },
     },
 }

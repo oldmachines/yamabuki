@@ -10,9 +10,12 @@
 const std = @import("std");
 const line_render = @import("line_render.zig");
 
-/// Visible framebuffer dimensions. Width is 256 (hi-res 512 is M4); height is
-/// the maximum (overscan) — 224-line output uses the first 224 rows.
+/// Visible framebuffer dimensions. `fb_width` is the standard 256-pixel line;
+/// hi-res lines (modes 5/6 and pseudo-hires) are `fb_width_max` wide, and the
+/// whole frame switches to that stride (see `fb_line_width`). Height is the
+/// maximum (overscan) — 224-line output uses the first 224 rows.
 pub const fb_width: u32 = 256;
+pub const fb_width_max: u32 = 512;
 pub const fb_height: u32 = 239;
 
 /// Per-background-layer configuration latched from the register file.
@@ -34,7 +37,7 @@ pub const Ppu = struct {
     // Derived state: the RGB565 palette and the brightness-scaled line palette
     // are rebuilt from cgram, and the framebuffer is output, so none is part of
     // the saved state.
-    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb" };
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -52,8 +55,12 @@ pub const Ppu = struct {
     lpal: [256]u16,
     /// Set when `lpal` must be recomputed (CGRAM or INIDISP brightness write).
     lpal_dirty: bool,
-    /// RGB565 framebuffer, row-major, fb_width * fb_height.
-    fb: [fb_width * fb_height]u16,
+    /// RGB565 framebuffer, row-major with a per-frame row stride of
+    /// `fb_line_width` (256, or 512 once any line rendered hi-res).
+    fb: [fb_width_max * fb_height]u16,
+    /// Current frame's row width/stride. Reset to 256 at line 0; the first
+    /// hi-res line promotes the frame (and the rows already rendered) to 512.
+    fb_line_width: u32,
 
     // --- display control --------------------------------------------------
     force_blank: bool, // $2100 bit7
@@ -87,6 +94,11 @@ pub const Ppu = struct {
     wobjlog: u8, // $212B OBJ bits0-1, color bits2-3
     tmw: u8, // $212E main-screen window masking (bit0 BG1 .. bit4 OBJ)
     tsw: u8, // $212F sub-screen window masking (color math, M4.5)
+
+    // --- display config ($2133) --------------------------------------------
+    // SETINI: bit0 screen interlace, bit1 OBJ interlace, bit2 overscan (239
+    // visible lines), bit3 pseudo-hires, bit6 EXTBG, bit7 external sync.
+    setini: u8,
 
     // --- color math ($2130-$2132) ------------------------------------------
     // CGWSEL: bit0 direct color (not yet modeled), bit1 addend = sub screen
@@ -143,6 +155,7 @@ pub const Ppu = struct {
         .lpal = @splat(0),
         .lpal_dirty = true,
         .fb = @splat(0),
+        .fb_line_width = fb_width,
         .force_blank = true,
         .brightness = 0,
         .bg_mode = 0,
@@ -165,6 +178,7 @@ pub const Ppu = struct {
         .wobjlog = 0,
         .tmw = 0,
         .tsw = 0,
+        .setini = 0,
         .cgwsel = 0,
         .cgadsub = 0,
         .fixed_color = 0,
@@ -200,6 +214,7 @@ pub const Ppu = struct {
     pub fn postLoad(self: *Ppu) void {
         for (self.cgram, 0..) |c, i| self.palette[i] = bgr15to565(c);
         self.lpal_dirty = true;
+        self.fb_line_width = fb_width; // rebuilt by the next frame's render
     }
 
     // --- register writes ($2100-$213F) ------------------------------------
@@ -305,7 +320,7 @@ pub const Ppu = struct {
                 if (value & 0x40 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x03E0)) | (intensity << 5);
                 if (value & 0x80 != 0) self.fixed_color = (self.fixed_color & ~@as(u16, 0x7C00)) | (intensity << 10);
             },
-            // SETINI: latched in later milestones.
+            0x33 => self.setini = value, // SETINI
             else => {},
         }
     }
@@ -466,16 +481,53 @@ pub const Ppu = struct {
 
     // --- rendering --------------------------------------------------------
 
+    /// Whether the current mode renders 512-pixel lines: BG modes 5/6, or
+    /// pseudo-hires (SETINI bit3) interleaving the sub and main screens.
+    pub fn hiresActive(self: *const Ppu) bool {
+        return self.bg_mode == 5 or self.bg_mode == 6 or self.setini & 0x08 != 0;
+    }
+
     /// Render one visible scanline into the framebuffer: force-blank/backdrop
-    /// handling plus the BG and sprite compositor.
+    /// handling plus the BG and sprite compositor. The frame's row stride
+    /// starts at 256 and is promoted (with the rows already rendered doubled
+    /// in place) the first time a line renders hi-res.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
+        if (line == 0) self.fb_line_width = fb_width;
+        if (self.fb_line_width == fb_width and !self.force_blank and self.hiresActive()) {
+            self.promoteFrame(line);
+        }
         line_render.renderLine(self, line);
     }
 
-    /// Visible framebuffer for the current display height.
+    /// Switch the frame to the 512-wide stride mid-frame: pixel-double the
+    /// `lines` rows already rendered at 256, repacking in place from the last
+    /// row backwards (destination offsets never precede their source).
+    fn promoteFrame(self: *Ppu, lines: u32) void {
+        self.fb_line_width = fb_width_max;
+        var l = lines;
+        while (l > 0) {
+            l -= 1;
+            const src = l * fb_width;
+            const dst = l * fb_width_max;
+            var x = fb_width;
+            while (x > 0) {
+                x -= 1;
+                const px = self.fb[src + x];
+                self.fb[dst + 2 * x] = px;
+                self.fb[dst + 2 * x + 1] = px;
+            }
+        }
+    }
+
+    /// SETINI bit2: 239 visible lines instead of 224.
+    pub fn overscan(self: *const Ppu) bool {
+        return self.setini & 0x04 != 0;
+    }
+
+    /// Visible framebuffer for the current display height and frame width.
     pub fn frame(self: *const Ppu, height: u32) []const u16 {
-        return self.fb[0 .. fb_width * height];
+        return self.fb[0 .. self.fb_line_width * height];
     }
 };
 
@@ -595,6 +647,16 @@ test "color math registers latch and COLDATA accumulates channels" {
     try std.testing.expectEqual(@as(u16, 0x43E0), ppu.fixed_color);
 }
 
+test "setini latches and drives overscan" {
+    var ppu: Ppu = .init;
+    try std.testing.expect(!ppu.overscan());
+    ppu.writeReg(0x2133, 0x04); // SETINI: overscan
+    try std.testing.expect(ppu.overscan());
+    ppu.writeReg(0x2133, 0x48); // SETINI: EXTBG + pseudo-hires
+    try std.testing.expectEqual(@as(u8, 0x48), ppu.setini);
+    try std.testing.expect(!ppu.overscan());
+}
+
 test "backdrop render fills the scanline" {
     var ppu: Ppu = .init;
     ppu.writeReg(0x2121, 0); // CGADD 0
@@ -608,6 +670,31 @@ test "backdrop render fills the scanline" {
     ppu.writeReg(0x2100, 0x80);
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0), ppu.fb[0]);
+}
+
+test "mid-frame hi-res switch promotes rendered lines to 512" {
+    var ppu: Ppu = .init;
+    ppu.writeReg(0x2121, 0);
+    ppu.writeReg(0x2122, 0x1F); // backdrop = red
+    ppu.writeReg(0x2122, 0x00);
+    ppu.writeReg(0x2100, 0x0F); // full brightness
+
+    ppu.renderScanline(0); // 256-wide backdrop line
+    try std.testing.expectEqual(fb_width, ppu.fb_line_width);
+
+    ppu.writeReg(0x2133, 0x08); // pseudo-hires mid-frame
+    ppu.renderScanline(1);
+    try std.testing.expectEqual(fb_width_max, ppu.fb_line_width);
+    // Line 0 was repacked to the 512 stride: doubled backdrop pixels.
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]);
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[511]);
+    // Line 1 rendered at the 512 stride directly.
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[512 + 511]);
+
+    // The next frame resets to 256 when the mode does.
+    ppu.writeReg(0x2133, 0x00);
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(fb_width, ppu.fb_line_width);
 }
 
 test "ppu serialize skips derived palette, postLoad rebuilds it" {
