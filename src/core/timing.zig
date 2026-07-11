@@ -12,6 +12,12 @@ pub const pal_master_hz: u64 = 21_281_370;
 pub const cycles_per_line: u64 = 1364;
 /// Dots per scanline; one dot = 4 master cycles (except two 6-cycle dots).
 pub const dots_per_line: u32 = 341;
+/// Master cycles per dot (the accurate core's beam arithmetic treats every
+/// dot as 4 cycles; the two long dots are a sub-pixel refinement it skips).
+pub const cycles_per_dot: u64 = 4;
+/// The dot at which output pixel 0 leaves the PPU (dots 0-21 are setup /
+/// left border).
+pub const render_start_dot: u64 = 22;
 
 pub const ntsc_lines_per_frame: u32 = 262;
 pub const pal_lines_per_frame: u32 = 312;

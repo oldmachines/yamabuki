@@ -226,6 +226,47 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     }
 }
 
+/// Render pixels [x0, x1) of a scanline with the *current* register state —
+/// the accurate core's piecewise path (fast mode always renders whole lines).
+/// The content is composed at 256 wide exactly like `renderLine` and only the
+/// requested span is copied out, so a line with no mid-line register writes
+/// is bit-identical to the whole-line render.
+pub fn renderSpan(ppu: *Ppu, line: u32, x0: u32, x1_in: u32) void {
+    const x1 = @min(x1_in, fb_width);
+    if (x0 >= x1) return;
+    const width = ppu.fb_line_width;
+    const row = ppu.fb[line * width ..][0..width];
+
+    if (ppu.force_blank) {
+        if (width == fb_width) @memset(row[x0..x1], 0) else @memset(row[2 * x0 .. 2 * x1], 0);
+        return;
+    }
+
+    if (ppu.lpal_dirty) {
+        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+        ppu.lpal_dirty = false;
+    }
+
+    var tmp: [fb_width]u16 = undefined;
+    var bgbuf: [4][fb_width_max]Cell = undefined;
+    var objbuf: [fb_width]Cell = undefined;
+    inline for (mode_table, 0..) |md, m| {
+        if (ppu.bg_mode == m) {
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, &tmp);
+            if (width == fb_width) {
+                @memcpy(row[x0..x1], tmp[x0..x1]);
+            } else {
+                // 256-wide content on a promoted (512-stride) frame.
+                for (x0..x1) |x| {
+                    row[2 * x] = tmp[x];
+                    row[2 * x + 1] = tmp[x];
+                }
+            }
+            return;
+        }
+    }
+}
+
 /// Decode a mode's BG layers and the OBJ layer into the line buffers.
 fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width_max]Cell, objbuf: *[fb_width]Cell) void {
     if (md.kind == .affine) {
