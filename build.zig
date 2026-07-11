@@ -41,13 +41,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(libretro);
 
-    // SDL3 desktop frontend (M7). Lazy: absence of the dependency never
-    // breaks `zig build`.
-    const enable_sdl = b.option(bool, "sdl", "Build the SDL3 desktop frontend") orelse false;
-    if (enable_sdl) {
-        std.debug.print("error: the SDL frontend is not implemented yet (milestone M7)\n", .{});
-        std.process.exit(1);
-    }
+    // SDL3 desktop frontend. SDL is dlopen'd at runtime (the ABI subset is
+    // hand-ported in src/frontends/sdl/sdl3.zig), so this builds everywhere
+    // with no SDL headers or libraries present — it only needs libc for
+    // dlopen/dlsym.
+    const sdl_frontend = b.addExecutable(.{
+        .name = "yamabuki-sdl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontends/sdl/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+            },
+        }),
+    });
+    b.installArtifact(sdl_frontend);
 
     // Unit tests live inline in core modules.
     const core_tests = b.addTest(.{ .root_module = core_mod });
