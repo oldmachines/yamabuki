@@ -5,6 +5,7 @@ const std = @import("std");
 const bus_mod = @import("bus.zig");
 const Bus = bus_mod.Bus;
 const Page = bus_mod.Page;
+const Sa1 = @import("../chips/sa1.zig").Sa1;
 const timing = @import("../timing.zig");
 
 const page_size = bus_mod.page_size;
@@ -22,7 +23,7 @@ pub fn buildPages(bus: *Bus) void {
     for (&bus.pages) |*p| p.* = .unmapped;
 
     switch (bus.cart.header.mapping) {
-        .lorom => mapLoRom(bus),
+        .lorom => if (bus.cart.chip == .sa1) mapSa1(bus) else mapLoRom(bus),
         .hirom => mapHiRom(bus, 0),
         .exhirom => mapHiRom(bus, 0x40_0000),
     }
@@ -130,6 +131,49 @@ fn mapGsuRam(bus: *Bus) void {
                 .speed = timing.speed_slow,
             };
         }
+    }
+}
+
+/// SA-1 carts: ROM pages go through the Super MMC's four switchable regions
+/// (rebuilt whenever an MMC register changes). Everything the SA-1 shares or
+/// substitutes stays off the fast path: IRAM ($3000, inside the MMIO hole),
+/// the BW-RAM window at $6000-$7FFF and banks $40-$4F (write protection and
+/// the CC1 conversion hook), and the vector page of banks $00/$80 (so the
+/// SA-1 can swap the SNES NMI/IRQ vectors to SNV/SIV).
+fn mapSa1(bus: *Bus) void {
+    const cart = bus.cart;
+    const sa1 = &bus.sa1;
+    var bank: u32 = 0;
+    while (bank < 0x100) : (bank += 1) {
+        const b: u8 = @intCast(bank);
+        if (b == 0x7E or b == 0x7F) continue;
+
+        if (bus_mod.isSystemBank(b)) {
+            // $8000-$FFFF through the MMC's LoROM-view regions.
+            for (4..8) |i| {
+                const addr: u24 = @intCast(bank << 16 | i * page_size);
+                const offset = sa1.mmcTranslate(Sa1.squashLo(addr), true);
+                bus.pages[pageIndex(b, @intCast(i))] = .{
+                    .read = cart.rom.ptr + offset,
+                    .write = null,
+                    .speed = romSpeed(b, bus.fastrom),
+                };
+            }
+            // Vector page: slow path for SNV/SIV substitution.
+            if (b & 0x7F == 0) bus.pages[pageIndex(b, 7)] = .unmapped;
+        } else if (b >= 0xC0) {
+            // $C0-$FF: full banks through the MMC's block registers.
+            for (0..8) |i| {
+                const addr: u24 = @intCast(bank << 16 | i * page_size);
+                const offset = sa1.mmcTranslate(@intCast(addr & 0x3F_FFFF), false);
+                bus.pages[pageIndex(b, @intCast(i))] = .{
+                    .read = cart.rom.ptr + offset,
+                    .write = null,
+                    .speed = romSpeed(b, bus.fastrom),
+                };
+            }
+        }
+        // Banks $40-$4F (BW-RAM) stay unmapped: slow path handles them.
     }
 }
 

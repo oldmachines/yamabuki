@@ -26,7 +26,7 @@ const Cpu = @import("cpu/wdc65816.zig").Cpu;
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 4;
+pub const state_version: u32 = 5;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -157,6 +157,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // scheme: MMIO accesses catch it up mid-line, the line end here.
             self.bus.apu.catchUp(self.bus.clock);
             if (self.bus.cart.chip == .superfx) self.bus.gsu.catchUp(self.bus.clock);
+            if (self.bus.cart.chip == .sa1) self.bus.sa1.catchUp(self.bus.clock);
 
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
@@ -188,7 +189,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // timer flag: reading $4211 (TIMEUP) clears irq_flag, which must
                 // deassert the line before the handler's RTI re-checks it. The
                 // Super FX's STOP interrupt (acked by reading SFR) ORs in.
-                const irq = io.irq_flag or self.bus.gsu.irq_line;
+                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.cpu.step();
                 self.steps +%= 1;
@@ -211,7 +212,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (fire_at) |t| {
                     if (self.bus.clock >= t) io.irq_flag = true;
                 }
-                const irq = io.irq_flag or self.bus.gsu.irq_line;
+                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.cpu.step();
                 self.steps +%= 1;
