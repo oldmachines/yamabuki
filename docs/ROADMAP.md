@@ -107,7 +107,10 @@ decoding, 8 voices, ADSR/gain envelopes, gaussian interpolation, echo, and
 noise, emitting 32 kHz stereo into a preallocated ring buffer drained each
 frame. Execution is **fully decoupled with lazy catch-up**: any CPU access to
 `$2140–43` first steps the APU to "now" — exact for the port handshake, and the
-biggest performance lever after CPU dispatch.
+biggest performance lever after CPU dispatch. All DSP volumes and FIR
+coefficients mix as signed values — that phase fidelity is what carries the
+Dolby Surround matrix some games encode (see
+[`AUDIO_SURROUND.md`](AUDIO_SURROUND.md)).
 
 ### DMA / HDMA
 
@@ -155,6 +158,14 @@ serialize/unserialize.
 - **Unit tests** live inline per module: header detection, mapper shapes, open
   bus, DMA readback, multiply/divide registers, BRR decode, envelopes, and
   serialize roundtrip byte-identity.
+- **Deterministic fuzz** (`zig build fuzz`, `tests/fuzz.zig`): seeded random
+  PPU register/memory states rendered as full frames, then random bus traffic
+  (PPU/APU ports, CPU I/O, live DMA/HDMA triggers) against a running console,
+  with a periodic serialize→restore→step roundtrip that must stay
+  byte-identical. Runs in Debug so every index/overflow safety check is armed;
+  a fixed default seed keeps CI reproducible and any failure replays with
+  `-Dfuzz-seed`. Its first outing found two renderer overflow traps, a DMA
+  self-retrigger stack overflow, and an APU catch-up hang.
 - **CI**: format check → unit tests + sampled SST (Debug *and* ReleaseFast, to
   catch UB) → cross-compile matrix (`x86_64-linux-gnu`, `aarch64-linux-gnu`,
   `aarch64-linux-musl`, `arm-linux-musleabihf`) → headless FPS benchmark vs a

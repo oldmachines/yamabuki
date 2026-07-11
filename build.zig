@@ -123,6 +123,30 @@ pub fn build(b: *std.Build) void {
     const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
     roms_step.dependOn(&run_roms.step);
 
+    // Deterministic fuzz harness: random register/memory streams rendered
+    // under Debug safety checks, plus a save/load roundtrip invariant.
+    const fuzz_iters = b.option(u32, "fuzz-iters", "Fuzz iterations per stage (0 = default)") orelse 0;
+    const fuzz_seed = b.option(u64, "fuzz-seed", "Fuzz PRNG seed (fixed default keeps CI reproducible)") orelse 0x59414d41;
+    const fuzz_opts = b.addOptions();
+    fuzz_opts.addOption(u32, "iters", fuzz_iters);
+    fuzz_opts.addOption(u64, "seed", fuzz_seed);
+
+    const fuzz = b.addExecutable(.{
+        .name = "yamabuki-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "fuzz_options", .module = fuzz_opts.createModule() },
+            },
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(fuzz);
+    const fuzz_step = b.step("fuzz", "Run the deterministic fuzz harness (PPU + console + save/load invariant)");
+    fuzz_step.dependOn(&run_fuzz.step);
+
     // Headless FPS benchmark.
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",

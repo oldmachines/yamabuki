@@ -29,6 +29,7 @@ tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignore
 zig build test-sst               # run 65816 SingleStepTests vectors
 zig build test-sst-spc700        # run SPC700 SingleStepTests vectors
 zig build test-roms              # render PeterLemon ROMs, check golden hashes
+zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
 ```

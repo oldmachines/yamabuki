@@ -26,6 +26,10 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build test -Doptimize=${{ matrix.optimize }}
+      # Deterministic fuzz: random PPU/bus traffic + the save/load roundtrip
+      # invariant. Debug only — that's where the safety checks are armed.
+      - if: matrix.optimize == 'Debug'
+        run: zig build fuzz
 
   sst:
     runs-on: ubuntu-latest

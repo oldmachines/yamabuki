@@ -591,8 +591,10 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
         var screen: u16 = 0;
         if (tile_col & 0x20 != 0) screen += 1;
         if (tile_row & 0x20 != 0) screen += if (width_tiles == 64) 2 else 1;
-        const map_addr = (layer.map_base + screen * 0x400 +
-            ((tile_row & 0x1F) << 5) + (tile_col & 0x1F)) & 0x7FFF;
+        // Wrapping: map_base tops out at $FC00 and the fourth screen adds
+        // $C00 more; the & 0x7FFF wrap makes the u16 overflow congruent.
+        const map_addr = (layer.map_base +% screen * 0x400 +%
+            ((tile_row & 0x1F) << 5) +% (tile_col & 0x1F)) & 0x7FFF;
         const entry = ppu.vram[map_addr];
 
         var tile_num: u16 = entry & 0x3FF;
@@ -811,7 +813,9 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         const fine_y = sy & 7;
 
         const cols: u16 = w >> 3;
-        const tbase: u16 = ppu.obj_char_base + (if (name_hi != 0) ppu.obj_char_gap else 0);
+        // Wrapping: base 7*$2000 + gap 4*$1000 exceeds u16; VRAM addressing
+        // wraps anyway (decodePlanar masks to the 32K-word space).
+        const tbase: u16 = ppu.obj_char_base +% (if (name_hi != 0) ppu.obj_char_gap else 0);
 
         var col: u16 = 0;
         var overflow = false;
