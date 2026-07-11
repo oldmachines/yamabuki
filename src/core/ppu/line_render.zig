@@ -73,8 +73,11 @@ const order_2bg = [_]Entry{
 };
 // Mode 6: BG1 only, interleaved with the OBJ priorities.
 const order_mode6 = [_]Entry{ obj(3), bg(0, 1), obj(2), obj(1), bg(0, 0), obj(0) };
-// Mode 7: a single BG1 plane below all sprites (no per-tile priority; EXTBG later).
+// Mode 7: a single BG1 plane below all sprites (no per-tile priority).
 const order_mode7 = [_]Entry{ obj(3), obj(2), obj(1), obj(0), bg(0, 0) };
+// Mode 7 with EXTBG: BG2 shows the same plane with the pixel's bit7 as its
+// priority — high-priority BG2 pixels rise above OBJ2, the rest sink below BG1.
+const order_mode7_extbg = [_]Entry{ obj(3), bg(1, 1), obj(2), obj(1), bg(0, 0), obj(0), bg(1, 0) };
 
 /// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
 /// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
@@ -98,6 +101,8 @@ const ModeDesc = struct {
     layers: []const LayerDesc = &.{},
     order: []const Entry = &.{},
     order_bg3_front: ?[]const Entry = null,
+    /// Mode 7's alternate order when EXTBG (SETINI bit6) adds the BG2 plane.
+    order_extbg: ?[]const Entry = null,
     kind: Kind = .planar,
     opt: OptMode = .none,
     /// Modes 5/6: BG tiles are 16 pixels wide and the layer plane is 512 wide;
@@ -167,8 +172,9 @@ const mode_table = [8]ModeDesc{
         .opt = .hv,
         .hires = true,
     },
-    .{ // mode 7: single affine BG1 (see fillMode7).
+    .{ // mode 7: single affine BG1 (see fillMode7); EXTBG adds the BG2 plane.
         .order = &order_mode7,
+        .order_extbg = &order_mode7_extbg,
         .kind = .affine,
     },
 };
@@ -223,7 +229,7 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
 /// Decode a mode's BG layers and the OBJ layer into the line buffers.
 fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width_max]Cell, objbuf: *[fb_width]Cell) void {
     if (md.kind == .affine) {
-        fillMode7(ppu, line, &bgbuf[0]);
+        fillMode7(ppu, line, bgbuf);
     } else {
         inline for (md.layers) |ld| {
             fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, md.hires, line, &bgbuf[ld.bg]);
@@ -232,8 +238,12 @@ fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width_
     fillObj(ppu, line, objbuf);
 }
 
-/// The mode's priority order, honoring the mode-1 BG3-priority alternate.
+/// The mode's priority order, honoring the mode-1 BG3-priority alternate and
+/// mode 7's EXTBG alternate.
 inline fn selectOrder(ppu: *const Ppu, comptime md: ModeDesc) []const Entry {
+    if (md.order_extbg) |ext| {
+        if (ppu.setini & 0x40 != 0) return ext;
+    }
     return if (md.order_bg3_front) |alt|
         (if (ppu.bg3_priority) alt else md.order)
     else
@@ -620,9 +630,15 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 /// scroll (M7HOFS,M7VOFS) to a texel in the 1024x1024 (128-tile) field, whose
 /// tilemap and 8bpp character data are byte-interleaved in VRAM (tilemap = low
 /// bytes, char = high bytes). M7SEL selects screen flip and out-of-area handling.
-fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width_max]Cell) void {
-    if ((ppu.main_screen | ppu.sub_screen) & 0x01 == 0) {
-        clearLine(buf); // BG1 disabled on both screens
+/// With EXTBG (SETINI bit6) the same plane also feeds BG2: the pixel's low 7
+/// bits are its color and bit7 its priority.
+fn fillMode7(ppu: *Ppu, line: u32, bgbuf: *[4][fb_width_max]Cell) void {
+    const buf = &bgbuf[0];
+    const extbg = ppu.setini & 0x40 != 0;
+    const enable_mask: u8 = if (extbg) 0x03 else 0x01;
+    if ((ppu.main_screen | ppu.sub_screen) & enable_mask == 0) {
+        clearLine(buf); // the mode-7 layers are disabled on both screens
+        if (extbg) clearLine(&bgbuf[1]);
         return;
     }
 
@@ -652,16 +668,14 @@ fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width_max]Cell) void {
         var ty = ((oy + c * sx) >> 8) + cy;
 
         var force_tile0 = false;
+        var transparent = false;
         if (tx < 0 or tx > 1023 or ty < 0 or ty > 1023) {
             switch (over) {
                 0, 1 => { // wrap the field
                     tx &= 1023;
                     ty &= 1023;
                 },
-                2 => { // outside is transparent
-                    buf[x] = .{};
-                    continue;
-                },
+                2 => transparent = true, // outside is transparent
                 3 => { // outside repeats character 0
                     tx &= 1023;
                     ty &= 1023;
@@ -670,11 +684,21 @@ fn fillMode7(ppu: *Ppu, line: u32, buf: *[fb_width_max]Cell) void {
             }
         }
 
-        const utx: u16 = @intCast(tx);
-        const uty: u16 = @intCast(ty);
-        const tile: u16 = if (force_tile0) 0 else ppu.vram[(uty >> 3) * 128 + (utx >> 3)] & 0xFF;
-        const pixel: u8 = @intCast(ppu.vram[tile * 64 + (uty & 7) * 8 + (utx & 7)] >> 8);
+        var pixel: u8 = 0;
+        if (!transparent) {
+            const utx: u16 = @intCast(tx);
+            const uty: u16 = @intCast(ty);
+            const tile: u16 = if (force_tile0) 0 else ppu.vram[(uty >> 3) * 128 + (utx >> 3)] & 0xFF;
+            pixel = @intCast(ppu.vram[tile * 64 + (uty & 7) * 8 + (utx & 7)] >> 8);
+        }
         buf[x] = if (pixel == 0) .{} else .{ .abs = pixel, .prio = 0, .solid = true };
+        if (extbg) {
+            const color = pixel & 0x7F;
+            bgbuf[1][x] = if (color == 0)
+                .{}
+            else
+                .{ .abs = color, .prio = @intCast(pixel >> 7), .solid = true };
+        }
     }
 }
 
@@ -1144,6 +1168,34 @@ test "pseudo-hires interleaves the sub and main screens" {
     try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[1]); // odd: main (red)
     try std.testing.expectEqual(@as(u16, 0x07E0), ppu.fb[510]);
     try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[511]);
+}
+
+test "EXTBG shows mode 7 BG2 with the pixel high bit as priority" {
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 7;
+    ppu.main_screen = 0x02; // BG2 only (the EXTBG plane)
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.m7a = 0x0100; // identity
+    ppu.m7d = 0x0100;
+    ppu.writeReg(0x2133, 0x40); // SETINI: EXTBG
+
+    // Texel (0,0) = 0x85: BG2 color 5, priority 1. Texel (2,0) = 0x05: color 5,
+    // priority 0 — still visible here (nothing else on the layer stack).
+    ppu.vram[0] = 0x8500;
+    ppu.vram[2] = 0x0500;
+    ppu.cgram[5] = 0x001F; // red
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]); // prio-1 pixel
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]); // empty texel
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[2]); // prio-0 pixel
+
+    // Without EXTBG, BG2 doesn't exist in mode 7: the line is backdrop.
+    ppu.writeReg(0x2133, 0x00);
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[0]);
 }
 
 test "mode 5 renders a 16-wide hi-res tile across sub/main half-dots" {
