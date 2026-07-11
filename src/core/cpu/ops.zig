@@ -1048,13 +1048,22 @@ pub fn dispatch(cpu: anytype, comptime m8: bool, comptime x8: bool) void {
 
         // Misc
         0xEA => cpu.idle(), // NOP
-        0x42 => _ = cpu.fetch8(), // WDM
+        // WDM: PC skips the signature byte, but the second cycle is an
+        // internal cycle on hardware (VDA/VPA low), not an operand fetch.
+        0x42 => {
+            cpu.regs.pc +%= 1;
+            cpu.idle();
+        },
         0xCB => { // WAI
+            // Hardware traces (SST) charge the first halted cycle to the
+            // instruction: fetch + 2 internal + 1 halt = 4 cycles.
+            cpu.idle();
             cpu.idle();
             cpu.idle();
             cpu.state = .waiting;
         },
         0xDB => { // STP
+            cpu.idle();
             cpu.idle();
             cpu.idle();
             cpu.state = .stopped;

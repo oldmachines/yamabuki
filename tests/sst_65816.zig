@@ -2,9 +2,10 @@
 //!
 //! Runs the JSON test vectors from https://github.com/SingleStepTests/65816
 //! (fetched into test-data/sst-65816 by tools/fetch_test_data.sh) against
-//! the CPU core on a mock bus. Register/memory accuracy is the pass gate;
-//! cycle-count parity is reported as a separate metric (cycle-position
-//! comparison belongs to the accurate-core milestone).
+//! the CPU core on a mock bus. Register/memory accuracy, cycle-count
+//! parity, and cycle-position parity (read/write/internal kind plus
+//! address/data per cycle, with VDA/VPA deciding what counts as a real
+//! access) are all hard gates.
 //!
 //! Options (see build.zig): -Dsst-filter=<substr>  -Dsst-sample=<n>
 
@@ -13,24 +14,37 @@ const core = @import("snes_core");
 const options = @import("sst_options");
 const Cpu = core.wdc65816.Cpu;
 
+/// One bus cycle as the core executed it, for cycle-position comparison
+/// against the vector traces.
+const BusEvent = struct {
+    kind: enum(u8) { read, write, internal },
+    addr: u24 = 0,
+    data: u8 = 0,
+};
+
 const MockBus = struct {
     mem: []u8, // full 16 MiB address space
     dirty: std.ArrayList(u32),
     cycles: u32,
+    events: std.ArrayList(BusEvent),
 
     pub fn read8(self: *MockBus, addr: u24) u8 {
         self.cycles += 1;
-        return self.mem[addr];
+        const v = self.mem[addr];
+        self.events.appendBounded(.{ .kind = .read, .addr = addr, .data = v }) catch unreachable;
+        return v;
     }
 
     pub fn write8(self: *MockBus, addr: u24, value: u8) void {
         self.cycles += 1;
         self.mem[addr] = value;
         self.dirty.appendBounded(addr) catch unreachable;
+        self.events.appendBounded(.{ .kind = .write, .addr = addr, .data = value }) catch unreachable;
     }
 
     pub fn idle(self: *MockBus) void {
         self.cycles += 1;
+        self.events.appendBounded(.{ .kind = .internal }) catch unreachable;
     }
 
     fn set(self: *MockBus, addr: u32, value: u8) void {
@@ -42,6 +56,7 @@ const MockBus = struct {
         for (self.dirty.items) |addr| self.mem[addr] = 0;
         self.dirty.clearRetainingCapacity();
         self.cycles = 0;
+        self.events.clearRetainingCapacity();
     }
 };
 
@@ -70,7 +85,44 @@ const FileResult = struct {
     cases: u32 = 0,
     failed: u32 = 0,
     cycle_mismatch: u32 = 0,
+    pos_mismatch: u32 = 0,
 };
+
+/// What one vector trace cycle claims happened on the bus. VDA/VPA ('d'/'p'
+/// in the flag string) distinguish a real memory access from an internal
+/// cycle — RWB ('r') stays high during internal cycles, so it can't.
+const VectorCycle = struct {
+    kind: enum(u8) { read, write, internal },
+    addr: u32 = 0,
+    data: u8 = 0,
+};
+
+fn decodeVectorCycle(v: std.json.Value) VectorCycle {
+    const items = v.array.items;
+    const flags = items[2].string;
+    const valid = std.mem.indexOfScalar(u8, flags, 'd') != null or
+        std.mem.indexOfScalar(u8, flags, 'p') != null;
+    if (!valid or items[0] == .null or items[1] == .null)
+        return .{ .kind = .internal };
+    const write = std.mem.indexOfScalar(u8, flags, 'w') != null;
+    return .{
+        .kind = if (write) .write else .read,
+        .addr = @intCast(items[0].integer),
+        .data = @intCast(items[1].integer),
+    };
+}
+
+/// Does the executed event sequence match the vector trace cycle-for-cycle?
+/// (kind for every cycle; address+data for real accesses.)
+fn cyclePositionsMatch(events: []const BusEvent, cycles: []std.json.Value) bool {
+    if (events.len != cycles.len) return false;
+    for (events, cycles) |ev, vc_raw| {
+        const vc = decodeVectorCycle(vc_raw);
+        if (@intFromEnum(ev.kind) != @intFromEnum(vc.kind)) return false;
+        if (vc.kind != .internal and (ev.addr != vc.addr or ev.data != vc.data)) return false;
+    }
+    return true;
+}
 
 fn loadRegs(cpu: anytype, s: *const SstState) void {
     cpu.regs = .{
@@ -171,10 +223,14 @@ fn runFile(
                 }
                 try out.flush();
             }
-        } else if (opcode != 0x44 and opcode != 0x54 and bus.cycles != case.cycles.len) {
+        } else if (opcode != 0x44 and opcode != 0x54) {
             // Block-move traces are truncated by SST; the harness runs whole
-            // iterations so its cycle count intentionally differs.
-            result.cycle_mismatch += 1;
+            // iterations so its cycle accounting intentionally differs.
+            if (bus.cycles != case.cycles.len) {
+                result.cycle_mismatch += 1;
+            } else if (!cyclePositionsMatch(bus.events.items, case.cycles)) {
+                result.pos_mismatch += 1;
+            }
         }
     }
     return result;
@@ -192,6 +248,7 @@ pub fn main(init: std.process.Init) !void {
         .mem = try gpa.alloc(u8, 1 << 24),
         .dirty = try .initCapacity(gpa, 4096),
         .cycles = 0,
+        .events = try .initCapacity(gpa, 4096),
     };
     @memset(bus.mem, 0);
     var cpu = Cpu(MockBus).init(&bus);
@@ -233,7 +290,9 @@ pub fn main(init: std.process.Init) !void {
         total.cases += r.cases;
         total.failed += r.failed;
         total.cycle_mismatch += r.cycle_mismatch;
-        if (r.failed > 0) try failing_files.append(gpa, name);
+        total.pos_mismatch += r.pos_mismatch;
+        if (r.failed > 0 or r.cycle_mismatch > 0) try failing_files.append(gpa, name);
+        if (r.pos_mismatch > 0) try out.print("POS-FILE {s}: {}\n", .{ name, r.pos_mismatch });
     }
 
     if (failing_files.items.len > 0) {
@@ -244,9 +303,9 @@ pub fn main(init: std.process.Init) !void {
     const files_with_failures: u32 = @intCast(failing_files.items.len);
 
     try out.print(
-        "\nsst-65816: {} files, {} cases, {} failed ({} files), {} cycle-count mismatches\n",
-        .{ names.items.len, total.cases, total.failed, files_with_failures, total.cycle_mismatch },
+        "\nsst-65816: {} files, {} cases, {} failed ({} files), {} cycle-count mismatches, {} cycle-position mismatches\n",
+        .{ names.items.len, total.cases, total.failed, files_with_failures, total.cycle_mismatch, total.pos_mismatch },
     );
     try out.flush();
-    if (total.failed > 0) std.process.exit(1);
+    if (total.failed > 0 or total.cycle_mismatch > 0 or total.pos_mismatch > 0) std.process.exit(1);
 }
