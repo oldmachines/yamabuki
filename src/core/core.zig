@@ -25,6 +25,7 @@ pub const ppu = @import("ppu/ppu.zig");
 pub const line_render = @import("ppu/line_render.zig");
 pub const gsu = @import("chips/gsu.zig");
 pub const dsp1 = @import("chips/dsp1.zig");
+pub const sa1 = @import("chips/sa1.zig");
 pub const console = @import("console.zig");
 
 pub const Cartridge = cartridge.Cartridge;
