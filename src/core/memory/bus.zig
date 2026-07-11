@@ -16,6 +16,7 @@ const Dma = @import("dma.zig").Dma;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Apu = @import("../apu/apu.zig").Apu;
 const Gsu = @import("../chips/gsu.zig").Gsu;
+const Dsp1 = @import("../chips/dsp1.zig").Dsp1;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -66,6 +67,8 @@ pub const Bus = struct {
     /// Super FX coprocessor; inert (never caught up or addressed) unless the
     /// cartridge chip is `.superfx`.
     gsu: Gsu,
+    /// DSP-1 math coprocessor (HLE); inert unless the cartridge chip is `.dsp`.
+    dsp1: Dsp1,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`, and the APU's SPC700 points back at
@@ -88,6 +91,7 @@ pub const Bus = struct {
         self.dma = .init;
         self.apu.init();
         self.gsu = .init;
+        self.dsp1 = .init;
         self.attachGsu();
         self.remap();
     }
@@ -114,6 +118,29 @@ pub const Bus = struct {
                 @field(self, f.name).postLoad();
             }
         }
+    }
+
+    /// DSP-1 port decode: null when `addr` is not a DSP port, else true for
+    /// SR (status), false for DR (data). Follows the board wirings: LoROM
+    /// carts up to 1 MiB decode banks $30-$3F/$B0-$BF upper half (DR below
+    /// $C000, SR above), larger LoROM boards use banks $60-$6F/$E0-$EF lower
+    /// half (DR below $4000, SR above), and HiROM uses $6000-$7FFF of banks
+    /// $00-$1F/$80-$9F (DR below $7000, SR above).
+    fn dsp1Port(self: *const Bus, bank: u8, a16: u16) ?bool {
+        if (self.cart.chip != .dsp) return null;
+        const b = bank & 0x7F;
+        switch (self.cart.header.mapping) {
+            .lorom => if (self.cart.rom.len <= 0x10_0000) {
+                if (b >= 0x30 and b <= 0x3F and a16 >= 0x8000)
+                    return a16 >= 0xC000;
+            } else {
+                if (b >= 0x60 and b <= 0x6F and a16 < 0x8000)
+                    return a16 >= 0x4000;
+            },
+            .hirom, .exhirom => if (b <= 0x1F and a16 >= 0x6000 and a16 < 0x8000)
+                return a16 >= 0x7000,
+        }
+        return null;
     }
 
     /// Accurate core: render the current scanline up to the pixel the beam
@@ -158,8 +185,13 @@ pub const Bus = struct {
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
 
-        // MMIO exists only in the system area (banks $00-$3F / $80-$BF).
+        // MMIO exists only in the system area (banks $00-$3F / $80-$BF),
+        // except the large-LoROM DSP-1 ports in banks $60-$6F.
         if (!isSystemBank(bank)) {
+            if (self.dsp1Port(bank, a16)) |sr| {
+                self.mdr = if (sr) self.dsp1.readStatus() else self.dsp1.readData();
+                return self.mdr;
+            }
             if (mappers.smallSramPtr(self, addr)) |p| {
                 self.mdr = p.*;
                 return self.mdr;
@@ -196,6 +228,10 @@ pub const Bus = struct {
             0x4218...0x421F => self.joy.readAuto(@truncate(a16 & 7)),
             0x4300...0x437F => self.dma.readReg(a16),
             else => {
+                if (self.dsp1Port(bank, a16)) |sr| {
+                    self.mdr = if (sr) self.dsp1.readStatus() else self.dsp1.readData();
+                    return self.mdr;
+                }
                 if (mappers.smallSramPtr(self, addr)) |p| {
                     self.mdr = p.*;
                     return self.mdr;
@@ -214,6 +250,10 @@ pub const Bus = struct {
         const a16: u16 = @truncate(addr);
 
         if (!isSystemBank(bank)) {
+            if (self.dsp1Port(bank, a16)) |sr| {
+                if (!sr) self.dsp1.writeData(value);
+                return;
+            }
             if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
             return;
         }
@@ -253,6 +293,10 @@ pub const Bus = struct {
                 }
             },
             else => {
+                if (self.dsp1Port(bank, a16)) |sr| {
+                    if (!sr) self.dsp1.writeData(value);
+                    return;
+                }
                 if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
             },
         }
@@ -295,6 +339,10 @@ const TestConsole = struct {
     bus: Bus,
 
     fn create(mapping_mode: u8, sram_log2kb: u8) !*TestConsole {
+        return createChip(mapping_mode, sram_log2kb, 0x02);
+    }
+
+    fn createChip(mapping_mode: u8, sram_log2kb: u8, chipset: u8) !*TestConsole {
         const alloc = std.testing.allocator;
         const raw = try alloc.alloc(u8, 512 * 1024);
         defer alloc.free(raw);
@@ -303,6 +351,7 @@ const TestConsole = struct {
         const h = raw[hoff..][0..64];
         @memcpy(h[0..21], "BUS TEST             ");
         h[0x15] = mapping_mode;
+        h[0x16] = chipset;
         h[0x17] = 9;
         h[0x18] = sram_log2kb;
         std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
@@ -459,6 +508,37 @@ test "dma a-bus cannot touch dma registers or retrigger itself" {
     tc.bus.write8(0x00_4305, 4);
     tc.bus.write8(0x00_420B, 0x01);
     try std.testing.expectEqual(@as(u8, 0x88), tc.bus.dma.channels[0].control);
+}
+
+test "dsp1 ports on a lorom dsp cart" {
+    var tc = try TestConsole.createChip(0x20, 1, 0x03);
+    defer tc.destroy();
+    // SR is always ready; the DR with no pending output reads $80 too.
+    try std.testing.expectEqual(@as(u8, 0x80), tc.bus.read8(0x30_C000));
+    try std.testing.expectEqual(@as(u8, 0x80), tc.bus.read8(0x3F_FFFF));
+    // Multiply command through the data port: 0.5 * 0.25 = $1000.
+    tc.bus.write8(0x30_8000, 0x00);
+    tc.bus.write8(0x30_8000, 0x00);
+    tc.bus.write8(0x30_8000, 0x40);
+    tc.bus.write8(0xB5_9123, 0x00); // mirror bank decodes the same port
+    tc.bus.write8(0x30_8000, 0x20);
+    try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x30_8000));
+    try std.testing.expectEqual(@as(u8, 0x10), tc.bus.read8(0x30_8000));
+    // Non-DSP banks still read ROM.
+    try std.testing.expectEqual(tc.cart.rom[0], tc.bus.read8(0x00_8000));
+}
+
+test "dsp1 ports on a hirom dsp cart" {
+    var tc = try TestConsole.createChip(0x21, 0, 0x03);
+    defer tc.destroy();
+    try std.testing.expectEqual(@as(u8, 0x80), tc.bus.read8(0x00_7000));
+    tc.bus.write8(0x00_6000, 0x00);
+    tc.bus.write8(0x00_6000, 0x00);
+    tc.bus.write8(0x00_6000, 0x40);
+    tc.bus.write8(0x85_6ABC, 0x00); // mirror bank
+    tc.bus.write8(0x00_6000, 0x20);
+    try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_6000));
+    try std.testing.expectEqual(@as(u8, 0x10), tc.bus.read8(0x00_6000));
 }
 
 test "bus state serialize roundtrip rebuilds pages" {
