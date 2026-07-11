@@ -72,6 +72,10 @@ and the SPC700 CPU-test ROMs run end-to-end on the audio CPU through an HLE
 boot handshake. An opt-in accurate core (`--accurate`, or the
 `yamabuki_accuracy` libretro option) renders piecewise at the beam position,
 so mid-scanline register writes split the line the way hardware does.
+Super FX (GSU) cartridges work: the full RISC instruction set with the
+hardware's prefetch pipeline, code cache, and PLOT bitplane pipeline, locked
+against all 31 krom GSUTest opcode screens and 27 plot demos (which match
+krom's reference captures pixel-for-pixel).
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -86,5 +90,5 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
 | M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
-| M9 enhancement chips (DSP-1, SA-1, Super FX, Cx4) | planned |
+| M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | in progress (Super FX done: 58 golden ROMs, both cores) |
 | M10 ARM performance tuning | planned |
