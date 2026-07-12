@@ -76,9 +76,19 @@ cmake -S "${src}/SPIRV-Cross" -B "${out}/build-spirv-cross" "${CM_ARGS[@]}" \
     -DSPIRV_CROSS_ENABLE_TESTS=OFF -DSPIRV_CROSS_CLI=ON
 cmake --build "${out}/build-spirv-cross" --parallel
 
-find "${out}/build-glslang" -name 'glslang' -o -name 'glslangValidator' -type f \
-    | head -1 | xargs -I{} cp {} "${out}/bin/glslang"
-cp "${out}/build-spirv-cross/spirv-cross" "${out}/bin/spirv-cross"
+# The parentheses matter: `-o` binds looser than the implicit `-a`, so
+# `-name a -o -name b -type f` means "(named a) OR (named b AND is a file)" —
+# which happily matches the glslang *directory* in the build tree.
+glslang_bin="$(find "${out}/build-glslang" -type f \
+    \( -name 'glslang' -o -name 'glslangValidator' \) -print -quit)"
+[ -n "${glslang_bin}" ] || { echo "glslang binary not found under ${out}/build-glslang" >&2; exit 1; }
+cp "${glslang_bin}" "${out}/bin/glslang"
+
+spirv_bin="$(find "${out}/build-spirv-cross" -type f -name 'spirv-cross' -print -quit)"
+[ -n "${spirv_bin}" ] || { echo "spirv-cross binary not found under ${out}/build-spirv-cross" >&2; exit 1; }
+cp "${spirv_bin}" "${out}/bin/spirv-cross"
+
+chmod +x "${out}/bin/glslang" "${out}/bin/spirv-cross"
 
 echo "shader tools built:"
 "${out}/bin/glslang" --version | head -1
