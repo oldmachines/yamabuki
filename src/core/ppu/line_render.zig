@@ -605,6 +605,13 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     const base_sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
     const base_tile_row = base_sy / tile_ph;
 
+    // Scanline-local tile-row decode cache: consecutive pixels almost always
+    // share a tile row (and repeated tiles recur across the line), so decode a
+    // row only when its char-data address changes. The sentinel is an
+    // impossible 17-bit value so the first pixel always misses.
+    var cached_addr: u32 = 0x1_0000;
+    var cached_row: [8]u8 = undefined;
+
     const out_w = if (hires) fb_width_max else fb_width;
     for (0..out_w) |x| {
         const xi: u32 = @intCast(x);
@@ -658,7 +665,12 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
             py &= 7;
         }
 
-        const color = decodePlanar(ppu, bpp, layer.char_base +% tile_num *% words_per_tile +% py, @intCast(px));
+        const char_row = layer.char_base +% tile_num *% words_per_tile +% py;
+        if (char_row != cached_addr) {
+            cached_row = decodeRow(ppu, bpp, char_row);
+            cached_addr = char_row;
+        }
+        const color = cached_row[@as(u3, @intCast(px))];
         // 8bpp backgrounds index all 256 CGRAM entries directly; the tilemap's
         // palette-group bits are ignored. Lower depths select a sub-palette.
         const abs: u16 = if (bpp == 8) cgram_base + color else cgram_base + pal_group * pal_size + color;
@@ -905,10 +917,54 @@ inline fn decodePlanar(ppu: *Ppu, comptime bpp: u4, char_addr: u16, px: u3) u8 {
     return color;
 }
 
+/// Decode a whole 8-pixel tile row at once: read each planar word a single
+/// time and scatter its bits across all eight pixels. This is bit-identical
+/// to calling `decodePlanar(char_addr, px)` for px 0..7, but reads `bpp/2`
+/// VRAM words per row instead of per pixel (8x fewer fetches for 8bpp) — the
+/// win that matters most on cache-poor ARM. `fillBg` memoizes the result by
+/// `char_addr` so a run of same-tile pixels decodes once.
+inline fn decodeRow(ppu: *Ppu, comptime bpp: u4, char_addr: u16) [8]u8 {
+    var row: [8]u8 = .{0} ** 8;
+    inline for (0..bpp / 2) |pair| {
+        const w = ppu.vram[(char_addr +% pair * 8) & 0x7FFF];
+        inline for (0..8) |px| {
+            const bit: u4 = @intCast(7 - px);
+            const lo: u8 = @intCast((w >> bit) & 1);
+            const hi: u8 = @intCast((w >> (@as(u4, 8) + bit)) & 1);
+            row[px] |= lo << @intCast(pair * 2);
+            row[px] |= hi << @intCast(pair * 2 + 1);
+        }
+    }
+    return row;
+}
+
 // --- tests ---------------------------------------------------------------
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "decodeRow matches per-pixel decodePlanar for every bit depth" {
+    // The tile-row cache in fillBg relies on decodeRow producing exactly what
+    // eight decodePlanar calls would. Cross-check over pseudo-random VRAM so a
+    // divergence (bit order, plane pairing) is caught without a golden ROM.
+    var ppu: Ppu = .init;
+    var seed: u32 = 0x1234_5678;
+    for (&ppu.vram) |*w| {
+        seed = seed *% 1664525 +% 1013904223;
+        w.* = @truncate(seed >> 8);
+    }
+    inline for (.{ 2, 4, 8 }) |bpp| {
+        for ([_]u16{ 0, 0x100, 0x2000, 0x7FF8, 0x8000 }) |addr| {
+            const row = decodeRow(&ppu, bpp, addr);
+            for (0..8) |px| {
+                try std.testing.expectEqual(
+                    decodePlanar(&ppu, bpp, addr, @intCast(px)),
+                    row[px],
+                );
+            }
+        }
+    }
 }
 
 test "mode 0 renders a single BG1 tile pixel" {

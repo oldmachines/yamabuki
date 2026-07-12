@@ -84,7 +84,11 @@ the Super MMC, BW-RAM projections, DMA with character conversion, and the
 arithmetic unit. The Cx4 (Mega Man X2/X3) is emulated at the command level:
 the wireframe transform/rasterizer, sprite scale/rotate, OAM builder, and the
 scalar math commands, driven synchronously through its $6000-$7FFF register
-window — completing M9's enhancement-chip set.
+window — completing M9's enhancement-chip set. Performance work (M10) is
+underway: the fast renderer now decodes each BG tile row in a single pass and
+caches it by char-data address, so a run of same-tile pixels reuses one decode
+instead of re-reading every plane word per pixel — bit-identical output, with
+noticeably less VRAM traffic on the decode-bound 8bpp backgrounds.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -100,4 +104,4 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
 | M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math — all unit-test gated) |
-| M10 ARM performance tuning | planned |
+| M10 ARM performance tuning | in progress (tile-row decode cache: single-pass BG decode memoized by char address, bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs; musl packaging + bench gate next) |
