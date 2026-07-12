@@ -350,6 +350,41 @@ pub const Chain = struct {
         api.glTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, @intCast(w), @intCast(h), gl.RGB, gl.UNSIGNED_SHORT_5_6_5, fb.ptr);
     }
 
+    /// Read the shader's own output back off the GPU as 24-bit RGB.
+    ///
+    /// This is the *rendered* picture — scanlines, mask, curvature and all — not
+    /// the console's framebuffer, which is what the headless `--ppm` already
+    /// dumps. Only the letterboxed rectangle is read, so the black bars never
+    /// end up in the shot.
+    ///
+    /// Call it after `render` and before the swap: the back buffer still holds
+    /// the frame. GL's origin is bottom-left, so the rows come back upside down
+    /// and are flipped here.
+    pub fn capture(self: *Chain, gpa: std.mem.Allocator, window: Size) !struct { w: u32, h: u32, rgb: []u8 } {
+        const api = self.api;
+        const box = letterbox(window, self.source_size);
+
+        const rgba = try gpa.alloc(u8, @as(usize, box.w) * @as(usize, box.h) * 4);
+        defer gpa.free(rgba);
+
+        api.glFinish();
+        api.glPixelStorei(gl.PACK_ALIGNMENT, 1);
+        api.glReadPixels(box.x, box.y, @intCast(box.w), @intCast(box.h), gl.RGBA, gl.UNSIGNED_BYTE, rgba.ptr);
+
+        const rgb = try gpa.alloc(u8, @as(usize, box.w) * @as(usize, box.h) * 3);
+        for (0..box.h) |y| {
+            const src_row = box.h - 1 - y; // flip: GL reads bottom-up
+            for (0..box.w) |x| {
+                const s = (src_row * box.w + x) * 4;
+                const d = (y * box.w + x) * 3;
+                rgb[d + 0] = rgba[s + 0];
+                rgb[d + 1] = rgba[s + 1];
+                rgb[d + 2] = rgba[s + 2];
+            }
+        }
+        return .{ .w = box.w, .h = box.h, .rgb = rgb };
+    }
+
     /// The letterboxed on-screen rectangle: the SNES 8:7 shape fitted into the
     /// window, matching the software path's logical presentation exactly.
     pub fn letterbox(window: Size, frame: Size) struct { x: i32, y: i32, w: u32, h: u32 } {
@@ -412,17 +447,27 @@ pub const Chain = struct {
                 api.glViewport(0, 0, @intCast(out_size.w), @intCast(out_size.h));
             }
 
+            // `mipmap_input` says THIS pass samples its *input* with mipmaps, so
+            // the chain has to exist on the source texture before the draw — not
+            // on this pass's output afterwards. Getting that backwards leaves the
+            // source with a mipmap MIN_FILTER and no mipmap levels, which makes it
+            // an *incomplete* texture; GL samples incomplete textures as black,
+            // and the black propagates all the way down the chain. That is
+            // exactly how crt-royale and crt-guest-advanced rendered a pure black
+            // frame while every mipmap-free preset was fine.
+            if (pass.mipmap and self.gles_major >= 3) {
+                api.glActiveTexture(gl.TEXTURE0);
+                api.glBindTexture(gl.TEXTURE_2D, src_tex);
+                api.glGenerateMipmap(gl.TEXTURE_2D);
+            }
+
             const prog = &self.programs[i];
             api.glUseProgram(prog.id);
             self.bindTextures(pass, prog, src_tex, i);
-            self.uploadUniforms(pass, prog, src_size, out_size, view);
+            self.uploadUniforms(pass, prog, src_size, out_size, view, is_last);
             self.drawQuad(prog);
 
             if (!is_last) {
-                if (pass.mipmap and self.gles_major >= 3) {
-                    api.glBindTexture(gl.TEXTURE_2D, self.targets[i].read());
-                    api.glGenerateMipmap(gl.TEXTURE_2D);
-                }
                 src_tex = self.targets[i].read();
                 src_size = self.targets[i].size;
             }
@@ -468,7 +513,12 @@ pub const Chain = struct {
             // mipmap chain. Re-applying the pass's filter here would silently
             // knock a mipmapped mask back to a single level.
             if (t.kind != .lut) {
-                api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMode(t.filter, pass.mipmap and self.gles_major >= 3));
+                // `mipmap_input` applies to this pass's Source alone. Handing a
+                // mipmap MIN_FILTER to Original, a pass alias or a feedback
+                // target — none of which have a mipmap chain — would make *them*
+                // incomplete, and sample black.
+                const mipped = pass.mipmap and t.kind == .source and self.gles_major >= 3;
+                api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMode(t.filter, mipped));
                 api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filterMode(t.filter, false));
                 api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.wrapMode(t.wrap, self.gles_major));
                 api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.wrapMode(t.wrap, self.gles_major));
@@ -486,6 +536,25 @@ pub const Chain = struct {
         -1, -1, -1, 1,
     };
 
+    /// The same, with Y negated — used by the final pass only.
+    ///
+    /// GL's framebuffer origin is bottom-left, so the console's *top* row (which
+    /// is texel row 0) lands at the *bottom* of whatever is being drawn into.
+    /// Every intermediate pass is self-consistent about that: it renders an FBO
+    /// upside-down and the next pass samples it upside-down, and the two cancel.
+    /// The default framebuffer is where the convention finally has to be paid,
+    /// so exactly one flip belongs here — at the last pass, and nowhere else.
+    ///
+    /// Flipping the geometry rather than the texcoords also leaves `vTexCoord`
+    /// with (0,0) at the top-left, which is what slang shaders assume when they
+    /// use it for curvature and vignetting.
+    const mvp_flip_y: [16]f32 = .{
+        2,  0,  0,  0,
+        0,  -2, 0,  0,
+        0,  0,  2,  0,
+        -1, 1,  -1, 1,
+    };
+
     /// The value of one semantic, in the shape the shader declared it.
     const Value = union(preset.UType) {
         mat4: [16]f32,
@@ -496,9 +565,9 @@ pub const Chain = struct {
         uint: u32,
     };
 
-    fn valueOf(self: *const Chain, u: preset.Uniform, src: Size, out: Size, view: Size) Value {
+    fn valueOf(self: *const Chain, u: preset.Uniform, src: Size, out: Size, view: Size, is_last: bool) Value {
         return switch (u.semantic) {
-            .mvp => .{ .mat4 = mvp },
+            .mvp => .{ .mat4 = if (is_last) mvp_flip_y else mvp },
             .source_size => .{ .vec4 = sizeVec(src) },
             .original_size => .{ .vec4 = sizeVec(self.source_size) },
             .output_size => .{ .vec4 = sizeVec(out) },
@@ -513,7 +582,7 @@ pub const Chain = struct {
         };
     }
 
-    fn uploadUniforms(self: *Chain, pass: *const Pass, prog: *const Program, src: Size, out: Size, view: Size) void {
+    fn uploadUniforms(self: *Chain, pass: *const Pass, prog: *const Program, src: Size, out: Size, view: Size, is_last: bool) void {
         const api = self.api;
 
         // std140 path (GLES3 / desktop): pack the block once, upload once.
@@ -522,7 +591,7 @@ pub const Chain = struct {
         if (use_block) @memset(block[0..pass.ubo_size], 0);
 
         for (pass.uniforms[0..pass.uniform_count], 0..) |u, i| {
-            const v = self.valueOf(u, src, out, view);
+            const v = self.valueOf(u, src, out, view, is_last);
             if (use_block and u.block == .ubo) {
                 writeBytes(block[0..pass.ubo_size], u.offset, switch (v) {
                     inline else => |*payload| std.mem.asBytes(payload),
@@ -735,7 +804,7 @@ test "frame_count is a uint, not a float — the std140 slot holds the integer" 
     chain.source_size = .{ .w = 256, .h = 224 };
     const one: Size = .{ .w = 1, .h = 1 };
 
-    const v = chain.valueOf(.{ .block = .ubo, .offset = 0, .semantic = .frame_count }, one, one, one);
+    const v = chain.valueOf(.{ .block = .ubo, .offset = 0, .semantic = .frame_count }, one, one, one, false);
     try testing.expectEqual(@as(u32, 1234), v.uint);
 
     var buf: [16]u8 = @splat(0);
@@ -765,6 +834,39 @@ test "feedback reads last frame's texture, and a plain pass reads this frame's" 
     try testing.expectEqual(@as(gl.Uint, 10), single.readPrev());
 }
 
+test "only the final pass flips Y — intermediate passes must not" {
+    // The bug this pins: every pass used the same MVP, so the console's top row
+    // (texel row 0) landed at the bottom of the default framebuffer and the
+    // whole picture rendered UPSIDE DOWN. It shipped, because the only test
+    // image was radially symmetric and no unit test looks at a screen.
+    //
+    // GL's origin is bottom-left. Intermediate passes render an FBO inverted and
+    // the next pass samples it inverted, so they cancel; the convention is paid
+    // exactly once, at the last pass. Flip anywhere else and it un-fixes itself.
+    var chain: Chain = undefined;
+    chain.source_size = .{ .w = 256, .h = 224 };
+    const one: Size = .{ .w = 1, .h = 1 };
+    const u: preset.Uniform = .{ .block = .ubo, .offset = 0, .semantic = .mvp };
+
+    const intermediate = chain.valueOf(u, one, one, one, false).mat4;
+    const final = chain.valueOf(u, one, one, one, true).mat4;
+
+    // m[5] is the Y scale; m[13] the Y translation.
+    try testing.expectEqual(@as(f32, 2), intermediate[5]);
+    try testing.expectEqual(@as(f32, -1), intermediate[13]);
+    try testing.expectEqual(@as(f32, -2), final[5]);
+    try testing.expectEqual(@as(f32, 1), final[13]);
+
+    // Both map the unit quad onto the full clip volume in Y — one upright, one
+    // inverted. y=0 and y=1 must land on -1 and +1 in some order, never inside.
+    for ([_][16]f32{ intermediate, final }) |m| {
+        const y_at_0 = m[13]; // y = 0
+        const y_at_1 = m[5] + m[13]; // y = 1
+        try testing.expectEqual(@as(f32, 0), y_at_0 + y_at_1); // symmetric about 0
+        try testing.expectEqual(@as(f32, 1), @abs(y_at_0));
+    }
+}
+
 test "a parameter resolves through its index to the live value" {
     var chain: Chain = undefined;
     chain.source_size = .{ .w = 256, .h = 224 };
@@ -775,6 +877,7 @@ test "a parameter resolves through its index to the live value" {
         one,
         one,
         one,
+        false,
     );
     try testing.expectEqual(@as(f32, 0.75), v.float);
 }

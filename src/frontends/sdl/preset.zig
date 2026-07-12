@@ -41,9 +41,17 @@
 const std = @import("std");
 
 pub const max_passes = 16;
-pub const max_uniforms = 48;
+pub const max_uniforms = 192;
 pub const max_textures = 12;
-pub const max_params = 64;
+// crt-guest-advanced alone declares 148 `#pragma parameter`s, and a pass can
+// reference nearly all of them plus the size semantics. The baker asserts
+// against these same numbers, so a shader that would overflow them fails on the
+// build host rather than at load on someone's handheld.
+//
+// These bounds make a Preset ~280 KiB, which is why Chain is never a local: it
+// lives in the heap-allocated GlVideo (see the frontend), and cycling
+// double-buffers between two slots rather than building one on the stack.
+pub const max_params = 192;
 pub const max_luts = 8;
 pub const max_name = 64;
 

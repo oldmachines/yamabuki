@@ -40,12 +40,21 @@ const GlVideo = struct {
     ctx: *sdl3.GlContext,
     api: gl.Api,
     gles_major: u32,
-    chain: shader.Chain,
+    /// Two chain slots. A Preset is ~280 KiB (crt-guest-advanced declares 148
+    /// parameters), so a Chain is far too big to sit on the stack — building the
+    /// replacement in the spare slot means cycling costs no allocation and no
+    /// 280 KiB stack frame, and the incumbent survives a preset that fails.
+    chains: [2]shader.Chain,
+    active: u1,
     /// The baked profile directory the ladder resolved to, e.g. `shaders/essl300`.
     profile_dir: []const u8,
     /// Every preset in that directory, sorted — the cycle order.
     names: [][]const u8,
     index: usize,
+
+    fn chain(self: *GlVideo) *shader.Chain {
+        return &self.chains[self.active];
+    }
 };
 
 /// Context attempts, best first. Each maps to a directory of baked GLSL: a
@@ -86,7 +95,43 @@ const Args = struct {
     accuracy: core.Accuracy = .fast,
     shader: ?[]const u8 = null,
     shader_dir: []const u8 = "shaders",
+    /// `--shot <prefix>`: write `<prefix>-<frame>.ppm` at each frame in
+    /// `shot_frames`. With a shader loaded this captures the *rendered* picture
+    /// off the GPU; without one it dumps the console's framebuffer.
+    shot: ?[]const u8 = null,
+    shot_frames: []const u32 = &.{},
 };
+
+/// Write 24-bit RGB as a binary PPM — the same format the headless runner emits,
+/// so one converter handles both.
+fn writePpm(io: std.Io, path: []const u8, w: u32, h: u32, rgb: []const u8) !void {
+    var header: [64]u8 = undefined;
+    const head = try std.fmt.bufPrint(&header, "P6\n{d} {d}\n255\n", .{ w, h });
+
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(head);
+    try writer.interface.writeAll(rgb);
+    try writer.interface.flush();
+}
+
+/// The console's own framebuffer, RGB565 expanded to RGB888 — what you get when
+/// no shader is loaded. The 5/6-bit channels are bit-replicated into 8 so white
+/// stays white instead of landing on 0xF8.
+fn framebufferRgb(gpa: std.mem.Allocator, fb: []const u16, w: u32, h: u32) ![]u8 {
+    const rgb = try gpa.alloc(u8, @as(usize, w) * @as(usize, h) * 3);
+    for (fb[0 .. @as(usize, w) * @as(usize, h)], 0..) |px, i| {
+        const r5: u8 = @intCast((px >> 11) & 0x1F);
+        const g6: u8 = @intCast((px >> 5) & 0x3F);
+        const b5: u8 = @intCast(px & 0x1F);
+        rgb[i * 3 + 0] = (r5 << 3) | (r5 >> 2);
+        rgb[i * 3 + 1] = (g6 << 2) | (g6 >> 4);
+        rgb[i * 3 + 2] = (b5 << 3) | (b5 >> 2);
+    }
+    return rgb;
+}
 
 const Keymap = struct { code: u32, mask: u16 };
 
@@ -176,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
     // driver, a GLES2-only chip, a preset with no variant for the profile we
     // got — degrades to the software blit with a printed reason. A missing
     // shader must never cost the user the emulator.
-    var glv: ?GlVideo = null;
+    var glv: ?*GlVideo = null;
     if (args.shader) |name| {
         glv = initGl(io, gpa, window, args.shader_dir, name, err) catch |e| blk: {
             try err.print("shader '{s}' unavailable ({s}); falling back to the software renderer\n", .{ name, @errorName(e) });
@@ -184,8 +229,8 @@ pub fn main(init: std.process.Init) !void {
             break :blk null;
         };
     }
-    defer if (glv) |*g| {
-        g.chain.deinit();
+    defer if (glv) |g| {
+        g.chain().deinit();
         _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
     };
 
@@ -268,8 +313,8 @@ pub fn main(init: std.process.Init) !void {
                         },
                         // Walk the presets baked for this GPU's profile. A no-op
                         // on the software path — there is nothing to cycle.
-                        sdl3.scancode.comma => if (glv) |*g| cycleShader(io, gpa, g, -1, err),
-                        sdl3.scancode.period => if (glv) |*g| cycleShader(io, gpa, g, 1, err),
+                        sdl3.scancode.comma => if (glv) |g| cycleShader(io, gpa, g, -1, err),
+                        sdl3.scancode.period => if (glv) |g| cycleShader(io, gpa, g, 1, err),
                         else => {},
                     };
                 },
@@ -287,16 +332,32 @@ pub fn main(init: std.process.Init) !void {
         const width = con.frameWidth();
         const height: u32 = @intCast(fb.len / width);
 
-        if (glv) |*g| {
-            g.chain.upload(fb, width, height);
+        if (glv) |g| {
+            g.chain().upload(fb, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
-            g.chain.render(.{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) }) catch |e| {
+            g.chain().render(.{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) }) catch |e| {
                 try err.print("error: shader render failed: {s}\n", .{@errorName(e)});
                 try err.flush();
                 std.process.exit(1);
             };
+            // Grab the rendered frame *before* the swap, while the back buffer
+            // still holds it.
+            if (args.shot) |prefix| {
+                if (wantsShot(args.shot_frames, frames_run)) {
+                    const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
+                    if (g.chain().capture(gpa, win)) |img| {
+                        const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
+                        writePpm(io, path, img.w, img.h, img.rgb) catch |e| {
+                            try err.print("shot failed: {s}\n", .{@errorName(e)});
+                        };
+                    } else |e| {
+                        try err.print("capture failed: {s}\n", .{@errorName(e)});
+                    }
+                    try err.flush();
+                }
+            }
             _ = g.sdl_gl.SDL_GL_SwapWindow(window);
         } else {
             const r = renderer.?;
@@ -329,6 +390,18 @@ pub fn main(init: std.process.Init) !void {
             _ = sdl.SDL_RenderClear(r);
             _ = sdl.SDL_RenderTexture(r, texture.?, null, null);
             _ = sdl.SDL_RenderPresent(r);
+
+            // No shader: the console's framebuffer *is* the picture.
+            if (args.shot) |prefix| {
+                if (wantsShot(args.shot_frames, frames_run)) {
+                    const rgb = try framebufferRgb(gpa, fb, width, height);
+                    const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
+                    writePpm(io, path, width, height, rgb) catch |e| {
+                        try err.print("shot failed: {s}\n", .{@errorName(e)});
+                        try err.flush();
+                    };
+                }
+            }
         }
 
         // Audio: drain the console ring into the SDL stream.
@@ -366,6 +439,16 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
+/// Is `frame` one of the moments we were asked to capture? An empty list means
+/// "the last frame only", which is what a bare `--shot` with `--frames N` wants.
+fn wantsShot(frames: []const u32, frame: u32) bool {
+    if (frames.len == 0) return false;
+    for (frames) |f| {
+        if (f == frame) return true;
+    }
+    return false;
+}
+
 fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8) !void {
     const data = try std.Io.Dir.cwd().readFile(io, path, buf);
     try con.loadState(data);
@@ -387,7 +470,7 @@ fn initGl(
     shader_root: []const u8,
     name: []const u8,
     err: *std.Io.Writer,
-) !GlVideo {
+) !*GlVideo {
     const sdl_gl = sdl3.loadGl() catch return InitGlError.NoGlSymbols;
 
     for (profiles) |prof| {
@@ -418,23 +501,27 @@ fn initGl(
         const version = api.glGetString(gl.VERSION) orelse "";
         const major = gl.majorVersion(std.mem.span(version));
 
-        var g: GlVideo = .{
+        // Heap, not stack: two Chains is well over half a megabyte, and Windows
+        // hands a thread 1 MiB by default.
+        const g = try gpa.create(GlVideo);
+        g.* = .{
             .sdl_gl = sdl_gl,
             .ctx = ctx,
             .api = api,
             .gles_major = major,
-            .chain = undefined,
+            .chains = undefined,
+            .active = 0,
             .profile_dir = profile_dir,
             .names = names,
             .index = start,
         };
-        buildChain(io, gpa, &g, start, &g.chain, err) catch |e| {
+        buildChain(io, gpa, g, start, g.chain(), err) catch |e| {
             _ = sdl_gl.SDL_GL_DestroyContext(ctx);
             return e;
         };
 
         try err.print("shader: {s} ({s}, {s}) — {} of {} presets, ',' / '.' to cycle\n", .{
-            g.chain.p.name_str(),
+            g.chain().p.name_str(),
             prof.dir,
             std.mem.span(version),
             start + 1,
@@ -519,8 +606,9 @@ fn cycleShader(
     if (g.names.len < 2) return;
     const next = preset.cycle(g.index, delta, g.names.len);
 
-    var fresh: shader.Chain = undefined;
-    buildChain(io, gpa, g, next, &fresh, err) catch |e| {
+    // Build into the spare slot; the incumbent keeps rendering until it works.
+    const spare: u1 = 1 - g.active;
+    buildChain(io, gpa, g, next, &g.chains[spare], err) catch |e| {
         err.print("shader '{s}' did not load ({s}) — staying on '{s}'\n", .{
             g.names[next], @errorName(e), g.names[g.index],
         }) catch {};
@@ -528,17 +616,17 @@ fn cycleShader(
         return;
     };
 
-    g.chain.deinit();
-    g.chain = fresh;
+    g.chain().deinit();
+    g.active = spare;
     g.index = next;
 
     err.print("shader: {s} ({} of {}, {} pass{s}, {s} tier)\n", .{
-        g.chain.p.name_str(),
+        g.chain().p.name_str(),
         next + 1,
         g.names.len,
-        g.chain.p.pass_count,
-        if (g.chain.p.pass_count == 1) "" else "es",
-        @tagName(g.chain.p.tier),
+        g.chain().p.pass_count,
+        if (g.chain().p.pass_count == 1) "" else "es",
+        @tagName(g.chain().p.tier),
     }) catch {};
     err.flush() catch {};
 }
@@ -571,6 +659,20 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             args.shader = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--shader-dir")) {
             args.shader_dir = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--shot")) {
+            args.shot = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--shot-frames")) {
+            // A comma list, so one run can grab several moments — a title screen
+            // and a gameplay frame cost the same emulation either way.
+            const v = it.next() orelse return error.MissingValue;
+            var list: std.ArrayList(u32) = .empty;
+            var parts = std.mem.splitScalar(u8, v, ',');
+            while (parts.next()) |part| {
+                const t = std.mem.trim(u8, part, " ");
+                if (t.len == 0) continue;
+                try list.append(gpa, try std.fmt.parseInt(u32, t, 10));
+            }
+            args.shot_frames = try list.toOwnedSlice(gpa);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;

@@ -485,6 +485,14 @@ def bake(name, tier, slangp, profile, verbose):
             if n.endswith("Feedback") and n[: -len("Feedback")] in aliases:
                 feedback_passes.add(aliases[n[: -len("Feedback")]])
 
+    # The runtime's limits are the baker's limits. crt-guest-advanced declares
+    # 148 parameters, and the first version of this baker happily emitted a
+    # manifest that the frontend then refused to load — exactly the "it is in the
+    # directory but it does not run" failure this pipeline exists to prevent.
+    # Mirror preset.zig here so the mismatch fails on the build host.
+    if len(all_params) > 192:  # preset.zig: max_params
+        raise Reject(f"{len(all_params)} parameters exceeds the runtime's limit of 192")
+
     # Emit params before anything references them by name.
     for p in all_params.values():
         lines.append(f"param {p['name']} {p['default']:g} {p['min']:g} {p['max']:g} {p['step']:g}")
