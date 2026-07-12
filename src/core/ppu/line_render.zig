@@ -640,7 +640,8 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 
         var tile_num: u16 = entry & 0x3FF;
         const pal_group: u16 = (entry >> 10) & 7;
-        const prio: u2 = @truncate(entry >> 13);
+        // Tilemap priority is a single bit; 14-15 are the flip bits.
+        const prio: u2 = @intCast((entry >> 13) & 1);
         const xflip = entry & 0x4000 != 0;
         const yflip = entry & 0x8000 != 0;
 
@@ -926,6 +927,28 @@ test "mode 0 renders a single BG1 tile pixel" {
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]);
     try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
+}
+
+test "flipped BG tiles keep their one-bit priority (flip bits must not leak)" {
+    // Regression: priority is tilemap bit 13 only. Taking two bits pulled in
+    // the X-flip bit (14), giving flipped tiles priority 2/3, which no BG
+    // order entry matches — every flipped tile vanished (found via SMRPG).
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01;
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    ppu.vram[0x400] = 0xC000; // tile 0, prio 0, X+Y flip
+    ppu.vram[0x401] = 0xE000; // tile 0, prio 1, X+Y flip
+    ppu.vram[0] = 0x0080; // pixel x=0 -> color 1 (x=7 when flipped)
+    ppu.vram[7] = 0x0080; // last row, for the Y flip
+    ppu.cgram[1] = 0x7C00; // blue
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[7]); // prio-0 flipped tile visible
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[8 + 7]); // prio-1 flipped tile visible
 }
 
 test "mode 3 renders an 8bpp BG1 pixel and ignores the tilemap palette group" {

@@ -21,7 +21,7 @@
         .{ .path = "HelloWorld/HelloWorld.sfc", .hash = 0x14ecd91531a2ca4c, .steps = 158338, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .hash = 0x3ad32cfefc54c6be, .steps = 154307, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG3Map2BPP32x328PAL/8x8BG3Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
-        .{ .path = "PPU/Rings/Rings.sfc", .hash = 0x20dc65b09f98c115, .steps = 152248, .cycles = 5717906 },
+        .{ .path = "PPU/Rings/Rings.sfc", .hash = 0xd56d79e2377a3965, .steps = 152248, .cycles = 5717906 },
         // M4.1: BG2/BG4 2bpp (mode 0 layer coverage), 4bpp (mode 1/2), 8bpp (modes 3/4).
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG2Map2BPP32x328PAL/8x8BG2Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG4Map2BPP32x328PAL/8x8BG4Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
@@ -30,7 +30,7 @@
         .{ .path = "PPU/BGMAP/8x8/8BPP/32x64/8x8BGMap8BPP32x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 151667, .cycles = 5717914 },
         .{ .path = "PPU/BGMAP/8x8/8BPP/64x32/8x8BGMap8BPP64x32.sfc", .hash = 0xce39d1f87fb4187e, .steps = 149934, .cycles = 5717916 },
         .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 146646, .cycles = 5717932 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x0aee22f7096e9c25, .steps = 158610, .cycles = 5717918 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x440e20213d3fef25, .steps = 158610, .cycles = 5717918 },
         // M4.2: mode-3 scene. NB: this demo's mosaic level is input-driven, so it
         // renders with mosaic off headless; the mosaic quantization itself is
         // covered by the inline unit test, not this hash.
@@ -66,7 +66,7 @@
         // of apparent colors. The HDMA/HiColor*PerTileRow ROMs stay unminted:
         // they race the beam (H-IRQ + latched V-counter + mid-scanline CGRAM
         // DMA) and need the accurate core's sub-line timing (M8).
-        .{ .path = "PPU/Blend/HiColor/HiColor575Myst/HiColor575Myst.sfc", .hash = 0x648efce3a804de22, .steps = 140944, .cycles = 5717918 },
+        .{ .path = "PPU/Blend/HiColor/HiColor575Myst/HiColor575Myst.sfc", .hash = 0xfb75a1bf32e03757, .steps = 140944, .cycles = 5717918 },
         .{ .path = "PPU/Blend/HiColor/HiColor3840/HiColor3840.sfc", .hash = 0xd7598be40b7f8ce5, .steps = 143917, .cycles = 5717904 },
         .{ .path = "PPU/Blend/HiColor/HiColor1241DLair/HiColor1241DLair.sfc", .hash = 0xffee96ffe902ac1a, .steps = 140284, .cycles = 5717924 },
         // M4.7: mode 5 hi-res (512-wide, 16-wide tiles). InterlaceFont locks a
@@ -77,10 +77,10 @@
         // Interlace{Myst,Simpsons}HDMA ROMs stay unminted: they need true
         // interlaced 448-line field rendering (the HDMA'd tile base assumes
         // field-interleaved rows), which the 224-line fast core doesn't model.
-        .{ .path = "PPU/Mosaic/Mode5/MosaicMode5.sfc", .hash = 0xf2e09c4f161ff725, .steps = 153077, .cycles = 5717918 },
-        .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x109a188a73e19540, .steps = 155006, .cycles = 5717912 },
-        .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0xf2e09c4f161ff725, .steps = 153077, .cycles = 5717924 },
-        .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0x0070e006af27c4ed, .steps = 147948, .cycles = 5717928 },
+        .{ .path = "PPU/Mosaic/Mode5/MosaicMode5.sfc", .hash = 0x048388428d8ac8d3, .steps = 153077, .cycles = 5717918 },
+        .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x2f92199a4d412900, .steps = 155006, .cycles = 5717912 },
+        .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0x048388428d8ac8d3, .steps = 153077, .cycles = 5717924 },
+        .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0xeb05fd8031f964e0, .steps = 147948, .cycles = 5717928 },
         // M5: SPC700 end-to-end. The CPUTest ROMs upload an SPC program via
         // the HLE boot handshake, run opcode self-tests on the audio CPU, and
         // hand results back through the mailbox ports — at 180 frames each
