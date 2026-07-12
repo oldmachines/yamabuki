@@ -33,7 +33,9 @@ zig build test-roms -Drom-accurate  # same goldens on the accurate core
 zig build test-libretro          # drive the libretro core against the same goldens
 zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
+zig build bench-check            # gate the deterministic perf baseline (steps/cycles/vram_reads)
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
+tools/package_handheld.sh        # static musl handheld package (asserts no dynamic deps)
 ```
 
 Run a ROM headless and dump a frame (and its audio) to inspect:
@@ -105,4 +107,4 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
 | M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math — all unit-test gated) |
-| M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites: single-pass planar decode, bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs and ~+13% on sprite-heavy Rings; musl packaging + bench gate next) |
+| M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites: single-pass planar decode, bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs and ~+13% on sprite-heavy Rings; deterministic VRAM-traffic bench gate + static-musl handheld packaging with a CI static-linkage assertion) |

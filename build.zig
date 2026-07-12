@@ -4,12 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Renderer VRAM-traffic perf counter: off for every shipping build and
+    // test (the increment folds away), on only for the bench so `bench --check`
+    // has a deterministic memory-traffic metric to gate against.
+    const perf_off = perfModule(b, false);
+    const perf_on = perfModule(b, true);
+
     // The emulator core: pure Zig, no libc, no external dependencies.
     const core_mod = b.addModule("snes_core", .{
         .root_source_file = b.path("src/core/core.zig"),
         .target = target,
         .optimize = optimize,
     });
+    core_mod.addImport("perf_options", perf_off);
 
     // Headless frontend: runs a ROM for N frames, dumps framebuffer as .ppm
     // and prints a hash. Primary development/verification tool.
@@ -183,7 +190,15 @@ pub fn build(b: *std.Build) void {
     const libretro_step = b.step("test-libretro", "Drive the libretro core against golden ROMs (needs test-data/)");
     libretro_step.dependOn(&run_libretro.step);
 
-    // Headless FPS benchmark.
+    // Headless FPS benchmark. It gets its own core module built with the perf
+    // counters enabled, so `bench --check` sees the VRAM-traffic counts while
+    // shipping binaries (which share `core_mod`) stay free of the increment.
+    const bench_core = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_core.addImport("perf_options", perf_on);
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",
         .root_module = b.createModule(.{
@@ -191,7 +206,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "snes_core", .module = bench_core },
+                .{ .name = "perf_options", .module = perf_on },
             },
         }),
     });
@@ -200,4 +216,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run the headless FPS benchmark (pass -- <rom> [--frames N])");
     bench_step.dependOn(&run_bench.step);
+
+    // Deterministic perf-regression gate: run the committed baseline ROMs and
+    // fail on any drift of steps/cycles/vram_reads (needs test-data/snes-roms).
+    const run_bench_check = b.addRunArtifact(bench);
+    run_bench_check.setCwd(b.path("."));
+    run_bench_check.addArg("--check");
+    const bench_check_step = b.step("bench-check", "Gate the deterministic bench baseline (needs test-data/)");
+    bench_check_step.dependOn(&run_bench_check.step);
+}
+
+/// A one-field options module exposing `enabled: bool` as `@import("perf_options")`.
+fn perfModule(b: *std.Build, enabled: bool) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "enabled", enabled);
+    return opts.createModule();
 }
