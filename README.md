@@ -38,6 +38,14 @@ zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
 tools/package_handheld.sh        # static musl handheld package (asserts no dynamic deps)
 ```
 
+CRT shaders are baked ahead of time, once:
+
+```sh
+tools/fetch_shaders.sh           # libretro slang-shaders (pinned, gitignored)
+tools/build_shader_tools.sh      # glslang + SPIRV-Cross, built with zig as the C++ compiler
+zig build shaders                # transpile the presets in shaders/presets.conf to GLSL
+```
+
 Run a ROM headless and dump a frame (and its audio) to inspect:
 
 ```sh
@@ -48,12 +56,94 @@ Or play it in a window (needs the SDL3 runtime library, `libSDL3.so.0` —
 the build has no SDL dependency, the library is dlopen'd):
 
 ```sh
-./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N]
+./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N] [--shader crt-lottes]
 ```
 
 Keyboard follows the RetroArch defaults — arrows = d-pad, `Z`=B, `X`=A,
 `A`=Y, `S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
 save/load state, `F1` reset, hold `Tab` to fast-forward, `Esc` to quit.
+
+## Shaders
+
+`--shader <name>` runs the frame through a libretro CRT shader chain. The
+shipped set is listed in [`shaders/presets.conf`](shaders/presets.conf) — the
+cheap single-pass ones (`zfast-crt`, `crt-pi`, `crt-lottes-fast`,
+`crt-easymode`, `sharp-bilinear`) and the heavyweights (`crt-royale`,
+`crt-guest-advanced`, `crt-lottes`, `crt-easymode-halation`, `gtu-v050`,
+`crt-geom`, `crt-hyllian`). Each is tagged `handheld` or `desktop`, and the tag
+is printed at startup: it is a claim about a Cortex-A53-class device, not a
+rating. crt-royale on a Mali-G31 is a slideshow, and the package says so rather
+than letting you find out.
+
+### The shaders are transpiled offline
+
+These are libretro *slang* presets — Vulkan GLSL. Running them the way RetroArch
+does means linking glslang and SPIRV-Cross (two C++ libraries, ~150k lines) into
+the binary and compiling shaders on the device at load. Yamabuki does the
+compile on the build host instead and ships the result:
+
+```
+  .slangp preset ──┐
+  .slang shaders ──┤  tools/transpile_shaders.py   (build host, never shipped)
+  .png LUTs      ──┘
+        │
+        ├─ glslang ──────► SPIR-V
+        ├─ SPIRV-Cross ──► GLSL ES 300 / GLSL 330 / GLSL ES 100
+        ├─ reflection ───► uniform offsets, types, sampler names
+        └─ zlib ─────────► raw RGBA LUTs
+        │
+        ▼
+  shaders/<profile>/<preset>/{preset.conf, pass*.vert, pass*.frag, *.bin}
+        │
+        ▼
+  yamabuki-sdl  ── reads bytes, plumbs them into offsets
+```
+
+What that buys:
+
+- **The emulator contains no shader compiler.** No glslang, no SPIRV-Cross, no
+  SPIR-V, no C++ — and no PNG decoder either, since crt-royale's phosphor masks
+  are decoded to raw RGBA at bake time. The runtime never parses a format it can
+  avoid parsing.
+- **The design goals survive.** The core stays pure Zig, `zig build` still needs
+  nothing installed, and the handheld package is still a static musl binary that
+  passes its own no-dynamic-deps assertion. A runtime shader compiler would have
+  cost all three.
+- **Nothing is compiled on the device.** A Cortex-A53 does not spend its startup
+  budget parsing GLSL, and a driver bug in a vendor's shader compiler surfaces on
+  the build machine rather than in someone's hands.
+- **Every ambiguity is resolved once, where it can fail loudly.** Uniform
+  offsets, sampler bindings, pass aliases, feedback targets, LUT dimensions — all
+  settled at bake time. The runtime's job is reduced to memcpy-into-offset, which
+  is why it can be allocation-free after `init`.
+- **A shader that cannot work is absent, not broken.** A preset is written for a
+  profile only if it transpiled *and* every uniform in it mapped to a semantic
+  the runtime supplies. Failures are printed at bake, not discovered on a
+  handheld.
+
+The one cost is that adding a shader is a build step, not a drop-in file. Given
+the target device, that trade is not close.
+
+**glslang and SPIRV-Cross are built by `zig c++`.** Zig ships clang, so
+`tools/build_shader_tools.sh` compiles both from pinned upstream source with the
+toolchain this repo already requires — no system g++, no Vulkan SDK, no package
+manager. The prerequisites for the whole shader pipeline are the pinned Zig,
+cmake, and ninja. This is also the honest reason the *offline* route was chosen
+over linking them in: it was never that Zig couldn't build them (it can, and
+does), but that shipping a 150k-line C++ compiler to a handheld to do work that
+can be done once on a laptop is the wrong shape.
+
+Three GLSL profiles are baked and the frontend picks one at startup: **GL ES 3**
+(the handheld primary), **GL 3.3** (desktop), and **GL ES 2** (for Mali-400-class
+parts). A preset is only written for a profile if it actually transpiled *and*
+every uniform in it mapped to a semantic the runtime supplies — so a preset
+appearing in the directory and a preset running on your GPU are the same
+statement. Five of the thirty-six (preset, profile) pairs are honestly skipped:
+crt-geom and crt-hyllian build their sampling kernels with multidimensional
+array constructors, which no ESSL below 310 has, and crt-guest-advanced needs
+`textureSize`, which ESSL 100 lacks. If no profile works — an old GLES2 chip, no
+GL driver at all, CI's dummy video driver — the frontend prints why and falls
+back to the software blit. A missing shader never costs you the emulator.
 
 ## Status
 
@@ -108,3 +198,74 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
 | M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math — all unit-test gated) |
 | M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites, ~+18–39% on 8bpp ROMs; SA-1 ROM-read fast path precomputes the MMC map, −15% total instructions / +15% FPS on Super Mario RPG, bit-identical; deterministic VRAM-traffic bench gate + static-musl handheld packaging with a CI static-linkage assertion) |
+
+## Design notes
+
+The decisions below are the ones that shape everything else in the tree.
+
+**Performance is gated deterministically, not by wall clock.** Timing a
+frame in CI is flaky, so the perf baseline (`bench/baseline.zon`) pins three
+counters per ROM instead: `steps` (instructions retired), `cycles` (master
+clock), and `vram_reads` (renderer word fetches). All three are identical
+across Debug/ReleaseFast and across target architectures, so `zig build
+bench-check` fails on drift rather than on noise. `vram_reads` is chosen to
+stand in for the optimization it protects: deleting the M10 tile-row decode
+cache multiplies the count ~8x and turns the gate red. An optimization that
+CI cannot see is an optimization that will be reverted by accident.
+
+**Accuracy is a `comptime` parameter, spent at frame granularity.**
+`Console(cfg)` is instantiated twice — fast and accurate — and only a handful
+of sites in the core branch on `cfg.accuracy`, all of them at scanline or
+frame level. The hot loops are fully monomorphized: no branch, no function
+pointer. Runtime selection (`--accurate`, `yamabuki_accuracy`) is a tagged
+union over the two instantiations (`AnyConsole`), so choosing a core costs one
+switch per frame, not one per pixel.
+
+**Save states are `comptime` reflection over plain data, and a pointer is a
+compile error.** `src/core/serialize.zig` walks the state tree and refuses to
+serialize pointers. That is the design, not a limitation: it forces derived
+state (bus page tables, decode caches, chip-to-ROM wiring) to be *rebuilt* by
+`postLoad()` hooks instead of persisted, so it cannot silently rot. It also
+makes `byteSize(T)` comptime-known, which is what lets libretro's
+`retro_serialize_size` stay fixed for a whole session; a `comptime` assert
+keeps the fast and accurate cores at the same state size.
+
+**A `Console` is self-referential: heap-allocate it and never move it.** The
+bus page table holds pointers into `self.cart` and `self.bus.wram`, and the
+CPU holds `&self.bus`. Construct in place with `init` and do not copy the
+value afterwards — a moved Console has a page table pointing at its own
+corpse.
+
+**Test data is fetched and revision-pinned, never vendored.** CI resolves the
+upstream SingleStepTests and PeterLemon repos with `git ls-remote` at run
+time; no ROMs or vectors are committed. Correctness is externally anchored:
+the 65816 is held to full cycle parity (count *and* per-cycle bus position
+over all 5.12M cases), and the golden framebuffer/audio hashes in
+`tests/golden_hashes.zon` are replayed through three drivers — the fast core,
+the accurate core (`-Drom-accurate`), and the libretro core.
+
+**Zero build-time dependencies is a hard constraint.** SDL3 is not linked: the
+frontend hand-ports the ABI subset it needs and `dlopen`s the library, so
+`zig build` alone cross-compiles to `aarch64-linux-musl` on a machine with no
+SDL installed. `tools/package_handheld.sh` then *asserts* the result is
+statically linked (no interpreter, no `NEEDED`), because a handheld firmware
+will not supply the shared objects a stray dynamic dep would demand.
+
+**Work that can happen on the build host does not happen on the device.** The
+CRT shaders are libretro slang presets, which normally require glslang and
+SPIRV-Cross — ~150k lines of C++ — linked into the emulator and run at load.
+Instead `tools/transpile_shaders.py` compiles them ahead of time and ships plain
+GLSL plus a manifest of reflected uniform offsets, and the phosphor-mask PNGs are
+decoded to raw RGBA the same way. The binary therefore holds no shader compiler,
+no SPIR-V, and no image decoder: it reads bytes and writes them at offsets. That
+is what keeps the pure-Zig core, the dependency-free `zig build`, and the static
+musl package all intact at once — and it means a preset that cannot work is
+*absent* from the package rather than failing on someone's handheld. The tools
+themselves are built by `zig c++`, so even the bake step needs no toolchain the
+repo does not already pin. See [Shaders](#shaders).
+
+**Enhancement chips are emulated at the level their games actually observe.**
+Super FX is low-level (real prefetch pipeline, code cache, PLOT bitplane
+pipeline) because games depend on its behaviour cycle by cycle; DSP-1 and Cx4
+are command-level HLE because they do not. SA-1 gets the cheapest treatment of
+all: it *is* the 65816 core, instantiated a second time on its own bus.
