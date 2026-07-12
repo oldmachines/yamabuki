@@ -210,6 +210,75 @@ serialize/unserialize.
 | M9 | Enhancement chips: Super FX → DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Cx4 (HLE) | krom CHIP suite golden-gated; Mario Kart, Kirby 3, Star Fox, MMX2 boot/play | Done — **Super FX (GSU) done**: full instruction set with the hardware's one-byte prefetch pipeline (delay slots and R15 semantics emerge from it), 512-byte code cache (16-byte line fills, SNES cache injection), ROM buffer, PLOT/RPIX pixel cache with column-major char addressing (2/4/8bpp × 128/160/192/OBJ heights, dither, transparency), catch-up scheduling off the master clock, STOP IRQ into the CPU line, save-stated. Gated by 58 golden ROMs: 31 GSUTest opcode screens (hardware-verified PASS/FAIL checks) + 27 plot demos matching krom's captures pixel-for-pixel modulo the global one-line display offset (see PPU notes). Ordered first because it is the only chip with test-ROM coverage. **DSP-1 (HLE) done**: the µPD7725 math coprocessor at the command level — the full documented command set (multiply, inverse with Newton refinement, interpolated sin/cos, 2D/3D rotate, attitude matrices with objective/subjective/scalar transforms, gyrate, radius/range/distance, and the mode 7 projection family: parameter → self-refilling raster stream → project/target), the DR/SR port state machine, and both board decodes (LoROM $30-$3F:$8000+ for carts up to 1 MiB, $60-$6F low half above that; HiROM $00-$1F:$6000-$7FFF). Data-ROM tables are regenerated at comptime from closed forms (reciprocal seeds round(2^29/d), sine trunc(32768·sin), power-of-two shift tables incl. the chip's $3C one-word bug); only the 49-word sqrt segment and a few polynomial constants are carried as documented literals. No DSP-1 test ROMs exist, so the gate is unit tests: exact vectors cross-checked against the reference HLE for every command family plus port-protocol edge cases (raster skip-writes, $80 idle bytes, ROM dump). Commands execute instantly (SR always ready) — documented HLE simplification. DSP-2/3/4 carry different µPD7725 programs and stay out of scope. **SA-1 done**: a second 65816 at 10.74 MHz reusing the same generic CPU core (the Sa1 struct is its bus), with 2 KiB IRAM, BW-RAM in linear and 2/4-bit bitmap projections, the Super MMC's four switchable 1 MiB ROM regions (page table rebuilt on bank writes), interrupt vectors served from registers by intercepting vector-window reads (the same trick swaps the SNES NMI/IRQ vectors to SNV/SIV — that page stays off the fast path), message ports and IRQs both directions, H/V and linear timers, normal DMA, both character-conversion DMA types, the multiply/divide/cumulative arithmetic unit, and the variable-length bit reader. Catch-up scheduled off the master clock (exactly half-rate) per scanline and before any shared access. No SA-1 test ROMs exist, so the gate is unit tests: the SA-1 boots from CRV and executes real 65816 code from MMC-mapped ROM in-process, IRQ/NMI delivery both ways, MMC remaps, DMA + CC1/CC2 conversions, arithmetic and bit-reader vectors, timers, protection bits, and a serialize roundtrip. Fast-core simplifications: no bus-conflict arbitration stalls, timer IRQs land on instruction boundaries, SA-1-side data reads of $00:FFEA-FFFF return the vector registers. **Cx4 (HLE) done**: the Hitachi HG51B169 on the Mega Man X2/X3 boards, at the command level. A plain memory-mapped device — an 8 KiB RAM window at $6000-$7FFF of banks $00-$3F/$80-$BF; games stage operands into the register file at $7F40-$7FA4 and poke a command byte to $7F4F, which runs the whole operation synchronously (no interrupt line, no busy flag the games poll, so nothing schedules — the command completes inside the port write and the $7F5E status reads 0). The full routine set: the wireframe transform + line rasterizer, OAM builder, affine scale/rotate, line transformer, bitplane wave, sprite disintegrate, and the scalar commands (24-bit multiply, 48-bit square, Pythagoras, atan2, polar↔rectangular with the radius clamp and y-bias, sum, trapezoid spans, coordinate transform, propulsion, set-vector-length). Sine/cosine are comptime round(32767·sin/cos(2πi/512)) — the chip's own table carries ±1 Q15 rounding noise with no single closed form, but that low bit can never move an integer screen coordinate, so the clean formula stands; only the 48-byte $5C self-test response is carried verbatim. No Cx4 test ROMs exist, so the gate is unit tests: every scalar command with vectors minted from the reference algorithm, the OAM builder, memory load, the status/window ports through the real bus, and a serialize roundtrip. HLE simplifications: commands complete instantly, double-precision trig drives the wireframe rotations (a rotated vertex can differ from the chip's fixed-point microcode by a sub-pixel amount before rounding), and degenerate projections fold the way an x86 double→int conversion would. The data ROM (needed only for the LLE approach, which requires the copyrighted Cx4 program) is unused. Fast-core simplifications for Super FX: synchronous ROM/RAM buffers (SFR "R" flag always reads 0), no RON/RAN arbitration stalls or SNES-side ROM lock during GO |
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | In progress — tile-row decode cache for both BG (memoized by char address) and sprites (once per tile column); each plane word read once per row instead of per pixel; bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs and ~+13% on the sprite-heavy Rings ROM. Bench gate hardened: a comptime-gated VRAM-word counter (`vram_reads`, compiled out of shipping builds) feeds `zig build bench-check`, a deterministic per-ROM baseline that fails CI on any steps/cycles/traffic drift — locking the decode cache in. Static-musl handheld packaging (`tools/package_handheld.sh`) with a CI assertion that every musl artifact has no dynamic libc / NEEDED shared object. The ≥60 FPS target is measured on-device |
 | M11 | CRT shaders: GL ES pipeline in the SDL frontend, libretro presets transpiled ahead of time | Presets render on-device; the bake gate holds the promised set | In progress — the SDL frontend had no GPU path at all (an `SDL_Renderer` blit of the RGB565 frame). Now: a GL ES context with the entry points resolved through `SDL_GL_GetProcAddress` (the same hand-ported-ABI, no-link-time-dependency stance as `sdl3.zig`), a multi-pass FBO chain with pass aliases, double-buffered feedback targets, an input-frame history ring, and LUT textures, plus a fallback ladder — **GL ES 3 → GL 3.3 → GL ES 2 → the existing software blit** — where every rung prints why it fell through, so a missing shader never costs the user the emulator. **The binary contains no shader compiler.** The presets are libretro *slang* (Vulkan GLSL); `tools/transpile_shaders.py` drives glslang and SPIRV-Cross on the *build host* and emits plain GLSL plus a manifest of reflected uniform offsets, and the phosphor-mask PNGs are decoded to raw RGBA there too — so the runtime holds no SPIR-V, no C++, and no image decoder, and the pure-Zig core, the dependency-free `zig build`, and the static-musl package all survive. The tools are themselves built by `zig c++`, so the bake needs no toolchain the repo does not already pin. Two uniform paths, because SPIRV-Cross emits different forms per profile: a real std140 block on ES3/desktop, plain per-member uniforms on ES2 (which has no uniform blocks); `--flatten-ubo` is unusable because it demands one basic type per block and the slang UBO mixes `mat4 MVP` with `uint FrameCount`. A preset is written for a profile only if it transpiled **and** every uniform mapped to a semantic the runtime supplies, so a shader that cannot work is *absent* rather than broken: 31 of 36 (preset, profile) pairs bake — crt-royale on all three, crt-guest-advanced on ES3 + desktop — and the 5 skips are printed with their reason (crt-geom/crt-hyllian use multidimensional array constructors, absent below ESSL 310; crt-guest-advanced needs `textureSize`, absent in ESSL 100). CI asserts the promised set still bakes. Presets are tagged `handheld` or `desktop` and the tag prints at startup — a claim about a Cortex-A53, not a rating. **Gap: not yet run on a GPU.** The pipeline is compile-verified on all targets and the fallible logic (pass geometry, manifest parsing, uniform encoding, feedback flipping, letterboxing) is unit-tested, but no lit pixel has been observed; expect first-run bugs |
+| M12 | ROM patch layer: soft-patching, a hash-keyed patch registry, auto-FastROM, and the traces that make SA-1 conversions possible | Patched ROMs boot and match the patch author's reference; `--save-patched` round-trips; auto-FastROM gated by a compat list | Planned |
+
+## M12 — the ROM patch layer
+
+The community around [Vitor Vilela](https://github.com/VitorVilela7) has spent
+years recovering performance the SNES left on the table: **SA-1 Root** (Gradius
+III, Contra III, Super R-Type, Race Drivin' — the last from ~4 fps to ~30), the
+**SMW SA-1 Pack** (which relocates most of Super Mario World's logic memory into
+SA-1-accessible space and is now foundational infrastructure under a large share
+of modern hacks), **Project FastROM** (Super Castlevania IV, F-Zero, Axelay —
+~30% faster cartridge access), and **wide-snes**, a true 16:9 Super Mario World
+that renders extra playfield rather than stretching it.
+
+Yamabuki should run all of it, and help make more of it. But the four are not
+one feature, and it is worth being precise about which parts an emulator can
+actually do.
+
+**What is tractable.**
+
+- **Soft-patching.** Apply BPS and IPS at load — `--patch <file>` — with the
+  source ROM verified by hash first, so a patch silently landing on the wrong
+  revision is an error rather than a corrupted cart. `--save-patched <out.sfc>`
+  writes the result. Nothing is mutated on disk unless asked.
+- **The SA-1 conversions already work.** Yamabuki emulates the SA-1 (M9), so a
+  converted ROM is just a cart with an SA-1 in its header; it boots today. The
+  patch layer is about *getting* the converted ROM, not about running it.
+- **A patch registry.** A manifest keyed by source-ROM hash — fetched and
+  revision-pinned, never vendored, exactly like the test data — so `--auto-patch`
+  can find the right SA-1 or FastROM patch for the cart you actually loaded, and
+  refuse when it does not recognise it. Patches are the authors' work and stay
+  theirs; the repo carries the index, not the payload, and never a ROM.
+- **Auto-FastROM (opt-in).** This one *is* mechanically derivable: set the speed
+  bit in the header, make the code write `$420D` bit 0, and map the ROM into the
+  fast banks. But it is not free — code timed against SlowROM access latency
+  breaks — so it ships behind a flag and a compatibility list, never as a
+  default. A heuristic that silently corrupts a save file is worse than no
+  feature.
+- **Widescreen, on the emulator side.** wide-snes needs a modified emulator
+  because stock hardware cannot output the wider framebuffer; providing that
+  wider framebuffer is squarely an emulator's job. The game-side patch stays
+  per-game.
+
+**What is not.** Automatically *generating* an SA-1 conversion for an arbitrary
+ROM. Vilela's conversions are per-game reverse engineering — identifying which
+routines can move, relocating the game's RAM into SA-1-visible regions, and
+rewriting logic to run in parallel across two CPUs that share a bus. That is
+authorship, not a transformation, and no emulator derives it from a binary. Any
+roadmap entry promising otherwise would be fiction.
+
+**Where an emulator genuinely helps: the traces.** Vilela's community "SA-1
+Collection" was driven by bsnes-plus trace logs and usage maps submitted from
+full playthroughs, used to reconstruct disassemblies and identify conversion
+candidates. Producing exactly those is something Yamabuki can do well, and it is
+the highest-leverage part of this milestone:
+
+- **Execution coverage** — which addresses were ever executed, and as what
+  (code, data, both). The raw material of a disassembly.
+- **Hot-routine profiles** — cycles attributed per call site, so the routines
+  worth moving to the SA-1 announce themselves instead of being guessed at.
+- **RAM access maps** — which regions are touched, by whom, and how often. This
+  is the map an author needs to know what can safely relocate, and it is the
+  single most tedious thing to reconstruct by hand.
+- **Emitted in a format the existing tooling already eats**, so the output joins
+  the ecosystem rather than starting a second one.
+
+The order matters: soft-patching first (it makes every existing patch usable),
+then the traces (they make new ones possible), then auto-FastROM and widescreen
+(they are narrower wins). Nothing here ships a ROM, and nothing here ships
+someone else's patch — only the ability to apply one you have.
 
 ## Performance engineering
 

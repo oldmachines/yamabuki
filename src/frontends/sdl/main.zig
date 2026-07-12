@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = parseArgs(init) catch {
+    const args = parseArgs(init, gpa) catch {
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
                 "                    [--shader NAME] [--shader-dir DIR]\n",
@@ -543,8 +543,15 @@ fn cycleShader(
     err.flush() catch {};
 }
 
-fn parseArgs(init: std.process.Init) !Args {
-    var it = init.minimal.args.iterate();
+fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
+    // `iterate()` is POSIX-only — on Windows the command line has to be decoded
+    // from UTF-16, which needs an allocator. The allocator form works on every
+    // target, so the frontend builds and runs on a dev box as well as on the
+    // handheld it is aimed at.
+    // Deliberately not deinit'd: on Windows the iterator owns the decoded
+    // strings, and `Args.rom` / `Args.shader` are slices into them. `gpa` is the
+    // process arena, so they live exactly as long as they need to.
+    var it = try init.minimal.args.iterateAllocator(gpa);
     _ = it.skip(); // program name
     var args: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;

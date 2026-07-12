@@ -162,30 +162,44 @@ pub const GlApi = struct {
     SDL_GetWindowSizeInPixels: *const fn (win: *Window, w: *c_int, h: *c_int) callconv(.c) bool,
 };
 
+// The library is opened by name at runtime on every platform — POSIX through
+// dlopen, Windows through LoadLibrary. Same stance either way: nothing is
+// linked, so the build needs no SDL present and the binary reports a friendly
+// error when the runtime is missing.
 extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
 extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
+extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 
 const rtld_now: c_int = 2;
+
+const is_windows = builtin.os.tag == .windows;
 
 pub const LoadError = error{ SdlNotFound, SdlTooOld };
 
 fn open() LoadError!*anyopaque {
     const names: []const [:0]const u8 = switch (builtin.os.tag) {
+        .windows => &.{"SDL3.dll"},
         .macos => &.{ "libSDL3.dylib", "libSDL3.0.dylib" },
         else => &.{ "libSDL3.so.0", "libSDL3.so" },
     };
     for (names) |name| {
-        // dlopen is refcounted and returns the same handle for the same
-        // library, so calling it again from loadGl is free.
-        if (dlopen(name, rtld_now)) |h| return h;
+        // Both loaders are refcounted and hand back the same handle for the
+        // same library, so calling this again from loadGl is free.
+        const h = if (is_windows) LoadLibraryA(name) else dlopen(name, rtld_now);
+        if (h) |handle| return handle;
     }
     return error.SdlNotFound;
+}
+
+fn symbol(h: *anyopaque, name: [*:0]const u8) ?*anyopaque {
+    return if (is_windows) GetProcAddress(h, name) else dlsym(h, name);
 }
 
 fn resolve(comptime T: type, h: *anyopaque) LoadError!T {
     var api: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
-        const sym = dlsym(h, f.name) orelse return error.SdlTooOld;
+        const sym = symbol(h, f.name) orelse return error.SdlTooOld;
         @field(api, f.name) = @ptrCast(@alignCast(sym));
     }
     return api;
