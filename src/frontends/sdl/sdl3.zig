@@ -16,6 +16,7 @@ pub const Window = opaque {};
 pub const Renderer = opaque {};
 pub const Texture = opaque {};
 pub const AudioStream = opaque {};
+pub const GlContext = opaque {};
 
 pub const AudioSpec = extern struct {
     format: c_uint,
@@ -53,7 +54,22 @@ pub const init_audio: u32 = 0x10;
 pub const init_video: u32 = 0x20;
 
 // SDL_video.h
+pub const window_opengl: u64 = 0x02;
 pub const window_resizable: u64 = 0x20;
+
+/// SDL_GLAttr (SDL_video.h) — only the attributes the GL path sets.
+pub const gl_attr = struct {
+    pub const doublebuffer: c_int = 5;
+    pub const depth_size: c_int = 6;
+    pub const stencil_size: c_int = 7;
+    pub const context_major_version: c_int = 17;
+    pub const context_minor_version: c_int = 18;
+    pub const context_profile_mask: c_int = 20;
+};
+
+/// SDL_GLProfile.
+pub const gl_profile_core: c_int = 0x0001;
+pub const gl_profile_es: c_int = 0x0004;
 
 // SDL_pixels.h
 pub const pixel_format_rgb565: c_uint = 0x15151002;
@@ -128,6 +144,22 @@ pub const Api = struct {
     SDL_DelayNS: *const fn (ns: u64) callconv(.c) void,
 };
 
+/// The GL entry points, resolved separately from `Api` and on demand.
+///
+/// Keeping these out of the required table matters: a build of SDL3 without a
+/// GL driver, or one where a symbol was renamed, must cost the user shaders —
+/// not the emulator. `loadGl` failing is a fallback, `load` failing is fatal.
+pub const GlApi = struct {
+    SDL_GL_SetAttribute: *const fn (attr: c_int, value: c_int) callconv(.c) bool,
+    SDL_GL_CreateContext: *const fn (win: *Window) callconv(.c) ?*GlContext,
+    SDL_GL_DestroyContext: *const fn (ctx: *GlContext) callconv(.c) bool,
+    SDL_GL_MakeCurrent: *const fn (win: *Window, ctx: *GlContext) callconv(.c) bool,
+    SDL_GL_GetProcAddress: *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+    SDL_GL_SwapWindow: *const fn (win: *Window) callconv(.c) bool,
+    SDL_GL_SetSwapInterval: *const fn (interval: c_int) callconv(.c) bool,
+    SDL_GetWindowSizeInPixels: *const fn (win: *Window, w: *c_int, h: *c_int) callconv(.c) bool,
+};
+
 extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
 extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
 
@@ -135,24 +167,35 @@ const rtld_now: c_int = 2;
 
 pub const LoadError = error{ SdlNotFound, SdlTooOld };
 
-/// dlopen SDL3 and resolve the whole Api table. `SdlTooOld` means the
-/// library was found but lacks a symbol (i.e. it is not SDL3).
-pub fn load() LoadError!Api {
+fn open() LoadError!*anyopaque {
     const names: []const [:0]const u8 = switch (builtin.os.tag) {
         .macos => &.{ "libSDL3.dylib", "libSDL3.0.dylib" },
         else => &.{ "libSDL3.so.0", "libSDL3.so" },
     };
-    var handle: ?*anyopaque = null;
     for (names) |name| {
-        handle = dlopen(name, rtld_now);
-        if (handle != null) break;
+        // dlopen is refcounted and returns the same handle for the same
+        // library, so calling it again from loadGl is free.
+        if (dlopen(name, rtld_now)) |h| return h;
     }
-    const h = handle orelse return error.SdlNotFound;
+    return error.SdlNotFound;
+}
 
-    var api: Api = undefined;
-    inline for (@typeInfo(Api).@"struct".fields) |f| {
+fn resolve(comptime T: type, h: *anyopaque) LoadError!T {
+    var api: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
         const sym = dlsym(h, f.name) orelse return error.SdlTooOld;
         @field(api, f.name) = @ptrCast(@alignCast(sym));
     }
     return api;
+}
+
+/// dlopen SDL3 and resolve the whole Api table. `SdlTooOld` means the
+/// library was found but lacks a symbol (i.e. it is not SDL3).
+pub fn load() LoadError!Api {
+    return resolve(Api, try open());
+}
+
+/// Resolve the GL entry points. Callers treat any error as "no shader support".
+pub fn loadGl() LoadError!GlApi {
+    return resolve(GlApi, try open());
 }

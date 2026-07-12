@@ -72,6 +72,30 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
 
+    // The SDL frontend's shader pipeline: the preset parser, the pass geometry,
+    // and the uniform encoding are pure logic and are tested on the host. They
+    // are reached through preset.zig rather than main.zig, which needs a real
+    // SDL and a real GPU.
+    const shader_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontends/sdl/shader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(shader_tests).step);
+
+    // Bake the shader presets listed in shaders/presets.conf into GLSL.
+    //
+    // This runs glslang and SPIRV-Cross on the *build host* and emits plain
+    // GLSL; nothing it produces is linked into the emulator. Needs
+    // tools/fetch_shaders.sh and tools/build_shader_tools.sh to have run once.
+    const bake = b.addSystemCommand(&.{ "python3", "tools/transpile_shaders.py" });
+    bake.setCwd(b.path("."));
+    if (b.args) |args| bake.addArgs(args);
+    const shaders_step = b.step("shaders", "Bake slang shader presets into GLSL (needs shader-src/ and .shader-tools/)");
+    shaders_step.dependOn(&bake.step);
+
     // SingleStepTests harness (65816 CPU vectors). Requires test-data/,
     // populated by tools/fetch_test_data.sh.
     const sst_filter = b.option([]const u8, "sst-filter", "Run only SST files whose name contains this substring (e.g. 'a9')");

@@ -55,6 +55,7 @@ pub fn byteSize(comptime T: type) usize {
 /// Write `value` into `out`, returning the number of bytes written.
 /// `out.len` must be at least `byteSize(T)`.
 pub fn write(comptime T: type, value: *const T, out: []u8) usize {
+    @setEvalBranchQuota(100_000);
     switch (@typeInfo(T)) {
         .int => {
             const n = comptime intByteSize(T);
@@ -97,6 +98,7 @@ pub const ReadError = error{ Corrupt, EndOfState };
 /// Read into `value` from `in`, returning the number of bytes consumed.
 /// Skipped fields are left untouched; callers rebuild them via postLoad().
 pub fn read(comptime T: type, value: *T, in: []const u8) ReadError!usize {
+    @setEvalBranchQuota(100_000);
     switch (@typeInfo(T)) {
         .int => {
             const n = comptime intByteSize(T);

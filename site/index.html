@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yamabuki — a SNES emulator in Zig</title>
+<meta name="description" content="A fast, cross-platform SNES emulator written in Zig, built to run full speed on underpowered ARM handhelds. Cycle-exact 65816, comptime-specialized cores, and CRT shaders compiled on the build host.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%2314171C%27/%3E%3Ctext x=%2716%27 y=%2723%27 font-size=%2720%27 text-anchor=%27middle%27 fill=%27%23F2B32C%27 font-family=%27serif%27%3E%E5%B1%B1%3C/text%3E%3C/svg%3E">
+
+<meta property="og:title" content="Yamabuki — a SNES emulator in Zig">
+<meta property="og:description" content="Built to run full speed on underpowered ARM handhelds. Every promise turned into something the compiler or CI can check.">
+<meta property="og:type" content="website">
+
+<style>
+  /* ───────────────────────────────────────────────────────────────
+     Yamabuki — 山吹, the Japanese golden-yellow the project is named
+     for. The accent is the name; the ground is a cool ink; the one
+     red is reserved for things that fail. Scanlines because the
+     subject draws one line at a time.
+     ─────────────────────────────────────────────────────────────── */
+  :root {
+    --gold: #F2B32C;
+    --gold-dim: #8A6A24;
+    --red: #E0574B;
+    --ground: #14171C;
+    --panel: #1B1F26;
+    --rule: #2C313A;
+    --ink: #EDECE7;
+    --ink-soft: #A0A4AB;
+    --ink-faint: #6B7079;
+    --scan: rgba(255, 255, 255, 0.022);
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+    --measure: 62ch;
+    --gutter: clamp(1.25rem, 4vw, 3rem);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --gold: #B0760E;
+      --gold-dim: #8A6A24;
+      --red: #C0392F;
+      --ground: #F3F2EE;
+      --panel: #E9E7E1;
+      --rule: #D2CFC6;
+      --ink: #1A1D22;
+      --ink-soft: #55585E;
+      --ink-faint: #8A8C90;
+      --scan: rgba(20, 23, 28, 0.028);
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The subject renders a scanline at a time; so does the page. */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 50;
+    background: repeating-linear-gradient(
+      to bottom,
+      var(--scan) 0px, var(--scan) 1px,
+      transparent 1px, transparent 3px);
+  }
+
+  .wrap {
+    max-width: 74rem;
+    margin: 0 auto;
+    padding: 0 var(--gutter);
+  }
+
+  a { color: var(--gold); text-underline-offset: 3px; }
+  a:hover { color: var(--ink); }
+  a:focus-visible, .btn:focus-visible {
+    outline: 2px solid var(--gold);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    background: var(--panel);
+    padding: 0.12em 0.38em;
+    border-radius: 2px;
+  }
+
+  /* ── collection bar ───────────────────────────────────────────── */
+  .collection {
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .collection .wrap {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-block: 0.85rem;
+    flex-wrap: wrap;
+  }
+  .collection a { color: var(--ink-faint); text-decoration: none; }
+  .collection a:hover { color: var(--gold); }
+
+  /* ── hero ─────────────────────────────────────────────────────── */
+  .hero { padding-block: clamp(3.5rem, 9vw, 7rem) clamp(2.5rem, 6vw, 4rem); }
+
+  .kanji {
+    font-size: clamp(4.5rem, 16vw, 11rem);
+    line-height: 0.9;
+    color: var(--gold);
+    font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+    letter-spacing: 0.02em;
+    margin: 0;
+  }
+  .romaji {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 1.1rem 0 0;
+  }
+  .lede {
+    font-size: clamp(1.15rem, 2.6vw, 1.5rem);
+    line-height: 1.5;
+    color: var(--ink-soft);
+    max-width: 36ch;
+    margin: 1.6rem 0 0;
+    text-wrap: balance;
+  }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .cta {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin-top: 2.25rem;
+  }
+  .btn {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    text-decoration: none;
+    padding: 0.7rem 1.15rem;
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    background: transparent;
+  }
+  .btn:hover { border-color: var(--gold); color: var(--gold); }
+  .btn.primary {
+    background: var(--gold);
+    border-color: var(--gold);
+    color: var(--ground);
+    font-weight: 600;
+  }
+  .btn.primary:hover { background: transparent; color: var(--gold); }
+
+  /* ── stat strip ───────────────────────────────────────────────── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+    gap: 1.5rem 2rem;
+    padding-block: 2rem;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+  }
+  .stat b {
+    display: block;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 1.6rem;
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .stat span {
+    display: block;
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-top: 0.3rem;
+  }
+
+  /* ── sections ─────────────────────────────────────────────────── */
+  section { padding-block: clamp(3rem, 7vw, 5rem); }
+  section + section { border-top: 1px solid var(--rule); }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin: 0 0 0.9rem;
+  }
+  h2 {
+    font-family: var(--mono);
+    font-size: clamp(1.4rem, 3vw, 2rem);
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+    margin: 0 0 1rem;
+    text-wrap: balance;
+  }
+  h2 em { font-style: normal; color: var(--gold); }
+  p { max-width: var(--measure); }
+  .muted { color: var(--ink-soft); }
+
+  /* ── notes grid ───────────────────────────────────────────────── */
+  .notes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin-top: 2rem;
+  }
+  .note {
+    background: var(--ground);
+    padding: 1.5rem 1.35rem;
+  }
+  .note h3 {
+    font-family: var(--mono);
+    font-size: 0.92rem;
+    font-weight: 600;
+    line-height: 1.4;
+    margin: 0 0 0.6rem;
+    color: var(--ink);
+  }
+  .note p {
+    margin: 0;
+    font-size: 0.92rem;
+    line-height: 1.6;
+    color: var(--ink-soft);
+  }
+  .note[data-kind="invariant"] h3 { color: var(--red); }
+
+  /* ── the ledger ───────────────────────────────────────────────── */
+  .ledger { margin-top: 2rem; border-top: 1px solid var(--rule); }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.1fr);
+    gap: 0.5rem 1rem;
+    align-items: baseline;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 0.86rem;
+  }
+  .row .promise { color: var(--ink-soft); }
+  .row .arrow { color: var(--gold); }
+  .row .check { color: var(--ink); }
+  .row[data-kind="unenforced"] .promise,
+  .row[data-kind="unenforced"] .check { color: var(--red); }
+  @media (max-width: 40rem) {
+    .row { grid-template-columns: 1fr; }
+    .row .arrow { display: none; }
+    .row .check::before { content: "→ "; color: var(--gold); }
+  }
+
+  /* ── code ─────────────────────────────────────────────────────── */
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--gold);
+    padding: 1.1rem 1.25rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.84rem;
+    line-height: 1.7;
+    margin: 1.5rem 0 0;
+    max-width: var(--measure);
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  pre .c { color: var(--ink-faint); }
+  pre .k { color: var(--gold); }
+
+  /* ── deck callout ─────────────────────────────────────────────── */
+  .deck-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.5rem;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    padding: clamp(1.5rem, 4vw, 2.5rem);
+    margin-top: 2rem;
+  }
+  @media (min-width: 52rem) {
+    .deck-card { grid-template-columns: 1fr auto; }
+  }
+  .deck-card h3 {
+    font-family: var(--mono);
+    font-size: 1.1rem;
+    margin: 0 0 0.5rem;
+  }
+  .deck-card p { margin: 0; color: var(--ink-soft); font-size: 0.95rem; }
+
+  /* ── footer ───────────────────────────────────────────────────── */
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-block: 2.5rem 3.5rem;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+  }
+  footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<div class="collection">
+  <div class="wrap">
+    <a href="/"><b>oldmachines</b> · the collection</a>
+    <span>the emulator that keeps the machine alive</span>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <h1 class="kanji">山吹</h1>
+    <p class="romaji">Yamabuki &nbsp;·&nbsp; SNES emulator &nbsp;·&nbsp; Zig</p>
+    <p class="lede">
+      A fast, cross-platform Super Nintendo emulator, built to run
+      <b>full speed on underpowered ARM handhelds</b>.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="./deck.html">Read the design notes →</a>
+      <a class="btn" href="https://github.com/oldmachines/yamabuki">Source</a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><b>16,279</b><span>lines of Zig</span></div>
+    <div class="stat"><b>5.12M</b><span>CPU cases, cycle-exact</span></div>
+    <div class="stat"><b>109</b><span>golden hashes</span></div>
+    <div class="stat"><b>12</b><span>CRT shaders</span></div>
+    <div class="stat"><b>0</b><span>build-time deps</span></div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">What it is</p>
+    <h2>The emulation is the easy part.</h2>
+    <p class="muted">
+      Yamabuki boots ROMs, renders every background mode, and plays sound — a
+      scanline renderer with Mode 7 and hi-res, the full APU, an opt-in
+      dot-accurate core, and the enhancement chips (Super FX, SA-1, DSP-1, Cx4).
+      That is table stakes for an emulator.
+    </p>
+    <p class="muted">
+      What is <em>interesting</em> is the machinery built around it to keep the
+      thing honest on a device with no cycles to spare. Every decision below
+      exists to turn a promise into something a machine can check.
+    </p>
+
+    <div class="notes">
+      <div class="note">
+        <h3>Performance is gated by counters, not a stopwatch</h3>
+        <p>Timing a frame in CI is flaky, so the baseline pins instructions retired, master cycles, and VRAM fetches — identical across every build mode and architecture. Delete the tile-row decode cache and VRAM reads multiply by eight. CI goes red.</p>
+      </div>
+      <div class="note">
+        <h3>Accuracy is a <code>comptime</code> parameter</h3>
+        <p>The fast and accurate cores are one source, instantiated twice. Only seven sites in the whole core branch on which — all at scanline level, so the hot loops carry no branch and no function pointer.</p>
+      </div>
+      <div class="note">
+        <h3>A pointer is a compile error</h3>
+        <p>Save states are comptime reflection over plain data, and the serializer refuses to write a pointer. Derived state must be <em>rebuilt</em> in <code>postLoad()</code> rather than persisted — so it cannot silently rot.</p>
+      </div>
+      <div class="note">
+        <h3>Zero build-time dependencies, asserted</h3>
+        <p>SDL3 is never linked: the frontend hand-ports the ABI it needs and <code>dlopen</code>s the library. The handheld package then <em>asserts</em> the binary is statically linked — no interpreter, no <code>NEEDED</code>.</p>
+      </div>
+      <div class="note">
+        <h3>Test data is fetched, never vendored</h3>
+        <p>CI resolves the upstream vectors and ROMs by revision at run time. Only the hashes are committed. The 65816 is held to per-cycle bus parity over 5.12M cases, replayed through three drivers.</p>
+      </div>
+      <div class="note" data-kind="invariant">
+        <h3>The one rule the compiler can't enforce</h3>
+        <p>A <code>Console</code> is self-referential — the bus page table points into its own struct. Heap-allocate it and never move it. A moved Console has a page table pointing at its own corpse.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Shaders</p>
+    <h2>Compile on the laptop, <em>not</em> the handheld.</h2>
+    <p class="muted">
+      Twelve libretro CRT presets ship — crt-royale, crt-guest-advanced,
+      zfast-crt, crt-pi and more. They are slang shaders, which normally means
+      linking glslang and SPIRV-Cross (~150k lines of C++) into the binary and
+      compiling on the device at load.
+    </p>
+    <p class="muted">
+      Yamabuki bakes them ahead of time instead. The emulator contains
+      <b>no shader compiler, no SPIR-V, and no PNG decoder</b> — the phosphor
+      masks are decoded to raw RGBA on the build host too. It reads bytes and
+      writes them at offsets. The pure-Zig core, the dependency-free build, and
+      the static-musl package all survive intact.
+    </p>
+<pre><code><span class="c"># the toolchain is built by zig itself — no system g++, no Vulkan SDK</span>
+tools/fetch_shaders.sh        <span class="c"># slang-shaders, pinned</span>
+tools/build_shader_tools.sh   <span class="c"># glslang + SPIRV-Cross, via `zig c++`</span>
+zig build shaders             <span class="c"># → GLSL ES 300 · GLSL 330 · GLSL ES 100</span>
+
+<span class="c"># then, on the device:</span>
+yamabuki-sdl mario.sfc <span class="k">--shader</span> crt-lottes</code></pre>
+    <p class="muted" style="margin-top:1.5rem">
+      A preset is written for a GPU profile only if it actually transpiled
+      <em>and</em> every uniform mapped to something the runtime supplies. A
+      shader that cannot work is <b>absent, not broken</b>.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">The through-line</p>
+    <h2>Every promise becomes something a machine checks.</h2>
+    <div class="ledger">
+      <div class="row"><span class="promise">"don't regress the renderer"</span><span class="arrow">→</span><span class="check">a counter that must not move</span></div>
+      <div class="row"><span class="promise">"don't serialize derived state"</span><span class="arrow">→</span><span class="check">a type that won't compile</span></div>
+      <div class="row"><span class="promise">"don't add a dependency"</span><span class="arrow">→</span><span class="check">a linker assertion</span></div>
+      <div class="row"><span class="promise">"fast mode stays fast"</span><span class="arrow">→</span><span class="check">a comptime param that can't leak a branch</span></div>
+      <div class="row"><span class="promise">"ship no shader that can't run"</span><span class="arrow">→</span><span class="check">a bake that refuses to emit one</span></div>
+      <div class="row" data-kind="unenforced"><span class="promise">"never move a Console"</span><span class="arrow">→</span><span class="check">documented three times</span></div>
+    </div>
+
+    <div class="deck-card">
+      <div>
+        <h3>The full design notes, as a deck</h3>
+        <p>Eleven slides on the decisions above — with the shader pipeline, the perf gate, and the one rule that stayed a promise. Arrow keys to advance, <code>?</code> for every shortcut.</p>
+      </div>
+      <a class="btn primary" href="./deck.html">Open the deck →</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Build it</p>
+    <h2>Zig, and nothing else.</h2>
+    <p class="muted">
+      No headers, no import libraries, no package manager. Zig cross-compiles
+      the handheld build on a bare machine.
+    </p>
+<pre><code>zig build                     <span class="c"># headless + libretro core + SDL3 app</span>
+zig build test                <span class="c"># unit tests</span>
+zig build bench-check         <span class="c"># the deterministic perf gate</span>
+
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
+tools/package_handheld.sh     <span class="c"># static musl; asserts no dynamic deps</span></code></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>山吹 — <em>yamabuki</em>, the golden-yellow it is named for</span>
+    <span><a href="https://github.com/oldmachines/yamabuki">github.com/oldmachines/yamabuki</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
