@@ -23,8 +23,35 @@
 const std = @import("std");
 const core = @import("snes_core");
 const sdl3 = @import("sdl3.zig");
+const gl = @import("gl.zig");
+const preset = @import("preset.zig");
+const shader = @import("shader.zig");
 
 const Button = core.joypad.Button;
+
+/// A GL context plus the loaded shader chain. Absent means the software blit.
+const GlVideo = struct {
+    sdl_gl: sdl3.GlApi,
+    ctx: *sdl3.GlContext,
+    chain: shader.Chain,
+};
+
+/// Context attempts, best first. Each maps to a directory of baked GLSL: a
+/// preset only appears under a profile if it actually transpiled and compiled
+/// for it at bake time, so "the shader is listed" and "the shader will run" are
+/// the same statement.
+const Profile = struct {
+    dir: []const u8,
+    profile_mask: c_int,
+    major: c_int,
+    minor: c_int,
+};
+
+const profiles = [_]Profile{
+    .{ .dir = "essl300", .profile_mask = sdl3.gl_profile_es, .major = 3, .minor = 0 },
+    .{ .dir = "glsl330", .profile_mask = sdl3.gl_profile_core, .major = 3, .minor = 3 },
+    .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0 },
+};
 
 /// NTSC frame duration: 262 lines x 1364 master clocks at 21.477 MHz.
 const frame_ns: u64 =
@@ -45,6 +72,8 @@ const Args = struct {
     frames: u32 = 0, // 0 = run until quit
     audio: bool = true,
     accuracy: core.Accuracy = .fast,
+    shader: ?[]const u8 = null,
+    shader_dir: []const u8 = "shaders",
 };
 
 const Keymap = struct { code: u32, mask: u16 };
@@ -77,7 +106,11 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = parseArgs(init) catch {
-        try err.print("usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n", .{});
+        try err.print(
+            "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
+                "                    [--shader NAME] [--shader-dir DIR]\n",
+            .{},
+        );
         try err.flush();
         std.process.exit(2);
     };
@@ -119,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
         "Yamabuki",
         @intCast(256 * args.scale),
         @intCast(224 * args.scale),
-        sdl3.window_resizable,
+        sdl3.window_resizable | if (args.shader != null) sdl3.window_opengl else 0,
     ) orelse {
         try err.print("error: SDL_CreateWindow: {s}\n", .{sdl.SDL_GetError()});
         try err.flush();
@@ -127,14 +160,36 @@ pub fn main(init: std.process.Init) !void {
     };
     defer sdl.SDL_DestroyWindow(window);
 
-    const renderer = sdl.SDL_CreateRenderer(window, null) orelse {
-        try err.print("error: SDL_CreateRenderer: {s}\n", .{sdl.SDL_GetError()});
-        try err.flush();
-        std.process.exit(1);
+    // Shaders are best-effort by construction. Every way this can fail — no GL
+    // driver, a GLES2-only chip, a preset with no variant for the profile we
+    // got — degrades to the software blit with a printed reason. A missing
+    // shader must never cost the user the emulator.
+    var glv: ?GlVideo = null;
+    if (args.shader) |name| {
+        glv = initGl(io, gpa, window, args.shader_dir, name, err) catch |e| blk: {
+            try err.print("shader '{s}' unavailable ({s}); falling back to the software renderer\n", .{ name, @errorName(e) });
+            try err.flush();
+            break :blk null;
+        };
+    }
+    defer if (glv) |*g| {
+        g.chain.deinit();
+        _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
     };
-    defer sdl.SDL_DestroyRenderer(renderer);
-    // Pacing is ours; a vsync'd present would re-pace the game to the display.
-    _ = sdl.SDL_SetRenderVSync(renderer, 0);
+
+    // The software path is what runs when there is no shader chain — including
+    // under CI's dummy video driver, which is why --frames still prints hashes.
+    var renderer: ?*sdl3.Renderer = null;
+    if (glv == null) {
+        renderer = sdl.SDL_CreateRenderer(window, null) orelse {
+            try err.print("error: SDL_CreateRenderer: {s}\n", .{sdl.SDL_GetError()});
+            try err.flush();
+            std.process.exit(1);
+        };
+        // Pacing is ours; a vsync'd present would re-pace the game to the display.
+        _ = sdl.SDL_SetRenderVSync(renderer.?, 0);
+    }
+    defer if (renderer) |r| sdl.SDL_DestroyRenderer(r);
 
     var audio: ?*sdl3.AudioStream = null;
     if (args.audio) {
@@ -210,39 +265,55 @@ pub fn main(init: std.process.Init) !void {
         con.runFrame();
         frames_run += 1;
 
-        // Video: native RGB565 straight into a streaming texture.
+        // Video: native RGB565, either through the shader chain or straight
+        // into a streaming texture.
         const fb = con.framebuffer();
         const width = con.frameWidth();
         const height: u32 = @intCast(fb.len / width);
-        if (texture == null or width != tex_w or height != tex_h) {
-            if (texture) |t| sdl.SDL_DestroyTexture(t);
-            texture = sdl.SDL_CreateTexture(
-                renderer,
-                sdl3.pixel_format_rgb565,
-                sdl3.texture_access_streaming,
-                @intCast(width),
-                @intCast(height),
-            ) orelse {
-                try err.print("error: SDL_CreateTexture: {s}\n", .{sdl.SDL_GetError()});
+
+        if (glv) |*g| {
+            g.chain.upload(fb, width, height);
+            var win_w: c_int = 0;
+            var win_h: c_int = 0;
+            _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+            g.chain.render(.{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) }) catch |e| {
+                try err.print("error: shader render failed: {s}\n", .{@errorName(e)});
                 try err.flush();
                 std.process.exit(1);
             };
-            _ = sdl.SDL_SetTextureScaleMode(texture.?, sdl3.scale_mode_nearest);
-            // 256-wide frames scale 2x onto the canvas, hi-res maps 1:1; the
-            // canvas keeps the SNES 8:7 shape and letterboxes into the window.
-            _ = sdl.SDL_SetRenderLogicalPresentation(
-                renderer,
-                512,
-                @intCast(height * 2),
-                sdl3.logical_presentation_letterbox,
-            );
-            tex_w = width;
-            tex_h = height;
+            _ = g.sdl_gl.SDL_GL_SwapWindow(window);
+        } else {
+            const r = renderer.?;
+            if (texture == null or width != tex_w or height != tex_h) {
+                if (texture) |t| sdl.SDL_DestroyTexture(t);
+                texture = sdl.SDL_CreateTexture(
+                    r,
+                    sdl3.pixel_format_rgb565,
+                    sdl3.texture_access_streaming,
+                    @intCast(width),
+                    @intCast(height),
+                ) orelse {
+                    try err.print("error: SDL_CreateTexture: {s}\n", .{sdl.SDL_GetError()});
+                    try err.flush();
+                    std.process.exit(1);
+                };
+                _ = sdl.SDL_SetTextureScaleMode(texture.?, sdl3.scale_mode_nearest);
+                // 256-wide frames scale 2x onto the canvas, hi-res maps 1:1; the
+                // canvas keeps the SNES 8:7 shape and letterboxes into the window.
+                _ = sdl.SDL_SetRenderLogicalPresentation(
+                    r,
+                    512,
+                    @intCast(height * 2),
+                    sdl3.logical_presentation_letterbox,
+                );
+                tex_w = width;
+                tex_h = height;
+            }
+            _ = sdl.SDL_UpdateTexture(texture.?, null, fb.ptr, @intCast(width * 2));
+            _ = sdl.SDL_RenderClear(r);
+            _ = sdl.SDL_RenderTexture(r, texture.?, null, null);
+            _ = sdl.SDL_RenderPresent(r);
         }
-        _ = sdl.SDL_UpdateTexture(texture.?, null, fb.ptr, @intCast(width * 2));
-        _ = sdl.SDL_RenderClear(renderer);
-        _ = sdl.SDL_RenderTexture(renderer, texture.?, null, null);
-        _ = sdl.SDL_RenderPresent(renderer);
 
         // Audio: drain the console ring into the SDL stream.
         var drain: [4096]i16 = undefined;
@@ -284,6 +355,77 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
     try con.loadState(data);
 }
 
+const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu };
+
+/// Bring up a GL context and load `name` from the best profile the driver will
+/// give us. Tries GLES 3, then desktop GL 3.3, then GLES 2 — and for each, only
+/// accepts it if the preset actually has a baked variant for that profile.
+///
+/// A GLES2-only device therefore silently gets the GLES2 build of a shader that
+/// has one, and a clear "not available for this GPU" for one that does not,
+/// rather than a context it cannot compile the shader in.
+fn initGl(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    window: *sdl3.Window,
+    shader_root: []const u8,
+    name: []const u8,
+    err: *std.Io.Writer,
+) !GlVideo {
+    const sdl_gl = sdl3.loadGl() catch return InitGlError.NoGlSymbols;
+
+    for (profiles) |prof| {
+        // Presence of a baked variant is the gate: no point holding a context
+        // we cannot use.
+        const dir_path = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ shader_root, prof.dir, name });
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch continue;
+
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_profile_mask, prof.profile_mask);
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_major_version, prof.major);
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_minor_version, prof.minor);
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.doublebuffer, 1);
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.depth_size, 0);
+        _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.stencil_size, 0);
+
+        const ctx = sdl_gl.SDL_GL_CreateContext(window) orelse {
+            dir.close(io);
+            continue;
+        };
+        _ = sdl_gl.SDL_GL_MakeCurrent(window, ctx);
+        // Pacing is ours, as in the software path: never vsync-throttle here or
+        // the game clock follows the display refresh.
+        _ = sdl_gl.SDL_GL_SetSwapInterval(0);
+
+        const api = gl.load(sdl_gl.SDL_GL_GetProcAddress) catch {
+            _ = sdl_gl.SDL_GL_DestroyContext(ctx);
+            dir.close(io);
+            continue;
+        };
+
+        const version = api.glGetString(gl.VERSION) orelse "";
+        const major = gl.majorVersion(std.mem.span(version));
+
+        const manifest = try dir.readFileAlloc(io, "preset.conf", gpa, .limited(1 << 20));
+        const p = try preset.parse(manifest);
+
+        var chain: shader.Chain = undefined;
+        try chain.init(io, gpa, api, major, p, dir, err);
+
+        try err.print("shader: {s} ({s}, {s}, {} pass{s}, {s} tier)\n", .{
+            p.name_str(),
+            prof.dir,
+            std.mem.span(version),
+            p.pass_count,
+            if (p.pass_count == 1) "" else "es",
+            @tagName(p.tier),
+        });
+        try err.flush();
+
+        return .{ .sdl_gl = sdl_gl, .ctx = ctx, .chain = chain };
+    }
+    return InitGlError.NoVariantForThisGpu;
+}
+
 fn parseArgs(init: std.process.Init) !Args {
     var it = init.minimal.args.iterate();
     _ = it.skip(); // program name
@@ -301,6 +443,10 @@ fn parseArgs(init: std.process.Init) !Args {
             args.audio = false;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             args.accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--shader")) {
+            args.shader = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--shader-dir")) {
+            args.shader_dir = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;

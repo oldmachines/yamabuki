@@ -72,5 +72,23 @@ pkg="yamabuki-$target"
 stage="$(mktemp -d)/$pkg"
 mkdir -p "$stage"
 cp -r zig-out/bin zig-out/lib "$stage"/ 2>/dev/null || true
+
+# Shaders, if they have been baked. Only the two GL ES profiles go on a handheld
+# -- glsl330 is desktop-only and would be dead weight. The binary probes the
+# device at startup and picks essl300 or essl100; a preset that could not be
+# transpiled for either simply is not in the package, so nothing here is a
+# shader the device cannot compile.
+if [ -d shaders/essl300 ] || [ -d shaders/essl100 ]; then
+  mkdir -p "$stage/shaders"
+  cp shaders/presets.conf "$stage/shaders/" 2>/dev/null || true
+  for profile in essl300 essl100; do
+    [ -d "shaders/$profile" ] || continue
+    cp -r "shaders/$profile" "$stage/shaders/"
+    echo ">> shaders: $profile ($(ls "shaders/$profile" | wc -l) presets)"
+  done
+else
+  echo ">> shaders: none baked (run 'zig build shaders'); the binary will run without them"
+fi
+
 tar -czf "$pkg.tar.gz" -C "$(dirname "$stage")" "$pkg"
 echo ">> wrote $pkg.tar.gz ($(stat -c%s "$pkg.tar.gz") bytes)"

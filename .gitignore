@@ -6,3 +6,18 @@ vendor/
 *.sfc
 *.smc
 *.tar.gz
+
+# Shader sources (fetched, pinned, never vendored) and the host-side tools that
+# transpile them. Same rule as test-data/.
+shader-src/
+.shader-tools/
+
+# Baked shader output: derived from shader-src/ by tools/transpile_shaders.py.
+# Regenerate with `zig build shaders`. shaders/presets.conf IS committed -- it is
+# the list of what we ship, which is a decision, not an artifact.
+shaders/essl300/
+shaders/essl100/
+shaders/glsl330/
+
+# Python bytecode from tools/
+__pycache__/

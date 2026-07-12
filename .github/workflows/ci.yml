@@ -187,3 +187,40 @@ jobs:
       - name: Assert musl artifacts are statically linked
         if: contains(matrix.target, 'musl')
         run: tools/package_handheld.sh --verify-only ${{ matrix.target }}
+
+  shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # glslang + SPIRV-Cross, built from pinned source with zig as the C++
+      # compiler (no system g++, no Vulkan SDK). Cached: it is the slow part.
+      - uses: actions/cache@v4
+        id: shader-tools-cache
+        with:
+          path: .shader-tools/bin
+          key: shader-tools-${{ hashFiles('tools/build_shader_tools.sh') }}
+      - if: steps.shader-tools-cache.outputs.cache-hit != 'true'
+        run: tools/build_shader_tools.sh
+      - run: tools/fetch_shaders.sh
+      - run: zig build shaders
+      # The bake is allowed to skip a (preset, profile) pair it cannot honour —
+      # that is the design. What must not happen is a *silent* regression in
+      # coverage, so assert the set we promise: every handheld-tier preset has
+      # to exist for GL ES 3, and the two shaders the whole transpile exists for
+      # (crt-royale, crt-guest-advanced) have to exist for desktop.
+      - name: Assert the promised presets baked
+        run: |
+          set -e
+          for p in zfast-crt crt-pi crt-lottes-fast crt-easymode sharp-bilinear; do
+            test -f "shaders/essl300/$p/preset.conf" \
+              || { echo "handheld preset '$p' missing from essl300" >&2; exit 1; }
+          done
+          for p in crt-royale crt-guest-advanced; do
+            test -f "shaders/glsl330/$p/preset.conf" \
+              || { echo "desktop preset '$p' missing from glsl330" >&2; exit 1; }
+          done
+          echo "baked $(find shaders -name preset.conf | wc -l) (preset, profile) pairs"
