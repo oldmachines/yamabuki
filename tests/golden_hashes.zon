@@ -86,13 +86,13 @@
         // hand results back through the mailbox ports — at 180 frames each
         // shows a verified PASS screen (the suites keep cycling sub-tests
         // beyond that; 180 is a deterministic mid-suite checkpoint).
-        .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0x420e94634463f1b1, .steps = 2959431, .cycles = 64326262, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0x420e94634463f1b1, .steps = 2959432, .cycles = 64326272, .frames = 180 },
         .{ .path = "CPUTest/SPC700/AND/SPC700AND.sfc", .hash = 0x76fd9f2391509961, .steps = 2959433, .cycles = 64326260, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x6137701a5b5fe4dd, .steps = 2960932, .cycles = 64326274, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x6137701a5b5fe4dd, .steps = 2960932, .cycles = 64326268, .frames = 180 },
         .{ .path = "CPUTest/SPC700/EOR/SPC700EOR.sfc", .hash = 0x28ee6457ca7887e5, .steps = 2959433, .cycles = 64326260, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0x82d485c6a584a90d, .steps = 2960932, .cycles = 64326274, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0x82d485c6a584a90d, .steps = 2960932, .cycles = 64326268, .frames = 180 },
         .{ .path = "CPUTest/SPC700/ORA/SPC700ORA.sfc", .hash = 0xc3c1b3812f314f75, .steps = 2959435, .cycles = 64326270, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x563dc88db83a4ab9, .steps = 2959431, .cycles = 64326284, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x563dc88db83a4ab9, .steps = 2959431, .cycles = 64326264, .frames = 180 },
         // M5b: the S-DSP. These SPC700 demo ROMs render a black screen by
         // design (audio-only; the CPU side uploads a driver then spins) — the
         // shared framebuffer hash guards the boot path, and `audio` locks the

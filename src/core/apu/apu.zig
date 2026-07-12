@@ -81,6 +81,15 @@ pub const Apu = struct {
     boot: BootState,
     boot_addr: u16,
     boot_index: u8,
+    /// A boot port-0 write is waiting to be acted on. The real IPL reads the
+    /// data port (P1) only after it has echoed the index and the main CPU has
+    /// finished writing the byte, so a boot step is deferred to the next
+    /// port-0 read (the main CPU always polls for the echo) — by then both P0
+    /// and P1 are final regardless of the order the game wrote them. Reacting
+    /// on the P0 write instead would latch a stale P1 for any uploader that
+    /// writes the index before the data (e.g. Kirby Super Star, via a 16-bit
+    /// store to $2140).
+    boot_pending: bool,
 
     /// Initialize in place; `self` must be at its final address (the SMP
     /// holds a pointer back to this struct as its bus).
@@ -109,6 +118,7 @@ pub const Apu = struct {
             .boot = .ready,
             .boot_addr = 0,
             .boot_index = 0,
+            .boot_pending = false,
         };
         self.smp = spc700.Smp(Apu).init(self);
     }
@@ -122,17 +132,26 @@ pub const Apu = struct {
 
     pub fn cpuRead(self: *Apu, master_clock: u64, port: u2) u8 {
         self.catchUp(master_clock);
+        // A deferred boot step runs here: the main CPU polls port 0 for the
+        // echo after writing a byte, so both P0 and P1 are final by now.
+        if (self.boot != .done and port == 0 and self.boot_pending) {
+            self.boot_pending = false;
+            self.bootPort0();
+        }
         return self.cpu_out[port];
     }
 
     pub fn cpuWrite(self: *Apu, master_clock: u64, port: u2, value: u8) void {
         self.catchUp(master_clock);
         self.cpu_in[port] = value;
-        if (self.boot != .done and port == 0) self.bootPort0(value);
+        if (self.boot != .done and port == 0) self.boot_pending = true;
     }
 
-    /// The HLE boot protocol, driven by main-CPU writes to port 0.
-    fn bootPort0(self: *Apu, value: u8) void {
+    /// The HLE boot protocol. Deferred from the port-0 write to the following
+    /// read (see `boot_pending`); the index is P0 (`cpu_in[0]`) and the data
+    /// byte is P1 (`cpu_in[1]`), both final at this point.
+    fn bootPort0(self: *Apu) void {
+        const value = self.cpu_in[0];
         const dest = @as(u16, self.cpu_in[3]) << 8 | self.cpu_in[2];
         switch (self.boot) {
             .ready => {
@@ -354,6 +373,45 @@ fn uploadAndRun(apu: *Apu, dest: u16, program: []const u8) void {
     apu.cpuWrite(0, 3, @truncate(dest >> 8));
     apu.cpuWrite(0, 1, 0);
     apu.cpuWrite(0, 0, @truncate(program.len + 2));
+    _ = apu.cpuRead(0, 0); // poll the echo: this runs the deferred execute
+}
+
+/// Same handshake as uploadAndRun, but each byte writes the index (P0) BEFORE
+/// the data (P1) — the order Kirby Super Star uses (a 16-bit store to $2140
+/// hits P0 first). The deferred boot must still latch the correct P1.
+fn uploadAndRunP0First(apu: *Apu, dest: u16, program: []const u8) void {
+    std.debug.assert(apu.cpuRead(0, 0) == 0xAA);
+    apu.cpuWrite(0, 2, @truncate(dest));
+    apu.cpuWrite(0, 3, @truncate(dest >> 8));
+    apu.cpuWrite(0, 0, 0xCC); // index/command first
+    apu.cpuWrite(0, 1, 0xCC); // then the "nonzero" flag
+    std.debug.assert(apu.cpuRead(0, 0) == 0xCC);
+    for (program, 0..) |byte, i| {
+        apu.cpuWrite(0, 0, @truncate(i)); // index first
+        apu.cpuWrite(0, 1, byte); // then the data byte
+        std.debug.assert(apu.cpuRead(0, 0) == @as(u8, @truncate(i)));
+    }
+    apu.cpuWrite(0, 2, @truncate(dest));
+    apu.cpuWrite(0, 3, @truncate(dest >> 8));
+    apu.cpuWrite(0, 0, @truncate(program.len + 2));
+    apu.cpuWrite(0, 1, 0);
+    _ = apu.cpuRead(0, 0); // poll the echo: this runs the deferred execute
+}
+
+test "HLE boot latches the right data byte when the index is written first" {
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    const program = [_]u8{ 0xE8, 0x42, 0xC4, 0xF4, 0x2F, 0xFE };
+    uploadAndRunP0First(apu, 0x0200, &program);
+    try std.testing.expectEqual(BootState.done, apu.boot);
+    try std.testing.expectEqual(@as(u16, 0x0200), apu.smp.regs.pc);
+    // The whole program must land byte-for-byte (the pre-fix bug shifted every
+    // byte by one and stored the stale handshake flag as byte 0).
+    try std.testing.expectEqualSlices(u8, &program, apu.aram[0x0200 .. 0x0200 + program.len]);
+    try std.testing.expectEqual(@as(u8, 0x42), apu.cpuRead(2100, 0));
 }
 
 test "HLE boot uploads a program and the SMP executes it" {
