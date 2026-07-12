@@ -1,0 +1,91 @@
+# Publishes the Yamabuki page. Every push to the default branch assembles
+# site/ — the landing page plus the design-notes deck — and deploys it to
+# GitHub Pages on THIS repo. Auth is the workflow's own OIDC token; no stored
+# credential anywhere.
+#
+# WHERE IT LANDS. A project page is served under its OWNER's Pages domain:
+#
+#   github.com/<owner>/yamabuki  ->  https://<owner>.github.io/yamabuki/
+#
+# So for the site to appear at oldmachines.io/yamabuki, two things have to be
+# true, and neither of them lives in this file:
+#
+#   1. this repo is owned by the `oldmachines` org (a repo under a personal
+#      account can only ever serve at <user>.github.io/yamabuki), and
+#   2. the org's site repo — oldmachines/oldmachines.github.io — has
+#      oldmachines.io set as its custom domain, with DNS pointed at GitHub.
+#      Project pages then inherit the domain as subpaths, which is exactly how
+#      the sibling machines already resolve (/apple2/, /genesis/, ...).
+#
+# There is deliberately NO CNAME file here. A CNAME in a *project* repo claims
+# the apex domain for this repo alone — it would take oldmachines.io away from
+# the collection hub. The domain belongs to the org site; this repo inherits it.
+name: publish site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'docs/*.deck.html'
+      - '.github/workflows/publish-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deployment at a time; never cancel one mid-flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r site/. _site/
+          # The deck is authored in docs/ and published as /deck.html — one
+          # source of truth, copied rather than duplicated in the tree.
+          cp docs/yamabuki-design-notes.deck.html _site/deck.html
+          # Pages runs Jekyll by default, which would eat paths beginning with
+          # an underscore and mangle the deck's inlined runtime.
+          touch _site/.nojekyll
+
+      # The deck is a self-contained file that must actually open. If it lost
+      # its runtime or its slides, fail here rather than shipping a blank page.
+      - name: Assert the deck is intact
+        run: |
+          set -euo pipefail
+          test -s _site/deck.html
+          grep -q '<div class="decklight">' _site/deck.html
+          slides=$(grep -c '<section' _site/deck.html)
+          test "$slides" -ge 10 || { echo "deck has only $slides slides" >&2; exit 1; }
+          grep -q 'Decklight.init' _site/deck.html
+          echo "deck ok — $slides slides, runtime inlined"
+
+      - name: Assert the landing page links resolve
+        run: |
+          set -euo pipefail
+          test -s _site/index.html
+          # ./deck.html is the only internal link; a typo here is a 404 on the
+          # one button the page exists to offer.
+          grep -q 'href="./deck.html"' _site/index.html
+          echo "landing page ok"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

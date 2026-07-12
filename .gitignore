@@ -21,3 +21,6 @@ shaders/glsl330/
 
 # Python bytecode from tools/
 __pycache__/
+
+# Assembled Pages output (built by .github/workflows/publish-site.yml)
+_site/
