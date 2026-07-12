@@ -198,6 +198,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
 | M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math — all unit-test gated) |
 | M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites, ~+18–39% on 8bpp ROMs; SA-1 ROM-read fast path precomputes the MMC map, −15% total instructions / +15% FPS on Super Mario RPG, bit-identical; deterministic VRAM-traffic bench gate + static-musl handheld packaging with a CI static-linkage assertion) |
+| M11 CRT shaders | in progress (GL ES 3 pipeline with GL 3.3, GL ES 2, and software fallbacks: multi-pass FBO chain, pass aliases, feedback targets, frame history, LUTs; 12 libretro presets transpiled ahead of time by glslang + SPIRV-Cross on the build host — 31 of 36 (preset, profile) pairs bake, the 5 skips are printed and CI-gated. **Not yet run on a GPU.**) |
 
 ## Design notes
 
