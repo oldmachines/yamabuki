@@ -886,12 +886,15 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
             chr = (chr & 0xF0) | ((chr +% scr_col) & 0x0F);
             const char_word = tbase +% chr *% 16;
 
+            // Decode the tile row's 8 pixels once (2 word reads) instead of
+            // re-reading both planar words per pixel through decodePlanar.
+            const row = decodeRow(ppu, 4, char_word +% fine_y);
             const px0 = xpos + @as(i32, @intCast(col * 8));
             for (0..8) |p| {
                 const sx = px0 + @as(i32, @intCast(p));
                 if (sx < 0 or sx >= fb_width) continue;
                 const fx: u3 = @intCast(if (xflip) 7 - p else p);
-                const color = decodePlanar(ppu, 4, char_word +% fine_y, fx);
+                const color = row[fx];
                 if (color == 0) continue;
                 const ux: usize = @intCast(sx);
                 if (buf[ux].solid) continue; // lower OAM index already claimed this pixel
