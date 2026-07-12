@@ -81,7 +81,10 @@ lookup tables regenerated from closed-form math and every command family
 locked by exact unit-test vectors. The SA-1 (Super Mario RPG, Kirby Super
 Star) runs as a second instance of the same 65816 core on its own bus, with
 the Super MMC, BW-RAM projections, DMA with character conversion, and the
-arithmetic unit.
+arithmetic unit. The Cx4 (Mega Man X2/X3) is emulated at the command level:
+the wireframe transform/rasterizer, sprite scale/rotate, OAM builder, and the
+scalar math commands, driven synchronously through its $6000-$7FFF register
+window — completing M9's enhancement-chip set.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 
@@ -96,5 +99,5 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
 | M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, NTSC pacing; CI golden-hash smoke test) |
 | M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
-| M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | in progress (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math, unit-test gated) |
+| M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math — all unit-test gated) |
 | M10 ARM performance tuning | planned |
