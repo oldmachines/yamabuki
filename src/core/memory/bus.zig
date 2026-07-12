@@ -17,6 +17,7 @@ const Ppu = @import("../ppu/ppu.zig").Ppu;
 const Apu = @import("../apu/apu.zig").Apu;
 const Gsu = @import("../chips/gsu.zig").Gsu;
 const Dsp1 = @import("../chips/dsp1.zig").Dsp1;
+const Sa1 = @import("../chips/sa1.zig").Sa1;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -69,6 +70,8 @@ pub const Bus = struct {
     gsu: Gsu,
     /// DSP-1 math coprocessor (HLE); inert unless the cartridge chip is `.dsp`.
     dsp1: Dsp1,
+    /// SA-1 coprocessor; inert unless the cartridge chip is `.sa1`.
+    sa1: Sa1,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`, and the APU's SPC700 points back at
@@ -92,7 +95,9 @@ pub const Bus = struct {
         self.apu.init();
         self.gsu = .init;
         self.dsp1 = .init;
+        self.sa1.init();
         self.attachGsu();
+        self.attachSa1();
         self.remap();
     }
 
@@ -100,6 +105,12 @@ pub const Bus = struct {
     fn attachGsu(self: *Bus) void {
         if (self.cart.chip != .superfx) return;
         self.gsu.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
+    }
+
+    /// Wire the SA-1 to the cartridge's ROM and BW-RAM (after init or load).
+    fn attachSa1(self: *Bus) void {
+        if (self.cart.chip != .sa1) return;
+        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
     }
 
     /// Rebuild the page table (after init, deserialize, or MEMSEL change).
@@ -111,6 +122,7 @@ pub const Bus = struct {
     /// then every component that declares its own postLoad hook (discovered
     /// at comptime, so new components can't be forgotten here).
     pub fn postLoad(self: *Bus) void {
+        self.attachSa1(); // before remap: the SA-1 page map reads MMC state
         self.remap();
         self.attachGsu();
         inline for (@typeInfo(Bus).@"struct".fields) |f| {
@@ -192,6 +204,10 @@ pub const Bus = struct {
                 self.mdr = if (sr) self.dsp1.readStatus() else self.dsp1.readData();
                 return self.mdr;
             }
+            if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
+                self.mdr = self.sa1.bwramReadSnes(self.clock, addr & 0xF_FFFF);
+                return self.mdr;
+            }
             if (mappers.smallSramPtr(self, addr)) |p| {
                 self.mdr = p.*;
                 return self.mdr;
@@ -211,10 +227,15 @@ pub const Bus = struct {
             0x213F => self.ppu.readStat78(self.mdr),
             0x2134...0x2136, 0x2138...0x213B, 0x213E => self.ppu.readReg(a16, self.mdr),
             0x2140...0x217F => self.apu.cpuRead(self.clock, @truncate(a16 & 3)),
-            0x3000...0x33FF => if (self.cart.chip == .superfx)
-                self.gsu.mmioRead(self.clock, a16, self.mdr)
+            0x2200...0x23FF => if (self.cart.chip == .sa1)
+                self.sa1.mmioRead(self.clock, a16, self.mdr)
             else
                 self.mdr,
+            0x3000...0x37FF => switch (self.cart.chip) {
+                .superfx => if (a16 <= 0x33FF) self.gsu.mmioRead(self.clock, a16, self.mdr) else self.mdr,
+                .sa1 => self.sa1.iramReadSnes(self.clock, a16),
+                else => self.mdr,
+            },
             0x2180 => self.wram.portRead(),
             0x4016 => self.joy.readSerial(0, self.mdr),
             0x4017 => self.joy.readSerial(1, self.mdr),
@@ -231,6 +252,20 @@ pub const Bus = struct {
                 if (self.dsp1Port(bank, a16)) |sr| {
                     self.mdr = if (sr) self.dsp1.readStatus() else self.dsp1.readData();
                     return self.mdr;
+                }
+                if (self.cart.chip == .sa1) {
+                    if (a16 >= 0x6000 and a16 < 0x8000) {
+                        // BW-RAM window (block selected by BMAPS).
+                        self.mdr = self.sa1.bwramReadSnes(self.clock, self.sa1.snesWindowOffset(a16));
+                        return self.mdr;
+                    }
+                    if (a16 >= 0xE000 and bank & 0x7F == 0) {
+                        // Vector page, kept off the fast path so the SA-1
+                        // can substitute the SNES NMI/IRQ vectors.
+                        self.sa1.catchUp(self.clock);
+                        self.mdr = self.sa1.snesVectorRead(addr);
+                        return self.mdr;
+                    }
                 }
                 if (mappers.smallSramPtr(self, addr)) |p| {
                     self.mdr = p.*;
@@ -254,6 +289,10 @@ pub const Bus = struct {
                 if (!sr) self.dsp1.writeData(value);
                 return;
             }
+            if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
+                self.sa1.bwramWriteSnes(self.clock, addr & 0xF_FFFF, value);
+                return;
+            }
             if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
             return;
         }
@@ -264,8 +303,19 @@ pub const Bus = struct {
                 self.ppu.writeReg(a16, value);
             },
             0x2140...0x217F => self.apu.cpuWrite(self.clock, @truncate(a16 & 3), value),
-            0x3000...0x33FF => if (self.cart.chip == .superfx)
-                self.gsu.mmioWrite(self.clock, a16, value),
+            0x2200...0x23FF => if (self.cart.chip == .sa1) {
+                self.sa1.mmioWrite(self.clock, a16, value);
+                if (self.sa1.mmc_dirty) {
+                    // Super MMC bank change: rebuild the ROM page mapping.
+                    self.sa1.mmc_dirty = false;
+                    self.remap();
+                }
+            },
+            0x3000...0x37FF => switch (self.cart.chip) {
+                .superfx => if (a16 <= 0x33FF) self.gsu.mmioWrite(self.clock, a16, value),
+                .sa1 => self.sa1.iramWriteSnes(self.clock, a16, value),
+                else => {},
+            },
             0x2180 => self.wram.portWrite(value),
             0x2181 => self.wram.setPortAddrLow(value),
             0x2182 => self.wram.setPortAddrMid(value),
@@ -295,6 +345,10 @@ pub const Bus = struct {
             else => {
                 if (self.dsp1Port(bank, a16)) |sr| {
                     if (!sr) self.dsp1.writeData(value);
+                    return;
+                }
+                if (self.cart.chip == .sa1 and a16 >= 0x6000 and a16 < 0x8000) {
+                    self.sa1.bwramWriteSnes(self.clock, self.sa1.snesWindowOffset(a16), value);
                     return;
                 }
                 if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
@@ -539,6 +593,53 @@ test "dsp1 ports on a hirom dsp cart" {
     tc.bus.write8(0x00_6000, 0x20);
     try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_6000));
     try std.testing.expectEqual(@as(u8, 0x10), tc.bus.read8(0x00_6000));
+}
+
+test "sa1 cart boots the coprocessor through the bus" {
+    var tc = try TestConsole.createChip(0x20, 5, 0x33);
+    defer tc.destroy();
+    // Poke an SA-1 program into the (const-loaded) test ROM at $00:8000:
+    // LDA #$85; STA $2209; STP — message 5 + IRQ to the SNES.
+    const rom = @constCast(tc.cart.rom);
+    const prog = [_]u8{ 0xA9, 0x85, 0x8D, 0x09, 0x22, 0xDB };
+    @memcpy(rom[0..prog.len], &prog);
+
+    tc.bus.write8(0x00_2201, 0x80); // SIE: enable SA-1 → SNES IRQ
+    tc.bus.write8(0x00_2203, 0x00); // CRV = $8000
+    tc.bus.write8(0x00_2204, 0x80);
+    tc.bus.write8(0x00_2200, 0x00); // release reset
+    tc.bus.clock += 500; // let the SA-1 run; MMIO access catches it up
+    try std.testing.expectEqual(@as(u8, 0x85), tc.bus.read8(0x00_2300)); // SFR
+    try std.testing.expect(tc.bus.sa1.snes_irq_line);
+    tc.bus.write8(0x00_2202, 0x80); // SIC clears
+    try std.testing.expect(!tc.bus.sa1.snes_irq_line);
+
+    // IRAM at $3000-$37FF (SIWP gates writes).
+    tc.bus.write8(0x00_3123, 0x5A);
+    try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_3123));
+    tc.bus.write8(0x00_2229, 0xFF);
+    tc.bus.write8(0x00_3123, 0x5A);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x80_3123));
+
+    // BW-RAM: the $6000 window (SBM block 1) aliases bank $40 linear.
+    tc.bus.write8(0x00_2224, 0x01);
+    tc.bus.write8(0x00_2226, 0x80); // SWEN
+    tc.bus.write8(0x00_6010, 0x77);
+    try std.testing.expectEqual(@as(u8, 0x77), tc.bus.read8(0x40_2010));
+
+    // MMC write triggers a page-table rebuild; ROM stays readable.
+    const before = tc.bus.read8(0x00_8000);
+    tc.bus.write8(0x00_2220, 0x81);
+    try std.testing.expectEqual(before, tc.bus.read8(0x00_8000));
+
+    // SNES NMI vector substitution when the SA-1 flips NVSW.
+    const rom_vec = tc.bus.read8(0x00_FFEA);
+    tc.bus.sa1.snv = 0x1234;
+    tc.bus.sa1.cpu_nvsw = true;
+    try std.testing.expectEqual(@as(u8, 0x34), tc.bus.read8(0x00_FFEA));
+    try std.testing.expectEqual(@as(u8, 0x12), tc.bus.read8(0x00_FFEB));
+    tc.bus.sa1.cpu_nvsw = false;
+    try std.testing.expectEqual(rom_vec, tc.bus.read8(0x00_FFEA));
 }
 
 test "bus state serialize roundtrip rebuilds pages" {
