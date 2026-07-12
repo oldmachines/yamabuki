@@ -18,6 +18,7 @@ const Apu = @import("../apu/apu.zig").Apu;
 const Gsu = @import("../chips/gsu.zig").Gsu;
 const Dsp1 = @import("../chips/dsp1.zig").Dsp1;
 const Sa1 = @import("../chips/sa1.zig").Sa1;
+const Cx4 = @import("../chips/cx4.zig").Cx4;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -72,6 +73,8 @@ pub const Bus = struct {
     dsp1: Dsp1,
     /// SA-1 coprocessor; inert unless the cartridge chip is `.sa1`.
     sa1: Sa1,
+    /// Cx4 coprocessor (HLE); inert unless the cartridge chip is `.cx4`.
+    cx4: Cx4,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`, and the APU's SPC700 points back at
@@ -96,8 +99,10 @@ pub const Bus = struct {
         self.gsu = .init;
         self.dsp1 = .init;
         self.sa1.init();
+        self.cx4.init();
         self.attachGsu();
         self.attachSa1();
+        self.attachCx4();
         self.remap();
     }
 
@@ -113,6 +118,12 @@ pub const Bus = struct {
         self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
     }
 
+    /// Wire the Cx4 to the cartridge's ROM (after init or load).
+    fn attachCx4(self: *Bus) void {
+        if (self.cart.chip != .cx4) return;
+        self.cx4.attach(self.cart.rom, self.cart.rom_mask);
+    }
+
     /// Rebuild the page table (after init, deserialize, or MEMSEL change).
     pub fn remap(self: *Bus) void {
         mappers.buildPages(self);
@@ -125,6 +136,7 @@ pub const Bus = struct {
         self.attachSa1(); // before remap: the SA-1 page map reads MMC state
         self.remap();
         self.attachGsu();
+        self.attachCx4();
         inline for (@typeInfo(Bus).@"struct".fields) |f| {
             if (comptime @typeInfo(f.type) == .@"struct" and @hasDecl(f.type, "postLoad")) {
                 @field(self, f.name).postLoad();
@@ -267,6 +279,10 @@ pub const Bus = struct {
                         return self.mdr;
                     }
                 }
+                if (self.cart.chip == .cx4 and a16 >= 0x6000 and a16 < 0x8000) {
+                    self.mdr = self.cx4.read(a16);
+                    return self.mdr;
+                }
                 if (mappers.smallSramPtr(self, addr)) |p| {
                     self.mdr = p.*;
                     return self.mdr;
@@ -349,6 +365,10 @@ pub const Bus = struct {
                 }
                 if (self.cart.chip == .sa1 and a16 >= 0x6000 and a16 < 0x8000) {
                     self.sa1.bwramWriteSnes(self.clock, self.sa1.snesWindowOffset(a16), value);
+                    return;
+                }
+                if (self.cart.chip == .cx4 and a16 >= 0x6000 and a16 < 0x8000) {
+                    self.cx4.write(a16, value);
                     return;
                 }
                 if (mappers.smallSramPtr(self, addr)) |p| p.* = value;
@@ -593,6 +613,27 @@ test "dsp1 ports on a hirom dsp cart" {
     tc.bus.write8(0x00_6000, 0x20);
     try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_6000));
     try std.testing.expectEqual(@as(u8, 0x10), tc.bus.read8(0x00_6000));
+}
+
+test "cx4 command runs through the $6000-$7fff window on a lorom cart" {
+    var tc = try TestConsole.createChip(0x20, 0, 0xF3);
+    defer tc.destroy();
+    try std.testing.expectEqual(@import("../cart/cartridge.zig").ChipKind.cx4, tc.cart.chip);
+    // Status byte $7f5e always reads 0.
+    try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_7F5E));
+    // Stage a 3·4 multiply ($25): operands as little-endian 24-bit at
+    // $7f80 and $7f83, then poke the command byte to $7f4f.
+    tc.bus.write8(0x00_7F80, 0x03);
+    tc.bus.write8(0x00_7F81, 0x00);
+    tc.bus.write8(0x00_7F82, 0x00);
+    tc.bus.write8(0x00_7F83, 0x04);
+    tc.bus.write8(0x00_7F84, 0x00);
+    tc.bus.write8(0x00_7F85, 0x00);
+    tc.bus.write8(0x80_7F4F, 0x25); // mirror bank decodes the same window
+    try std.testing.expectEqual(@as(u8, 0x0C), tc.bus.read8(0x00_7F80));
+    try std.testing.expectEqual(@as(u8, 0x00), tc.bus.read8(0x00_7F81));
+    // ROM outside the window still reads normally.
+    try std.testing.expectEqual(tc.cart.rom[0], tc.bus.read8(0x00_8000));
 }
 
 test "sa1 cart boots the coprocessor through the bus" {
