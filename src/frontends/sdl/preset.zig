@@ -317,6 +317,18 @@ pub fn passSize(pass: *const Pass, source: Size, viewport: Size) Size {
     };
 }
 
+/// Step `delta` places through a list of `len` presets, wrapping both ways.
+///
+/// Lives here rather than in the frontend so the wrap is actually testable:
+/// stepping back from the first entry has to land on the last, and Zig's `@mod`
+/// (euclidean, unlike `@rem`) is what makes that true for a negative delta.
+pub fn cycle(index: usize, delta: isize, len: usize) usize {
+    if (len == 0) return 0;
+    const n: isize = @intCast(len);
+    const i: isize = @intCast(index);
+    return @intCast(@mod(i + delta, n));
+}
+
 pub const ParseError = error{
     BadDirective,
     BadValue,
@@ -703,4 +715,21 @@ test "parse: passes must be declared in order" {
 
 test "parse: a manifest with no passes is an error" {
     try testing.expectError(error.NoPasses, parse("name empty\ntier desktop\n"));
+}
+
+test "cycle: wraps both ways, and backwards from the first lands on the last" {
+    // The bug this exists to prevent: `@rem(-1, 3)` is -1, which would index
+    // out of bounds. `@mod` gives 2.
+    try testing.expectEqual(@as(usize, 1), cycle(0, 1, 3));
+    try testing.expectEqual(@as(usize, 2), cycle(1, 1, 3));
+    try testing.expectEqual(@as(usize, 0), cycle(2, 1, 3)); // forward wrap
+    try testing.expectEqual(@as(usize, 2), cycle(0, -1, 3)); // backward wrap
+    try testing.expectEqual(@as(usize, 1), cycle(2, -1, 3));
+
+    // A single preset always cycles back to itself, never off the end.
+    try testing.expectEqual(@as(usize, 0), cycle(0, 1, 1));
+    try testing.expectEqual(@as(usize, 0), cycle(0, -1, 1));
+
+    // An empty list must not divide by zero.
+    try testing.expectEqual(@as(usize, 0), cycle(0, -1, 0));
 }

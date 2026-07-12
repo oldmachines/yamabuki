@@ -61,12 +61,18 @@ the build has no SDL dependency, the library is dlopen'd):
 
 Keyboard follows the RetroArch defaults — arrows = d-pad, `Z`=B, `X`=A,
 `A`=Y, `S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
-save/load state, `F1` reset, hold `Tab` to fast-forward, `Esc` to quit.
+save/load state, `F1` reset, hold `Tab` to fast-forward, `Esc` to quit, and
+`,` / `.` to cycle shaders.
 
 ## Shaders
 
-`--shader <name>` runs the frame through a libretro CRT shader chain. The
-shipped set is listed in [`shaders/presets.conf`](shaders/presets.conf) — the
+`--shader <name>` runs the frame through a libretro CRT shader chain, and
+`,` / `.` cycle through the rest of them without restarting. The cycle only
+walks presets baked for the GPU profile you actually got, so it can never land
+on a shader this device cannot compile; the replacement chain is built before
+the incumbent is torn down, so a preset that fails costs a printed line and not
+the picture. The shipped set is listed in
+[`shaders/presets.conf`](shaders/presets.conf) — the
 cheap single-pass ones (`zfast-crt`, `crt-pi`, `crt-lottes-fast`,
 `crt-easymode`, `sharp-bilinear`) and the heavyweights (`crt-royale`,
 `crt-guest-advanced`, `crt-lottes`, `crt-easymode-halation`, `gtu-v050`,
