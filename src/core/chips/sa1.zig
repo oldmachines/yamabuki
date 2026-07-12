@@ -33,7 +33,7 @@ const std = @import("std");
 const wdc65816 = @import("../cpu/wdc65816.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -101,6 +101,12 @@ pub const Sa1 = struct {
     fbmode: bool,
     /// Set when an MMC register changes; the bus rebuilds its page table.
     mmc_dirty: bool,
+    /// Derived from the four MMC bank registers, refreshed on every change
+    /// (`refreshMmc`) so the per-read `mmcTranslate` is two array loads instead
+    /// of a 4-way register switch. `mmc_base[r]` is the mapped ROM base for
+    /// 1 MiB region `r`; `mmc_flat[r]` marks the lo-half direct-projection mode.
+    mmc_base: [4]u32,
+    mmc_flat: [4]bool,
     // $2224-$222A BW-RAM / IRAM mapping and protection
     sbm: u5,
     cbm: u7,
@@ -167,6 +173,7 @@ pub const Sa1 = struct {
         self.fb = 3;
         self.bwp = 0x0f;
         self.vbd_len = 16;
+        self.refreshMmc();
     }
 
     /// Wire to the cartridge ROM and BW-RAM (after init or state load).
@@ -176,6 +183,19 @@ pub const Sa1 = struct {
         self.bwram = bwram;
         self.bwram_mask = bwram_mask;
         self.cpu.bus = self;
+        self.refreshMmc(); // derived table isn't serialized; rebuild after load
+    }
+
+    /// Recompute the per-region ROM mapping from the MMC bank registers. Cheap
+    /// and rare (register writes, reset, load), so `mmcTranslate` stays branchy-
+    /// free on the hot read path.
+    fn refreshMmc(self: *Sa1) void {
+        const blocks = [4]u3{ self.cb, self.db, self.eb, self.fb };
+        const modes = [4]bool{ self.cbmode, self.dbmode, self.ebmode, self.fbmode };
+        for (0..4) |r| {
+            self.mmc_base[r] = @as(u32, blocks[r]) << 20;
+            self.mmc_flat[r] = !modes[r];
+        }
     }
 
     fn running(self: *const Sa1) bool {
@@ -288,14 +308,8 @@ pub const Sa1 = struct {
     /// region straight to the matching image quarter instead of the block.
     pub fn mmcTranslate(self: *const Sa1, a: u22, lo: bool) u32 {
         const region: u2 = @intCast(a >> 20);
-        const block: u32, const mode = switch (region) {
-            0 => .{ self.cb, self.cbmode },
-            1 => .{ self.db, self.dbmode },
-            2 => .{ self.eb, self.ebmode },
-            3 => .{ self.fb, self.fbmode },
-        };
-        if (lo and !mode) return a & self.rom_mask;
-        return (block << 20 | (a & 0xF_FFFF)) & self.rom_mask;
+        if (lo and self.mmc_flat[region]) return a & self.rom_mask;
+        return (self.mmc_base[region] | (a & 0xF_FFFF)) & self.rom_mask;
     }
 
     /// Full-address ROM read on the SA-1/SNES shared map ($00-$3F/$80-$BF
@@ -396,28 +410,34 @@ pub const Sa1 = struct {
     }
 
     pub fn read8(self: *Sa1, addr: u24) u8 {
-        // Vector window (bank $00 only): CRV/CNV/CIV supply the vectors.
-        if (addr >= 0x00_FFEA and addr <= 0x00_FFFF) {
-            const vec: ?u16 = switch (@as(u16, @truncate(addr))) {
-                0xFFEA, 0xFFEB, 0xFFFA, 0xFFFB => self.cnv,
-                0xFFEE, 0xFFEF, 0xFFFE, 0xFFFF => self.civ,
-                0xFFFC, 0xFFFD => self.crv,
-                else => null, // reserved slots fall through to ROM
-            };
-            if (vec) |v| {
-                self.budget -= 2;
-                self.mdr = if (addr & 1 == 0) @truncate(v) else @truncate(v >> 8);
-                return self.mdr;
+        // ROM $00-$3F/$80-$BF:8000-FFFF — the dominant case (SA-1 code and
+        // operand fetch), tested first so the common path is one branch.
+        if (addr & 0x40_8000 == 0x00_8000) {
+            self.budget -= 2;
+            // CRV/CNV/CIV vectors overlay $00:FFEA-FFFF (bank $00 only).
+            if (addr <= 0x00_FFFF and addr >= 0x00_FFEA) {
+                const vec: ?u16 = switch (@as(u16, @truncate(addr))) {
+                    0xFFEA, 0xFFEB, 0xFFFA, 0xFFFB => self.cnv,
+                    0xFFEE, 0xFFEF, 0xFFFE, 0xFFFF => self.civ,
+                    0xFFFC, 0xFFFD => self.crv,
+                    else => null, // reserved slots fall through to ROM
+                };
+                if (vec) |v| {
+                    self.mdr = if (addr & 1 == 0) @truncate(v) else @truncate(v >> 8);
+                    return self.mdr;
+                }
             }
+            self.mdr = self.rom[self.mmcTranslate(squashLo(addr), true)];
+            return self.mdr;
+        }
+        if (addr & 0xC0_0000 == 0xC0_0000) { // ROM $C0-$FF
+            self.budget -= 2;
+            self.mdr = self.rom[self.mmcTranslate(@intCast(addr & 0x3F_FFFF), false)];
+            return self.mdr;
         }
         if (addr & 0x40_FE00 == 0x00_2200) {
             self.budget -= 2;
             self.mdr = self.readIoSa1(@truncate(addr), self.mdr);
-            return self.mdr;
-        }
-        if (addr & 0x40_8000 == 0x00_8000 or addr & 0xC0_0000 == 0xC0_0000) {
-            self.budget -= 2;
-            self.mdr = self.romRead(addr);
             return self.mdr;
         }
         if (addr & 0x40_E000 == 0x00_6000 or addr & 0xE0_0000 == 0x40_0000 or addr & 0xF0_0000 == 0x60_0000) {
@@ -549,21 +569,25 @@ pub const Sa1 = struct {
                 self.cb = @truncate(value);
                 self.cbmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
+                self.refreshMmc();
             },
             0x2221 => {
                 self.db = @truncate(value);
                 self.dbmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
+                self.refreshMmc();
             },
             0x2222 => {
                 self.eb = @truncate(value);
                 self.ebmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
+                self.refreshMmc();
             },
             0x2223 => {
                 self.fb = @truncate(value);
                 self.fbmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
+                self.refreshMmc();
             },
             0x2224 => self.sbm = @truncate(value),
             0x2226 => self.swen = value & 0x80 != 0,

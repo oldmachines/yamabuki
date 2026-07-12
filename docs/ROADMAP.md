@@ -224,6 +224,14 @@ serialize/unserialize.
   per-pixel decode (all goldens unchanged); it cuts VRAM fetch traffic ~8x for
   8bpp BG rows and for every 4bpp sprite tile — the win that compounds on
   cache-poor ARM.
+- **SA-1 ROM-read fast path** (M10) — on a SA-1 cartridge the chip runs a
+  second 65816 whose every fetch goes through `Sa1.read8`, which profiling put
+  at ~38% of total work on Super Mario RPG. The Super-MMC bank map is now
+  precomputed into a four-entry region table on register writes (rare) instead
+  of a per-read switch, and `read8` tests the dominant ROM case first with the
+  vector window folded in. Bit-identical (SMRPG and Kirby Super Star render and
+  sound identical frame-for-frame); ~15% fewer total instructions and ~+15%
+  headless FPS on SMRPG.
 - **ReleaseFast** is the shipped mode; Debug/ReleaseSafe and the SST suite run
   in both to catch UB early.
 - **Zero per-frame allocation** — one large `Console` struct owns every buffer
