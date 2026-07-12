@@ -5,3 +5,4 @@ vendor/
 *.ppm
 *.sfc
 *.smc
+*.tar.gz

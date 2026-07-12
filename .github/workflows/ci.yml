@@ -101,11 +101,12 @@ jobs:
       # Frontend parity: the libretro entry points must reproduce the same
       # golden video/audio hashes and replay save states deterministically.
       - run: zig build test-libretro -Doptimize=${{ matrix.optimize }}
-      # Informational only: prints deterministic steps/cycles plus wall-clock FPS.
-      # FPS is machine-dependent and never gated; the deterministic counts are
-      # gated by test-roms above.
+      # Deterministic perf-regression gate: runs the baseline ROMs and fails on
+      # any drift of steps/cycles/vram_reads. vram_reads (renderer VRAM word
+      # traffic) locks in the tile-row decode cache; wall-clock FPS is printed
+      # for information but never gated (it's machine-dependent).
       - if: matrix.optimize == 'ReleaseFast'
-        run: zig build bench -Doptimize=ReleaseFast -- test-data/snes-roms/PPU/Rings/Rings.sfc --frames 120
+        run: zig build bench-check
 
   sdl:
     runs-on: ubuntu-latest
@@ -181,3 +182,8 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+      # Handheld builds must be self-contained: no dynamic libc, no NEEDED
+      # shared objects. Assert it for the musl targets that ship to devices.
+      - name: Assert musl artifacts are statically linked
+        if: contains(matrix.target, 'musl')
+        run: tools/package_handheld.sh --verify-only ${{ matrix.target }}

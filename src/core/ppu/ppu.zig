@@ -37,7 +37,7 @@ pub const Ppu = struct {
     // Derived state: the RGB565 palette and the brightness-scaled line palette
     // are rebuilt from cgram, and the framebuffer is output, so none is part of
     // the saved state.
-    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width" };
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width", "perf_vram_reads" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -161,6 +161,13 @@ pub const Ppu = struct {
     ophct_second: bool,
     opvct_second: bool,
 
+    /// Deterministic count of VRAM word reads performed by the renderer's tile
+    /// decode. Compiled to a dead field unless the `perf_counters` build option
+    /// is set (only the bench enables it), so shipping builds pay nothing. Used
+    /// by `zig build bench --check` to gate memory-traffic regressions: the
+    /// tile-row decode cache reduces this ~8x, and a revert would fail the gate.
+    perf_vram_reads: u64,
+
     pub const init: Ppu = .{
         .vram = @splat(0),
         .cgram = @splat(0),
@@ -227,6 +234,7 @@ pub const Ppu = struct {
         .counters_latched = false,
         .ophct_second = false,
         .opvct_second = false,
+        .perf_vram_reads = 0,
     };
 
     /// Rebuild the RGB565 palette from CGRAM after deserialization. The
