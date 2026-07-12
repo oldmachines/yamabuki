@@ -259,24 +259,60 @@ rewriting logic to run in parallel across two CPUs that share a bus. That is
 authorship, not a transformation, and no emulator derives it from a binary. Any
 roadmap entry promising otherwise would be fiction.
 
-**Where an emulator genuinely helps: the traces.** Vilela's community "SA-1
-Collection" was driven by bsnes-plus trace logs and usage maps submitted from
-full playthroughs, used to reconstruct disassemblies and identify conversion
-candidates. Producing exactly those is something Yamabuki can do well, and it is
-the highest-leverage part of this milestone:
+### The candidacy analyser — `--sa1-report`
 
-- **Execution coverage** — which addresses were ever executed, and as what
-  (code, data, both). The raw material of a disassembly.
-- **Hot-routine profiles** — cycles attributed per call site, so the routines
-  worth moving to the SA-1 announce themselves instead of being guessed at.
-- **RAM access maps** — which regions are touched, by whom, and how often. This
-  is the map an author needs to know what can safely relocate, and it is the
-  single most tedious thing to reconstruct by hand.
-- **Emitted in a format the existing tooling already eats**, so the output joins
-  the ecosystem rather than starting a second one.
+The headline feature: a tool you trigger *from the emulator*, while the game
+runs, that answers one question — **would this game convert well to the SA-1,
+and what would it cost?** Play the game (or let a demo run); Yamabuki watches and
+reports.
+
+It works because of a hardware fact that decides the whole problem: **the SA-1
+cannot see the SNES's WRAM.** `$7E0000-$7FFFFF` is invisible to it. The SA-1's
+world is ROM, up to 256 KiB of BW-RAM on the cartridge, and **2 KiB of I-RAM**.
+So a conversion is never "move this routine to the fast CPU" — it is *"move this
+routine, and every byte of state it touches, out of WRAM."* That relocation is
+the entire difficulty, and it is why the SMW SA-1 Pack's headline achievement is
+relocating the game's logic memory rather than anything about the CPU. It is also
+exactly the thing an emulator is in a perfect position to measure.
+
+So the report is not a trace dump. It is an answer:
+
+- **Is the game even CPU-bound?** Per frame, how many master cycles the CPU
+  actually burned against the budget, and how often it overran — i.e. *does this
+  game slow down at all, and where.* A game that never misses its budget is not a
+  candidate no matter how attractive it looks, and this is the first thing the
+  tool should be able to say.
+- **Which routines cost the frame.** Cycles attributed per call site, so the code
+  worth moving announces itself rather than being guessed at.
+- **The working set of each hot routine, and where it lives.** For every address a
+  hot routine reads or writes: WRAM, BW-RAM-able cartridge space, zero page, or
+  MMIO. This is the number that decides the project — the volume of WRAM state a
+  routine touches is precisely the volume that has to be relocated for the SA-1
+  to run it.
+- **The blockers.** WRAM the hot code shares with code that must stay on the
+  S-CPU; DMA and HDMA sources that would have to move with it; MMIO the SA-1
+  cannot reach. These are the reasons a promising-looking game turns out to be a
+  nightmare, and they should surface in an afternoon rather than three weeks in.
+- **A verdict, with its reasoning shown.** "78% of overrun frames are spent in
+  three routines whose combined WRAM working set is 1.4 KiB — that fits I-RAM"
+  is a conversion worth attempting. "Hot code touches 22 KiB of WRAM shared with
+  the sprite engine" is a warning that saves someone a month. The tool's job is to
+  make the second answer as cheap to obtain as the first.
+
+The same instrumentation, dumped rather than summarised, gives the artefacts the
+community already works with — execution coverage (which addresses ran, and as
+code or data), hot-routine profiles, and RAM access maps — emitted in a format
+the existing tooling eats, so the output joins that ecosystem rather than
+starting a second one. Vilela's "SA-1 Collection" reconstructed disassemblies
+from bsnes-plus trace logs and usage maps mailed in from playthroughs; Yamabuki
+should be able to produce those as a by-product of someone simply *playing the
+game*.
+
+The analyser does not write the patch. It tells you whether the patch is worth
+writing, and hands the author the map.
 
 The order matters: soft-patching first (it makes every existing patch usable),
-then the traces (they make new ones possible), then auto-FastROM and widescreen
+then the analyser (it makes new ones possible), then auto-FastROM and widescreen
 (they are narrower wins). Nothing here ships a ROM, and nothing here ships
 someone else's patch — only the ability to apply one you have.
 
