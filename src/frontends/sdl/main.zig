@@ -162,10 +162,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = parseArgs(init, gpa) catch {
+    const args = parseArgs(init, gpa) catch |e| {
+        if (e == error.ShotNeedsFrames) {
+            try err.print("error: --shot without --shot-frames captures the last frame, which needs --frames N\n", .{});
+        }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
-                "                    [--shader NAME] [--shader-dir DIR]\n",
+                "                    [--shader NAME] [--shader-dir DIR]\n" ++
+                "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
+                "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
+                "  or at the final frame when --shot-frames is omitted.\n",
             .{},
         );
         try err.flush();
@@ -345,7 +351,7 @@ pub fn main(init: std.process.Init) !void {
             // Grab the rendered frame *before* the swap, while the back buffer
             // still holds it.
             if (args.shot) |prefix| {
-                if (wantsShot(args.shot_frames, frames_run)) {
+                if (wantsShot(args.shot_frames, frames_run, args.frames)) {
                     const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
                     if (g.chain().capture(gpa, win)) |img| {
                         const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
@@ -393,7 +399,7 @@ pub fn main(init: std.process.Init) !void {
 
             // No shader: the console's framebuffer *is* the picture.
             if (args.shot) |prefix| {
-                if (wantsShot(args.shot_frames, frames_run)) {
+                if (wantsShot(args.shot_frames, frames_run, args.frames)) {
                     const rgb = try framebufferRgb(gpa, fb, width, height);
                     const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
                     writePpm(io, path, width, height, rgb) catch |e| {
@@ -440,13 +446,34 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Is `frame` one of the moments we were asked to capture? An empty list means
-/// "the last frame only", which is what a bare `--shot` with `--frames N` wants.
-fn wantsShot(frames: []const u32, frame: u32) bool {
-    if (frames.len == 0) return false;
+/// "the last frame only", which is what a bare `--shot` with `--frames N`
+/// wants. (`total` is `--frames`; parseArgs rejects a bare `--shot` when it is
+/// zero, i.e. run-until-quit, because "the last frame" does not exist then.)
+fn wantsShot(frames: []const u32, frame: u32, total: u32) bool {
+    if (frames.len == 0) return total != 0 and frame == total;
     for (frames) |f| {
         if (f == frame) return true;
     }
     return false;
+}
+
+test "wantsShot: an empty list means the last frame only" {
+    // The doc comment above used to promise this while the code returned
+    // false for every frame — a bare `--shot --frames N` captured nothing.
+    try std.testing.expect(wantsShot(&.{}, 60, 60));
+    try std.testing.expect(!wantsShot(&.{}, 59, 60));
+    try std.testing.expect(!wantsShot(&.{}, 0, 60));
+    // Run-until-quit has no last frame; parseArgs rejects the combination,
+    // and the predicate stays false as the backstop.
+    try std.testing.expect(!wantsShot(&.{}, 0, 0));
+}
+
+test "wantsShot: an explicit list is unchanged" {
+    const list = [_]u32{ 10, 20 };
+    try std.testing.expect(wantsShot(&list, 10, 60));
+    try std.testing.expect(wantsShot(&list, 20, 60));
+    try std.testing.expect(!wantsShot(&list, 60, 60)); // total is NOT implied
+    try std.testing.expect(!wantsShot(&list, 15, 60));
 }
 
 fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8) !void {
@@ -678,5 +705,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else return error.TooManyArgs;
     }
     args.rom = rom orelse return error.NoRom;
+    // A bare `--shot` captures the final frame — which only exists when the
+    // run has one. Refuse the run-until-quit combination up front instead of
+    // silently writing nothing.
+    if (args.shot != null and args.shot_frames.len == 0 and args.frames == 0)
+        return error.ShotNeedsFrames;
     return args;
 }

@@ -85,6 +85,22 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(shader_tests).step);
 
+    // The SDL frontend's pure helpers (`wantsShot`) are tested through
+    // main.zig itself: compiling it needs no SDL — the ABI is dlopen'd at
+    // runtime — only libc and the core module import, same as the exe.
+    const sdl_main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontends/sdl/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sdl_main_tests).step);
+
     // Bake the shader presets listed in shaders/presets.conf into GLSL.
     //
     // This runs glslang and SPIRV-Cross on the *build host* and emits plain
