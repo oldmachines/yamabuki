@@ -198,13 +198,29 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
       # glslang + SPIRV-Cross, built from pinned source with zig as the C++
       # compiler (no system g++, no Vulkan SDK). Cached: it is the slow part.
+      #
+      # The key carries the OS and the zig version, and the restored binaries
+      # are HEALTH-CHECKED rather than trusted. Both lessons were paid for: a
+      # cache entry is immutable per key and actions/cache saves even from a
+      # failed run, so one bad save wedged this job for every branch — the bake
+      # "succeeded" with 0 pairs baked (36 "tool failed" skips) until the
+      # assert below caught it. A cache hit proves the entry exists, not that
+      # its binaries run.
       - uses: actions/cache@v4
         id: shader-tools-cache
         with:
           path: .shader-tools/bin
-          key: shader-tools-${{ hashFiles('tools/build_shader_tools.sh') }}
-      - if: steps.shader-tools-cache.outputs.cache-hit != 'true'
-        run: tools/build_shader_tools.sh
+          key: shader-tools-${{ runner.os }}-zig0.16.0-${{ hashFiles('tools/build_shader_tools.sh') }}
+      - name: Build shader tools (on cache miss or unusable cache)
+        run: |
+          if .shader-tools/bin/glslang --version >/dev/null 2>&1 \
+             && .shader-tools/bin/spirv-cross --help >/dev/null 2>&1; then
+            echo "cached shader tools are healthy"
+          else
+            echo "shader tools missing or not runnable; building"
+            rm -rf .shader-tools/bin
+            tools/build_shader_tools.sh
+          fi
       - run: tools/fetch_shaders.sh
       - run: zig build shaders
       # The bake is allowed to skip a (preset, profile) pair it cannot honour —
