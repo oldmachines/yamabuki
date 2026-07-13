@@ -176,6 +176,9 @@ jobs:
           - aarch64-linux-gnu
           - aarch64-linux-musl
           - arm-linux-musleabihf
+          # The dev box is Windows and three frontends carry Windows-specific
+          # code (UTF-16 arg decoding, LoadLibraryA) that nothing else compiles.
+          - x86_64-windows-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -223,6 +226,10 @@ jobs:
           fi
       - run: tools/fetch_shaders.sh
       - run: zig build shaders
+      # Parse every baked manifest through the runtime's own parser and stat
+      # every vert/frag/LUT it references — a truncated bake or an
+      # inconsistent manifest fails HERE, not on a device.
+      - run: zig build validate-shaders
       # The bake is allowed to skip a (preset, profile) pair it cannot honour —
       # that is the design. What must not happen is a *silent* regression in
       # coverage, so assert the set we promise: every handheld-tier preset has
