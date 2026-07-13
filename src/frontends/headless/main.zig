@@ -3,11 +3,17 @@
 //! whole audio stream as a WAV, both for eyeballing.
 //!
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
-//!                     [--accurate]
+//!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
 //! output to inspect, and the printed hashes are what `zig build test-roms`
 //! locks against.
+//!
+//! `--patch` applies a BPS or IPS patch to the ROM in memory at load — the file
+//! on disk is never touched. BPS verifies the source CRC before applying (a
+//! patch for the wrong ROM revision is an error naming both checksums) and the
+//! target CRC after; IPS has no checksums, and says so. `--save-patched`
+//! writes the patched image and exits without emulating.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -18,6 +24,8 @@ const Args = struct {
     ppm: ?[]const u8 = null,
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
+    patch: ?[]const u8 = null,
+    save_patched: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -29,16 +37,35 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = parseArgs(init, gpa) catch {
-        try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]\n", .{});
+        try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]\n" ++
+            "                          [--patch p.bps|p.ips] [--save-patched out.sfc]\n", .{});
         try out.flush();
         std.process.exit(2);
     };
 
-    const image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
+    var image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
         try out.print("error: cannot read ROM '{s}'\n", .{args.rom});
         try out.flush();
         std.process.exit(1);
     };
+
+    if (args.patch) |patch_path| {
+        image = applyPatch(io, gpa, out, image, patch_path) catch std.process.exit(1);
+        if (args.save_patched) |save_path| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = save_path, .data = image }) catch {
+                try out.print("error: cannot write '{s}'\n", .{save_path});
+                try out.flush();
+                std.process.exit(1);
+            };
+            try out.print("wrote {s} ({d} bytes)\n", .{ save_path, image.len });
+            try out.flush();
+            return;
+        }
+    } else if (args.save_patched != null) {
+        try out.print("error: --save-patched needs --patch\n", .{});
+        try out.flush();
+        std.process.exit(2);
+    }
 
     const cart = core.Cartridge.load(gpa, image) catch |e| {
         try out.print("error: cannot load ROM: {s}\n", .{@errorName(e)});
@@ -86,6 +113,48 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// Apply `--patch`: reads the patch file, strips the ROM's copier header (the
+/// community's patches are made against unheadered images), applies, and
+/// reports what kind of guarantee the format could give. Errors are printed
+/// here so every failure names its cause; the caller just exits.
+fn applyPatch(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    image: []u8,
+    patch_path: []const u8,
+) ![]u8 {
+    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try out.print("error: cannot read patch '{s}'\n", .{patch_path});
+        try out.flush();
+        return error.PatchFailed;
+    };
+    const stripped = core.header.stripCopierHeader(image);
+    var mm: core.patch.CrcMismatch = .{};
+    const res = core.patch.apply(gpa, stripped, pbytes, &mm) catch |e| {
+        switch (e) {
+            error.WrongSource => try out.print(
+                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
+                .{ patch_path, mm.expected, mm.actual },
+            ),
+            error.PatchChecksum => try out.print("error: patch '{s}' is damaged (its own checksum fails)\n", .{patch_path}),
+            error.TargetChecksum => try out.print("error: patch '{s}' applied but the output failed its target checksum\n", .{patch_path}),
+            error.UnknownFormat => try out.print("error: '{s}' is neither a BPS nor an IPS patch\n", .{patch_path}),
+            error.Corrupt => try out.print("error: patch '{s}' is structurally broken\n", .{patch_path}),
+            error.OutOfMemory => try out.print("error: out of memory applying '{s}'\n", .{patch_path}),
+        }
+        try out.flush();
+        return error.PatchFailed;
+    };
+    if (res.verified) {
+        try out.print("patch applied: {s} (source and target checksums verified)\n", .{patch_path});
+    } else {
+        try out.print("patch applied: {s} (IPS carries no checksums; the result is unverified)\n", .{patch_path});
+    }
+    try out.flush();
+    return res.image;
+}
+
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // POSIX-only otherwise; Windows decodes the command line from UTF-16 and
     // needs an allocator. Not deinit'd — the returned Args slice into it, and
@@ -97,6 +166,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     var ppm: ?[]const u8 = null;
     var wav: ?[]const u8 = null;
     var accuracy: core.Accuracy = .fast;
+    var patch: ?[]const u8 = null;
+    var save_patched: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--frames")) {
             const v = it.next() orelse return error.MissingValue;
@@ -107,11 +178,23 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--patch")) {
+            patch = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--save-patched")) {
+            save_patched = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
-    return .{ .rom = rom orelse return error.NoRom, .frames = frames, .ppm = ppm, .wav = wav, .accuracy = accuracy };
+    return .{
+        .rom = rom orelse return error.NoRom,
+        .frames = frames,
+        .ppm = ppm,
+        .wav = wav,
+        .accuracy = accuracy,
+        .patch = patch,
+        .save_patched = save_patched,
+    };
 }
 
 /// Write interleaved stereo i16 samples as a 32 kHz PCM WAV.
