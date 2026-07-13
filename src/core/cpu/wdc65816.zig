@@ -162,11 +162,23 @@ pub fn Cpu(comptime BusT: type) type {
             self.bus.idle();
         }
 
+        /// A *data* read. Code fetches deliberately do not come through here
+        /// (see `fetch8`), so `last_data_read` records only the addresses an
+        /// instruction actually operates on, never the instruction stream.
+        ///
+        /// That distinction is what lets the frame-budget profiler tell a wait
+        /// loop from a working one: a wait polls the same address every time
+        /// round, and a loop that is computing something walks memory.
         pub inline fn read8(self: *Self, addr: u24) u8 {
+            if (@hasField(BusT, "last_data_read")) self.bus.last_data_read = addr;
             return self.bus.read8(addr);
         }
 
+        /// A *data* write. Stack pushes deliberately do not come through here
+        /// (see `push8`), so `last_data_write` records only writes that change
+        /// the machine's state, never call/return bookkeeping.
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             self.bus.write8(addr, value);
         }
 
@@ -194,8 +206,10 @@ pub fn Cpu(comptime BusT: type) type {
             self.write8(addr16 +% 1, @truncate(value >> 8));
         }
 
+        /// An opcode/operand fetch: goes straight to the bus, so it does not
+        /// register as a data read. Identical timing; see `read8`.
         pub inline fn fetch8(self: *Self) u8 {
-            const v = self.read8(@as(u24, self.regs.pbr) << 16 | self.regs.pc);
+            const v = self.bus.read8(@as(u24, self.regs.pbr) << 16 | self.regs.pc);
             self.regs.pc +%= 1;
             return v;
         }
@@ -218,8 +232,13 @@ pub fn Cpu(comptime BusT: type) type {
         // (push8/pull8); native-only instructions use full 16-bit arithmetic
         // (push8n/pull8n) and may leave page 1.
 
+        /// Stack traffic goes straight to the bus, so it does not register as a
+        /// data read or write. A JSL/RTL pair leaves the machine exactly as it
+        /// found it, and a wait loop built around a subroutine call — which is
+        /// how most SNES main loops are written — must not look like a loop with
+        /// side effects just because it pushed a return address.
         pub fn push8(self: *Self, value: u8) void {
-            self.write8(self.regs.s, value);
+            self.bus.write8(self.regs.s, value);
             if (self.regs.e) {
                 self.regs.s = 0x0100 | ((self.regs.s -% 1) & 0xFF);
             } else {
@@ -233,17 +252,17 @@ pub fn Cpu(comptime BusT: type) type {
             } else {
                 self.regs.s +%= 1;
             }
-            return self.read8(self.regs.s);
+            return self.bus.read8(self.regs.s);
         }
 
         pub fn push8n(self: *Self, value: u8) void {
-            self.write8(self.regs.s, value);
+            self.bus.write8(self.regs.s, value);
             self.regs.s -%= 1;
         }
 
         pub fn pull8n(self: *Self) u8 {
             self.regs.s +%= 1;
-            return self.read8(self.regs.s);
+            return self.bus.read8(self.regs.s);
         }
 
         pub fn push16(self: *Self, value: u16) void {

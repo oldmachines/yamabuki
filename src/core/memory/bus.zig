@@ -37,12 +37,34 @@ pub const page_count = 0x100_0000 / page_size; // 2048
 pub const Bus = struct {
     // The page table holds raw pointers into wram/cart and is rebuilt by
     // remap() on load; the cart reference is re-supplied by the frontend.
-    pub const serialize_skip = .{ "pages", "cart" };
+    // `last_data_read`, `last_data_write` and `input_polled` are diagnostics,
+    // not machine state.
+    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled" };
+
+    /// `last_data_read`/`last_data_write` when there has been none since they
+    /// were cleared. Out of u24 range, so it cannot collide with a real address.
+    pub const no_data_access: u32 = 0x0100_0000;
 
     pages: [page_count]Page,
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
+    /// Address of the most recent *data* read / write (`Cpu.read8`/`Cpu.write8`),
+    /// or `no_data_access`. Set by the CPU — never by an instruction fetch, and
+    /// never by a stack push or pull, both of which go straight to the bus.
+    ///
+    /// The profiler clears them before each instruction, so what it finds
+    /// afterwards is the memory that instruction actually operated on. That is
+    /// what lets it recognise a wait: a loop that reads one fixed address and
+    /// changes nothing is waiting, however it is spelled. Diagnostics only;
+    /// nothing in the core reads them.
+    last_data_read: u32,
+    last_data_write: u32,
+    /// The game has read a controller register ($4016/$4017 serial, or the
+    /// $4218-$421F auto-read results) since the profiler last cleared this. A
+    /// frame in which it stays false is a frame the main loop never came around:
+    /// a dropped frame. Diagnostic only; nothing in the core reads it.
+    input_polled: bool,
     /// Memory data register: the value of the last bus transfer (open bus).
     mdr: u8,
     /// $420D MEMSEL bit 0: FastROM enabled.
@@ -82,6 +104,9 @@ pub const Bus = struct {
     pub fn init(self: *Bus, cart: *Cartridge) void {
         self.cart = cart;
         self.clock = 0;
+        self.last_data_read = no_data_access;
+        self.last_data_write = no_data_access;
+        self.input_polled = false;
         self.mdr = 0;
         self.fastrom = false;
         self.wram = .init;
@@ -249,8 +274,14 @@ pub const Bus = struct {
                 else => self.mdr,
             },
             0x2180 => self.wram.portRead(),
-            0x4016 => self.joy.readSerial(0, self.mdr),
-            0x4017 => self.joy.readSerial(1, self.mdr),
+            0x4016 => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readSerial(0, self.mdr);
+            },
+            0x4017 => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readSerial(1, self.mdr);
+            },
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
             0x4212 => self.cpuio.readHvbjoy(self.mdr),
@@ -258,7 +289,10 @@ pub const Bus = struct {
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
             0x4217 => @truncate(self.math.rdmpy >> 8),
-            0x4218...0x421F => self.joy.readAuto(@truncate(a16 & 7)),
+            0x4218...0x421F => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readAuto(@truncate(a16 & 7));
+            },
             0x4300...0x437F => self.dma.readReg(a16),
             else => {
                 if (self.dsp1Port(bank, a16)) |sr| {
