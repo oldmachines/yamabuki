@@ -151,6 +151,35 @@ array constructors, which no ESSL below 310 has, and crt-guest-advanced needs
 GL driver at all, CI's dummy video driver — the frontend prints why and falls
 back to the software blit. A missing shader never costs you the emulator.
 
+## Games
+
+![Twenty SNES games running in Yamabuki with the crt-royale shader](site/shots/gallery.png)
+
+*Super Metroid · Turtles in Time · Super Street Fighter II · Kirby Super Star ·
+Donkey Kong Country · Super Mario World · EarthBound · Super Castlevania IV ·
+Mega Man X · Contra III · Super Mario Kart · Final Fantasy VI — captured with
+`--shot`, rendered through crt-royale on an RTX 2070.*
+
+These are the first commercial games Yamabuki has ever run. Every golden test in
+this repo is homebrew (PeterLemon, krom), and it turns out that proves less than
+it looks like it does.
+
+**Twenty of the canonical SNES library, run for 3,700 frames each:**
+
+| | |
+|---|---|
+| **16 / 20** | boot and render |
+| **2 / 20** | refuse on purpose — Donkey Kong Country 2 (E) and Secret of Mana (E) are PAL ROMs, and they correctly print *"THIS GAME PAK IS NOT DESIGNED FOR YOUR SUPER NES"*. Not a bug: PAL support is deferred (M0 parameterized the region constants for exactly this). |
+| **4 / 20** | **never render a frame** — Chrono Trigger, F-Zero, Super Mario RPG, Yoshi's Island. Three sit on a forced-blank screen with an identical static framebuffer hash from frame 300 to frame 6,000: the CPU is stuck before it ever enables the display. |
+
+F-Zero is the one that stings. LoROM, no coprocessor, a launch title — if that
+does not boot, this is not an exotic edge case. Kirby Super Star (also SA-1)
+boots fine, so the SA-1 is not uniformly broken either. And **Super Mario Kart's
+Mode 7 attract demo renders as a flat yellow field** while its title screen is
+perfect.
+
+None of this was visible from 100 passing golden ROMs. Chasing it is M13.
+
 ## Status
 
 Early development. The console boots ROMs, renders, and plays sound: scheduler
@@ -206,6 +235,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
 | M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites, ~+18–39% on 8bpp ROMs; SA-1 ROM-read fast path precomputes the MMC map, −15% total instructions / +15% FPS on Super Mario RPG, bit-identical; deterministic VRAM-traffic bench gate + static-musl handheld packaging with a CI static-linkage assertion) |
 | M11 CRT shaders | in progress (GL ES 3 pipeline with GL 3.3, GL ES 2, and software fallbacks: multi-pass FBO chain, pass aliases, feedback targets, frame history, LUTs; 12 libretro presets transpiled ahead of time by glslang + SPIRV-Cross on the build host — 31 of 36 (preset, profile) pairs bake, the 5 skips are printed and CI-gated. **Not yet run on a GPU.**) |
 | M12 ROM patch layer + SA-1 candidacy analyser | planned. **`--sa1-report`**: run the game and Yamabuki tells you whether it would convert well to the SA-1, and what it would cost. The whole problem is one hardware fact — **the SA-1 cannot see the SNES's WRAM** ($7E-$7F); its world is ROM, cartridge BW-RAM, and 2 KiB of I-RAM. So a conversion is never "move this routine to the fast CPU", it is "move this routine *and every byte of state it touches* out of WRAM" — which is why the SMW SA-1 Pack's headline feat is relocating the game's logic memory. The analyser measures exactly that: is the game even CPU-bound (which frames overran, and by how much), which routines cost the frame, the WRAM working set of each one (the number that decides the project), the blockers (WRAM shared with code that must stay put, DMA sources, unreachable MMIO), and a verdict with its reasoning shown. It does not write the patch; it tells you whether the patch is worth writing, and hands the author the map. The same instrumentation dumped rather than summarised gives execution coverage, hot-routine profiles and RAM access maps — the artefacts Vilela's "SA-1 Collection" was built from. Also: soft-patching (BPS/IPS at load, source hash-verified, `--save-patched` to write the result) and a hash-keyed registry so `--auto-patch` finds the right SA-1 / FastROM patch for your cart — Yamabuki already emulates the SA-1, so a converted ROM boots today. Plus opt-in auto-FastROM (mechanically derivable, but it breaks cycle-timed code, so it is a flag and a compat list, never a default) and a wider framebuffer for widescreen hacks. Automatically *generating* an SA-1 conversion is explicitly not on the roadmap: those are per-game reverse engineering, not something derivable from a binary. The repo carries the patch index, never the payload, and never a ROM |
+| M13 game compatibility | planned. The first run against commercial games found what 100 passing homebrew goldens could not: **4 of the canonical 20 never render a frame** (Chrono Trigger, F-Zero, Super Mario RPG, Yoshi's Island — three of them stuck on a forced-blank screen with a static framebuffer hash from frame 300 to 6,000, i.e. the CPU never reaches the point of enabling the display), and Super Mario Kart's Mode 7 attract demo renders as a flat yellow field while its title screen is pixel-perfect. F-Zero is the tell — LoROM, no coprocessor, a launch title. The fix for the test suite is the same as the fix for the emulator: goldens minted from *commercial* boot sequences, not just homebrew, so a regression here fails CI instead of being discovered by eye. PAL support (deferred since M0, region constants already parameterized) closes the other two: DKC2 (E) and Secret of Mana (E) correctly refuse to run on an NTSC machine |
 
 ## Design notes
 

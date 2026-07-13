@@ -319,6 +319,44 @@
   }
   .deck-card p { margin: 0; color: var(--ink-soft); font-size: 0.95rem; }
 
+  /* ── gallery ──────────────────────────────────────────────────── */
+  .shots {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin-top: 2rem;
+  }
+  .shot {
+    position: relative;
+    background: var(--ground);
+    line-height: 0;
+  }
+  .shot img {
+    width: 100%;
+    height: auto;
+    display: block;
+    image-rendering: auto;
+  }
+  .shot figcaption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 0.55rem 0.7rem;
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    line-height: 1.4;
+    color: var(--ink);
+    background: linear-gradient(to top, rgba(10, 12, 16, 0.92), rgba(10, 12, 16, 0));
+  }
+  .shot figcaption b { color: var(--gold); font-weight: 600; }
+  .shot figcaption span { color: var(--ink-faint); }
+  .shot[data-chip] figcaption span { color: var(--gold-dim); }
+
   /* ── footer ───────────────────────────────────────────────────── */
   footer {
     border-top: 1px solid var(--rule);
@@ -406,6 +444,82 @@
         <p>A <code>Console</code> is self-referential — the bus page table points into its own struct. Heap-allocate it and never move it. A moved Console has a page table pointing at its own corpse.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Games</p>
+    <h2>The first commercial games it has ever run.</h2>
+    <p class="muted">
+      Every golden test in the repo is homebrew. Running twenty of the canonical
+      library for the first time proved that this is worth less than it looks:
+      <b>sixteen boot and render, four never produce a frame at all.</b> Rendered
+      here through crt-royale on an RTX 2070.
+    </p>
+
+    <div class="shots">
+      <figure class="shot">
+        <img src="shots/super-metroid.png" alt="Super Metroid running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Super Metroid</b> <span>· gameplay</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/turtles-in-time.png" alt="TMNT IV: Turtles in Time running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Turtles in Time</b> <span>· gameplay</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/super-street-fighter-ii.png" alt="Super Street Fighter II running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Super Street Fighter II</b> <span>· gameplay</span></figcaption>
+      </figure>
+      <figure class="shot" data-chip>
+        <img src="shots/kirby-super-star.png" alt="Kirby Super Star running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Kirby Super Star</b> <span>· gameplay · SA-1</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/donkey-kong-country.png" alt="Donkey Kong Country running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Donkey Kong Country</b> <span>· gameplay</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/super-mario-world.png" alt="Super Mario World running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Super Mario World</b> <span>· title</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/earthbound.png" alt="EarthBound running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>EarthBound</b> <span>· intro</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/super-castlevania-iv.png" alt="Super Castlevania IV running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Super Castlevania IV</b> <span>· intro</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/mega-man-x.png" alt="Mega Man X running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Mega Man X</b> <span>· intro</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/contra-iii.png" alt="Contra III running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Contra III</b> <span>· title</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/super-mario-kart.png" alt="Super Mario Kart running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Super Mario Kart</b> <span>· title · Mode 7</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="shots/final-fantasy-vi.png" alt="Final Fantasy VI running in Yamabuki" loading="lazy" width="512" height="448">
+        <figcaption><b>Final Fantasy VI</b> <span>· title</span></figcaption>
+      </figure>
+    </div>
+
+    <p class="muted" style="margin-top:2rem">
+      And the part worth publishing: <b>four never render a frame</b> — Chrono
+      Trigger, F-Zero, Super Mario RPG, Yoshi's Island. Three of them sit on a
+      forced-blank screen with an <em>identical static framebuffer hash from frame
+      300 to frame 6,000</em>: the CPU never reaches the point of enabling the
+      display. F-Zero is the one that stings — LoROM, no coprocessor, a launch
+      title. Super Mario Kart's Mode 7 attract demo renders as a flat yellow field
+      while its title screen is pixel-perfect. Two more (DKC2 and Secret of Mana,
+      both PAL) refuse on purpose, correctly, because PAL support is deferred.
+      None of it was visible from a hundred passing homebrew goldens.
+    </p>
   </div>
 </section>
 
