@@ -332,15 +332,33 @@ pub fn main(init: std.process.Init) !void {
         const width = con.frameWidth();
         const height: u32 = @intCast(fb.len / width);
 
-        if (glv) |g| {
+        if (glv) |g| gl_path: {
             g.chain().upload(fb, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
             g.chain().render(.{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) }) catch |e| {
-                try err.print("error: shader render failed: {s}\n", .{@errorName(e)});
+                // The rule this file states at initGl applies mid-game too: a
+                // shader must never cost the user the emulator. Print once,
+                // tear the GL path down, and hand the rest of the session to
+                // the software blit — the same fallback initGl takes, later.
+                // This frame's video is lost; emulation and audio are not.
+                try err.print("shader render failed ({s}); falling back to the software renderer\n", .{@errorName(e)});
                 try err.flush();
-                std.process.exit(1);
+                g.chain().deinit();
+                _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
+                glv = null;
+                renderer = sdl.SDL_CreateRenderer(window, null) orelse {
+                    // No GL and no renderer: nothing left can put pixels on
+                    // screen, so exiting is the honest move.
+                    try err.print("error: SDL_CreateRenderer after shader failure: {s}\n", .{sdl.SDL_GetError()});
+                    try err.flush();
+                    std.process.exit(1);
+                };
+                _ = sdl.SDL_SetRenderVSync(renderer.?, 0);
+                // `g` is gone; skip the rest of the GL branch. The audio
+                // drain and pacing below still run for this frame.
+                break :gl_path;
             };
             // Grab the rendered frame *before* the swap, while the back buffer
             // still holds it.
