@@ -54,7 +54,7 @@ pub fn stripCopierHeader(image: []const u8) []const u8 {
 
 fn parseAt(rom: []const u8, offset: u32, mapping: Mapping) Header {
     const h = rom[offset..][0..64];
-    var header: Header = .{
+    const header: Header = .{
         .mapping = mapping,
         .offset = offset,
         .title = h[0..21].*,
@@ -67,7 +67,6 @@ fn parseAt(rom: []const u8, offset: u32, mapping: Mapping) Header {
         .checksum = std.mem.readInt(u16, h[0x1E..0x20], .little),
         .reset_vector = std.mem.readInt(u16, h[0x3C..0x3E], .little),
     };
-    _ = &header;
     return header;
 }
 

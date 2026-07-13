@@ -139,23 +139,33 @@ pub const Dma = struct {
         const adjust: u2 = @truncate(ch.control >> 3);
         const total: u32 = if (ch.count == 0) 0x10000 else ch.count;
 
+        // The A-bus bank is fixed for the whole transfer (only a_addr moves,
+        // wrapping in 16 bits), so whether this channel can reach the guarded
+        // window at all is loop-invariant — hoist it, and the common case
+        // (a non-system bank) skips the per-byte aBusValid range check.
+        const a_guarded = (ch.a_bank & 0x7F) < 0x40;
+
         var remaining = total;
         var p: usize = 0;
         while (remaining > 0) : (remaining -= 1) {
-            const off = pattern[p % pattern.len];
+            // `pattern` is a runtime slice, so `p % pattern.len` compiles to a
+            // real division on every transferred byte — 65,536 of them for a
+            // full VRAM upload. A wrapping counter costs one compare.
+            const off = pattern[p];
+            p += 1;
+            if (p == pattern.len) p = 0;
             const b: u24 = 0x2100 | @as(u24, ch.b_addr +% off);
             const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             if (b_to_a) {
-                aWrite(bus, a, bus.read8(b));
+                if (a_guarded) aWrite(bus, a, bus.read8(b)) else bus.write8(a, bus.read8(b));
             } else {
-                bus.write8(b, aRead(bus, a));
+                bus.write8(b, if (a_guarded) aRead(bus, a) else bus.read8(a));
             }
             switch (adjust) {
                 0 => ch.a_addr +%= 1, // increment
                 2 => ch.a_addr -%= 1, // decrement
                 else => {}, // 1, 3: fixed
             }
-            p += 1;
         }
         ch.count = 0; // GDMA leaves DAS counted down to zero
         return total;
