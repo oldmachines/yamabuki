@@ -11,8 +11,8 @@
 //! lower OAM index wins on overlap, and each sprite's OBJ priority (0-3) places
 //! it in the composite order relative to the BG layers.
 //!
-//! Modes 5/6 (hi-res) arrive in a later slice; unsupported modes fall back to
-//! the backdrop.
+//! All eight modes render, including the hi-res pair (5/6, which interleave
+//! main and sub at 512 wide) and Mode 7's affine map.
 
 const std = @import("std");
 const ppu_mod = @import("ppu.zig");
@@ -91,8 +91,8 @@ const order_mode7 = [_]Entry{ obj(3), obj(2), obj(1), obj(0), bg(0, 0) };
 // priority — high-priority BG2 pixels rise above OBJ2, the rest sink below BG1.
 const order_mode7_extbg = [_]Entry{ obj(3), bg(1, 1), obj(2), obj(1), bg(0, 0), obj(0), bg(1, 0) };
 
-/// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map.
-/// Only `.planar` is rendered today; `.affine` is reserved for M4's Mode 7.
+/// Whether a mode's BG layers are planar (modes 0-6) or an affine Mode 7 map
+/// (rendered by `fillMode7`).
 const Kind = enum { planar, affine };
 
 /// Offset-per-tile behavior for a mode's BG1/BG2 layers. `.hv` (modes 2/6) reads
@@ -196,17 +196,13 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     const row = ppu.fb[line * width ..][0..width];
 
     if (ppu.force_blank) {
+        @branchHint(.unlikely);
         @memset(row, 0);
         return;
     }
 
-    // Brightness-scaled palette (index 0 is the backdrop). Rebuilt only when
-    // CGRAM or master brightness changed since the last render; HDMA per-line
-    // INIDISP writes re-dirty it, so mid-frame brightness splits stay correct.
-    if (ppu.lpal_dirty) {
-        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
-        ppu.lpal_dirty = false;
-    }
+    // Brightness-scaled palette (index 0 is the backdrop).
+    ensureLpal(ppu);
 
     // Content composes at 256 pixels; on a 512-stride frame (a mixed-width
     // frame whose earlier lines were hi-res) it is pixel-doubled into the row.
@@ -250,14 +246,12 @@ pub fn renderSpan(ppu: *Ppu, line: u32, x0: u32, x1_in: u32) void {
     const row = ppu.fb[line * width ..][0..width];
 
     if (ppu.force_blank) {
+        @branchHint(.unlikely);
         if (width == fb_width) @memset(row[x0..x1], 0) else @memset(row[2 * x0 .. 2 * x1], 0);
         return;
     }
 
-    if (ppu.lpal_dirty) {
-        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
-        ppu.lpal_dirty = false;
-    }
+    ensureLpal(ppu);
 
     var tmp: [fb_width]u16 = undefined;
     var bgbuf: [4][fb_width_max]Cell = undefined;
@@ -276,6 +270,17 @@ pub fn renderSpan(ppu: *Ppu, line: u32, x0: u32, x1_in: u32) void {
             }
             return;
         }
+    }
+}
+
+/// Rebuild the brightness-scaled palette if CGRAM or master brightness changed
+/// since the last render. HDMA per-line INIDISP writes re-dirty it, so
+/// mid-frame brightness splits stay correct. Shared by the whole-line and
+/// span renderers so the two can never disagree.
+fn ensureLpal(ppu: *Ppu) void {
+    if (ppu.lpal_dirty) {
+        for (0..256) |i| ppu.lpal[i] = ppu_mod.scaleBrightness(ppu.cgram[i], ppu.brightness);
+        ppu.lpal_dirty = false;
     }
 }
 
@@ -414,6 +419,15 @@ fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
             else => @truncate(ppu.wobjlog >> 2),
         };
 
+        // A layer with neither window enabled masks nothing — skip the pixel
+        // loop entirely instead of computing 256 constant `false`s. Most games
+        // window one or two layers, so this saves the bulk of the sweep on any
+        // line where windows or color math are active at all.
+        if (!w1_en and !w2_en) {
+            @memset(&mask[layer], false);
+            continue;
+        }
+
         for (0..fb_width) |x| {
             const xi: u8 = @intCast(x);
             var a = xi >= ppu.wh0 and xi <= ppu.wh1;
@@ -429,10 +443,8 @@ fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
                 }
             else if (w1_en)
                 a
-            else if (w2_en)
-                b
             else
-                false;
+                b;
         }
     }
 }
@@ -575,8 +587,15 @@ fn compositeMath(
                 }
             }
             color = colorMath(color, addend, subtract, half);
+            row[x] = ppu_mod.scaleBrightness(color, ppu.brightness);
+        } else if (clipped) {
+            row[x] = ppu_mod.scaleBrightness(color, ppu.brightness);
+        } else {
+            // Neither math nor clipping touched this pixel, so the answer is
+            // exactly the brightness-scaled palette entry — which `lpal`
+            // already holds. Skip the per-pixel rescale.
+            row[x] = ppu.lpal[main.abs];
         }
-        row[x] = ppu_mod.scaleBrightness(color, ppu.brightness);
     }
 }
 
@@ -858,6 +877,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
 
         in_range += 1;
         if (in_range > obj_per_line_max) {
+            @branchHint(.unlikely);
             ppu.obj_range_over = true;
             break;
         }
@@ -888,6 +908,7 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
         while (col < cols) : (col += 1) {
             tiles += 1;
             if (tiles > obj_tiles_per_line_max) {
+                @branchHint(.unlikely);
                 ppu.obj_time_over = true;
                 overflow = true;
                 break;
