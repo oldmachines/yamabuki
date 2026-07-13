@@ -28,6 +28,11 @@ const Entry = struct {
     /// the fast core (mid-scanline races, e.g. a VRAM refresh DMA overrunning
     /// into active display). 0 = same image on both cores.
     hash_accurate: u64 = 0,
+    /// Pad-1 buttons held for the whole run (core.joypad.Button bits). The
+    /// input-driven entries exist because a neutral pad exercises none of the
+    /// input plumbing — RotZoom rotates under R, so its held-R golden fails if
+    /// input ever stops reaching the machine.
+    buttons: u16 = 0,
 };
 
 const Golden = struct {
@@ -96,9 +101,18 @@ fn runOne(
     con.init(if (options.accurate) .accurate else .fast, cart);
 
     // The audio ring holds ~15 video frames, so drain and hash every frame.
+    // Halfway through, snapshot the whole machine: after the run finishes,
+    // the state is restored and the second half replayed — the golden hash
+    // must come out twice. A serialization bug in any component (PPU, APU,
+    // DMA, a coprocessor) diverges the replay, so every golden ROM now gates
+    // save/load, not just the fuzz harness's synthetic cart.
+    const half = frames / 2;
+    const state = try gpa.alloc(u8, core.AnyConsole.state_size);
     var got_audio = core.console.audio_hash_init;
     var drain: [4096]i16 = undefined;
-    for (0..frames) |_| {
+    for (0..frames) |i| {
+        if (i == half) _ = con.saveState(state);
+        con.setButtons(0, entry.buttons);
         con.runFrame();
         while (true) {
             const n = con.readAudio(&drain);
@@ -115,6 +129,17 @@ fn runOne(
         inline else => |*c| c.bus.clock,
     };
 
+    // Replay the second half from the snapshot; audio is drained (the ring is
+    // finite) but not hashed — the golden audio hash covers the first pass.
+    try con.loadState(state);
+    for (half..frames) |_| {
+        con.setButtons(0, entry.buttons);
+        con.runFrame();
+        while (con.readAudio(&drain) != 0) {}
+    }
+    const replay_hash = core.console.hashFrame(con.framebuffer());
+    const roundtrip_ok = replay_hash == got_hash;
+
     // Deterministic perf counts are gated only once baselined (0 = unset)
     // and only on the fast core (the accurate core's IRQ dot placement
     // shifts instruction interleaving on IRQ-driven ROMs).
@@ -122,7 +147,7 @@ fn runOne(
     const cycles_ok = options.accurate or entry.cycles == 0 or entry.cycles == got_cycles;
     const audio_ok = entry.audio == 0 or entry.audio == got_audio;
     const want_hash = if (options.accurate and entry.hash_accurate != 0) entry.hash_accurate else entry.hash;
-    const ok = got_hash == want_hash and steps_ok and cycles_ok and audio_ok;
+    const ok = got_hash == want_hash and steps_ok and cycles_ok and audio_ok and roundtrip_ok;
 
     try out.print("{s} {s}\n    hash   got {x:0>16} want {x:0>16}\n    steps  got {d:<10} want {d}\n    cycles got {d:<10} want {d}\n    audio  got {x:0>16} want {x:0>16}\n", .{
         if (ok) "PASS" else "FAIL", entry.path,
@@ -131,5 +156,8 @@ fn runOne(
         got_cycles,                 entry.cycles,
         got_audio,                  entry.audio,
     });
+    if (!roundtrip_ok) {
+        try out.print("    ROUNDTRIP DIVERGED: replay from the frame-{d} snapshot ended at {x:0>16}\n", .{ half, replay_hash });
+    }
     return ok;
 }

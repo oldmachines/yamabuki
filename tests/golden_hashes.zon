@@ -46,6 +46,12 @@
         // joypad, which used to read open-bus garbage (phantom presses) and
         // now correctly reads a neutral pad. `.ppm`s re-eyeballed.
         .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x8ba211f2fc899f95, .steps = 150702, .cycles = 5717926 },
+        // Input-driven goldens: a neutral pad exercises none of the input
+        // plumbing. RotZoom rotates under R and zooms under L (per its own
+        // on-screen help), so these hashes fail if pad state ever stops
+        // reaching the machine. Minted at 60 frames of held input.
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0xe90ad70a2bbaa4f7, .frames = 60, .buttons = 0x0010 }, // R held
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x2bc7bd18eeeb8517, .frames = 60, .buttons = 0x0020 }, // L held
         .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0xca6c36e8a6140b02, .steps = 138331, .cycles = 5717928 },
         .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0x72489634a8ee621d, .steps = 158867, .cycles = 5717910 },
         // M4.5: HDMA-driven register goldens. WindowHDMA (deferred from M4.4)

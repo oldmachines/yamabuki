@@ -46,8 +46,17 @@ pub fn main(init: std.process.Init) !void {
     try out.print("stage A (ppu):     {} frames rendered, state hash {x:0>16}\n", .{ iters, ppu_hash });
     try out.flush();
 
-    const con_hash = try fuzzConsole(gpa, out, iters);
+    const con_hash = try fuzzConsole(gpa, out, iters, 0x00);
     try out.print("stage B (console): {} frames run, state hash {x:0>16}\n", .{ iters, con_hash });
+    try out.flush();
+
+    // The same stage on an SA-1 cart: the chip is attached, caught up every
+    // scanline, and its SNES-side MMIO window joins the write ranges — random
+    // traffic can start/stop the second CPU, and the save/load roundtrip
+    // invariant now covers coprocessor state. Before this, no fuzzing touched
+    // any coprocessor at all.
+    const sa1_hash = try fuzzConsole(gpa, out, iters, 0x34);
+    try out.print("stage C (sa1):     {} frames run, state hash {x:0>16}\n", .{ iters, sa1_hash });
     try out.print("fuzz: ok\n", .{});
     try out.flush();
 }
@@ -101,6 +110,10 @@ fn fuzzPpu(gpa: std.mem.Allocator, iters: u32) !u64 {
 /// triggers, $2140-$2143 walks the APU mailbox (and its HLE boot protocol).
 const write_ranges = [_]struct { base: u24, len: u16, weight: u8 }{
     .{ .base = 0x2100, .len = 0x40, .weight = 4 },
+    // SA-1 SNES-side MMIO (CCNT and friends). Ignored by a chipless cart, so
+    // the plain stage keeps its determinism while the SA-1 stage gets live
+    // start/stop/IRQ traffic on the second CPU.
+    .{ .base = 0x2200, .len = 0x40, .weight = 1 },
     .{ .base = 0x4300, .len = 0x80, .weight = 3 },
     .{ .base = 0x4200, .len = 0x0E, .weight = 2 },
     .{ .base = 0x2140, .len = 0x04, .weight = 2 },
@@ -127,12 +140,12 @@ fn pickWrite(rand: std.Random) u24 {
     unreachable;
 }
 
-fn fuzzConsole(gpa: std.mem.Allocator, out: *std.Io.Writer, iters: u32) !u64 {
+fn fuzzConsole(gpa: std.mem.Allocator, out: *std.Io.Writer, iters: u32, chipset: u8) !u64 {
     @setEvalBranchQuota(20000);
     var prng = std.Random.DefaultPrng.init(options.seed ^ 0xB5B5B5B5B5B5B5B5);
     const rand = prng.random();
 
-    const rom = try buildSpinRom(gpa);
+    const rom = try buildSpinRom(gpa, chipset);
     const con = try gpa.create(core.FastConsole);
     con.init(try core.Cartridge.load(gpa, rom));
     const shadow = try gpa.create(core.FastConsole);
@@ -185,7 +198,7 @@ fn fuzzConsole(gpa: std.mem.Allocator, out: *std.Io.Writer, iters: u32) !u64 {
 
 /// Minimal LoROM: reset code masks IRQs and spins; every interrupt vector
 /// lands on an RTI so random NMITIMEN/IRQ traffic can't derail the CPU.
-fn buildSpinRom(gpa: std.mem.Allocator) ![]u8 {
+fn buildSpinRom(gpa: std.mem.Allocator, chipset: u8) ![]u8 {
     const rom = try gpa.alloc(u8, 0x8000);
     @memset(rom, 0);
 
@@ -197,8 +210,9 @@ fn buildSpinRom(gpa: std.mem.Allocator) ![]u8 {
     const h = rom[0x7FC0..][0..64];
     @memcpy(h[0..21], "FUZZ SPIN            ");
     h[0x15] = 0x20; // LoROM, SlowROM
-    h[0x16] = 0x00; // ROM only
+    h[0x16] = chipset; // 0x00 = ROM only; 0x34 attaches an SA-1
     h[0x17] = 5; // 32 KiB
+    h[0x18] = 5; // 32 KiB SRAM/BW-RAM, so an attached SA-1 has memory to see
     std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little); // complement
     std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little); // checksum
     // Emulation-mode vectors: COP, BRK (unused slot), ABORT, NMI, RESET, IRQ/BRK.
