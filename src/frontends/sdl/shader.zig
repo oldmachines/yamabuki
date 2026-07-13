@@ -113,6 +113,11 @@ pub const Chain = struct {
     luts: [preset.max_luts]gl.Uint = @splat(0),
 
     quad: gl.Uint = 0,
+    /// One VAO for the whole chain, bound at init and never touched again.
+    /// Zero on GLES2, which has no VAOs; on a desktop *core* context it is
+    /// mandatory — every attribute call without one is GL_INVALID_OPERATION
+    /// and the picture is silently black (see the note in gl.zig).
+    vao: gl.Uint = 0,
     viewport: Size = .{ .w = 0, .h = 0 },
     frame_count: u32 = 0,
 
@@ -147,6 +152,15 @@ pub const Chain = struct {
             const vs = try dir.readFileAlloc(io, pass.vert_str(), gpa, .limited(1 << 20));
             const fs = try dir.readFileAlloc(io, pass.frag_str(), gpa, .limited(1 << 20));
             self.programs[i] = try self.buildProgram(gpa, vs, fs, pass, log);
+        }
+
+        // A core-profile context (the desktop glsl330 rung) has no default
+        // vertex array object, and attribute state cannot be set without one.
+        // Bind a single VAO for the chain's lifetime wherever the entry points
+        // exist; on ES3 it is redundant but harmless, and on ES2 they are null.
+        if (api.glGenVertexArrays) |gen| {
+            gen(1, @ptrCast(&self.vao));
+            api.glBindVertexArray.?(self.vao);
         }
 
         // A unit quad in [0,1]; the MVP maps it to clip space. This is the
@@ -219,6 +233,7 @@ pub const Chain = struct {
             if (t != 0) api.glDeleteTextures(1, @ptrCast(&t));
         }
         api.glDeleteBuffers(1, @ptrCast(&self.quad));
+        if (self.vao != 0) api.glDeleteVertexArrays.?(1, @ptrCast(&self.vao));
     }
 
     fn historyDepth(pass: *const Pass) u8 {
@@ -418,6 +433,11 @@ pub const Chain = struct {
     pub fn render(self: *Chain, window: Size) !void {
         const api = self.api;
         const p = &self.p;
+        // Re-assert our VAO every frame: during a shader cycle two chains are
+        // alive at once, and the other one's init/deinit may have moved the
+        // binding. One redundant bind per frame is free; a missing one on a
+        // core context is a black screen.
+        if (self.vao != 0) api.glBindVertexArray.?(self.vao);
         const box = letterbox(window, self.source_size);
         const view: Size = .{ .w = box.w, .h = box.h };
 
