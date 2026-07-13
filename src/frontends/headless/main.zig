@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = parseArgs(init) catch {
+    const args = parseArgs(init, gpa) catch {
         try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]\n", .{});
         try out.flush();
         std.process.exit(2);
@@ -86,8 +86,11 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn parseArgs(init: std.process.Init) !Args {
-    var it = init.minimal.args.iterate();
+fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
+    // POSIX-only otherwise; Windows decodes the command line from UTF-16 and
+    // needs an allocator. Not deinit'd — the returned Args slice into it, and
+    // `gpa` is the process arena.
+    var it = try init.minimal.args.iterateAllocator(gpa);
     _ = it.skip(); // program name
     var rom: ?[]const u8 = null;
     var frames: u32 = 1;

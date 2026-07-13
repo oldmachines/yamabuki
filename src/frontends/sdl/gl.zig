@@ -70,6 +70,7 @@ pub const UNSIGNED_SHORT_5_6_5: Enum = 0x8363;
 pub const HALF_FLOAT: Enum = 0x140B;
 pub const FLOAT: Enum = 0x1406;
 pub const UNPACK_ALIGNMENT: Enum = 0x0CF5;
+pub const PACK_ALIGNMENT: Enum = 0x0D05;
 
 // Framebuffers
 pub const FRAMEBUFFER: Enum = 0x8D40;
@@ -95,6 +96,8 @@ pub const Api = struct {
     glDisable: *const fn (cap: Enum) callconv(.c) void,
     glDrawArrays: *const fn (mode: Enum, first: Int, count: Sizei) callconv(.c) void,
     glPixelStorei: *const fn (pname: Enum, param: Int) callconv(.c) void,
+    glReadPixels: *const fn (x: Int, y: Int, w: Sizei, h: Sizei, format: Enum, kind: Enum, pixels: *anyopaque) callconv(.c) void,
+    glFinish: *const fn () callconv(.c) void,
 
     glCreateShader: *const fn (kind: Enum) callconv(.c) Uint,
     glShaderSource: *const fn (s: Uint, count: Sizei, strings: [*]const [*]const Char, lengths: ?[*]const Int) callconv(.c) void,
