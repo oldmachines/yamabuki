@@ -201,6 +201,14 @@ pub const Bus = struct {
         self.ppu.renderUpTo(self.beam_line, @intCast(@min(x, 256)));
     }
 
+    /// Where the beam is on the current scanline, in dots. Falls out of the
+    /// master clock and the line start the console maintains every scanline —
+    /// which is the only way to know it in the fast core, where the CPU runs a
+    /// whole line in one batch.
+    pub fn beamDot(self: *const Bus) u16 {
+        return @intCast((self.clock -% self.hv_line_start) / timing.cycles_per_dot % timing.dots_per_line);
+    }
+
     /// One CPU internal cycle (no bus access).
     pub inline fn idle(self: *Bus) void {
         self.clock += timing.speed_fast;
@@ -256,8 +264,7 @@ pub const Bus = struct {
             // $2137 SLHV latches the beam counters; the dot position falls
             // out of the master clock and the console-maintained line start.
             0x2137 => blk: {
-                const dot: u16 = @intCast((self.clock -% self.hv_line_start) / timing.cycles_per_dot % 341);
-                self.ppu.latchCounters(dot, @intCast(self.hv_line & 0x1FF));
+                self.ppu.latchCounters(self.beamDot(), @intCast(self.hv_line & 0x1FF));
                 break :blk self.mdr;
             },
             0x213C, 0x213D => self.ppu.readCounterLatch(a16, self.mdr),
@@ -284,7 +291,19 @@ pub const Bus = struct {
             },
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
-            0x4212 => self.cpuio.readHvbjoy(self.mdr),
+            // HVBJOY. Bit 6 is the H-blank flag, and it has to be derived from
+            // the beam here rather than latched by the scheduler: the fast core
+            // runs a whole scanline of CPU in one batch, so nothing else knows
+            // where in the line we are.
+            //
+            // It was previously never set at all, and `BIT $4212 / BVC` — which
+            // is how you wait for H-blank, because BIT drops bit 6 into V — hung
+            // forever. That is exactly what F-Zero does at $8616, and it is why a
+            // launch title with no coprocessor never drew a frame.
+            0x4212 => blk: {
+                self.cpuio.in_hblank = isHblank(self.beamDot());
+                break :blk self.cpuio.readHvbjoy(self.mdr);
+            },
             0x4214 => @truncate(self.math.rddiv),
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
@@ -410,6 +429,13 @@ pub const Bus = struct {
         }
     }
 };
+
+/// Dots 274..341 and 0..1 are horizontal blanking. Used for HVBJOY's H-blank
+/// flag ($4212 bit 6) — the thing `BIT $4212 / BVC` waits on, because BIT puts
+/// bit 6 straight into the V flag.
+pub fn isHblank(dot: u16) bool {
+    return dot >= 274 or dot <= 1;
+}
 
 pub fn isSystemBank(bank: u8) bool {
     return (bank & 0x7F) <= 0x3F;
@@ -739,4 +765,31 @@ test "bus state serialize roundtrip rebuilds pages" {
     try std.testing.expectEqual(saved_clock, tc2.bus.clock);
     try std.testing.expectEqual(@as(u8, 0x99), tc2.bus.read8(0x7E_0100));
     try std.testing.expectEqual(@as(u16, 25), tc2.bus.math.rdmpy);
+}
+
+test "HVBJOY exposes the H-blank flag ($4212 bit 6)" {
+    // `BIT $4212 / BVC` is how a game waits for H-blank: BIT drops bit 6 straight
+    // into the V flag. The flag was never set — `in_hblank` was declared, read,
+    // and assigned by nobody — so that wait never ended. F-Zero spins on it at
+    // $8616, which is why a LoROM launch title with no coprocessor never drew a
+    // frame, and why 100 passing golden ROMs never noticed.
+    try std.testing.expect(isHblank(0)); // dots 0-1 and 274+ are blanking
+    try std.testing.expect(isHblank(1));
+    try std.testing.expect(!isHblank(2));
+    try std.testing.expect(!isHblank(22)); // picture
+    try std.testing.expect(!isHblank(273));
+    try std.testing.expect(isHblank(274)); // H-blank begins
+    try std.testing.expect(isHblank(340));
+
+    const tc = try TestConsole.create(0x20, 0); // LoROM
+    defer tc.destroy();
+
+    // Mid-picture: the flag is clear.
+    tc.bus.hv_line_start = tc.bus.clock;
+    tc.bus.clock += 100 * timing.cycles_per_dot;
+    try std.testing.expectEqual(@as(u8, 0), tc.bus.read8(0x00_4212) & 0x40);
+
+    // Past dot 274: it must appear, or `BVC` loops forever.
+    tc.bus.clock = tc.bus.hv_line_start + 280 * timing.cycles_per_dot;
+    try std.testing.expect(tc.bus.read8(0x00_4212) & 0x40 != 0);
 }
