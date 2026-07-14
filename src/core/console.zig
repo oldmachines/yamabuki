@@ -20,6 +20,7 @@ const serialize = @import("serialize.zig");
 const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
+const profile = @import("profile.zig");
 
 /// Save-state container magic ("YMBK") and format version. The version bumps
 /// whenever the serialized field layout changes (there is no migration —
@@ -35,6 +36,10 @@ pub const Accuracy = enum { fast, accurate };
 
 pub const CoreConfig = struct {
     accuracy: Accuracy = .fast,
+    /// Compile in the frame-budget profiler (M12's `--sa1-report`). A separate
+    /// instantiation rather than a runtime flag, so the shipped core carries no
+    /// branch for it at all — the same trick as `accuracy`.
+    profile: bool = false,
 };
 
 pub fn Console(comptime cfg: CoreConfig) type {
@@ -44,12 +49,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
-        // `steps` is a diagnostic counter, not machine state.
-        pub const serialize_skip = .{"steps"};
+        // `steps` and `prof` are diagnostics, not machine state.
+        pub const serialize_skip = .{ "steps", "prof" };
 
         cart: Cartridge,
         bus: Bus,
         cpu: Cpu(Bus),
+
+        /// Zero-sized (and every use of it compiled away) unless `cfg.profile`.
+        prof: if (cfg.profile) profile.Profiler else void,
 
         region: timing.Region,
         /// Current scanline within the frame (0-based).
@@ -81,6 +89,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.line_start = self.bus.clock;
             self.frame = 0;
             self.steps = 0;
+            if (cfg.profile) self.prof = .init;
         }
 
         /// Re-wire the internal self-pointers after deserialization. The ROM
@@ -128,6 +137,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 io.nmi_flag = false;
             }
             if (line == self.vblankLine()) {
+                // The game's deadline: its main loop had until now to come
+                // around. Close the profiler's frame here rather than at
+                // scanline 0, so the window matches the NMI-to-NMI period the
+                // game's logic actually runs in.
+                if (cfg.profile) {
+                    self.prof.endFrame(self.frame, self.bus.input_polled);
+                    self.bus.input_polled = false;
+                }
                 // Entering vblank: latch the NMI flag and deliver if enabled.
                 io.in_vblank = true;
                 io.nmi_flag = true;
@@ -191,10 +208,44 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // Super FX's STOP interrupt (acked by reading SFR) ORs in.
                 const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
-                self.cpu.step();
+                self.stepCpu();
                 self.steps +%= 1;
             }
             self.line_start = line_end;
+        }
+
+        /// One CPU instruction, with the frame-budget profiler's accounting
+        /// folded in. When `cfg.profile` is false the condition is comptime-known
+        /// and the whole thing collapses to `self.cpu.step()`.
+        inline fn stepCpu(self: *Self) void {
+            if (!cfg.profile) {
+                self.cpu.step();
+                return;
+            }
+            const pc = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc;
+            const t0 = self.bus.clock;
+            const waiting = self.cpu.state != .running;
+            self.bus.last_data_read = Bus.no_data_access;
+            self.bus.last_data_write = Bus.no_data_access;
+            self.cpu.step();
+            self.prof.step(
+                pc,
+                self.bus.clock -% t0,
+                waiting,
+                dataAddr(self.bus.last_data_read),
+                dataAddr(self.bus.last_data_write),
+            );
+        }
+
+        fn dataAddr(v: u32) ?u24 {
+            return if (v == Bus.no_data_access) null else @intCast(v);
+        }
+
+        /// Collect the frame the profiler closed at the last vblank, if any.
+        /// Always null on a non-profiling console.
+        pub fn takeProfile(self: *Self) ?profile.FrameSample {
+            if (!cfg.profile) return null;
+            return self.prof.take();
         }
 
         /// Accurate-mode line loop: beam bookkeeping for the bus's mid-line
@@ -214,7 +265,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 }
                 const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
-                self.cpu.step();
+                self.stepCpu();
                 self.steps +%= 1;
             }
             self.line_start = line_end;
@@ -313,6 +364,10 @@ pub const FastConsole = Console(.{ .accuracy = .fast });
 /// The opt-in accurate core: piecewise beam-position rendering (mid-scanline
 /// $21xx writes split the line) and dot-placed H-IRQs.
 pub const AccurateConsole = Console(.{ .accuracy = .accurate });
+
+/// The fast core with the frame-budget profiler compiled in: what `--sa1-report`
+/// runs. Emulation is bit-identical to `FastConsole` — the profiler only reads.
+pub const ProfilingConsole = Console(.{ .accuracy = .fast, .profile = true });
 
 /// Runtime accuracy selection: a tagged union over the two comptime
 /// instantiations, dispatched at frame/API granularity so the hot paths stay

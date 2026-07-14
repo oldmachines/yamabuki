@@ -29,12 +29,14 @@ pub const dsp1 = @import("chips/dsp1.zig");
 pub const sa1 = @import("chips/sa1.zig");
 pub const cx4 = @import("chips/cx4.zig");
 pub const console = @import("console.zig");
+pub const profile = @import("profile.zig");
 
 pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;
 pub const Console = console.Console;
 pub const FastConsole = console.FastConsole;
 pub const AccurateConsole = console.AccurateConsole;
+pub const ProfilingConsole = console.ProfilingConsole;
 pub const AnyConsole = console.AnyConsole;
 pub const Accuracy = console.Accuracy;
 

@@ -65,7 +65,9 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    var it = init.minimal.args.iterate();
+    // The allocator form, not `iterate()`: Windows decodes the command line from
+    // UTF-16 and needs one. (`gpa` is the process arena; the args outlive it.)
+    var it = try init.minimal.args.iterateAllocator(gpa);
     _ = it.skip();
     var rom: ?[]const u8 = null;
     var frames: u32 = 600;

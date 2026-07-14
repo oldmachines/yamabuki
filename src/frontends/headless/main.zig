@@ -4,6 +4,7 @@
 //!
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
 //!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc]
+//!   yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
 //! output to inspect, and the printed hashes are what `zig build test-roms`
@@ -14,19 +15,36 @@
 //! patch for the wrong ROM revision is an error naming both checksums) and the
 //! target CRC after; IPS has no checksums, and says so. `--save-patched`
 //! writes the patched image and exits without emulating.
+//!
+//! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
+//! game with the frame-budget profiler compiled in and answers the question that
+//! comes before every other one — *is this game CPU-bound at all?* See
+//! `core/profile.zig` for what is being measured and why.
 
 const std = @import("std");
 const core = @import("snes_core");
+const profile = core.profile;
 
 const Args = struct {
     rom: []const u8,
-    frames: u32 = 1,
+    frames: ?u32 = null,
     ppm: ?[]const u8 = null,
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
     patch: ?[]const u8 = null,
     save_patched: ?[]const u8 = null,
+    sa1_report: bool = false,
+    /// Frames to run before the profiler starts counting. Boot is not gameplay:
+    /// the game is decompressing, clearing RAM, and handshaking with the APU,
+    /// and none of that is representative of the frame budget in play.
+    skip: u32 = 300,
+    json: bool = false,
+    /// Dump the hottest loops and how each was classified.
+    hot: bool = false,
 };
+
+/// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
+const report_frames_default: u32 = 3600;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -37,8 +55,18 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = parseArgs(init, gpa) catch {
-        try out.print("usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]\n" ++
-            "                          [--patch p.bps|p.ips] [--save-patched out.sfc]\n", .{});
+        try out.print(
+            \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
+            \\                         [--patch p.bps|p.ips] [--save-patched out.sfc]
+            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
+            \\
+            \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
+            \\  --save-patched  write the patched image and exit without emulating (needs --patch)
+            \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
+            \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
+            \\  --hot         also list the loops the frame is spent in, and how each was classified
+            \\
+        , .{});
         try out.flush();
         std.process.exit(2);
     };
@@ -73,6 +101,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (args.sa1_report) {
+        try runReport(io, gpa, out, args, cart);
+        return;
+    }
+
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
 
@@ -82,7 +115,8 @@ pub fn main(init: std.process.Init) !void {
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
     var drain: [4096]i16 = undefined;
-    for (0..args.frames) |_| {
+    const frames = args.frames orelse 1;
+    for (0..frames) |_| {
         con.runFrame();
         while (true) {
             const n = con.readAudio(&drain);
@@ -97,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     const width = con.frameWidth();
     const hash = core.console.hashFrame(fb);
     try out.print("{s}: {} frames, {}x{}, hash={x:0>16}, audio={x:0>16} (peak {})\n", .{
-        args.rom, args.frames, width, fb.len / width, hash, audio_hash, audio_peak,
+        args.rom, frames, width, fb.len / width, hash, audio_hash, audio_peak,
     });
     try out.flush();
 
@@ -155,46 +189,217 @@ fn applyPatch(
     return res.image;
 }
 
+/// `--sa1-report`: run the game with the frame-budget profiler and report
+/// whether it is CPU-bound.
+///
+/// Nothing presses any buttons, so what gets profiled is whatever the game does
+/// on its own — the attract/demo loop for most carts, a title screen for the
+/// rest. That is a real limitation and the report says so, because a title
+/// screen idling at 8% utilisation is not evidence of anything.
+fn runReport(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    cart: core.Cartridge,
+) !void {
+    _ = io;
+    const want = args.frames orelse report_frames_default;
+
+    const con = try gpa.create(core.ProfilingConsole);
+    con.init(cart);
+
+    var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+    try samples.ensureTotalCapacity(want);
+
+    var drain: [4096]i16 = undefined;
+    for (0..args.skip + want) |i| {
+        con.runFrame();
+        while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
+        const s = con.takeProfile() orelse continue;
+        if (i >= args.skip) samples.appendAssumeCapacity(s);
+    }
+
+    const scratch = try gpa.alloc(f64, samples.items.len);
+    const sum = profile.summarise(samples.items, scratch);
+
+    const h = &con.cart.header;
+    const chip = @tagName(con.cart.chip);
+    const map = @tagName(h.mapping);
+    const title = std.mem.trim(u8, &h.title, " \x00");
+
+    if (args.json) {
+        try out.print(
+            // `std.json.fmt` emits the surrounding quotes itself.
+            "{{\"rom\":{f},\"title\":{f},\"map\":\"{s}\",\"chip\":\"{s}\"," ++
+                "\"fastrom\":{},\"frames\":{}," ++
+                "\"slow_frames\":{},\"slow_ratio\":{d:.4}," ++
+                "\"stall_frames\":{},\"stalls\":{}," ++
+                "\"longest_stall\":{},\"longest_stall_at\":{}," ++
+                "\"mean_util\":{d:.4},\"median_util\":{d:.4},\"p95_util\":{d:.4}," ++
+                "\"max_util\":{d:.4},\"verdict\":\"{s}\"}}\n",
+            .{
+                std.json.fmt(args.rom, .{}), std.json.fmt(title, .{}),
+                map,                         chip,
+                h.fastRom(),                 sum.frames,
+                sum.slow_frames,             sum.slowRatio(),
+                sum.stall_frames,            sum.stalls,
+                sum.longest_stall,           sum.longest_stall_at,
+                sum.mean_util,               sum.median_util,
+                sum.p95_util,                sum.max_util,
+                @tagName(sum.verdict),
+            },
+        );
+        try out.flush();
+        return;
+    }
+
+    const seconds = @as(f64, @floatFromInt(sum.frames)) / 60.0;
+    try out.print("{s}\n", .{title});
+    try out.print("  {s}, {s}, {s}\n", .{
+        map,
+        if (con.cart.chip == .none) "no coprocessor" else chip,
+        if (h.fastRom()) "FastROM" else "SlowROM",
+    });
+    try out.print("  profiled {} frames ({d:.0}s) after {} boot frames\n\n", .{
+        sum.frames, seconds, args.skip,
+    });
+
+    try out.print("  CPU utilisation   mean {d:.0}%   median {d:.0}%   p95 {d:.0}%   max {d:.0}%\n", .{
+        sum.mean_util * 100, sum.median_util * 100, sum.p95_util * 100, sum.max_util * 100,
+    });
+    try out.print("  slowdown          {} of {} frames ({d:.1}%)\n", .{
+        sum.slow_frames, sum.frames, sum.slowRatio() * 100,
+    });
+    if (sum.stalls > 0) {
+        try out.print("  stalls            {} ({} frames) — loads or transitions, not slowdown\n", .{
+            sum.stalls, sum.stall_frames,
+        });
+        try out.print("  longest           {} frames, from frame {}\n", .{
+            sum.longest_stall, sum.longest_stall_at,
+        });
+    }
+
+    try out.print("\n  verdict: {s}\n", .{sum.verdict.describe()});
+    switch (sum.verdict) {
+        .not_cpu_bound => try out.print(
+            \\    The CPU idles through {d:.0}% of an average frame and never falls behind.
+            \\    A faster CPU has nothing to do here.
+            \\
+        , .{(1 - sum.mean_util) * 100}),
+        .at_the_limit => try out.print(
+            \\    Never falls behind, but its 95th-percentile frame is {d:.0}% busy: there is
+            \\    nothing left over. Not slow today; the first thing that would break if
+            \\    anything were added to it.
+            \\
+        , .{sum.p95_util * 100}),
+        .drops_frames => try out.print(
+            \\    Loses {d:.1}% of its frames to slowdown — occasional, not constant.
+            \\    Worth finding out where before drawing any conclusion.
+            \\
+        , .{sum.slowRatio() * 100}),
+        .cpu_bound => try out.print(
+            \\    Loses {d:.1}% of its frames to slowdown, spread through the capture rather
+            \\    than bunched into loads. This is a game genuinely short of CPU, and the
+            \\    kind a conversion exists for.
+            \\
+        , .{sum.slowRatio() * 100}),
+        .no_signal => try out.print(
+            \\    The game never read the controller — not in one of {} frames. It has not
+            \\    finished booting, or it is sitting on something that does not poll, or it
+            \\    has hung. Every frame looks dropped and none of them mean anything, so
+            \\    there is no verdict to give. Try a longer --skip.
+            \\
+        , .{sum.frames}),
+    }
+
+    if (args.hot) {
+        // Where every cycle went, loop or not.
+        const Page = struct { pc: u32, cycles: u64 };
+        var pages: std.array_list.Managed(Page) = .init(gpa);
+        for (con.prof.pages, 0..) |c, i| {
+            if (c != 0) try pages.append(.{ .pc = @intCast(i << 8), .cycles = c });
+        }
+        std.mem.sort(Page, pages.items, {}, struct {
+            fn gt(_: void, a: Page, b: Page) bool {
+                return a.cycles > b.cycles;
+            }
+        }.gt);
+        var total: u64 = 0;
+        for (pages.items) |e| total += e.cycles;
+        try out.print("\n  hottest 256-byte pages ({} distinct, {} cycles total)\n", .{ pages.items.len, total });
+        for (pages.items[0..@min(12, pages.items.len)]) |e| {
+            try out.print("     ${x:0>6}   {d:>14}  {d:>5.1}%\n", .{
+                e.pc, e.cycles, @as(f64, @floatFromInt(e.cycles)) * 100 / @as(f64, @floatFromInt(total)),
+            });
+        }
+
+        var hot: [profile.hot_slots]profile.Hot = con.prof.hot;
+        std.mem.sort(profile.Hot, &hot, {}, struct {
+            fn gt(_: void, a: profile.Hot, b: profile.Hot) bool {
+                return a.cycles > b.cycles;
+            }
+        }.gt);
+        try out.print("\n  hottest loops (>= {} revisits)\n", .{profile.min_iters});
+        try out.print("     {s:<10} {s:>14} {s:>13} {s:>10}  {s}\n", .{ "pc", "cycles", "instructions", "entries", "counted as" });
+        for (hot[0..@min(12, hot.len)]) |e| {
+            if (e.pc == profile.Hot.empty or e.cycles == 0) break;
+            try out.print("     ${x:0>6}   {d:>14} {d:>13} {d:>10}  {s}\n", .{
+                e.pc, e.cycles, e.iters, e.hits, if (e.idle) "idle" else "WORK",
+            });
+        }
+    }
+
+    // Everything a reader could over-trust, said out loud.
+    try out.print(
+        \\
+        \\  Measured from the game's own attract/demo loop — no buttons were pressed.
+        \\  Idle is WAI plus loops that change nothing, so a wait this misses reads as
+        \\  work: utilisation is an UPPER bound. A game that polls the pad in its NMI
+        \\  handler never registers a dropped frame at all, so slowdown is a LOWER
+        \\  bound. The two errors bracket the truth; they do not compound.
+        \\
+    , .{});
+    try out.flush();
+}
+
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // POSIX-only otherwise; Windows decodes the command line from UTF-16 and
     // needs an allocator. Not deinit'd — the returned Args slice into it, and
     // `gpa` is the process arena.
     var it = try init.minimal.args.iterateAllocator(gpa);
     _ = it.skip(); // program name
+    var out: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;
-    var frames: u32 = 1;
-    var ppm: ?[]const u8 = null;
-    var wav: ?[]const u8 = null;
-    var accuracy: core.Accuracy = .fast;
-    var patch: ?[]const u8 = null;
-    var save_patched: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--frames")) {
             const v = it.next() orelse return error.MissingValue;
-            frames = try std.fmt.parseInt(u32, v, 10);
+            out.frames = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--skip")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.skip = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--ppm")) {
-            ppm = it.next() orelse return error.MissingValue;
+            out.ppm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wav")) {
-            wav = it.next() orelse return error.MissingValue;
+            out.wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
-            accuracy = .accurate;
+            out.accuracy = .accurate;
         } else if (std.mem.eql(u8, a, "--patch")) {
-            patch = it.next() orelse return error.MissingValue;
+            out.patch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--save-patched")) {
-            save_patched = it.next() orelse return error.MissingValue;
+            out.save_patched = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--sa1-report")) {
+            out.sa1_report = true;
+        } else if (std.mem.eql(u8, a, "--json")) {
+            out.json = true;
+        } else if (std.mem.eql(u8, a, "--hot")) {
+            out.hot = true;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
-    return .{
-        .rom = rom orelse return error.NoRom,
-        .frames = frames,
-        .ppm = ppm,
-        .wav = wav,
-        .accuracy = accuracy,
-        .patch = patch,
-        .save_patched = save_patched,
-    };
+    out.rom = rom orelse return error.NoRom;
+    return out;
 }
 
 /// Write interleaved stereo i16 samples as a 32 kHz PCM WAV.
