@@ -46,7 +46,17 @@ pub const Cartridge = struct {
 
         const padded_len = std.math.ceilPowerOfTwoAssert(usize, image.len);
         const rom = try allocator.alloc(u8, padded_len);
-        for (0..padded_len) |i| rom[i] = image[i % image.len];
+        // Cyclic mirror by doubling: each pass copies the (whole multiple of
+        // the image already laid down) forward, so the result is identical to
+        // `rom[i] = image[i % image.len]` in a handful of block copies instead
+        // of a division per byte over up to 8 MiB.
+        @memcpy(rom[0..image.len], image);
+        var filled = image.len;
+        while (filled < padded_len) {
+            const n = @min(filled, padded_len - filled);
+            @memcpy(rom[filled..][0..n], rom[0..n]);
+            filled += n;
+        }
 
         var cart: Cartridge = .{
             .rom = rom,

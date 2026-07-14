@@ -3,9 +3,9 @@
 //! MathUnit — it only holds register state and the read-side-effect logic; the
 //! scheduler (Console) decides *when* to set the flags and drive the CPU lines.
 
-/// $4200 NMITIMEN bit layout.
+// $4200 NMITIMEN bit layout: bit 7 NMI enable, bits 5-4 IRQ mode (0 off,
+// 1 H-IRQ, 2 V-IRQ, 3 H+V-IRQ — decoded by `irqMode`), bit 0 auto-joypad.
 pub const nmi_enable: u8 = 0x80;
-/// IRQ mode = bits 5-4: 0 off, 1 H-IRQ, 2 V-IRQ, 3 H+V-IRQ.
 pub const auto_joypad_enable: u8 = 0x01;
 
 pub const CpuIo = struct {

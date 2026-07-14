@@ -238,9 +238,9 @@ pub const Bus = struct {
 
     fn slowRead(self: *Bus, addr: u24) u8 {
         @branchHint(.unlikely);
-        self.clock += speedOf(addr, self.fastrom);
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
+        self.clock += speedOfParts(bank, a16, self.fastrom);
 
         // MMIO exists only in the system area (banks $00-$3F / $80-$BF),
         // except the large-LoROM DSP-1 ports in banks $60-$6F.
@@ -349,9 +349,9 @@ pub const Bus = struct {
 
     fn slowWrite(self: *Bus, addr: u24, value: u8) void {
         @branchHint(.unlikely);
-        self.clock += speedOf(addr, self.fastrom);
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
+        self.clock += speedOfParts(bank, a16, self.fastrom);
 
         if (!isSystemBank(bank)) {
             if (self.dsp1Port(bank, a16)) |sr| {
@@ -443,8 +443,13 @@ pub fn isSystemBank(bank: u8) bool {
 
 /// Master cycles for one access at `addr` (anomie's memory-speed map).
 pub fn speedOf(addr: u24, fastrom: bool) u8 {
-    const bank: u8 = @intCast(addr >> 16);
-    const a16: u16 = @truncate(addr);
+    return speedOfParts(@intCast(addr >> 16), @truncate(addr), fastrom);
+}
+
+/// `speedOf` for a caller that already split the address — the MMIO slow path
+/// derives bank/a16 for its own dispatch, so deriving them again inside the
+/// speed lookup was pure waste.
+pub fn speedOfParts(bank: u8, a16: u16, fastrom: bool) u8 {
     if (bank >= 0xC0) return if (fastrom) timing.speed_fast else timing.speed_slow;
     if (bank >= 0x80) return systemAreaSpeed(a16, fastrom);
     if (bank >= 0x40) return timing.speed_slow;
