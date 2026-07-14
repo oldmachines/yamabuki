@@ -100,6 +100,9 @@ const Args = struct {
     /// off the GPU; without one it dumps the console's framebuffer.
     shot: ?[]const u8 = null,
     shot_frames: []const u32 = &.{},
+    /// `--patch <file>`: apply a BPS/IPS patch to the ROM in memory at load.
+    /// BPS is CRC-verified both ways; IPS is applied with a printed warning.
+    patch: ?[]const u8 = null,
 };
 
 /// Write 24-bit RGB as a binary PPM — the same format the headless runner emits,
@@ -168,7 +171,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
-                "                    [--shader NAME] [--shader-dir DIR]\n" ++
+                "                    [--shader NAME] [--shader-dir DIR] [--patch p.bps|p.ips]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
@@ -188,11 +191,35 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // --- console ------------------------------------------------------------
-    const image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
+    var image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read ROM '{s}'\n", .{args.rom});
         try err.flush();
         std.process.exit(1);
     };
+    if (args.patch) |patch_path| {
+        const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
+            try err.print("error: cannot read patch '{s}'\n", .{patch_path});
+            try err.flush();
+            std.process.exit(1);
+        };
+        var mm: core.patch.CrcMismatch = .{};
+        const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
+            switch (e) {
+                error.WrongSource => try err.print(
+                    "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
+                    .{ patch_path, mm.expected, mm.actual },
+                ),
+                else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
+            }
+            try err.flush();
+            std.process.exit(1);
+        };
+        if (!res.verified) {
+            try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
+            try err.flush();
+        }
+        image = res.image;
+    }
     const cart = core.Cartridge.load(gpa, image) catch |e| {
         try err.print("error: cannot load ROM: {s}\n", .{@errorName(e)});
         try err.flush();
@@ -684,6 +711,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             args.accuracy = .accurate;
         } else if (std.mem.eql(u8, a, "--shader")) {
             args.shader = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--patch")) {
+            args.patch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--shader-dir")) {
             args.shader_dir = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--shot")) {

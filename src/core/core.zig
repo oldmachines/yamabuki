@@ -8,6 +8,7 @@ pub const timing = @import("timing.zig");
 pub const serialize = @import("serialize.zig");
 pub const header = @import("cart/header.zig");
 pub const cartridge = @import("cart/cartridge.zig");
+pub const patch = @import("cart/patch.zig");
 pub const bus = @import("memory/bus.zig");
 pub const wram = @import("memory/wram.zig");
 pub const math_unit = @import("memory/math_unit.zig");
