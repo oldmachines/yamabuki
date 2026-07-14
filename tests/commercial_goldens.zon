@@ -1,0 +1,38 @@
+// Commercial-boot goldens for `zig build test-commercial -Dcommercial-roms=<dir>`.
+//
+// Each entry pins a real game's boot: run `frames` frames headless with no
+// input on the fast core, then the framebuffer and whole-stream audio hashes
+// must match. ROMs are identified by the sha256 of the copier-stripped image
+// (filenames vary between dumps); title/region/checksum are the internal
+// header's, kept for humane messages when a local dump differs.
+//
+// The ROMs themselves are never committed and never fetched: absent ones are
+// SKIPPED, so CI (which has none) stays green. Re-mint an entry with
+// `zig build test-commercial -Dcommercial-roms=<dir> -Dcommercial-mint`.
+//
+// F-Zero and Chrono Trigger are the reason this gate exists: both passed every
+// homebrew golden while never rendering a frame (HVBJOY's H-blank flag was
+// never set), and this file is what would have caught it.
+// Super Mario RPG (SA-1) is deliberately absent: minting it found the
+// emulator renders it pure black while its audio plays (checked out to
+// 1800 frames) — a real bug this gate caught before it ever ran in anger.
+// Pin it once it renders.
+.{
+    .roms = .{
+        .{ .sha256 = "0838e531fe22c077528febe14cb3ff7c492f1f5fa8de354192bdff7137c27f5b", .title = "SUPER MARIOWORLD", .region = 1, .checksum = 0xa0da, .frames = 600, .fb = 0x5019960f926fa1be, .audio = 0x235c34a91079b6d8 },
+        .{ .sha256 = "12b77c4bc9c1832cee8881244659065ee1d84c70c3d29e6eaf92e6798cc2ca72", .title = "Super Metroid", .region = 0, .checksum = 0xf8df, .frames = 600, .fb = 0xb8c0cd744645da9d, .audio = 0xd9008a1ac7ace4ba },
+        .{ .sha256 = "4e095fbbdec4a16b075d7140385ff68b259870ca9e3357f076dfff7f3d1c4a62", .title = "KIRBY SUPER DELUXE", .region = 1, .checksum = 0xc6aa, .frames = 600, .fb = 0x53a796d59cae2673, .audio = 0x98e804938e1fcb42 },
+        .{ .sha256 = "628147468c3539283197f58f03b94df49758a332831857481ea9cc31645f0527", .title = "DONKEY KONG COUNTRY", .region = 1, .checksum = 0x2bcc, .frames = 600, .fb = 0x66d259011b66cf2a, .audio = 0x9ccdb27a53e261cd },
+        .{ .sha256 = "a8fe2226728002786d68c27ddddf0b90a894db52e4dfe268fdf72a68cae5f02e", .title = "EARTH BOUND", .region = 1, .checksum = 0x4048, .frames = 600, .fb = 0x9743befaee85ceec, .audio = 0xae155d55539b0f95 },
+        // Frame 600 lands on the shared Konami logo for both Konami games (their
+        // framebuffer hashes collide!) and on black for Mega Man X; 900 lands on
+        // real, distinct content for all three.
+        .{ .sha256 = "0ef6f4cce5a2273fa49fe1ce724e0048a8e39c91da6b00dbb693fe1ba909177d", .title = "SUPER CASTLEVANIA 4", .region = 1, .checksum = 0x0325, .frames = 900, .fb = 0xc35a438cc29dfc29, .audio = 0x4c2bef72573ad7a2 },
+        .{ .sha256 = "a93ea87fc835c530b5135c5294433d15eef6dbf656144b387e89ac19cf864996", .title = "CONTRA3 THE ALIEN WAR", .region = 1, .checksum = 0x0c3c, .frames = 900, .fb = 0xf5b14f1452131643, .audio = 0x26a620e6b8e534f8 },
+        .{ .sha256 = "b8f70a6e7fb93819f79693578887e2c11e196bdf1ac6ddc7cb924b1ad0be2d32", .title = "MEGAMAN X", .region = 1, .checksum = 0x4cc2, .frames = 900, .fb = 0x5316cb93df0851ce, .audio = 0x559694849329c4d6 },
+        // The two that gate the HVBJOY H-blank fix: both passed every homebrew
+        // golden while never rendering a frame.
+        .{ .sha256 = "bf16c3c867c58e2ab061c70de9295b6930d63f29f81cc986f5ecae03e0ad18d2", .title = "F-ZERO", .region = 1, .checksum = 0xc92e, .frames = 600, .fb = 0xc4b760ab37aaeff2, .audio = 0x3c520f3d59a43eea },
+        .{ .sha256 = "06d1c2b06b716052c5596aaa0c2e5632a027fee1a9a28439e509f813c30829a9", .title = "CHRONO TRIGGER", .region = 1, .checksum = 0x788c, .frames = 600, .fb = 0x210f8ac48ec767d4, .audio = 0xe9276e1f0b6a7860 },
+    },
+}

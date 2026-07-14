@@ -34,9 +34,16 @@ zig build test-libretro          # drive the libretro core against the same gold
 zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
 zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
 zig build bench-check            # gate the deterministic perf baseline (steps/cycles/vram_reads)
+zig build test-commercial -Dcommercial-roms=<dir>  # boot YOUR OWN commercial ROMs against pinned hashes
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
 tools/package_handheld.sh        # static musl handheld package (asserts no dynamic deps)
 ```
+
+`test-commercial` is the one gate that needs ROMs you supply yourself —
+commercial ROMs are never fetched or vendored. It identifies dumps by content
+hash (`tests/commercial_goldens.zon`), skips pinned games you don't have, and
+exists because all the committed goldens are homebrew: a launch title that
+never booted (F-Zero) passed every one of them.
 
 CRT shaders are baked ahead of time, once:
 
