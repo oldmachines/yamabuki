@@ -182,6 +182,32 @@ pub fn build(b: *std.Build) void {
     const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
     roms_step.dependOn(&run_roms.step);
 
+    // Baked-shader validation: parse every shaders/*/*/preset.conf through the
+    // runtime's own parser and stat every vert/frag/LUT it references, on the
+    // host, no GPU. The shaders CI job runs it right after the bake, so a
+    // truncated file or an inconsistent manifest fails there instead of on a
+    // handheld. The preset module is imported straight from the SDL frontend —
+    // it is deliberately GL-free for exactly this purpose.
+    const shader_validate = b.addExecutable(.{
+        .name = "shader-validate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/shader_validate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "preset.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/frontends/sdl/preset.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+    const run_shader_validate = b.addRunArtifact(shader_validate);
+    run_shader_validate.setCwd(b.path("."));
+    const shader_validate_step = b.step("validate-shaders", "Parse every baked shader manifest and stat the files it references");
+    shader_validate_step.dependOn(&run_shader_validate.step);
+
     // Deterministic fuzz harness: random register/memory streams rendered
     // under Debug safety checks, plus a save/load roundtrip invariant.
     const fuzz_iters = b.option(u32, "fuzz-iters", "Fuzz iterations per stage (0 = default)") orelse 0;
