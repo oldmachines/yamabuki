@@ -8,10 +8,18 @@
 //! The entry points below are the intersection of GL ES 2.0 and GL ES 3.0 —
 //! every one of them exists on both. That is deliberate: the renderer has one
 //! code path, and the GLES2 fallback is not a second implementation that only
-//! runs on hardware nobody tests on. The two things GLES2 genuinely lacks
-//! (vertex array objects, uniform blocks) are simply not used: geometry is a
-//! single quad whose attributes are re-bound per draw, and uniform blocks are
+//! runs on hardware nobody tests on. Uniform blocks, which GLES2 lacks, are
 //! flattened to `vec4` arrays at bake time (see `preset.zig`).
+//!
+//! Vertex array objects are the one exception to "not used". GLES2 has none
+//! and GLES3 supplies a default VAO, so the quad's attributes are simply
+//! re-bound per draw — but a desktop **core** context (the glsl330 rung of the
+//! ladder) has no default VAO, and every attribute call without one is
+//! `GL_INVALID_OPERATION`: nothing draws, and the screen stays black. The two
+//! entry points are therefore optional; the chain creates and binds a single
+//! VAO when they exist and never touches them again. That rung is reached only
+//! by presets absent from the ES profiles (crt-geom, crt-hyllian), which is
+//! exactly why the bug shipped: nothing else ever executed it.
 
 const std = @import("std");
 
@@ -132,6 +140,11 @@ pub const Api = struct {
     glGetUniformBlockIndex: ?*const fn (p: Uint, name: [*:0]const Char) callconv(.c) Uint,
     glUniformBlockBinding: ?*const fn (p: Uint, block: Uint, binding: Uint) callconv(.c) void,
     glUniform1ui: ?*const fn (loc: Int, v: Uint) callconv(.c) void,
+    // Vertex array objects: absent on GLES2, mandatory on a desktop core
+    // context (see the header). The chain binds one at init when these resolve.
+    glGenVertexArrays: ?*const fn (n: Sizei, out: [*]Uint) callconv(.c) void,
+    glBindVertexArray: ?*const fn (v: Uint) callconv(.c) void,
+    glDeleteVertexArrays: ?*const fn (n: Sizei, v: [*]const Uint) callconv(.c) void,
 
     glGenBuffers: *const fn (n: Sizei, out: [*]Uint) callconv(.c) void,
     glBindBuffer: *const fn (target: Enum, buf: Uint) callconv(.c) void,
