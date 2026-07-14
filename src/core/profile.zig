@@ -208,6 +208,87 @@ pub const FrameSample = struct {
 /// How many distinct loops the hot table can hold before it starts dropping.
 pub const hot_slots: usize = 256;
 
+// --- step two: which routines cost the frame ---------------------------------
+//
+// Step one answers "is this game CPU-bound"; step two answers "WHERE does the
+// frame go", so the code worth moving to an SA-1 announces itself instead of
+// being guessed at. The model is a call stack: JSR/JSL push a routine (keyed by
+// its entry address), RTS/RTL/RTI pop, interrupts push a frame tagged as the
+// NMI/IRQ handler. Every instruction's cycles are attributed to the routine on
+// top (self time); a routine's inclusive time is the wall cycles between its
+// entry and its exit.
+//
+// Games do not promise structured control flow, so the pops resync on the
+// stack pointer instead of trusting bracketing: each frame records S as it was
+// before the call, and a return unwinds every frame whose recorded S the new S
+// has passed. A `PLA PLA` that eats a return address, a `TXS` that resets the
+// stack, or a longjmp-style bailout all come out as "unwind several frames" or
+// "unwind none", never as a corrupted stack. Overflow (recursion deeper than
+// the model) resets the stack and counts the reset rather than guessing.
+//
+// Cycles the wait classifier ends up calling idle are attributed to a
+// synthetic "(waiting)" routine rather than to the routine the wait loop
+// happens to live in — otherwise every ranking would be topped by the idle
+// spin, which is precisely the code an SA-1 conversion does NOT need to move.
+// Since a loop can only be classified after the fact, in-loop cycles are
+// staged in a small ledger (per routine) and settled when the loop is judged:
+// the sum of every routine's self time plus "(waiting)" therefore equals the
+// profiler's work+idle exactly, and a unit test holds it to that.
+
+/// How many distinct routines the table can hold before dropping (counted).
+pub const routine_slots: usize = 512;
+/// Deepest call nesting the model follows before resetting (counted).
+pub const call_stack_max: usize = 64;
+/// Distinct routines one loop may touch before the ledger folds the excess
+/// into its first entry (attribution smears inside the loop; the total stays
+/// exact).
+pub const ledger_max: usize = 8;
+
+/// What kind of code a routine is — interrupt handlers are worth telling
+/// apart, since moving an NMI handler to the SA-1 is a different job.
+pub const RoutineKind = enum(u8) { code, nmi, irq };
+
+/// Control-transfer classification for one instruction, detected by the
+/// caller (the console peeks the opcode byte; the profiler never touches the
+/// bus). `target`/`sp_after` are the CPU state after the instruction ran.
+pub const Event = struct {
+    pub const Kind = enum(u8) { none, call, ret, nmi, irq };
+    kind: Kind = .none,
+    /// pbr:pc after the instruction — the callee's entry on call/interrupt.
+    target: u24 = 0,
+    /// S before the instruction: where the caller's stack stood. The frame
+    /// remembers it, and returns unwind against it.
+    sp_before: u16 = 0,
+    /// S after the instruction: what a return resyncs the stack against.
+    sp_after: u16 = 0,
+};
+
+/// One routine, keyed by entry address.
+pub const Routine = struct {
+    entry: u32,
+    kind: RoutineKind,
+    /// Times it was entered (calls + interrupt dispatches).
+    calls: u64,
+    /// Master cycles attributed while it was on top of the stack, waits
+    /// excluded — the ranking number.
+    self_cycles: u64,
+    /// Wall cycles between entry and exit of its outermost instance —
+    /// includes callees and any waiting done inside.
+    incl_cycles: u64,
+    /// Self cycles accrued during frames the lag detector called dropped.
+    slow_cycles: u64,
+    /// Self cycles accrued during the frame in progress (folded into
+    /// `slow_cycles` at the frame boundary if the frame lagged).
+    frame_cycles: u64,
+    /// Live instances on the call stack (recursion guard for inclusive time).
+    on_stack: u16,
+
+    pub const empty: u32 = 0xFFFF_FFFF;
+};
+
+/// Ledger sentinel: cycles that belong to depth-0 code (no call frame).
+const slot_main: u16 = 0xFFFF;
+
 /// One loop, identified by its anchor. A preview of step two of the analyser
 /// ("which routines cost the frame") — but its first job was more basic than
 /// that: when a game reports 100% utilisation, this is what tells you whether the
@@ -297,6 +378,47 @@ pub const Profiler = struct {
     /// the backstop when the loop table does not add up to a whole frame.
     pages: [1 << 16]u64,
 
+    // --- step two: per-routine attribution -------------------------------------
+    routines: [routine_slots]Routine,
+    routines_dropped: u64,
+    /// The call stack model. Each frame: which routine, where S stood before
+    /// the call, and the observed-cycle counter at entry (for inclusive time).
+    stack: [call_stack_max]StackFrame,
+    depth: u16,
+    stack_resets: u64,
+    /// Every cycle the profiler has seen, work or idle — the wall clock that
+    /// inclusive time is measured on.
+    observed: u64,
+    /// In-loop attribution ledger: cycles staged per routine until the loop is
+    /// classified. `pure` mirrors `pure_cycles`, `iter` mirrors `iter_cycles`.
+    ledger: [ledger_max]LedgerEntry,
+    n_ledger: u8,
+    /// Self time of code running at depth 0 — the main loop between calls.
+    main_self: u64,
+    main_frame: u64,
+    main_slow: u64,
+    /// Self time of everything the wait classifier called idle, wherever the
+    /// wait loop lived.
+    waiting_self: u64,
+    waiting_frame: u64,
+    waiting_slow: u64,
+    /// Run totals (the per-frame `work`/`idle` reset at every boundary; these
+    /// do not) — what the attribution invariant is checked against.
+    total_work: u64,
+    total_idle: u64,
+
+    pub const StackFrame = struct {
+        slot: u16,
+        sp_pre: u16,
+        observed_at: u64,
+    };
+
+    pub const LedgerEntry = struct {
+        slot: u16, // routine index, or `slot_main`
+        pure: u64,
+        iter: u64,
+    };
+
     pub const init: Profiler = .{
         .seen = @splat(0),
         .nseen = 0,
@@ -322,6 +444,31 @@ pub const Profiler = struct {
         .hot = @splat(.{ .pc = Hot.empty, .cycles = 0, .iters = 0, .hits = 0, .idle = false }),
         .hot_dropped = 0,
         .pages = @splat(0),
+        .routines = @splat(.{
+            .entry = Routine.empty,
+            .kind = .code,
+            .calls = 0,
+            .self_cycles = 0,
+            .incl_cycles = 0,
+            .slow_cycles = 0,
+            .frame_cycles = 0,
+            .on_stack = 0,
+        }),
+        .routines_dropped = 0,
+        .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0 }),
+        .depth = 0,
+        .stack_resets = 0,
+        .observed = 0,
+        .ledger = @splat(.{ .slot = 0, .pure = 0, .iter = 0 }),
+        .n_ledger = 0,
+        .main_self = 0,
+        .main_frame = 0,
+        .main_slow = 0,
+        .waiting_self = 0,
+        .waiting_frame = 0,
+        .waiting_slow = 0,
+        .total_work = 0,
+        .total_idle = 0,
     };
 
     /// Account for one retired instruction.
@@ -331,6 +478,7 @@ pub const Profiler = struct {
     ///   waiting the CPU was halted in `WAI`/`STP` — no instruction really ran
     ///   read    the data address it read, if any (never a code fetch or a pull)
     ///   write   the data address it wrote, if any (never a push)
+    ///   ev      control transfer the instruction made, if any (see `Event`)
     pub fn step(
         self: *Profiler,
         pc: u24,
@@ -338,52 +486,192 @@ pub const Profiler = struct {
         waiting: bool,
         read: ?u24,
         write: ?u24,
+        ev: Event,
     ) void {
         self.pages[pc >> 8] += cycles;
+        self.observed += cycles;
 
         if (waiting) {
-            // WAI: halted until an interrupt. Waiting, by construction.
+            // WAI: halted until an interrupt. Waiting, by construction — and a
+            // halted cycle transfers control nowhere, so no event to apply.
             self.endLoop();
             self.idle += cycles;
+            self.creditWaiting(cycles);
             return;
         }
 
-        if (self.anchor) |a| {
-            if (pc == a) {
-                self.retireIteration();
-            } else if (!self.inLoop(pc)) {
-                // An address the loop does not run at. While it is still being
-                // learned (its first couple of passes), take this as part of it;
-                // afterwards, it means the CPU has left, and the loop is over.
-                if (self.iters_done >= 2 or self.n_loop_pcs == max_seen_pcs) {
+        classify: {
+            if (self.anchor) |a| {
+                if (pc == a) {
+                    self.retireIteration();
+                } else if (!self.inLoop(pc)) {
+                    // An address the loop does not run at. While it is still being
+                    // learned (its first couple of passes), take this as part of it;
+                    // afterwards, it means the CPU has left, and the loop is over.
+                    if (self.iters_done >= 2 or self.n_loop_pcs == max_seen_pcs) {
+                        self.endLoop();
+                        self.creditWork(cycles);
+                        break :classify;
+                    }
+                    self.loop_pcs[self.n_loop_pcs] = pc;
+                    self.n_loop_pcs += 1;
+                } else if (self.iter_instrs >= max_iter_instrs) {
+                    // Backstop: a "loop" that never comes back to its anchor is not
+                    // one. (Rare — the address test above almost always fires first.)
                     self.endLoop();
-                    self.work += cycles;
-                    return;
+                    self.creditWork(cycles);
+                    break :classify;
                 }
-                self.loop_pcs[self.n_loop_pcs] = pc;
-                self.n_loop_pcs += 1;
-            } else if (self.iter_instrs >= max_iter_instrs) {
-                // Backstop: a "loop" that never comes back to its anchor is not
-                // one. (Rare — the address test above almost always fires first.)
-                self.endLoop();
-                self.work += cycles;
+            } else if (self.sawPc(pc)) {
+                // It has come back. This is a loop, and `pc` is its anchor.
+                self.startLoop(pc);
+            } else {
+                // Straight-line, as far as we can tell: work.
+                self.notePc(pc);
+                self.creditWork(cycles);
+                break :classify;
+            }
+
+            self.iter_cycles += cycles;
+            self.iter_instrs +|= 1;
+            self.loop_cycles += cycles;
+            if (read) |addr| self.noteRead(addr);
+            if (write) |addr| self.noteWrite(addr);
+            // In a loop the work/idle call is made later, so the attribution
+            // is staged too, against whoever is on top of the stack right now.
+            self.ledgerAdd(self.topSlot(), cycles);
+        }
+
+        self.applyEvent(ev);
+    }
+
+    // --- step two: attribution --------------------------------------------------
+
+    /// Immediate attribution: these cycles are work, banked now, to whoever is
+    /// on top of the call stack.
+    fn creditWork(self: *Profiler, cycles: u64) void {
+        self.work += cycles;
+        self.creditSelf(self.topSlot(), cycles);
+    }
+
+    fn creditSelf(self: *Profiler, slot: u16, cycles: u64) void {
+        if (cycles == 0) return;
+        if (slot == slot_main) {
+            self.main_self += cycles;
+            self.main_frame += cycles;
+        } else {
+            const r = &self.routines[slot];
+            r.self_cycles += cycles;
+            r.frame_cycles += cycles;
+        }
+    }
+
+    fn creditWaiting(self: *Profiler, cycles: u64) void {
+        self.waiting_self += cycles;
+        self.waiting_frame += cycles;
+    }
+
+    fn topSlot(self: *const Profiler) u16 {
+        return if (self.depth == 0) slot_main else self.stack[self.depth - 1].slot;
+    }
+
+    /// Stage in-loop cycles against `slot` until the loop is classified.
+    fn ledgerAdd(self: *Profiler, slot: u16, cycles: u64) void {
+        if (cycles == 0) return;
+        for (self.ledger[0..self.n_ledger]) |*e| {
+            if (e.slot == slot) {
+                e.iter += cycles;
                 return;
             }
-        } else if (self.sawPc(pc)) {
-            // It has come back. This is a loop, and `pc` is its anchor.
-            self.startLoop(pc);
-        } else {
-            // Straight-line, as far as we can tell: work.
-            self.notePc(pc);
-            self.work += cycles;
+        }
+        if (self.n_ledger == ledger_max) {
+            // Fold into the first entry: attribution smears inside this one
+            // loop, but the total stays exact.
+            self.ledger[0].iter += cycles;
             return;
         }
+        self.ledger[self.n_ledger] = .{ .slot = slot, .pure = 0, .iter = cycles };
+        self.n_ledger += 1;
+    }
 
-        self.iter_cycles += cycles;
-        self.iter_instrs +|= 1;
-        self.loop_cycles += cycles;
-        if (read) |addr| self.noteRead(addr);
-        if (write) |addr| self.noteWrite(addr);
+    fn applyEvent(self: *Profiler, ev: Event) void {
+        switch (ev.kind) {
+            .none => {},
+            .call => self.pushFrame(ev.target, ev.sp_before),
+            .nmi, .irq => {
+                self.pushFrame(ev.target, ev.sp_before);
+                // Tag the handler. First insert wins; a routine both called
+                // and interrupted into keeps whichever it was seen as first.
+                if (self.depth > 0) {
+                    const r = &self.routines[self.stack[self.depth - 1].slot];
+                    if (r.calls == 1) r.kind = if (ev.kind == .nmi) .nmi else .irq;
+                }
+            },
+            .ret => {
+                // Unwind every frame whose pre-call S the return has passed: a
+                // clean RTS pops exactly one, a longjmp-style bailout pops
+                // several, and a return whose call the model never saw (or
+                // whose return address the routine ate off the stack) pops
+                // none. The stack pointer is the ground truth; bracketing is
+                // just the common case.
+                while (self.depth > 0 and self.stack[self.depth - 1].sp_pre <= ev.sp_after) {
+                    self.popFrame();
+                }
+            },
+        }
+    }
+
+    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16) void {
+        if (self.depth == call_stack_max) {
+            // Deeper than the model follows — recursion, or a game using the
+            // stack in ways no model survives. Start over and count it rather
+            // than guess.
+            while (self.depth > 0) self.popFrame();
+            self.stack_resets += 1;
+        }
+        const slot = self.routineSlot(entry) orelse return;
+        const r = &self.routines[slot];
+        r.calls += 1;
+        r.on_stack += 1;
+        self.stack[self.depth] = .{ .slot = slot, .sp_pre = sp_pre, .observed_at = self.observed };
+        self.depth += 1;
+    }
+
+    fn popFrame(self: *Profiler) void {
+        self.depth -= 1;
+        const f = self.stack[self.depth];
+        const r = &self.routines[f.slot];
+        r.on_stack -|= 1;
+        // Inclusive time is charged once per outermost instance, so recursion
+        // does not double-count the same wall cycles.
+        if (r.on_stack == 0) r.incl_cycles += self.observed - f.observed_at;
+    }
+
+    /// Find or insert the routine keyed by `entry` (open addressing, drop and
+    /// count when full — same policy as the hot table).
+    fn routineSlot(self: *Profiler, entry: u24) ?u16 {
+        var i: usize = (@as(usize, entry) *% 2654435761) % routine_slots;
+        for (0..routine_slots) |_| {
+            const r = &self.routines[i];
+            if (r.entry == Routine.empty) {
+                r.entry = entry;
+                return @intCast(i);
+            }
+            if (r.entry == entry) return @intCast(i);
+            i = (i + 1) % routine_slots;
+        }
+        self.routines_dropped += 1;
+        return null;
+    }
+
+    /// The attribution invariant step two is held to: every cycle banked as
+    /// work or idle is in the routine table — named routine, "(main)", or
+    /// "(waiting)" — and nowhere else. Cycles still staged in an unclassified
+    /// loop are excluded on both sides, so this holds exactly at any instant.
+    pub fn attributionBalanced(self: *const Profiler) bool {
+        var s: u64 = self.main_self + self.waiting_self;
+        for (self.routines) |r| s += r.self_cycles;
+        return s == self.total_work + self.total_idle + self.work + self.idle;
     }
 
     fn startLoop(self: *Profiler, pc: u24) void {
@@ -410,12 +698,20 @@ pub const Profiler = struct {
         if (self.loopIsPure()) {
             self.pure_iters +|= 1;
             self.pure_cycles += self.iter_cycles;
+            // The pass keeps its innocence for now: roll its staged
+            // attribution into the pure pot alongside it.
+            for (self.ledger[0..self.n_ledger]) |*e| {
+                e.pure += e.iter;
+                e.iter = 0;
+            }
         } else {
             // The loop is doing something. Everything it has run is work —
             // including the earlier passes that happened to look innocent.
             self.work += self.pure_cycles + self.iter_cycles;
             self.pure_iters = 0;
             self.pure_cycles = 0;
+            for (self.ledger[0..self.n_ledger]) |*e| self.creditSelf(e.slot, e.pure + e.iter);
+            self.n_ledger = 0;
         }
         self.iter_cycles = 0;
         self.iter_instrs = 0;
@@ -427,9 +723,17 @@ pub const Profiler = struct {
             const is_idle = self.pure_iters >= min_iters;
             if (is_idle) self.idle += self.pure_cycles else self.work += self.pure_cycles;
             self.recordHot(a, self.loop_cycles, is_idle);
+            // Settle the staged attribution the same way: an idle loop's pure
+            // passes belong to "(waiting)", not to the routine the spin lives
+            // in; everything else lands where it was staged.
+            for (self.ledger[0..self.n_ledger]) |*e| {
+                if (is_idle) self.creditWaiting(e.pure) else self.creditSelf(e.slot, e.pure);
+                self.creditSelf(e.slot, e.iter);
+            }
         }
         // The partial pass that broke out of the loop is not part of it.
         self.work += self.iter_cycles;
+        self.n_ledger = 0;
         self.anchor = null;
         self.pure_iters = 0;
         self.pure_cycles = 0;
@@ -525,6 +829,12 @@ pub const Profiler = struct {
         if (self.pure_iters >= min_iters) {
             self.idle += self.pure_cycles;
             self.pure_cycles = 0;
+            // Its staged attribution goes to "(waiting)" with it; the partial
+            // pass in flight stays staged, like `iter_cycles` does.
+            for (self.ledger[0..self.n_ledger]) |*e| {
+                self.creditWaiting(e.pure);
+                e.pure = 0;
+            }
         }
         self.pending = .{
             .frame = frame,
@@ -532,8 +842,22 @@ pub const Profiler = struct {
             .idle = self.idle,
             .lag = !polled,
         };
+        self.total_work += self.work;
+        self.total_idle += self.idle;
         self.work = 0;
         self.idle = 0;
+
+        // Slow-frame correlation: a routine's cycles in a frame the lag
+        // detector called dropped are the cycles a conversion would actually
+        // buy back. Settled per frame, because "dropped" is only known here.
+        if (!polled) {
+            for (&self.routines) |*r| r.slow_cycles += r.frame_cycles;
+            self.main_slow += self.main_frame;
+            self.waiting_slow += self.waiting_frame;
+        }
+        for (&self.routines) |*r| r.frame_cycles = 0;
+        self.main_frame = 0;
+        self.waiting_frame = 0;
     }
 
     /// Collect the frame closed by the last `endFrame`, if any.
@@ -753,7 +1077,50 @@ const Trace = struct {
     const cyc = 6;
 
     fn run(t: *Trace, pc: u24, read: ?u24, write: ?u24) void {
-        t.p.step(pc, cyc, false, read, write);
+        t.p.step(pc, cyc, false, read, write, .{});
+    }
+
+    /// A JSR/JSL: `sp` is S before the call, and the callee entry is where
+    /// the (synthetic) CPU landed. The call instruction itself runs at `pc`.
+    fn call(t: *Trace, pc: u24, target: u24, sp: u16) void {
+        t.p.step(pc, cyc, false, null, null, .{
+            .kind = .call,
+            .target = target,
+            .sp_before = sp,
+            .sp_after = sp - 2,
+        });
+    }
+
+    /// An RTS: S after it has popped back to `sp_after`.
+    fn ret(t: *Trace, pc: u24, sp_after: u16) void {
+        t.p.step(pc, cyc, false, null, null, .{
+            .kind = .ret,
+            .target = 0,
+            .sp_before = sp_after - 2,
+            .sp_after = sp_after,
+        });
+    }
+
+    /// An interrupt dispatch interrupting the instruction at `pc`.
+    fn interrupt(t: *Trace, pc: u24, handler: u24, sp: u16, kind: Event.Kind) void {
+        t.p.step(pc, cyc, false, null, null, .{
+            .kind = kind,
+            .target = handler,
+            .sp_before = sp,
+            .sp_after = sp - 4,
+        });
+    }
+
+    /// The routine slot for `entry`, which must exist.
+    fn routine(t: *Trace, entry: u24) *const Routine {
+        var i: usize = (@as(usize, entry) *% 2654435761) % routine_slots;
+        for (0..routine_slots) |_| {
+            const r = &t.p.routines[i];
+            if (r.entry == entry) return r;
+            std.debug.assert(r.entry != Routine.empty);
+            i = (i + 1) % routine_slots;
+        }
+        unreachable;
     }
 
     /// `n` turns of a two-instruction loop polling one fixed address:
@@ -853,7 +1220,7 @@ test "a wait built around a subroutine call is idle" {
 
 test "WAI is idle" {
     var t: Trace = .{};
-    t.p.step(0x00_9000, 600, true, null, null);
+    t.p.step(0x00_9000, 600, true, null, null, .{});
     const s = t.frame();
     try std.testing.expectEqual(@as(u64, 600), s.idle);
     try std.testing.expectEqual(@as(u64, 0), s.work);
@@ -1154,4 +1521,177 @@ test "percentiles" {
     try std.testing.expectEqual(@as(f64, 94), percentile(&v, 95));
     try std.testing.expectEqual(@as(f64, 99), percentile(&v, 100));
     try std.testing.expectEqual(@as(f64, 0), percentile(v[0..1], 95));
+}
+
+// --- step two: routine attribution tests --------------------------------------
+
+test "nested calls attribute self and inclusive time exactly" {
+    var t: Trace = .{};
+    // main -> B -> C, every instruction 6 cycles, all addresses distinct so
+    // the loop classifier stays out of the way.
+    t.run(0x00_9000, null, null); // main
+    t.run(0x00_9003, null, null); // main
+    t.call(0x00_9006, 0x00_A000, 0x1FF); // main (the JSR itself), then push B
+    t.run(0x00_A000, null, null); // B
+    t.run(0x00_A003, null, null); // B
+    t.call(0x00_A006, 0x00_B000, 0x1FD); // B, then push C
+    t.run(0x00_B000, null, null); // C
+    t.run(0x00_B003, null, null); // C
+    t.ret(0x00_B006, 0x1FD); // C (the RTS itself), then pop C
+    t.run(0x00_A009, null, null); // B again
+    t.ret(0x00_A00C, 0x1FF); // B, then pop B
+    t.run(0x00_900C, null, null); // main
+
+    const b = t.routine(0x00_A000);
+    const c = t.routine(0x00_B000);
+    try std.testing.expectEqual(@as(u64, 1), b.calls);
+    try std.testing.expectEqual(@as(u64, 1), c.calls);
+    try std.testing.expectEqual(@as(u64, 30), b.self_cycles);
+    try std.testing.expectEqual(@as(u64, 18), c.self_cycles);
+    // Inclusive: wall cycles from entry to exit. C: pushed at 36, popped at
+    // 54. B: pushed at 18, popped at 66 — C's time included.
+    try std.testing.expectEqual(@as(u64, 18), c.incl_cycles);
+    try std.testing.expectEqual(@as(u64, 48), b.incl_cycles);
+    try std.testing.expectEqual(@as(u64, 24), t.p.main_self);
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "recursion counts inclusive time once" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF); // push A (outer)
+    t.run(0x00_A100, null, null);
+    t.call(0x00_A103, 0x00_A000, 0x1FD); // push A (inner)
+    try std.testing.expectEqual(@as(u16, 2), t.routine(0x00_A000).on_stack);
+    t.run(0x00_A100, null, null); // revisited pc: the loop model may engage;
+    t.run(0x00_A106, null, null); // attribution stays balanced regardless
+    t.ret(0x00_A109, 0x1FD); // pop inner: still on stack, no inclusive yet
+    try std.testing.expectEqual(@as(u64, 0), t.routine(0x00_A000).incl_cycles);
+    t.ret(0x00_A10C, 0x1FF); // pop outer: one inclusive span for both
+    const a = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u64, 2), a.calls);
+    try std.testing.expectEqual(@as(u16, 0), a.on_stack);
+    // Pushed (outer) at observed 6, popped at 42: one span, not two.
+    try std.testing.expectEqual(@as(u64, 36), a.incl_cycles);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "an interrupt pushes a tagged handler frame" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, null, null);
+    t.interrupt(0x00_A003, 0x00_F000, 0x1FD, .nmi); // dispatch mid-routine
+    t.run(0x00_F000, null, null);
+    t.run(0x00_F003, null, null);
+    t.ret(0x00_F006, 0x1FD); // RTI: pops the handler, not A
+    try std.testing.expectEqual(@as(u16, 1), t.p.depth);
+    const h = t.routine(0x00_F000);
+    try std.testing.expectEqual(RoutineKind.nmi, h.kind);
+    try std.testing.expectEqual(@as(u64, 1), h.calls);
+    t.ret(0x00_A006, 0x1FF);
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "an unmatched return is a no-op, not a corrupted stack" {
+    var t: Trace = .{};
+    t.ret(0x00_9000, 0x1FF); // nothing to pop
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+    // A routine that eats its return address: the RTS's popped-to S is BELOW
+    // the frame's pre-call S, so nothing unwinds until the real return.
+    t.call(0x00_9003, 0x00_A000, 0x1FF);
+    t.ret(0x00_A000, 0x1F9); // some inner juggling returned deeper
+    try std.testing.expectEqual(@as(u16, 1), t.p.depth);
+    t.ret(0x00_A003, 0x1FF); // the real return
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "a longjmp-style return unwinds every passed frame" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.call(0x00_A000, 0x00_B000, 0x1FD);
+    t.call(0x00_B000, 0x00_C000, 0x1FB);
+    try std.testing.expectEqual(@as(u16, 3), t.p.depth);
+    t.ret(0x00_C000, 0x1FF); // S restored to the top: everything unwinds
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "call-stack overflow resets and counts" {
+    var t: Trace = .{};
+    var sp: u16 = 0x1FF;
+    for (0..call_stack_max) |i| {
+        const n: u24 = @intCast(i);
+        t.call(0x00_9000 + n * 16, 0x02_0000 + n * 16, sp);
+        sp -= 2;
+    }
+    try std.testing.expectEqual(@as(u16, call_stack_max), t.p.depth);
+    try std.testing.expectEqual(@as(u64, 0), t.p.stack_resets);
+    t.call(0x00_8000, 0x03_0000, sp); // one deeper than the model follows
+    try std.testing.expectEqual(@as(u64, 1), t.p.stack_resets);
+    try std.testing.expectEqual(@as(u16, 1), t.p.depth);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "an idle spin's cycles land on (waiting), not its routine" {
+    var t: Trace = .{};
+    t.poll(0x00_9000, 100, 0x00_0010);
+    t.run(0x00_9100, null, null); // leave the loop: it gets classified here
+    const s = t.frame();
+    // Everything the frame banked as idle is exactly what "(waiting)" holds.
+    try std.testing.expectEqual(s.idle, t.p.waiting_self);
+    try std.testing.expect(t.p.waiting_self > 0);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "a subroutine-shaped wait credits (waiting), and the callee stays cheap" {
+    var t: Trace = .{};
+    // Contra III's idiom: main loop JSLs a checker that polls a flag and
+    // returns. The spin's cycles must land on "(waiting)" — moving the checker
+    // to an SA-1 buys nothing — while the call count stays honest.
+    for (0..100) |_| {
+        t.call(0x00_8166, 0x00_8200, 0x1FF); // JSL check
+        t.run(0x00_8200, 0x00_0042, null); // LDA flag
+        t.ret(0x00_8203, 0x1FF); // RTL
+        t.run(0x00_816A, null, null); // BRA back
+    }
+    t.run(0x00_9000, null, null); // leave the loop
+    const s = t.frame();
+    try std.testing.expectEqual(s.idle, t.p.waiting_self);
+    try std.testing.expect(s.utilisation() < 0.05);
+    const check = t.routine(0x00_8200);
+    try std.testing.expectEqual(@as(u64, 100), check.calls);
+    // The checker keeps only the cycles from before the loop was recognised
+    // and after it broke — a sliver, not the frame.
+    try std.testing.expect(check.self_cycles < s.idle / 10);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "a working loop's cycles stay with its routine" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.clear(0x00_A000, 100, 0x7E_2000); // memory clear: work, inside A
+    t.ret(0x00_A006, 0x1FF);
+    const s = t.frame();
+    try std.testing.expectEqual(@as(u64, 0), t.p.waiting_self);
+    const a = t.routine(0x00_A000);
+    // Everything except main's JSR and the frame's odds and ends is A's.
+    try std.testing.expect(a.self_cycles > s.work * 8 / 10);
+    try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "slow-frame correlation follows the lag flag" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.clear(0x00_A000, 50, 0x7E_2000);
+    t.p.endFrame(0, false); // lagged: this frame's cycles count as slow
+    _ = t.p.take();
+    t.clear(0x00_A000, 50, 0x7E_4000);
+    t.p.endFrame(1, true); // polled fine: these don't
+    _ = t.p.take();
+    const a = t.routine(0x00_A000);
+    try std.testing.expect(a.slow_cycles > 0);
+    try std.testing.expect(a.slow_cycles < a.self_cycles);
+    try std.testing.expect(t.p.attributionBalanced());
 }

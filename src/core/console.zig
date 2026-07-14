@@ -20,6 +20,7 @@ const serialize = @import("serialize.zig");
 const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
+const CpuFlags = @import("cpu/wdc65816.zig").Flags;
 const profile = @import("profile.zig");
 
 /// Save-state container magic ("YMBK") and format version. The version bumps
@@ -225,6 +226,27 @@ pub fn Console(comptime cfg: CoreConfig) type {
             const pc = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc;
             const t0 = self.bus.clock;
             const waiting = self.cpu.state != .running;
+            // Classify the control transfer this step will make before it
+            // runs. The interrupt test mirrors `Cpu.step`'s own dispatch; the
+            // opcode peek is side-effect-free (no clock, no MDR, no MMIO), so
+            // emulation stays bit-identical. All of it is the profiler's
+            // business — the CPU core carries no instrumentation.
+            const sp_before = self.cpu.regs.s;
+            var kind: profile.Event.Kind = .none;
+            if (!waiting) {
+                if (self.cpu.nmi_pending) {
+                    kind = .nmi;
+                } else if (self.cpu.irq_line and (self.cpu.regs.p & CpuFlags.i) == 0) {
+                    kind = .irq;
+                } else if (self.bus.peek8(pc)) |op| {
+                    kind = switch (op) {
+                        0x20, 0x22, 0xFC => .call, // JSR abs / JSL / JSR (abs,X)
+                        0x60, 0x6B, 0x40 => .ret, // RTS / RTL / RTI
+                        0x00, 0x02 => .irq, // BRK / COP enter a handler too
+                        else => .none,
+                    };
+                }
+            }
             self.bus.last_data_read = Bus.no_data_access;
             self.bus.last_data_write = Bus.no_data_access;
             self.cpu.step();
@@ -234,6 +256,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 waiting,
                 dataAddr(self.bus.last_data_read),
                 dataAddr(self.bus.last_data_write),
+                .{
+                    .kind = kind,
+                    .target = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc,
+                    .sp_before = sp_before,
+                    .sp_after = self.cpu.regs.s,
+                },
             );
         }
 
