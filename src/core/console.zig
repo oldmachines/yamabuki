@@ -173,8 +173,16 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // catch it up mid-line as needed). The Super FX follows the same
             // scheme: MMIO accesses catch it up mid-line, the line end here.
             self.bus.apu.catchUp(self.bus.clock);
-            if (self.bus.cart.chip == .superfx) self.bus.gsu.catchUp(self.bus.clock);
-            if (self.bus.cart.chip == .sa1) self.bus.sa1.catchUp(self.bus.clock);
+            // Catching a coprocessor up can raise (or time out) its IRQ, so
+            // re-derive the aggregated line the CPU loop reads.
+            if (self.bus.cart.chip == .superfx) {
+                self.bus.gsu.catchUp(self.bus.clock);
+                self.bus.syncCoprocIrq();
+            }
+            if (self.bus.cart.chip == .sa1) {
+                self.bus.sa1.catchUp(self.bus.clock);
+                self.bus.syncCoprocIrq();
+            }
 
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
@@ -205,8 +213,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // Keep the CPU's level-sensitive IRQ input in sync with the
                 // timer flag: reading $4211 (TIMEUP) clears irq_flag, which must
                 // deassert the line before the handler's RTI re-checks it. The
-                // Super FX's STOP interrupt (acked by reading SFR) ORs in.
-                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
+                // coprocessor IRQs (GSU STOP, SA-1 message/timer/CC-DMA) OR in
+                // through the bus's one aggregated line — the loop no longer
+                // loads two large chip structs that are dead weight on a
+                // plain cart.
+                const irq = io.irq_flag or self.bus.coproc_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.stepCpu();
                 self.steps +%= 1;
@@ -263,7 +274,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (fire_at) |t| {
                     if (self.bus.clock >= t) io.irq_flag = true;
                 }
-                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
+                const irq = io.irq_flag or self.bus.coproc_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.stepCpu();
                 self.steps +%= 1;
