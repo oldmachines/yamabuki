@@ -266,7 +266,11 @@ def instance_name(glsl, block_name, fallback):
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **kw)
     if r.returncode != 0:
-        raise Reject((r.stdout + r.stderr).strip().splitlines()[0] if (r.stdout + r.stderr).strip() else "tool failed")
+        # A tool that fails with no output at all is a crash, not a compile
+        # error; carry the exit code so the two are distinguishable (a signal
+        # shows up as a negative code on POSIX).
+        out = (r.stdout + r.stderr).strip()
+        raise Reject(out.splitlines()[0] if out else f"tool failed silently (exit {r.returncode})")
     return r.stdout
 
 

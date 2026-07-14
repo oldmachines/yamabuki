@@ -37,12 +37,34 @@ pub const page_count = 0x100_0000 / page_size; // 2048
 pub const Bus = struct {
     // The page table holds raw pointers into wram/cart and is rebuilt by
     // remap() on load; the cart reference is re-supplied by the frontend.
-    pub const serialize_skip = .{ "pages", "cart" };
+    // `last_data_read`, `last_data_write` and `input_polled` are diagnostics,
+    // not machine state.
+    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled" };
+
+    /// `last_data_read`/`last_data_write` when there has been none since they
+    /// were cleared. Out of u24 range, so it cannot collide with a real address.
+    pub const no_data_access: u32 = 0x0100_0000;
 
     pages: [page_count]Page,
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
+    /// Address of the most recent *data* read / write (`Cpu.read8`/`Cpu.write8`),
+    /// or `no_data_access`. Set by the CPU — never by an instruction fetch, and
+    /// never by a stack push or pull, both of which go straight to the bus.
+    ///
+    /// The profiler clears them before each instruction, so what it finds
+    /// afterwards is the memory that instruction actually operated on. That is
+    /// what lets it recognise a wait: a loop that reads one fixed address and
+    /// changes nothing is waiting, however it is spelled. Diagnostics only;
+    /// nothing in the core reads them.
+    last_data_read: u32,
+    last_data_write: u32,
+    /// The game has read a controller register ($4016/$4017 serial, or the
+    /// $4218-$421F auto-read results) since the profiler last cleared this. A
+    /// frame in which it stays false is a frame the main loop never came around:
+    /// a dropped frame. Diagnostic only; nothing in the core reads it.
+    input_polled: bool,
     /// Memory data register: the value of the last bus transfer (open bus).
     mdr: u8,
     /// $420D MEMSEL bit 0: FastROM enabled.
@@ -82,6 +104,9 @@ pub const Bus = struct {
     pub fn init(self: *Bus, cart: *Cartridge) void {
         self.cart = cart;
         self.clock = 0;
+        self.last_data_read = no_data_access;
+        self.last_data_write = no_data_access;
+        self.input_polled = false;
         self.mdr = 0;
         self.fastrom = false;
         self.wram = .init;
@@ -176,6 +201,14 @@ pub const Bus = struct {
         self.ppu.renderUpTo(self.beam_line, @intCast(@min(x, 256)));
     }
 
+    /// Where the beam is on the current scanline, in dots. Falls out of the
+    /// master clock and the line start the console maintains every scanline —
+    /// which is the only way to know it in the fast core, where the CPU runs a
+    /// whole line in one batch.
+    pub fn beamDot(self: *const Bus) u16 {
+        return @intCast((self.clock -% self.hv_line_start) / timing.cycles_per_dot % timing.dots_per_line);
+    }
+
     /// One CPU internal cycle (no bus access).
     pub inline fn idle(self: *Bus) void {
         self.clock += timing.speed_fast;
@@ -231,8 +264,7 @@ pub const Bus = struct {
             // $2137 SLHV latches the beam counters; the dot position falls
             // out of the master clock and the console-maintained line start.
             0x2137 => blk: {
-                const dot: u16 = @intCast((self.clock -% self.hv_line_start) / timing.cycles_per_dot % 341);
-                self.ppu.latchCounters(dot, @intCast(self.hv_line & 0x1FF));
+                self.ppu.latchCounters(self.beamDot(), @intCast(self.hv_line & 0x1FF));
                 break :blk self.mdr;
             },
             0x213C, 0x213D => self.ppu.readCounterLatch(a16, self.mdr),
@@ -249,16 +281,37 @@ pub const Bus = struct {
                 else => self.mdr,
             },
             0x2180 => self.wram.portRead(),
-            0x4016 => self.joy.readSerial(0, self.mdr),
-            0x4017 => self.joy.readSerial(1, self.mdr),
+            0x4016 => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readSerial(0, self.mdr);
+            },
+            0x4017 => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readSerial(1, self.mdr);
+            },
             0x4210 => self.cpuio.readRdnmi(self.mdr),
             0x4211 => self.cpuio.readTimeup(self.mdr),
-            0x4212 => self.cpuio.readHvbjoy(self.mdr),
+            // HVBJOY. Bit 6 is the H-blank flag, and it has to be derived from
+            // the beam here rather than latched by the scheduler: the fast core
+            // runs a whole scanline of CPU in one batch, so nothing else knows
+            // where in the line we are.
+            //
+            // It was previously never set at all, and `BIT $4212 / BVC` — which
+            // is how you wait for H-blank, because BIT drops bit 6 into V — hung
+            // forever. That is exactly what F-Zero does at $8616, and it is why a
+            // launch title with no coprocessor never drew a frame.
+            0x4212 => blk: {
+                self.cpuio.in_hblank = isHblank(self.beamDot());
+                break :blk self.cpuio.readHvbjoy(self.mdr);
+            },
             0x4214 => @truncate(self.math.rddiv),
             0x4215 => @truncate(self.math.rddiv >> 8),
             0x4216 => @truncate(self.math.rdmpy),
             0x4217 => @truncate(self.math.rdmpy >> 8),
-            0x4218...0x421F => self.joy.readAuto(@truncate(a16 & 7)),
+            0x4218...0x421F => blk: {
+                self.input_polled = true;
+                break :blk self.joy.readAuto(@truncate(a16 & 7));
+            },
             0x4300...0x437F => self.dma.readReg(a16),
             else => {
                 if (self.dsp1Port(bank, a16)) |sr| {
@@ -376,6 +429,13 @@ pub const Bus = struct {
         }
     }
 };
+
+/// Dots 274..341 and 0..1 are horizontal blanking. Used for HVBJOY's H-blank
+/// flag ($4212 bit 6) — the thing `BIT $4212 / BVC` waits on, because BIT puts
+/// bit 6 straight into the V flag.
+pub fn isHblank(dot: u16) bool {
+    return dot >= 274 or dot <= 1;
+}
 
 pub fn isSystemBank(bank: u8) bool {
     return (bank & 0x7F) <= 0x3F;
@@ -705,4 +765,31 @@ test "bus state serialize roundtrip rebuilds pages" {
     try std.testing.expectEqual(saved_clock, tc2.bus.clock);
     try std.testing.expectEqual(@as(u8, 0x99), tc2.bus.read8(0x7E_0100));
     try std.testing.expectEqual(@as(u16, 25), tc2.bus.math.rdmpy);
+}
+
+test "HVBJOY exposes the H-blank flag ($4212 bit 6)" {
+    // `BIT $4212 / BVC` is how a game waits for H-blank: BIT drops bit 6 straight
+    // into the V flag. The flag was never set — `in_hblank` was declared, read,
+    // and assigned by nobody — so that wait never ended. F-Zero spins on it at
+    // $8616, which is why a LoROM launch title with no coprocessor never drew a
+    // frame, and why 100 passing golden ROMs never noticed.
+    try std.testing.expect(isHblank(0)); // dots 0-1 and 274+ are blanking
+    try std.testing.expect(isHblank(1));
+    try std.testing.expect(!isHblank(2));
+    try std.testing.expect(!isHblank(22)); // picture
+    try std.testing.expect(!isHblank(273));
+    try std.testing.expect(isHblank(274)); // H-blank begins
+    try std.testing.expect(isHblank(340));
+
+    const tc = try TestConsole.create(0x20, 0); // LoROM
+    defer tc.destroy();
+
+    // Mid-picture: the flag is clear.
+    tc.bus.hv_line_start = tc.bus.clock;
+    tc.bus.clock += 100 * timing.cycles_per_dot;
+    try std.testing.expectEqual(@as(u8, 0), tc.bus.read8(0x00_4212) & 0x40);
+
+    // Past dot 274: it must appear, or `BVC` loops forever.
+    tc.bus.clock = tc.bus.hv_line_start + 280 * timing.cycles_per_dot;
+    try std.testing.expect(tc.bus.read8(0x00_4212) & 0x40 != 0);
 }
