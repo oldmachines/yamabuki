@@ -1,0 +1,90 @@
+name: Claude build loop
+
+# Autonomous "babysit + advance" development loop for yamabuki, driven by the
+# Claude Code GitHub Action and authenticated with a Claude subscription token
+# (Pro/Max) instead of API credits.
+#
+# ── One-time setup ───────────────────────────────────────────────────────────
+#   1. Generate a subscription OAuth token locally (interactive; opens a
+#      browser). Requires a Claude Pro or Max plan:
+#          claude setup-token
+#   2. Add the printed token as a repository secret named CLAUDE_CODE_OAUTH_TOKEN
+#      (Settings -> Secrets and variables -> Actions -> New repository secret).
+#   3. Optional but recommended: add a fine-grained PAT as secret GH_PAT with
+#      contents + pull-requests + issues write. The loop then uses it instead of
+#      the built-in GITHUB_TOKEN, so the PRs it opens still trigger CI and it can
+#      merge across branch protection. Without it, GitHub suppresses workflow
+#      runs on GITHUB_TOKEN-created PRs, so their CI would not start.
+#
+#   The schedule only runs once this file is on the default branch, so merge the
+#   PR that adds it to activate the loop.
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"   # every 3 hours (UTC); GitHub may delay under load
+  workflow_dispatch: {}       # manual "Run workflow" button in the Actions tab
+
+# Never overlap ticks: if one is still running, let it finish rather than
+# starting a second in parallel.
+concurrency:
+  group: claude-build-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+  checks: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the loop can rebase PR branches
+
+      - name: Claude build-loop tick
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          claude_args: "--max-turns 60"
+          prompt: |
+            You are the autonomous build loop for the yamabuki SNES-emulator
+            repository (oldmachines/yamabuki). The default/base branch is
+            claude/snes-emulator-zig-8glugf. Do AT MOST ONE meaningful unit of
+            work this run, then finish — this keeps each tick small and
+            reviewable.
+
+            STEP 1 — Babysit open PRs. List the open pull requests. For each,
+            check its CI conclusion, mergeability, and any unresolved review
+            comments.
+            - If a PR is green, mergeable, and has no unresolved review feedback,
+              merge it into the default branch. When several are ready, merge the
+              ones that do NOT touch the emulator core first, then the
+              core-overlapping ones one at a time.
+            - After a merge, rebase the other open PRs onto the updated default
+              branch and push them so CI re-runs. Do NOT merge a PR whose CI is
+              red or whose conflicts you cannot resolve mechanically — if a CI
+              failure has a clear fix, push it; otherwise leave the PR and stop.
+            - If a review comment is ambiguous or asks for an architecturally
+              significant change, leave a short comment asking for clarification
+              instead of guessing.
+            Merging or rebasing one PR (plus rebasing the others it disturbs) is a
+            complete unit of work — stop after it.
+
+            STEP 2 — Advance, ONLY if nothing in Step 1 was actionable (nothing to
+            merge, nothing red to fix, nothing to rebase). Pick the highest-value
+            open issue labeled "ready-for-dev" whose dependencies are all merged;
+            skip any issue blocked by a still-open PR. Implement it on a new branch
+            claude/issue-<n>-<slug> cut from the default branch, follow the issue's
+            acceptance criteria, and open a ready-for-review pull request whose
+            body says "Closes #<n>". That PR is a complete unit of work — stop
+            after it.
+
+            If there was nothing to do in either step, finish quietly without
+            opening issues or PRs.
