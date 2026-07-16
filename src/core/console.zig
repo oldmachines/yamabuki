@@ -20,6 +20,7 @@ const serialize = @import("serialize.zig");
 const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
+const CpuFlags = @import("cpu/wdc65816.zig").Flags;
 const profile = @import("profile.zig");
 
 /// Save-state container magic ("YMBK") and format version. The version bumps
@@ -27,7 +28,8 @@ const profile = @import("profile.zig");
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 6;
+// v7: the header's spare bytes carry a structural fingerprint of the layout.
+pub const state_version: u32 = 7;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -173,8 +175,16 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // catch it up mid-line as needed). The Super FX follows the same
             // scheme: MMIO accesses catch it up mid-line, the line end here.
             self.bus.apu.catchUp(self.bus.clock);
-            if (self.bus.cart.chip == .superfx) self.bus.gsu.catchUp(self.bus.clock);
-            if (self.bus.cart.chip == .sa1) self.bus.sa1.catchUp(self.bus.clock);
+            // Catching a coprocessor up can raise (or time out) its IRQ, so
+            // re-derive the aggregated line the CPU loop reads.
+            if (self.bus.cart.chip == .superfx) {
+                self.bus.gsu.catchUp(self.bus.clock);
+                self.bus.syncCoprocIrq();
+            }
+            if (self.bus.cart.chip == .sa1) {
+                self.bus.sa1.catchUp(self.bus.clock);
+                self.bus.syncCoprocIrq();
+            }
 
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
@@ -205,8 +215,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // Keep the CPU's level-sensitive IRQ input in sync with the
                 // timer flag: reading $4211 (TIMEUP) clears irq_flag, which must
                 // deassert the line before the handler's RTI re-checks it. The
-                // Super FX's STOP interrupt (acked by reading SFR) ORs in.
-                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
+                // coprocessor IRQs (GSU STOP, SA-1 message/timer/CC-DMA) OR in
+                // through the bus's one aggregated line — the loop no longer
+                // loads two large chip structs that are dead weight on a
+                // plain cart.
+                const irq = io.irq_flag or self.bus.coproc_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.stepCpu();
                 self.steps +%= 1;
@@ -225,6 +238,27 @@ pub fn Console(comptime cfg: CoreConfig) type {
             const pc = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc;
             const t0 = self.bus.clock;
             const waiting = self.cpu.state != .running;
+            // Classify the control transfer this step will make before it
+            // runs. The interrupt test mirrors `Cpu.step`'s own dispatch; the
+            // opcode peek is side-effect-free (no clock, no MDR, no MMIO), so
+            // emulation stays bit-identical. All of it is the profiler's
+            // business — the CPU core carries no instrumentation.
+            const sp_before = self.cpu.regs.s;
+            var kind: profile.Event.Kind = .none;
+            if (!waiting) {
+                if (self.cpu.nmi_pending) {
+                    kind = .nmi;
+                } else if (self.cpu.irq_line and (self.cpu.regs.p & CpuFlags.i) == 0) {
+                    kind = .irq;
+                } else if (self.bus.peek8(pc)) |op| {
+                    kind = switch (op) {
+                        0x20, 0x22, 0xFC => .call, // JSR abs / JSL / JSR (abs,X)
+                        0x60, 0x6B, 0x40 => .ret, // RTS / RTL / RTI
+                        0x00, 0x02 => .irq, // BRK / COP enter a handler too
+                        else => .none,
+                    };
+                }
+            }
             self.bus.last_data_read = Bus.no_data_access;
             self.bus.last_data_write = Bus.no_data_access;
             self.cpu.step();
@@ -234,6 +268,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 waiting,
                 dataAddr(self.bus.last_data_read),
                 dataAddr(self.bus.last_data_write),
+                .{
+                    .kind = kind,
+                    .target = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc,
+                    .sp_before = sp_before,
+                    .sp_after = self.cpu.regs.s,
+                },
             );
         }
 
@@ -263,7 +303,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (fire_at) |t| {
                     if (self.bus.clock >= t) io.irq_flag = true;
                 }
-                const irq = io.irq_flag or self.bus.gsu.irq_line or self.bus.sa1.snes_irq_line;
+                const irq = io.irq_flag or self.bus.coproc_irq_line;
                 if (irq != self.cpu.irq_line) self.cpu.setIrqLine(irq);
                 self.stepCpu();
                 self.steps +%= 1;
@@ -311,6 +351,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
             break :blk state_header_size + serialize.byteSize(Self);
         };
 
+        /// Structural fingerprint of the serialized layout, carried in the
+        /// header's spare bytes (truncated to 24 bits). The version number is
+        /// hand-maintained and the size check only sees the byte count — a
+        /// same-width field reorder passes both and deserializes garbage.
+        /// This is the check nobody has to remember to bump.
+        const state_fingerprint: u24 = @truncate(serialize.fingerprint(Self));
+
         /// Serialize the whole machine into `out` (>= `state_size` bytes)
         /// behind a versioned header. The ROM image is not saved; loading
         /// requires a console built from the same ROM.
@@ -321,7 +368,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             std.mem.writeInt(u32, out[4..8], state_version, .little);
             std.mem.writeInt(u32, out[8..12], payload_size, .little);
             out[12] = @intFromEnum(cfg.accuracy);
-            @memset(out[13..16], 0);
+            std.mem.writeInt(u24, out[13..16], state_fingerprint, .little);
             _ = serialize.write(Self, self, out[state_header_size..]);
             return state_size;
         }
@@ -340,6 +387,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 payload.len != state_size - state_header_size)
                 return error.WrongSize;
             if (in[12] != @intFromEnum(cfg.accuracy)) return error.Corrupt;
+            // A state whose layout fingerprint disagrees was written by a
+            // build whose field tree differs — even at the same version and
+            // byte count. Refusing it here is what stops a same-size field
+            // reorder from deserializing garbage into the wrong fields.
+            if (std.mem.readInt(u24, in[13..16], .little) != state_fingerprint)
+                return error.UnsupportedVersion;
             _ = serialize.read(Self, self, payload) catch return error.Corrupt;
             self.postLoad();
         }
@@ -806,6 +859,12 @@ test "versioned save state roundtrips and rejects bad headers" {
     try std.testing.expectError(error.UnsupportedVersion, b.loadState(buf));
     buf[4] = @truncate(state_version);
     try std.testing.expectError(error.WrongSize, b.loadState(buf[0 .. buf.len - 1]));
+    // A wrong layout fingerprint — a state from a build whose field tree
+    // differs, even at the same version and size — is unsupported, not fed
+    // to the deserializer.
+    buf[13] +%= 1;
+    try std.testing.expectError(error.UnsupportedVersion, b.loadState(buf));
+    buf[13] -%= 1;
     buf[12] = 0xEE;
     try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }

@@ -5,7 +5,8 @@
 // (master cycles elapsed), and `vram_reads` (renderer VRAM word fetches) are
 // deterministic across Debug/ReleaseFast and target architectures. A drift in
 // any of them fails CI — in particular `vram_reads` locks in the M10 tile-row
-// decode cache: reverting it would multiply the count ~8x and turn the gate red.
+// decode cache and the per-tile tilemap-entry cache: reverting either would
+// multiply the count and turn the gate red.
 //
 // The ROMs are a cross-section of the render paths the counter covers: 2/4/8bpp
 // planar backgrounds, an 8bpp tile-flip case, the sprite-heavy Rings, and a
@@ -15,11 +16,11 @@
 .{
     .frames = 120,
     .roms = .{
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .steps = 1699632, .cycles = 42884194, .vram_reads = 7448435 },
-        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .steps = 1694016, .cycles = 42884186, .vram_reads = 8200932 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .steps = 1576414, .cycles = 42884178, .vram_reads = 9047040 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .steps = 1703934, .cycles = 42884178, .vram_reads = 6727500 },
-        .{ .path = "PPU/Rings/Rings.sfc", .steps = 1582245, .cycles = 42884192, .vram_reads = 14672028 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .steps = 1699632, .cycles = 42884194, .vram_reads = 1652435 },
+        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .steps = 1694016, .cycles = 42884186, .vram_reads = 2455332 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .steps = 1576414, .cycles = 42884178, .vram_reads = 3301440 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .steps = 1703934, .cycles = 42884178, .vram_reads = 931500 },
+        .{ .path = "PPU/Rings/Rings.sfc", .steps = 1582245, .cycles = 42884192, .vram_reads = 3180828 },
         .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .steps = 1580214, .cycles = 42884198, .vram_reads = 13233152 },
     },
 }

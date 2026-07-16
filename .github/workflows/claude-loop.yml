@@ -52,11 +52,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-          claude_args: "--max-turns 60"
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(gh api:*),Bash(git:*),Edit,Write"
           prompt: |
             You are the autonomous build loop for the yamabuki SNES-emulator
             repository (oldmachines/yamabuki). The default/base branch is
-            claude/snes-emulator-zig-8glugf. Do AT MOST ONE meaningful unit of
+            main. Do AT MOST ONE meaningful unit of
             work this run, then finish — this keeps each tick small and
             reviewable.
 

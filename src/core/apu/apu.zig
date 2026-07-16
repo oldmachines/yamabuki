@@ -16,6 +16,7 @@
 //! (CONTROL bit7 + jump to $FFC0) is not supported.
 
 const std = @import("std");
+
 const spc700 = @import("spc700.zig");
 const dsp_mod = @import("dsp.zig");
 const timing = @import("../timing.zig");
@@ -84,11 +85,11 @@ pub const Apu = struct {
     /// A boot port-0 write is waiting to be acted on. The real IPL reads the
     /// data port (P1) only after it has echoed the index and the main CPU has
     /// finished writing the byte, so a boot step is deferred to the next
-    /// port-0 read (the main CPU always polls for the echo) — by then both P0
-    /// and P1 are final regardless of the order the game wrote them. Reacting
-    /// on the P0 write instead would latch a stale P1 for any uploader that
-    /// writes the index before the data (e.g. Kirby Super Star, via a 16-bit
-    /// store to $2140).
+    /// mailbox read — by then both P0 and P1 are final regardless of the
+    /// order the game wrote them. Reacting on the P0 write instead would
+    /// latch a stale P1 for any uploader that writes the index before the
+    /// data (e.g. Kirby Super Star, via a 16-bit store to $2140). Any-port,
+    /// not port-0: Super Mario RPG polls ports 2/3 after the execute command.
     boot_pending: bool,
 
     /// Initialize in place; `self` must be at its final address (the SMP
@@ -132,9 +133,14 @@ pub const Apu = struct {
 
     pub fn cpuRead(self: *Apu, master_clock: u64, port: u2) u8 {
         self.catchUp(master_clock);
-        // A deferred boot step runs here: the main CPU polls port 0 for the
-        // echo after writing a byte, so both P0 and P1 are final by now.
-        if (self.boot != .done and port == 0 and self.boot_pending) {
+        // A deferred boot step runs here: by the time the main CPU reads ANY
+        // mailbox port it has finished writing the byte, so P0 and P1 are
+        // final. It must be any port, not just port 0: after the execute
+        // command (P1=0 index jump) Super Mario RPG never reads port 0 again
+        // — it polls ports 2/3 for the started driver's reply — so a step
+        // gated on a port-0 read left the SPC parked in the IPL forever and
+        // the game waiting on a driver that never ran.
+        if (self.boot != .done and self.boot_pending) {
             self.boot_pending = false;
             self.bootPort0();
         }
@@ -412,6 +418,41 @@ test "HLE boot latches the right data byte when the index is written first" {
     // byte by one and stored the stale handshake flag as byte 0).
     try std.testing.expectEqualSlices(u8, &program, apu.aram[0x0200 .. 0x0200 + program.len]);
     try std.testing.expectEqual(@as(u8, 0x42), apu.cpuRead(2100, 0));
+}
+
+test "HLE boot executes even when only ports 2/3 are polled afterwards" {
+    // Super Mario RPG's uploader: after the execute command it never reads
+    // port 0 again — it polls ports 2/3 for the started driver's reply. The
+    // deferred boot step must fire on ANY mailbox read, or the SPC stays
+    // parked in the IPL forever while the game waits for a driver that never
+    // ran (the game hangs on a black screen, silent).
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    // MOV A,#$02; MOV $F7,A; BRA -2 (spin) — the driver replies on port 3.
+    const program = [_]u8{ 0xE8, 0x02, 0xC4, 0xF7, 0x2F, 0xFE };
+    std.debug.assert(apu.cpuRead(0, 0) == 0xAA);
+    apu.cpuWrite(0, 2, 0x00);
+    apu.cpuWrite(0, 3, 0x02);
+    apu.cpuWrite(0, 1, 0xCC);
+    apu.cpuWrite(0, 0, 0xCC);
+    std.debug.assert(apu.cpuRead(0, 0) == 0xCC);
+    for (program, 0..) |byte, i| {
+        apu.cpuWrite(0, 1, byte);
+        apu.cpuWrite(0, 0, @truncate(i));
+        std.debug.assert(apu.cpuRead(0, 0) == @as(u8, @truncate(i)));
+    }
+    // Execute at $0200 — and from here on, read nothing but port 3.
+    apu.cpuWrite(0, 2, 0x00);
+    apu.cpuWrite(0, 3, 0x02);
+    apu.cpuWrite(0, 1, 0);
+    apu.cpuWrite(0, 0, @truncate(program.len + 2));
+    try std.testing.expectEqual(@as(u8, 0), apu.cpuRead(0, 3)); // fires the exec
+    try std.testing.expectEqual(BootState.done, apu.boot);
+    // Let the driver run; its reply must appear on port 3.
+    try std.testing.expectEqual(@as(u8, 0x02), apu.cpuRead(50_000, 3));
 }
 
 test "HLE boot uploads a program and the SMP executes it" {

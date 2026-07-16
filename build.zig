@@ -200,6 +200,36 @@ pub fn build(b: *std.Build) void {
     const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
     roms_step.dependOn(&run_roms.step);
 
+    // Commercial-boot golden gate (M13): opt-in, local ROMs only — commercial
+    // ROMs cannot be fetched or vendored. With no directory every pinned game
+    // prints SKIP and the step exits 0, so CI needs no special casing.
+    const commercial_roms = b.option([]const u8, "commercial-roms", "Directory of your own commercial ROMs for test-commercial");
+    const commercial_mint = b.option(bool, "commercial-mint", "Print ready-to-paste manifest entries for every ROM in the directory") orelse false;
+    const commercial_filter = b.option([]const u8, "commercial-filter", "Only pinned games whose title (or file, when minting) contains this");
+    const commercial_frames = b.option(u32, "commercial-frames", "Frames per game when minting (0 = default 600)") orelse 0;
+    const commercial_opts = b.addOptions();
+    commercial_opts.addOption(?[]const u8, "roms", commercial_roms);
+    commercial_opts.addOption(bool, "mint", commercial_mint);
+    commercial_opts.addOption(?[]const u8, "filter", commercial_filter);
+    commercial_opts.addOption(u32, "frames", commercial_frames);
+
+    const commercial_runner = b.addExecutable(.{
+        .name = "commercial-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/commercial_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "commercial_options", .module = commercial_opts.createModule() },
+            },
+        }),
+    });
+    const run_commercial = b.addRunArtifact(commercial_runner);
+    run_commercial.setCwd(b.path("."));
+    const commercial_step = b.step("test-commercial", "Boot your own commercial ROMs and check golden hashes (opt-in: -Dcommercial-roms=<dir>)");
+    commercial_step.dependOn(&run_commercial.step);
+
     // Baked-shader validation: parse every shaders/*/*/preset.conf through the
     // runtime's own parser and stat every vert/frag/LUT it references, on the
     // host, no GPU. The shaders CI job runs it right after the bake, so a
