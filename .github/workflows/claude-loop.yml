@@ -56,7 +56,7 @@ jobs:
           prompt: |
             You are the autonomous build loop for the yamabuki SNES-emulator
             repository (oldmachines/yamabuki). The default/base branch is
-            claude/snes-emulator-zig-8glugf. Do AT MOST ONE meaningful unit of
+            main. Do AT MOST ONE meaningful unit of
             work this run, then finish — this keeps each tick small and
             reviewable.
 
