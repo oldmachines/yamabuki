@@ -226,6 +226,15 @@ pub const Bus = struct {
         self.clock += timing.speed_fast;
     }
 
+    /// Side-effect-free read for diagnostics (the profiler's opcode peek):
+    /// no clock charge, no MDR update, no MMIO dispatch. Returns null off the
+    /// fast path — code executing from an MMIO page is not worth peeking.
+    pub inline fn peek8(self: *const Bus, addr: u24) ?u8 {
+        const page = &self.pages[addr >> 13];
+        if (page.read) |p| return p[addr & (page_size - 1)];
+        return null;
+    }
+
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const page = &self.pages[addr >> 13];
         if (page.read) |p| {
