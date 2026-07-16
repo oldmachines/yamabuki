@@ -203,26 +203,34 @@ jobs:
       # compiler (no system g++, no Vulkan SDK). Cached: it is the slow part.
       #
       # The key carries the OS and the zig version, and the restored binaries
-      # are HEALTH-CHECKED rather than trusted. Both lessons were paid for: a
+      # are HEALTH-CHECKED rather than trusted — by compiling a real shader,
+      # not by answering --version. All three lessons were paid for: (1) a
       # cache entry is immutable per key and actions/cache saves even from a
-      # failed run, so one bad save wedged this job for every branch — the bake
-      # "succeeded" with 0 pairs baked (36 "tool failed" skips) until the
-      # assert below caught it. A cache hit proves the entry exists, not that
-      # its binaries run.
+      # failed run, so one bad save wedged this job for every branch; (2) the
+      # bake "succeeds" with 0 pairs baked (36 "tool failed" skips) unless the
+      # assert below catches it; (3) a restored binary that answers --version
+      # can still fail its first real compile with no output at all — the only
+      # health check that means anything is the tool doing its actual job.
       - uses: actions/cache@v4
         id: shader-tools-cache
         with:
           path: .shader-tools/bin
-          key: shader-tools-${{ runner.os }}-zig0.16.0-${{ hashFiles('tools/build_shader_tools.sh') }}
+          key: shader-tools-v2-${{ runner.os }}-zig0.16.0-${{ hashFiles('tools/build_shader_tools.sh') }}
       - name: Build shader tools (on cache miss or unusable cache)
         run: |
-          if .shader-tools/bin/glslang --version >/dev/null 2>&1 \
-             && .shader-tools/bin/spirv-cross --help >/dev/null 2>&1; then
-            echo "cached shader tools are healthy"
+          smoke() {
+            tmp="$(mktemp -d)"
+            printf '#version 450\nlayout(location=0) out vec4 c;\nvoid main() { c = vec4(1.0); }\n' > "$tmp/s.frag"
+            .shader-tools/bin/glslang -V "$tmp/s.frag" -o "$tmp/s.spv" >/dev/null 2>&1 \
+              && .shader-tools/bin/spirv-cross "$tmp/s.spv" --version 330 >/dev/null 2>&1
+          }
+          if smoke; then
+            echo "cached shader tools are healthy (compiled a real shader)"
           else
-            echo "shader tools missing or not runnable; building"
+            echo "shader tools missing or failed the compile smoke test; building"
             rm -rf .shader-tools/bin
             tools/build_shader_tools.sh
+            smoke || { echo "freshly built shader tools failed the smoke test" >&2; exit 1; }
           fi
       - run: tools/fetch_shaders.sh
       - run: zig build shaders
