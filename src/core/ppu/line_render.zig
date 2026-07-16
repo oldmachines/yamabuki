@@ -643,6 +643,18 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     var cached_addr: u32 = 0x1_0000;
     var cached_row: [8]u8 = undefined;
 
+    // The same idea one level up: consecutive pixels share a tilemap entry for
+    // the whole tile width, so 7 of every 8 map fetches — and the entire
+    // attribute unpack — are redundant. Offset-per-tile changes `map_addr`
+    // whenever the OPT column swaps scroll, so the guard covers it naturally.
+    // The sentinel is outside the & 0x7FFF address space.
+    var cached_map_addr: u16 = 0xFFFF;
+    var cached_tile: u16 = 0;
+    var cached_pal_group: u16 = 0;
+    var cached_prio: u2 = 0;
+    var cached_xflip = false;
+    var cached_yflip = false;
+
     const out_w = if (hires) fb_width_max else fb_width;
     for (0..out_w) |x| {
         const xi: u32 = @intCast(x);
@@ -674,14 +686,22 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
         // $C00 more; the & 0x7FFF wrap makes the u16 overflow congruent.
         const map_addr = (layer.map_base +% screen * 0x400 +%
             ((tile_row & 0x1F) << 5) +% (tile_col & 0x1F)) & 0x7FFF;
-        const entry = vread(ppu, map_addr);
+        if (map_addr != cached_map_addr) {
+            const entry = vread(ppu, map_addr);
+            cached_map_addr = map_addr;
+            cached_tile = entry & 0x3FF;
+            cached_pal_group = (entry >> 10) & 7;
+            // Tilemap priority is a single bit; 14-15 are the flip bits.
+            cached_prio = @intCast((entry >> 13) & 1);
+            cached_xflip = entry & 0x4000 != 0;
+            cached_yflip = entry & 0x8000 != 0;
+        }
 
-        var tile_num: u16 = entry & 0x3FF;
-        const pal_group: u16 = (entry >> 10) & 7;
-        // Tilemap priority is a single bit; 14-15 are the flip bits.
-        const prio: u2 = @intCast((entry >> 13) & 1);
-        const xflip = entry & 0x4000 != 0;
-        const yflip = entry & 0x8000 != 0;
+        var tile_num = cached_tile;
+        const pal_group = cached_pal_group;
+        const prio = cached_prio;
+        const xflip = cached_xflip;
+        const yflip = cached_yflip;
 
         var px: u16 = sx % tile_pw;
         var py: u16 = sy % tile_ph;

@@ -51,6 +51,8 @@ const Args = struct {
     json: bool = false,
     /// Dump the hottest loops and how each was classified.
     hot: bool = false,
+    /// Step two of the analyser: the per-routine cycle attribution table.
+    routines: bool = false,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
@@ -68,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--patch p.bps|p.ips] [--auto-patch] [--patch-dir DIR] [--save-patched out.sfc]
-            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
+            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
             \\  --auto-patch  look this ROM up in patches/registry.zon and apply its registered patch
@@ -77,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
+            \\  --routines    step two: which routines cost the frame (self/inclusive cycles per call site)
             \\
         , .{});
         try out.flush();
@@ -390,7 +393,7 @@ fn runReport(
                 "\"stall_frames\":{},\"stalls\":{}," ++
                 "\"longest_stall\":{},\"longest_stall_at\":{}," ++
                 "\"mean_util\":{d:.4},\"median_util\":{d:.4},\"p95_util\":{d:.4}," ++
-                "\"max_util\":{d:.4},\"verdict\":\"{s}\"}}\n",
+                "\"max_util\":{d:.4},\"verdict\":\"{s}\"",
             .{
                 std.json.fmt(args.rom, .{}), std.json.fmt(title, .{}),
                 map,                         chip,
@@ -403,6 +406,28 @@ fn runReport(
                 @tagName(sum.verdict),
             },
         );
+        if (args.routines) {
+            const rows = try routineRows(gpa, &con.prof);
+            const total = attributedTotal(rows);
+            try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"routines\":[", .{
+                con.prof.stack_resets, con.prof.routines_dropped,
+            });
+            for (rows, 0..) |r, i| {
+                if (i != 0) try out.print(",", .{});
+                switch (r.what) {
+                    .waiting => try out.print("{{\"entry\":\"(waiting)\"", .{}),
+                    .main => try out.print("{{\"entry\":\"(main)\"", .{}),
+                    .code => try out.print("{{\"entry\":\"{x:0>2}:{x:0>4}\",\"kind\":\"{s}\",\"calls\":{},\"incl\":{}", .{
+                        r.entry >> 16, r.entry & 0xFFFF, @tagName(r.kind), r.calls, r.incl,
+                    }),
+                }
+                try out.print(",\"self\":{},\"self_pct\":{d:.4},\"slow\":{}}}", .{
+                    r.self, pct(r.self, total), r.slow,
+                });
+            }
+            try out.print("]", .{});
+        }
+        try out.print("}}\n", .{});
         try out.flush();
         return;
     }
@@ -503,6 +528,47 @@ fn runReport(
         }
     }
 
+    if (args.routines) {
+        // Step two: where the frame goes, routine by routine. "(waiting)" is
+        // every cycle the wait classifier called idle — kept out of the code
+        // rows so the ranking shows work, which is what a conversion moves.
+        // "(main)" is code running under no call frame at all.
+        const rows = try routineRows(gpa, &con.prof);
+        const total = attributedTotal(rows);
+        var shown: usize = 0;
+        for (rows) |r| shown += @intFromBool(r.what == .code);
+        try out.print("\n  routines ({} named; showing the top {} by self time)\n", .{
+            shown, @min(rows.len, routine_rows_shown),
+        });
+        try out.print("     {s:<10} {s:>9} {s:>14} {s:>7} {s:>7} {s:>7}  {s}\n", .{
+            "entry", "calls", "self cycles", "self%", "incl%", "slow%", "",
+        });
+        for (rows[0..@min(rows.len, routine_rows_shown)]) |r| {
+            switch (r.what) {
+                .waiting => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
+                    "(waiting)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
+                }),
+                .main => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
+                    "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
+                }),
+                .code => try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
+                    r.entry >> 16,       r.entry & 0xFFFF,
+                    r.calls,             r.self,
+                    pct(r.self, total),  pct(r.incl, total),
+                    pct(r.slow, r.self), if (r.kind == .code) "" else @tagName(r.kind),
+                }),
+            }
+        }
+        if (con.prof.stack_resets != 0 or con.prof.routines_dropped != 0) {
+            try out.print("     ({} stack resets; {} cycles in dropped routines)\n", .{
+                con.prof.stack_resets, con.prof.routines_dropped,
+            });
+        }
+        if (!con.prof.attributionBalanced()) {
+            try out.print("     WARNING: attribution imbalance — the table does not sum to work+idle (bug)\n", .{});
+        }
+    }
+
     // Everything a reader could over-trust, said out loud.
     try out.print(
         \\
@@ -514,6 +580,61 @@ fn runReport(
         \\
     , .{});
     try out.flush();
+}
+
+const routine_rows_shown: usize = 16;
+
+/// One row of the `--routines` table: a named routine, or one of the two
+/// synthetic rows the attribution invariant needs — "(waiting)" (idle cycles,
+/// wherever the wait lived) and "(main)" (code under no call frame).
+const RoutineRow = struct {
+    what: enum { code, waiting, main },
+    entry: u24 = 0,
+    kind: core.profile.RoutineKind = .code,
+    calls: u64 = 0,
+    self: u64,
+    incl: u64 = 0,
+    slow: u64,
+};
+
+/// Collect and rank every routine with self time, synthetics included.
+fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]RoutineRow {
+    var rows: std.array_list.Managed(RoutineRow) = .init(gpa);
+    if (prof.waiting_self != 0)
+        try rows.append(.{ .what = .waiting, .self = prof.waiting_self, .slow = prof.waiting_slow });
+    if (prof.main_self != 0)
+        try rows.append(.{ .what = .main, .self = prof.main_self, .slow = prof.main_slow });
+    for (prof.routines) |r| {
+        if (r.entry == core.profile.Routine.empty or r.self_cycles == 0) continue;
+        try rows.append(.{
+            .what = .code,
+            .entry = @intCast(r.entry),
+            .kind = r.kind,
+            .calls = r.calls,
+            .self = r.self_cycles,
+            .incl = r.incl_cycles,
+            .slow = r.slow_cycles,
+        });
+    }
+    std.mem.sort(RoutineRow, rows.items, {}, struct {
+        fn gt(_: void, a: RoutineRow, b: RoutineRow) bool {
+            return a.self > b.self;
+        }
+    }.gt);
+    return rows.items;
+}
+
+/// Sum of every row's self time == everything banked as work or idle: the
+/// denominator every percentage in the table is against.
+fn attributedTotal(rows: []const RoutineRow) u64 {
+    var t: u64 = 0;
+    for (rows) |r| t += r.self;
+    return t;
+}
+
+fn pct(part: u64, whole: u64) f64 {
+    if (whole == 0) return 0;
+    return @as(f64, @floatFromInt(part)) * 100 / @as(f64, @floatFromInt(whole));
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
@@ -551,6 +672,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.json = true;
         } else if (std.mem.eql(u8, a, "--hot")) {
             out.hot = true;
+        } else if (std.mem.eql(u8, a, "--routines")) {
+            out.routines = true;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
