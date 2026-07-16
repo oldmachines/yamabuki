@@ -27,7 +27,8 @@ const profile = @import("profile.zig");
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
-pub const state_version: u32 = 6;
+// v7: the header's spare bytes carry a structural fingerprint of the layout.
+pub const state_version: u32 = 7;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -311,6 +312,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
             break :blk state_header_size + serialize.byteSize(Self);
         };
 
+        /// Structural fingerprint of the serialized layout, carried in the
+        /// header's spare bytes (truncated to 24 bits). The version number is
+        /// hand-maintained and the size check only sees the byte count — a
+        /// same-width field reorder passes both and deserializes garbage.
+        /// This is the check nobody has to remember to bump.
+        const state_fingerprint: u24 = @truncate(serialize.fingerprint(Self));
+
         /// Serialize the whole machine into `out` (>= `state_size` bytes)
         /// behind a versioned header. The ROM image is not saved; loading
         /// requires a console built from the same ROM.
@@ -321,7 +329,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             std.mem.writeInt(u32, out[4..8], state_version, .little);
             std.mem.writeInt(u32, out[8..12], payload_size, .little);
             out[12] = @intFromEnum(cfg.accuracy);
-            @memset(out[13..16], 0);
+            std.mem.writeInt(u24, out[13..16], state_fingerprint, .little);
             _ = serialize.write(Self, self, out[state_header_size..]);
             return state_size;
         }
@@ -340,6 +348,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 payload.len != state_size - state_header_size)
                 return error.WrongSize;
             if (in[12] != @intFromEnum(cfg.accuracy)) return error.Corrupt;
+            // A state whose layout fingerprint disagrees was written by a
+            // build whose field tree differs — even at the same version and
+            // byte count. Refusing it here is what stops a same-size field
+            // reorder from deserializing garbage into the wrong fields.
+            if (std.mem.readInt(u24, in[13..16], .little) != state_fingerprint)
+                return error.UnsupportedVersion;
             _ = serialize.read(Self, self, payload) catch return error.Corrupt;
             self.postLoad();
         }
@@ -798,6 +812,12 @@ test "versioned save state roundtrips and rejects bad headers" {
     try std.testing.expectError(error.UnsupportedVersion, b.loadState(buf));
     buf[4] = @truncate(state_version);
     try std.testing.expectError(error.WrongSize, b.loadState(buf[0 .. buf.len - 1]));
+    // A wrong layout fingerprint — a state from a build whose field tree
+    // differs, even at the same version and size — is unsupported, not fed
+    // to the deserializer.
+    buf[13] +%= 1;
+    try std.testing.expectError(error.UnsupportedVersion, b.loadState(buf));
+    buf[13] -%= 1;
     buf[12] = 0xEE;
     try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }
