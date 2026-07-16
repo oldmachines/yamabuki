@@ -13,10 +13,6 @@
 // F-Zero and Chrono Trigger are the reason this gate exists: both passed every
 // homebrew golden while never rendering a frame (HVBJOY's H-blank flag was
 // never set), and this file is what would have caught it.
-// Super Mario RPG (SA-1) is deliberately absent: minting it found the
-// emulator renders it pure black while its audio plays (checked out to
-// 1800 frames) — a real bug this gate caught before it ever ran in anger.
-// Pin it once it renders.
 .{
     .roms = .{
         .{ .sha256 = "0838e531fe22c077528febe14cb3ff7c492f1f5fa8de354192bdff7137c27f5b", .title = "SUPER MARIOWORLD", .region = 1, .checksum = 0xa0da, .frames = 600, .fb = 0x5019960f926fa1be, .audio = 0x235c34a91079b6d8 },
@@ -33,6 +29,9 @@
         // The two that gate the HVBJOY H-blank fix: both passed every homebrew
         // golden while never rendering a frame.
         .{ .sha256 = "bf16c3c867c58e2ab061c70de9295b6930d63f29f81cc986f5ecae03e0ad18d2", .title = "F-ZERO", .region = 1, .checksum = 0xc92e, .frames = 600, .fb = 0xc4b760ab37aaeff2, .audio = 0x3c520f3d59a43eea },
+        // Minted after PR #64 fixed the APU HLE boot (the game polls ports 2/3
+        // after the execute command): the gate's first catch, pinned at last.
+        .{ .sha256 = "740646f3535bfb365ca44e70d46ab433467b142bd84010393070bd0b141af853", .title = "SUPER MARIO RPG", .region = 1, .checksum = 0x3bb4, .frames = 900, .fb = 0xe19cc635487a3a10, .audio = 0x763bf57147a27638 },
         .{ .sha256 = "06d1c2b06b716052c5596aaa0c2e5632a027fee1a9a28439e509f813c30829a9", .title = "CHRONO TRIGGER", .region = 1, .checksum = 0x788c, .frames = 600, .fb = 0x210f8ac48ec767d4, .audio = 0xe9276e1f0b6a7860 },
     },
 }
