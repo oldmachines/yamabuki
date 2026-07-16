@@ -38,8 +38,9 @@ pub const Bus = struct {
     // The page table holds raw pointers into wram/cart and is rebuilt by
     // remap() on load; the cart reference is re-supplied by the frontend.
     // `last_data_read`, `last_data_write` and `input_polled` are diagnostics,
-    // not machine state.
-    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled" };
+    // not machine state; `coproc_irq_line` is derived from the chips' own
+    // serialized lines and rebuilt in postLoad.
+    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled", "coproc_irq_line" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
@@ -97,6 +98,15 @@ pub const Bus = struct {
     sa1: Sa1,
     /// Cx4 coprocessor (HLE); inert unless the cartridge chip is `.cx4`.
     cx4: Cx4,
+    /// The coprocessor IRQ lines (GSU, SA-1), aggregated. The per-instruction
+    /// scheduler loop reads this one bool instead of reaching into two large
+    /// chip structs by name — those loads were pure overhead on a plain cart.
+    /// Kept fresh by `syncCoprocIrq` on every path that can move a line: the
+    /// bus's own slow path (every SNES-side chip access catches the chip up,
+    /// and catching up can raise or ack an IRQ) and the console's per-line
+    /// catch-up. Derived state: skipped by the serializer, rebuilt in
+    /// postLoad from the chips' serialized lines.
+    coproc_irq_line: bool,
 
     /// Initialize in place. `self` must be at its final address (the page
     /// table points into `self.wram`, and the APU's SPC700 points back at
@@ -125,6 +135,7 @@ pub const Bus = struct {
         self.dsp1 = .init;
         self.sa1.init();
         self.cx4.init();
+        self.coproc_irq_line = false;
         self.attachGsu();
         self.attachSa1();
         self.attachCx4();
@@ -162,6 +173,7 @@ pub const Bus = struct {
         self.remap();
         self.attachGsu();
         self.attachCx4();
+        self.syncCoprocIrq(); // derived from the chips' serialized lines
         inline for (@typeInfo(Bus).@"struct".fields) |f| {
             if (comptime @typeInfo(f.type) == .@"struct" and @hasDecl(f.type, "postLoad")) {
                 @field(self, f.name).postLoad();
@@ -236,8 +248,28 @@ pub const Bus = struct {
         self.slowWrite(addr, value);
     }
 
+    /// Re-derive the aggregated coprocessor IRQ line. Cheap enough to call
+    /// unconditionally wherever a chip might have moved its line; gated on
+    /// the cart's chip at the call sites so plain carts never touch the
+    /// coprocessor structs at all.
+    pub fn syncCoprocIrq(self: *Bus) void {
+        self.coproc_irq_line = self.gsu.irq_line or self.sa1.snes_irq_line;
+    }
+
+    /// Every SNES-side access to a coprocessor catches the chip up first, and
+    /// catching up can raise or ack its IRQ — so the one place that covers
+    /// every such path (MMIO, IRAM, BW-RAM, the vector page) is the slow
+    /// path's exit. `defer` covers the early returns.
+    inline fn coprocIrqGuard(self: *Bus) bool {
+        return switch (self.cart.chip) {
+            .superfx, .sa1 => true,
+            else => false,
+        };
+    }
+
     fn slowRead(self: *Bus, addr: u24) u8 {
         @branchHint(.unlikely);
+        defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
         self.clock += speedOfParts(bank, a16, self.fastrom);
@@ -349,6 +381,7 @@ pub const Bus = struct {
 
     fn slowWrite(self: *Bus, addr: u24, value: u8) void {
         @branchHint(.unlikely);
+        defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
         self.clock += speedOfParts(bank, a16, self.fastrom);
@@ -770,6 +803,49 @@ test "bus state serialize roundtrip rebuilds pages" {
     try std.testing.expectEqual(saved_clock, tc2.bus.clock);
     try std.testing.expectEqual(@as(u8, 0x99), tc2.bus.read8(0x7E_0100));
     try std.testing.expectEqual(@as(u16, 25), tc2.bus.math.rdmpy);
+}
+
+test "aggregated coprocessor IRQ line follows the SA-1 and survives save/load" {
+    const serialize = @import("../serialize.zig");
+    var tc = try TestConsole.createChip(0x23, 5, 0x34); // SA-1
+    defer tc.destroy();
+
+    // SA-1 program at $00:8000: LDA #$85; STA $2209; STP — message 5 with the
+    // IRQ bit, raised at the SNES.
+    const rom = @constCast(tc.cart.rom);
+    const prog = [_]u8{ 0xA9, 0x85, 0x8D, 0x09, 0x22, 0xDB };
+    @memcpy(rom[0..prog.len], &prog);
+
+    tc.bus.write8(0x00_2201, 0x80); // SIE: enable SA-1 -> SNES IRQ
+    tc.bus.write8(0x00_2203, 0x00); // CRV = $8000
+    tc.bus.write8(0x00_2204, 0x80);
+    tc.bus.write8(0x00_2200, 0x00); // release reset
+    tc.bus.clock += 500;
+    _ = tc.bus.read8(0x00_2300); // SFR read catches the SA-1 up
+    try std.testing.expect(tc.bus.sa1.snes_irq_line);
+    // The aggregate the CPU loop actually reads tracked it through the bus.
+    try std.testing.expect(tc.bus.coproc_irq_line);
+
+    // Save with the IRQ pending, restore into a fresh console: the aggregate
+    // is skipped by the serializer, so postLoad must rebuild it — a missed
+    // rebuild would swallow a pending coprocessor IRQ across a save/load.
+    const size = comptime serialize.byteSize(Bus);
+    const buf = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(buf);
+    _ = serialize.write(Bus, &tc.bus, buf);
+
+    var tc2 = try TestConsole.createChip(0x23, 5, 0x34);
+    defer tc2.destroy();
+    try std.testing.expect(!tc2.bus.coproc_irq_line);
+    _ = try serialize.read(Bus, &tc2.bus, buf);
+    tc2.bus.postLoad();
+    try std.testing.expect(tc2.bus.sa1.snes_irq_line);
+    try std.testing.expect(tc2.bus.coproc_irq_line);
+
+    // Acking through the restored bus drops the aggregate with the line.
+    tc2.bus.write8(0x00_2202, 0x80); // SIC clears the message IRQ
+    try std.testing.expect(!tc2.bus.sa1.snes_irq_line);
+    try std.testing.expect(!tc2.bus.coproc_irq_line);
 }
 
 test "HVBJOY exposes the H-blank flag ($4212 bit 6)" {
