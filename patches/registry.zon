@@ -1,0 +1,47 @@
+// Patch registry for `--auto-patch`: an INDEX, never a payload.
+//
+// Keyed by the sha256 of the copier-stripped source ROM (the dump the patch
+// author made the patch against — BPS verifies the source CRC again at apply
+// time). `patch_name` is the file `--auto-patch` looks for in `--patch-dir`
+// (default: this directory); `patch_sha256` pins the exact patch file, and a
+// file that does not match is REFUSED, not applied. `url` is where to fetch
+// it — the emulator never downloads anything.
+//
+// Patch files themselves are gitignored here: the repo carries the index and
+// nothing else. Every entry below was verified end-to-end before being added
+// (patch fetched, sha pinned, applied against the named dump with source and
+// target checksums green).
+//
+// Not yet listed, same upstreams, for whoever holds the matching dumps:
+// SA-1 Root also publishes Gradius III (JPN/USA) and Super R-Type (USA), and
+// Project FastROM also publishes Axelay and U.N. Squadron. Add an entry by
+// hashing your dump: `zig build test-commercial -Dcommercial-mint` prints the
+// sha256 of any ROM it identifies.
+.{
+    .patches = .{
+        .{
+            .source_sha256 = "a93ea87fc835c530b5135c5294433d15eef6dbf656144b387e89ac19cf864996",
+            .title = "Contra III: The Alien Wars (USA)",
+            .patch_name = "Contra-III-USA-v12.bps",
+            .patch_sha256 = "fad577c79764c2cc06c5bb8f4694387d16bd1019a7f3fd11de50d0f22d067872",
+            .url = "https://github.com/VitorVilela7/SA1-Root/releases/tag/v1.8",
+            .license_note = "SA-1 Root by Vitor Vilela; patch distributed via GitHub releases",
+        },
+        .{
+            .source_sha256 = "bf16c3c867c58e2ab061c70de9295b6930d63f29f81cc986f5ecae03e0ad18d2",
+            .title = "F-Zero (USA)",
+            .patch_name = "fzero.bps",
+            .patch_sha256 = "994dab97f29468fd6421884e3d3c82f4ecae4fb7cf6aee0b155711a6a9b6871a",
+            .url = "https://github.com/VitorVilela7/fastrom/releases/tag/v1.40",
+            .license_note = "Project FastROM by Vitor Vilela; patch distributed via GitHub releases",
+        },
+        .{
+            .source_sha256 = "0ef6f4cce5a2273fa49fe1ce724e0048a8e39c91da6b00dbb693fe1ba909177d",
+            .title = "Super Castlevania IV (USA)",
+            .patch_name = "super-castlevania-iv.bps",
+            .patch_sha256 = "ba023de776f79da9c31dbde8e1c884214d51b4427ea2869342a79eb13b3368a4",
+            .url = "https://github.com/VitorVilela7/fastrom/releases/tag/v1.40",
+            .license_note = "Project FastROM by Vitor Vilela; patch distributed via GitHub releases",
+        },
+    },
+}
