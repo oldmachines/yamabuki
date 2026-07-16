@@ -43,6 +43,9 @@ const Args = struct {
     /// apply its registered patch from `patch_dir` (verified, never fetched).
     auto_patch: bool = false,
     patch_dir: []const u8 = "patches",
+    /// Pin MEMSEL to 1 (FastROM cartridge timing for a SlowROM game), gated
+    /// by patches/fastrom-compat.zon: `broken` refuses, unknown warns.
+    auto_fastrom: bool = false,
     sa1_report: bool = false,
     /// Frames to run before the profiler starts counting. Boot is not gameplay:
     /// the game is decompressing, clearing RAM, and handshaking with the APU,
@@ -76,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
             \\  --auto-patch  look this ROM up in patches/registry.zon and apply its registered patch
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
+            \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -116,6 +120,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (args.auto_fastrom) checkFastromCompat(out, core.header.stripCopierHeader(image)) catch std.process.exit(1);
+
     const cart = core.Cartridge.load(gpa, image) catch |e| {
         try out.print("error: cannot load ROM: {s}\n", .{@errorName(e)});
         try out.flush();
@@ -129,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
 
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    if (args.auto_fastrom) con.enableAutoFastrom();
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -221,6 +228,34 @@ fn applyBytes(
     }
     try out.flush();
     return res.image;
+}
+
+/// The `--auto-fastrom` compat gate: `broken` refuses with its reason (an
+/// error), `ok` proceeds, anything else — `untested` or absent — runs behind
+/// a warning the user is meant to read. The option is already an explicit
+/// flag, so the unknown case warns rather than refuses.
+fn checkFastromCompat(out: *std.Io.Writer, stripped: []const u8) !void {
+    defer out.flush() catch {};
+    const hex = core.registry.sha256Hex(stripped);
+    if (core.fastrom_compat.find(&hex)) |e| {
+        switch (e.status) {
+            .ok => try out.print("auto-fastrom: {s} is verified compatible\n", .{e.title}),
+            .broken => {
+                try out.print("error: auto-fastrom: {s} is known BROKEN with FastROM timing: {s}\n", .{ e.title, e.note });
+                return error.FastromIncompatible;
+            },
+            .untested => try out.print(
+                "auto-fastrom: WARNING: {s} is listed but untested ({s}) — expect anything from nothing to corrupted saves\n",
+                .{ e.title, e.note },
+            ),
+        }
+    } else {
+        try out.print(
+            "auto-fastrom: WARNING: this ROM (sha256 {s}) is not in patches/fastrom-compat.zon —\n" ++
+                "  untested with FastROM timing; expect anything from nothing to corrupted saves\n",
+            .{&hex},
+        );
+    }
 }
 
 /// What `--auto-patch` should do, decided from the registry lookup and the
@@ -364,6 +399,7 @@ fn runReport(
 
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
+    if (args.auto_fastrom) con.bus.enableAutoFastrom();
 
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(want);
@@ -662,6 +698,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.patch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--auto-patch")) {
             out.auto_patch = true;
+        } else if (std.mem.eql(u8, a, "--auto-fastrom")) {
+            out.auto_fastrom = true;
         } else if (std.mem.eql(u8, a, "--patch-dir")) {
             out.patch_dir = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--save-patched")) {

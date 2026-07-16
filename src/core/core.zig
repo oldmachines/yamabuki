@@ -10,6 +10,7 @@ pub const header = @import("cart/header.zig");
 pub const cartridge = @import("cart/cartridge.zig");
 pub const patch = @import("cart/patch.zig");
 pub const registry = @import("cart/registry.zig");
+pub const fastrom_compat = @import("cart/fastrom_compat.zig");
 pub const bus = @import("memory/bus.zig");
 pub const wram = @import("memory/wram.zig");
 pub const math_unit = @import("memory/math_unit.zig");

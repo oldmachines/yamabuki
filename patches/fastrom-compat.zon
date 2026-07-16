@@ -1,0 +1,35 @@
+// Auto-FastROM compatibility list, keyed by the sha256 of the copier-stripped
+// ROM (same key as registry.zon).
+//
+// `--auto-fastrom` gives a SlowROM game FastROM cartridge timing. That is
+// mechanically derivable and usually free — but code timed against SlowROM
+// latency genuinely breaks, and a heuristic that silently corrupts a save is
+// worse than no feature. So: `ok` means verified on this exact dump (the
+// 1800-frame framebuffer hash is identical with and without the flag, i.e.
+// the faster bus changed nothing the player sees), `broken` refuses with its
+// reason, and `untested` (or absence from this list) warns loudly and runs.
+//
+// Re-verify an entry: run 1800 frames headless with and without
+// `--auto-fastrom` and compare the printed hashes.
+.{
+    .roms = .{
+        .{
+            .sha256 = "0838e531fe22c077528febe14cb3ff7c492f1f5fa8de354192bdff7137c27f5b",
+            .title = "Super Mario World (USA)",
+            .status = .ok,
+            .note = "1800-frame fb hash identical with/without the flag",
+        },
+        .{
+            .sha256 = "bf16c3c867c58e2ab061c70de9295b6930d63f29f81cc986f5ecae03e0ad18d2",
+            .title = "F-Zero (USA)",
+            .status = .ok,
+            .note = "1800-frame fb hash identical with/without the flag",
+        },
+        .{
+            .sha256 = "0ef6f4cce5a2273fa49fe1ce724e0048a8e39c91da6b00dbb693fe1ba909177d",
+            .title = "Super Castlevania IV (USA)",
+            .status = .ok,
+            .note = "1800-frame fb hash identical with/without the flag",
+        },
+    },
+}

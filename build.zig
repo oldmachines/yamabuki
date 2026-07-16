@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     // The --auto-patch registry index (patches/registry.zon) lives outside the
     // module root, so it is injected as an anonymous import.
     core_mod.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
+    core_mod.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
 
     // Headless frontend: runs a ROM for N frames, dumps framebuffer as .ppm
     // and prints a hash. Primary development/verification tool.
@@ -313,6 +314,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_core.addImport("perf_options", perf_on);
     bench_core.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
+    bench_core.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",
         .root_module = b.createModule(.{
