@@ -24,3 +24,8 @@ __pycache__/
 
 # Assembled Pages output (built by .github/workflows/publish-site.yml)
 _site/
+
+# Patch payloads: the repo commits the registry index (patches/registry.zon),
+# never the patches themselves. Fetch them from the registry's URLs.
+patches/*.bps
+patches/*.ips

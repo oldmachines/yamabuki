@@ -16,6 +16,12 @@
 //! target CRC after; IPS has no checksums, and says so. `--save-patched`
 //! writes the patched image and exits without emulating.
 //!
+//! `--auto-patch` looks the loaded ROM up in the committed registry
+//! (patches/registry.zon, keyed by content hash) and applies its registered
+//! patch from `--patch-dir` — after verifying the patch file's own sha256
+//! against the registry. A missing patch prints where to fetch it and runs
+//! unpatched; the emulator never downloads anything.
+//!
 //! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
 //! game with the frame-budget profiler compiled in and answers the question that
 //! comes before every other one — *is this game CPU-bound at all?* See
@@ -33,6 +39,10 @@ const Args = struct {
     accuracy: core.Accuracy = .fast,
     patch: ?[]const u8 = null,
     save_patched: ?[]const u8 = null,
+    /// Look the loaded ROM up in patches/registry.zon by content hash and
+    /// apply its registered patch from `patch_dir` (verified, never fetched).
+    auto_patch: bool = false,
+    patch_dir: []const u8 = "patches",
     sa1_report: bool = false,
     /// Frames to run before the profiler starts counting. Boot is not gameplay:
     /// the game is decompressing, clearing RAM, and handshaking with the APU,
@@ -59,11 +69,13 @@ pub fn main(init: std.process.Init) !void {
     const args = parseArgs(init, gpa) catch {
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
-            \\                         [--patch p.bps|p.ips] [--save-patched out.sfc]
+            \\                         [--patch p.bps|p.ips] [--auto-patch] [--patch-dir DIR] [--save-patched out.sfc]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
-            \\  --save-patched  write the patched image and exit without emulating (needs --patch)
+            \\  --auto-patch  look this ROM up in patches/registry.zon and apply its registered patch
+            \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
+            \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -80,22 +92,28 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    var patched = false;
     if (args.patch) |patch_path| {
+        if (args.auto_patch) try out.print("note: --patch overrides --auto-patch\n", .{});
         image = applyPatch(io, gpa, out, image, patch_path) catch std.process.exit(1);
-        if (args.save_patched) |save_path| {
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = save_path, .data = image }) catch {
-                try out.print("error: cannot write '{s}'\n", .{save_path});
-                try out.flush();
-                std.process.exit(1);
-            };
-            try out.print("wrote {s} ({d} bytes)\n", .{ save_path, image.len });
+        patched = true;
+    } else if (args.auto_patch) {
+        image = autoPatch(io, gpa, out, image, args.patch_dir, &patched) catch std.process.exit(1);
+    }
+    if (args.save_patched) |save_path| {
+        if (!patched) {
+            try out.print("error: --save-patched needs a patch that actually applied\n", .{});
             try out.flush();
-            return;
+            std.process.exit(2);
         }
-    } else if (args.save_patched != null) {
-        try out.print("error: --save-patched needs --patch\n", .{});
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = save_path, .data = image }) catch {
+            try out.print("error: cannot write '{s}'\n", .{save_path});
+            try out.flush();
+            std.process.exit(1);
+        };
+        try out.print("wrote {s} ({d} bytes)\n", .{ save_path, image.len });
         try out.flush();
-        std.process.exit(2);
+        return;
     }
 
     const cart = core.Cartridge.load(gpa, image) catch |e| {
@@ -166,7 +184,20 @@ fn applyPatch(
         try out.flush();
         return error.PatchFailed;
     };
-    const stripped = core.header.stripCopierHeader(image);
+    return applyBytes(gpa, out, core.header.stripCopierHeader(image), pbytes, patch_path);
+}
+
+/// Apply already-read patch bytes to an already-stripped image, reporting what
+/// kind of guarantee the format could give. Shared by `--patch` (which read
+/// the file the user named) and `--auto-patch` (which read — and hash-verified
+/// — the file the registry named).
+fn applyBytes(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    stripped: []const u8,
+    pbytes: []const u8,
+    patch_path: []const u8,
+) ![]u8 {
     var mm: core.patch.CrcMismatch = .{};
     const res = core.patch.apply(gpa, stripped, pbytes, &mm) catch |e| {
         switch (e) {
@@ -190,6 +221,128 @@ fn applyPatch(
     }
     try out.flush();
     return res.image;
+}
+
+/// What `--auto-patch` should do, decided from the registry lookup and the
+/// bytes found (or not) at the registered patch's path. Pure — the I/O wrapper
+/// below feeds it, and the unit tests drive all four flows synthetically.
+const AutoPatchDecision = union(enum) {
+    /// The loaded ROM's hash is not in the registry: run unpatched.
+    unknown,
+    /// Registered, but the patch file is absent: print where to fetch it
+    /// (never fetch it ourselves), run unpatched.
+    missing: *const core.registry.Entry,
+    /// A file exists but is not byte-for-byte the registered patch: REFUSE.
+    /// BPS would likely catch corruption at apply time, IPS never would — and
+    /// either way, an unverified patch is unknown code for someone's ROM.
+    tampered: struct { entry: *const core.registry.Entry, got: [64]u8 },
+    /// Verified: apply it.
+    apply: *const core.registry.Entry,
+};
+
+fn autoPatchDecision(entry: ?*const core.registry.Entry, patch_bytes: ?[]const u8) AutoPatchDecision {
+    const e = entry orelse return .unknown;
+    const pbytes = patch_bytes orelse return .{ .missing = e };
+    const got = core.registry.sha256Hex(pbytes);
+    if (!std.ascii.eqlIgnoreCase(&got, e.patch_sha256))
+        return .{ .tampered = .{ .entry = e, .got = got } };
+    return .{ .apply = e };
+}
+
+/// `--auto-patch`: identify the loaded ROM by content hash, find its
+/// registered patch in `dir`, verify, apply. Only the `tampered` case is an
+/// error; everything else runs, patched or not, with its reason printed.
+fn autoPatch(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    image: []u8,
+    dir: []const u8,
+    patched: *bool,
+) ![]u8 {
+    const stripped = core.header.stripCopierHeader(image);
+    const hex = core.registry.sha256Hex(stripped);
+    const entry = core.registry.find(&hex);
+    var pbytes: ?[]const u8 = null;
+    var path: []const u8 = "";
+    if (entry) |e| {
+        path = try std.fs.path.join(gpa, &.{ dir, e.patch_name });
+        pbytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch null;
+    }
+    defer out.flush() catch {};
+    switch (autoPatchDecision(entry, pbytes)) {
+        .unknown => {
+            try out.print("auto-patch: this ROM is not in the registry (sha256 {s}); running unpatched\n", .{&hex});
+            return image;
+        },
+        .missing => |e| {
+            try out.print(
+                "auto-patch: {s} has a registered patch '{s}', but it is not in {s}{c}\n" ++
+                    "  fetch it yourself from {s}\n  ({s})\n  running unpatched\n",
+                .{ e.title, e.patch_name, dir, std.fs.path.sep, e.url, e.license_note },
+            );
+            return image;
+        },
+        .tampered => |t| {
+            try out.print(
+                "error: auto-patch: '{s}' is not the registered patch for {s}\n" ++
+                    "  file    sha256 {s}\n  registry pins  {s}\n  refusing to apply it\n",
+                .{ path, t.entry.title, &t.got, t.entry.patch_sha256 },
+            );
+            return error.PatchFailed;
+        },
+        .apply => |e| {
+            try out.print("auto-patch: {s} -> {s} (registry hash verified)\n", .{ e.title, e.patch_name });
+            patched.* = true;
+            return applyBytes(gpa, out, stripped, pbytes.?, path);
+        },
+    }
+}
+
+test "auto-patch decides all four flows" {
+    // A fabricated registry entry whose pinned patch hash matches "GOODPATCH"
+    // — the decision logic is what's under test, not the committed index.
+    const good = "GOODPATCH";
+    const good_hex = core.registry.sha256Hex(good);
+    const entry: core.registry.Entry = .{
+        .source_sha256 = "00" ** 32,
+        .title = "Synthetic Game",
+        .patch_name = "synthetic.bps",
+        .patch_sha256 = &good_hex,
+        .url = "https://example.invalid/",
+        .license_note = "test",
+    };
+    try std.testing.expectEqual(AutoPatchDecision.unknown, autoPatchDecision(null, good));
+    try std.testing.expectEqual(
+        AutoPatchDecision{ .missing = &entry },
+        autoPatchDecision(&entry, null),
+    );
+    switch (autoPatchDecision(&entry, "EVILPATCH")) {
+        .tampered => |t| {
+            try std.testing.expectEqual(&entry, t.entry);
+            try std.testing.expect(!std.mem.eql(u8, &t.got, &good_hex));
+        },
+        else => return error.TestExpectedTampered,
+    }
+    try std.testing.expectEqual(
+        AutoPatchDecision{ .apply = &entry },
+        autoPatchDecision(&entry, good),
+    );
+    // Case must not matter: registries get hand-edited.
+    var upper: [64]u8 = undefined;
+    for (good_hex, 0..) |c, i| upper[i] = std.ascii.toUpper(c);
+    const entry_upper: core.registry.Entry = .{
+        .source_sha256 = "00" ** 32,
+        .title = "Synthetic Game",
+        .patch_name = "synthetic.bps",
+        .patch_sha256 = &upper,
+        .url = "https://example.invalid/",
+        .license_note = "test",
+    };
+    try std.testing.expectEqual(
+        AutoPatchDecision{ .apply = &entry_upper },
+        autoPatchDecision(&entry_upper, good),
+    );
 }
 
 /// `--sa1-report`: run the game with the frame-budget profiler and report
@@ -507,6 +660,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.accuracy = .accurate;
         } else if (std.mem.eql(u8, a, "--patch")) {
             out.patch = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--auto-patch")) {
+            out.auto_patch = true;
+        } else if (std.mem.eql(u8, a, "--patch-dir")) {
+            out.patch_dir = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--save-patched")) {
             out.save_patched = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--sa1-report")) {

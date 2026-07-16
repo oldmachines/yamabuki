@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_mod.addImport("perf_options", perf_off);
+    // The --auto-patch registry index (patches/registry.zon) lives outside the
+    // module root, so it is injected as an anonymous import.
+    core_mod.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
 
     // Headless frontend: runs a ROM for N frames, dumps framebuffer as .ppm
     // and prints a hash. Primary development/verification tool.
@@ -100,6 +103,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(sdl_main_tests).step);
+
+    // The headless frontend's pure helpers (the --auto-patch decision) are
+    // tested through main.zig itself, same pattern as the SDL frontend above.
+    const headless_main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontends/headless/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(headless_main_tests).step);
 
     // Bake the shader presets listed in shaders/presets.conf into GLSL.
     //
@@ -295,6 +312,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_core.addImport("perf_options", perf_on);
+    bench_core.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",
         .root_module = b.createModule(.{
