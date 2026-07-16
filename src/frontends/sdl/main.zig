@@ -103,6 +103,10 @@ const Args = struct {
     /// `--patch <file>`: apply a BPS/IPS patch to the ROM in memory at load.
     /// BPS is CRC-verified both ways; IPS is applied with a printed warning.
     patch: ?[]const u8 = null,
+    /// `--auto-fastrom`: pin MEMSEL to 1 (FastROM cartridge timing for a
+    /// SlowROM game), gated by patches/fastrom-compat.zon — `broken` refuses,
+    /// unknown warns loudly.
+    auto_fastrom: bool = false,
 };
 
 /// Write 24-bit RGB as a binary PPM — the same format the headless runner emits,
@@ -171,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
-                "                    [--shader NAME] [--shader-dir DIR] [--patch p.bps|p.ips]\n" ++
+                "                    [--shader NAME] [--shader-dir DIR] [--patch p.bps|p.ips] [--auto-fastrom]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
@@ -220,6 +224,21 @@ pub fn main(init: std.process.Init) !void {
         }
         image = res.image;
     }
+    if (args.auto_fastrom) {
+        const hex = core.registry.sha256Hex(core.header.stripCopierHeader(image));
+        if (core.fastrom_compat.find(&hex)) |e| switch (e.status) {
+            .ok => try err.print("auto-fastrom: {s} is verified compatible\n", .{e.title}),
+            .broken => {
+                try err.print("error: auto-fastrom: {s} is known BROKEN with FastROM timing: {s}\n", .{ e.title, e.note });
+                try err.flush();
+                std.process.exit(1);
+            },
+            .untested => try err.print("auto-fastrom: WARNING: {s} is untested with FastROM timing ({s})\n", .{ e.title, e.note }),
+        } else {
+            try err.print("auto-fastrom: WARNING: this ROM is not in patches/fastrom-compat.zon — untested with FastROM timing\n", .{});
+        }
+        try err.flush();
+    }
     const cart = core.Cartridge.load(gpa, image) catch |e| {
         try err.print("error: cannot load ROM: {s}\n", .{@errorName(e)});
         try err.flush();
@@ -227,6 +246,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    if (args.auto_fastrom) con.enableAutoFastrom();
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{args.rom});
 
@@ -731,6 +751,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             args.shader = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--patch")) {
             args.patch = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--auto-fastrom")) {
+            args.auto_fastrom = true;
         } else if (std.mem.eql(u8, a, "--shader-dir")) {
             args.shader_dir = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--shot")) {

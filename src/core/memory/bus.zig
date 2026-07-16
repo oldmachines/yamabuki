@@ -39,7 +39,10 @@ pub const Bus = struct {
     // remap() on load; the cart reference is re-supplied by the frontend.
     // `last_data_read`, `last_data_write` and `input_polled` are diagnostics,
     // not machine state.
-    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled" };
+    // `auto_fastrom` is frontend configuration, not machine state: it is set
+    // once at startup and must survive a loadState (skipped fields keep their
+    // in-memory value), so an old save does not silently turn the option off.
+    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled", "auto_fastrom" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
@@ -69,6 +72,12 @@ pub const Bus = struct {
     mdr: u8,
     /// $420D MEMSEL bit 0: FastROM enabled.
     fastrom: bool,
+    /// Opt-in auto-FastROM (M12): treat MEMSEL as permanently 1, giving a
+    /// SlowROM game FastROM cartridge timing in the upper banks. Purely an
+    /// emulation-level speed change — the header is untouched, and it is
+    /// gated behind an explicit flag plus a compat list, because code timed
+    /// against SlowROM latency genuinely breaks.
+    auto_fastrom: bool,
     wram: Wram,
     math: MathUnit,
     cpuio: CpuIo,
@@ -109,6 +118,7 @@ pub const Bus = struct {
         self.input_polled = false;
         self.mdr = 0;
         self.fastrom = false;
+        self.auto_fastrom = false;
         self.wram = .init;
         self.math = .init;
         self.cpuio = .init;
@@ -157,7 +167,18 @@ pub const Bus = struct {
     /// Called after deserialization to rebuild derived state: the page table,
     /// then every component that declares its own postLoad hook (discovered
     /// at comptime, so new components can't be forgotten here).
+    /// Turn auto-FastROM on (frontends call this once, after init and after
+    /// the compat-list check): MEMSEL behaves as permanently 1 from now on.
+    pub fn enableAutoFastrom(self: *Bus) void {
+        self.auto_fastrom = true;
+        self.fastrom = true;
+        self.remap();
+    }
+
     pub fn postLoad(self: *Bus) void {
+        // A save made without auto-FastROM restores fastrom=false; the
+        // in-memory option (skipped by the serializer) re-pins it.
+        if (self.auto_fastrom) self.fastrom = true;
         self.attachSa1(); // before remap: the SA-1 page map reads MMC state
         self.remap();
         self.attachGsu();
@@ -405,7 +426,9 @@ pub const Bus = struct {
             0x420C => self.dma.hdmaen = value,
             0x4300...0x437F => self.dma.writeReg(a16, value),
             0x420D => {
-                const enable = (value & 1) != 0;
+                // Auto-FastROM pins MEMSEL: a game clearing it (usually just
+                // its own reset code writing 0) must not undo the option.
+                const enable = (value & 1) != 0 or self.auto_fastrom;
                 if (enable != self.fastrom) {
                     self.fastrom = enable;
                     self.remap();
@@ -770,6 +793,40 @@ test "bus state serialize roundtrip rebuilds pages" {
     try std.testing.expectEqual(saved_clock, tc2.bus.clock);
     try std.testing.expectEqual(@as(u8, 0x99), tc2.bus.read8(0x7E_0100));
     try std.testing.expectEqual(@as(u16, 25), tc2.bus.math.rdmpy);
+}
+
+test "auto-FastROM pins MEMSEL and remaps the upper-bank ROM pages" {
+    var tc = try TestConsole.create(0x20, 3); // LoROM, SlowROM header
+    defer tc.destroy();
+
+    // A ROM page in the upper banks ($80:8000) charges SlowROM by default.
+    const upper_page = &tc.bus.pages[0x80_8000 >> 13];
+    try std.testing.expectEqual(timing.speed_slow, upper_page.speed);
+
+    tc.bus.enableAutoFastrom();
+    try std.testing.expect(tc.bus.fastrom);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
+    // The mirror in the lower banks stays slow — FastROM only ever applies
+    // to $80-$FF, exactly like a real MEMSEL=1.
+    try std.testing.expectEqual(timing.speed_slow, tc.bus.pages[0x00_8000 >> 13].speed);
+
+    // The game clearing MEMSEL (reset code writing 0) must not undo it.
+    tc.bus.write8(0x00_420D, 0);
+    try std.testing.expect(tc.bus.fastrom);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
+
+    // And the option survives a save/load: fastrom is serialized as false in
+    // an old save, but the skipped in-memory option re-pins it in postLoad.
+    const serialize = @import("../serialize.zig");
+    var plain = try TestConsole.create(0x20, 3);
+    defer plain.destroy();
+    const buf = try std.testing.allocator.alloc(u8, comptime serialize.byteSize(Bus));
+    defer std.testing.allocator.free(buf);
+    _ = serialize.write(Bus, &plain.bus, buf); // a save with fastrom OFF
+    _ = try serialize.read(Bus, &tc.bus, buf);
+    tc.bus.postLoad();
+    try std.testing.expect(tc.bus.fastrom);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
 }
 
 test "HVBJOY exposes the H-blank flag ($4212 bit 6)" {

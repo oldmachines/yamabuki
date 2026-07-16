@@ -454,6 +454,14 @@ pub const AnyConsole = union(Accuracy) {
         }
     }
 
+    /// Opt-in auto-FastROM (M12): pin MEMSEL to 1. Frontends call this once
+    /// after init, after they have consulted the compat list.
+    pub fn enableAutoFastrom(self: *AnyConsole) void {
+        switch (self.*) {
+            inline else => |*c| c.bus.enableAutoFastrom(),
+        }
+    }
+
     pub fn saveState(self: *const AnyConsole, out: []u8) usize {
         switch (self.*) {
             inline else => |*c| return c.saveState(out),
