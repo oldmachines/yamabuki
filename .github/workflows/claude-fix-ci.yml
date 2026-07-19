@@ -1,0 +1,82 @@
+name: Claude Fix CI
+
+# Build Loop 2/3 — repair a claude/issue-* branch whose CI went red.
+#
+# Reacts to yamabuki's CI (ci.yml) completing with `failure` on a loop branch,
+# reads the failing logs, fixes ONLY what the failure requires, and pushes —
+# which retriggers CI. Bounded to 3 attempts (counted by the "[claude-fix]"
+# commit prefix) so a red build can never loop forever.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  group: claude-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  id-token: write
+  actions: read
+  checks: read
+
+jobs:
+  fix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      startsWith(github.event.workflow_run.head_branch, 'claude/issue-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the failing branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fix the failing branch
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          # The branch was pushed by our own bot; allow the agent to act on it.
+          allowed_bots: "claude"
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(gh api:*),Bash(git:*),Bash(zig:*),Read,Glob,Grep,Edit,Write"
+          prompt: |
+            You are Build Loop step 2/3 (Fix CI) for oldmachines/yamabuki. The CI
+            run on branch `${{ github.event.workflow_run.head_branch }}` FAILED
+            (run id ${{ github.event.workflow_run.id }}). Repair it — but only if
+            we are under the attempt cap.
+
+            ATTEMPT CAP FIRST. Count commits on this branch whose message starts
+            with "[claude-fix]": `git log --format=%s origin/main..HEAD`. If there
+            are already 3 or more, STOP: do not change code — comment on the PR
+            that the branch has hit the 3-attempt Fix-CI cap and needs a human,
+            then finish.
+
+            Otherwise:
+            1. Read the failing logs:
+               `gh run view ${{ github.event.workflow_run.id }} --log-failed`.
+            2. If the failure is pure infrastructure (runner offline, network,
+               a flaky asset fetch) rather than a real defect, re-run instead of
+               patching: `gh run rerun ${{ github.event.workflow_run.id }} --failed`,
+               then stop.
+            3. Otherwise fix ONLY what the failure requires. Do not expand scope.
+               Do NOT weaken, skip, or delete tests/goldens to go green — if a
+               golden must legitimately be re-minted, do so deliberately and note
+               it. You may run `zig build test` locally to confirm (asset-backed
+               suites may be unavailable locally — CI is the real check).
+            4. Commit with a message STARTING with "[claude-fix] " (this exact
+               prefix is how attempts are counted) and push, which retriggers CI.
+
+            One repair, then stop.

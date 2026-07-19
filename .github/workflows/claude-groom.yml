@@ -1,0 +1,73 @@
+name: Claude Groom
+
+# Backlog hygiene (from the omega-ios set). Once a day it reads every open,
+# non-`ready-for-dev` issue, checks it against the CURRENT code, and grooms:
+#   - bug provably fixed in code           -> close it, citing file:line
+#   - feature request with no usable spec  -> add `needs-spec` + comment
+#   - spec gone stale (renamed APIs, etc.) -> edit only the stale facts + comment
+#
+# Defaults to a DRY RUN: it prints intended actions to the run Summary and
+# changes nothing. Flip dry_run to false (or run manually) once you trust it.
+# It NEVER touches `ready-for-dev` issues (the human gate), closed issues, or PRs.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print intended actions without changing anything"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+  id-token: write
+
+jobs:
+  groom:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Groom the backlog
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Bash(gh issue:*),Bash(gh api:*),Bash(git:*),Read,Glob,Grep"
+          prompt: |
+            You are the daily backlog groomer for oldmachines/yamabuki.
+            DRY RUN = ${{ github.event.inputs.dry_run || 'true' }}. When dry run is
+            true, DO NOT edit, comment on, close, or label anything — instead write
+            your per-issue verdict to the job Summary (append to $GITHUB_STEP_SUMMARY)
+            and finish.
+
+            Read every OPEN issue that is NOT labeled `ready-for-dev` (that label
+            is the human build gate — never touch those issues, closed issues, or
+            PRs). For each, check it against the current code on main and choose
+            ONE:
+
+            - BUG PROVABLY FIXED IN CODE: close it with a comment citing exact
+              `file:line` evidence. A shipped feature or a CHANGELOG line is NOT
+              proof — only code is. If you cannot cite file:line, do not close.
+            - FEATURE REQUEST WITH NO EXECUTABLE SPEC: add label `needs-spec` and
+              comment naming exactly what's missing to implement it.
+            - SPEC GONE STALE (closed blockers, renamed APIs, already-shipped
+              parts): edit ONLY the stale facts, preserving the issue's scope, and
+              comment what changed; add `needs-rewrite` if it needs human
+              rescoping.
+
+            Cite-or-abstain: every close or edit must cite file:line. When in
+            doubt, leave the issue alone. Ensure the `needs-spec` and
+            `needs-rewrite` labels exist before using them
+            (`gh label create ... || true`). Always write a per-issue verdict to
+            the Summary, dry run or not.
