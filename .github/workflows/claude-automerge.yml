@@ -1,0 +1,68 @@
+name: Claude Auto-merge
+
+# Build Loop 3/3 — squash-merge a loop PR once CI is green.
+#
+# Reacts to yamabuki's CI (ci.yml) completing with `success` on a claude/issue-*
+# branch, re-confirms the PR's checks are green and it isn't a draft, then
+# squash-merges and closes the linked issues. This is an explicit
+# workflow_run-driven merge, so it works without branch-protection rules.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  group: claude-automerge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+  checks: read
+
+jobs:
+  automerge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'claude/issue-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Squash-merge the green PR
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          allowed_bots: "claude"
+          claude_args: >-
+            --max-turns 40
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh api:*),Bash(git:*)"
+          prompt: |
+            You are Build Loop step 3/3 (Auto-merge) for oldmachines/yamabuki. CI
+            PASSED on branch `${{ github.event.workflow_run.head_branch }}`.
+
+            1. Find the open PR for that branch:
+               `gh pr list --head "${{ github.event.workflow_run.head_branch }}" --state open --json number,isDraft,body`.
+               If there is none, or it is a draft, STOP.
+            2. Re-confirm the PR is actually green right now (a newer commit may
+               have landed after this run started): `gh pr checks <n>`. If any
+               required check is failing or still pending, STOP — a fresher CI run
+               will handle it. Merge only when all required checks are green.
+            3. Squash-merge and delete the branch:
+               `gh pr merge <n> --squash --delete-branch`.
+            4. Close the linked issues. Parse close/fix/resolve keywords from the
+               PR body (e.g. "Closes #<n>", "Fixes #<n>", "Resolves #<n>") and,
+               for each STILL-OPEN issue, close it with a short completion comment
+               (`gh issue close <n> --comment "..."`). A token-made merge does not
+               always auto-close, so close explicitly; skip any issue already
+               closed.
+
+            Merge exactly one PR, then stop.

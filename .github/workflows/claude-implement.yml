@@ -1,0 +1,102 @@
+name: Claude Implement
+
+# Build Loop 1/3 — take an approved issue to an open PR.
+#
+# Adapted from the omega-ios build loop for yamabuki. The key adaptation: the
+# authoritative verification is yamabuki's own CI workflow (ci.yml — zig build
+# test, fuzz, SST, goldens, bench). This job may build locally to reduce Fix-CI
+# rounds, but it never has to: CI runs on the PR and is the gate. The agent
+# writes code, pushes a claude/issue-<n> branch, and opens a PR — Build (CI),
+# Fix CI, and Auto-merge drive it the rest of the way.
+#
+# Entry point: a human applies the `ready-for-dev` label (the same label the old
+# loop used). For issues that are ALREADY labeled (the label event fired in the
+# past and won't replay), use the manual "Run workflow" button with the issue
+# number, or remove+re-add the label.
+#
+# NOTE: `issues`-triggered and scheduled workflows only fire once this file is on
+# the default branch — merge the PR that adds it to activate the loop.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to implement (manual kick for already-labeled issues)"
+        required: true
+        type: string
+
+# One build per issue; a re-label must not start a second.
+concurrency:
+  group: claude-implement-${{ github.event.issue.number || github.event.inputs.issue }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+  checks: read
+
+jobs:
+  implement:
+    # Only the human build-approval label, or an explicit manual dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'ready-for-dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the agent can branch from main cleanly
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Implement the issue
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # GH_PAT (not GITHUB_TOKEN) so the branch push / PR open re-triggers CI,
+          # which is what wakes Fix CI / Auto-merge. Without it the loop stalls.
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh api:*),Bash(git:*),Bash(zig:*),Read,Glob,Grep,Edit,Write"
+          prompt: |
+            You are Build Loop step 1/3 (Implement) for the yamabuki
+            SNES-emulator repository (oldmachines/yamabuki). The base branch is
+            main. Implement exactly ONE issue, end to end, then stop.
+
+            The issue number is: ${{ github.event.issue.number || github.event.inputs.issue }}
+
+            1. Read the issue: `gh issue view <n>`. Understand its acceptance
+               criteria and stay STRICTLY within its stated scope — do not
+               refactor or "improve" adjacent code.
+            2. Create a branch `claude/issue-<n>-<short-slug>` cut from the latest
+               origin/main.
+            3. Implement the change.
+               - You MAY run `zig build` / `zig build test` / `zig build fuzz`
+                 locally to sanity-check your work. Note some suites (goldens,
+                 commercial, SST vectors) need test ROMs / vectors that only CI
+                 fetches — so a local pass is a bonus, not a requirement.
+               - The AUTHORITATIVE gate is CI (.github/workflows/ci.yml), which
+                 runs the full golden/SST/bench/fuzz suite on your PR.
+               - NEVER weaken, skip, or delete a test/golden to make CI pass. If a
+                 golden genuinely must be re-minted, do it deliberately and say so
+                 in the PR body with justification.
+            4. Commit with a clear message whose body ends with "Closes #<n>",
+               then push: `git push -u origin claude/issue-<n>-<slug>`.
+            5. Open a ready-for-review PR (base main) whose body contains
+               "Closes #<n>" and summarizes the change and any golden re-mints.
+               If a PR template exists under .github, mirror its headings.
+            6. Comment the PR link on the issue.
+
+            Do NOT merge — CI verifies and Auto-merge lands it. If you cannot fully
+            finish, push what you have, open a DRAFT PR, and comment on the issue
+            what remains. Never leave a branch without a PR.
