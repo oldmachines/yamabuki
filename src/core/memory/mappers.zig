@@ -20,7 +20,11 @@ fn romSpeed(bank: u8, fastrom: bool) u8 {
 }
 
 pub fn buildPages(bus: *Bus) void {
-    for (&bus.pages) |*p| p.* = .unmapped;
+    for (&bus.page_read, &bus.page_write, &bus.page_speed) |*r, *w, *s| {
+        r.* = null;
+        w.* = null;
+        s.* = timing.speed_slow;
+    }
 
     switch (bus.cart.header.mapping) {
         .lorom => if (bus.cart.chip == .sa1) mapSa1(bus) else mapLoRom(bus),
@@ -37,11 +41,11 @@ fn mapSystem(bus: *Bus) void {
 
     // Banks $7E-$7F: all 128 KiB, linear.
     for (0..16) |i| {
-        bus.pages[pageIndex(0x7E, @intCast(i))] = .{
+        bus.setPage(pageIndex(0x7E, @intCast(i)), .{
             .read = wram + i * page_size,
             .write = wram + i * page_size,
             .speed = timing.speed_slow,
-        };
+        });
     }
 
     var bank: u32 = 0;
@@ -49,10 +53,10 @@ fn mapSystem(bus: *Bus) void {
         const b: u8 = @intCast(bank);
         if (!bus_mod.isSystemBank(b) or b == 0x7E or b == 0x7F) continue;
         // $0000-$1FFF: mirror of first 8 KiB of WRAM.
-        bus.pages[pageIndex(b, 0)] = .{ .read = wram, .write = wram, .speed = timing.speed_slow };
+        bus.setPage(pageIndex(b, 0), .{ .read = wram, .write = wram, .speed = timing.speed_slow });
         // $2000-$5FFF: MMIO — always slow path.
-        bus.pages[pageIndex(b, 1)] = .unmapped;
-        bus.pages[pageIndex(b, 2)] = .unmapped;
+        bus.setPage(pageIndex(b, 1), .unmapped);
+        bus.setPage(pageIndex(b, 2), .unmapped);
     }
 }
 
@@ -66,11 +70,11 @@ fn mapLoRom(bus: *Bus) void {
         // $8000-$FFFF: 32 KiB ROM window.
         for (4..8) |i| {
             const offset = ((bank & 0x7F) * 0x8000 + (@as(u32, @intCast(i)) - 4) * page_size) & cart.rom_mask;
-            bus.pages[pageIndex(b, @intCast(i))] = .{
+            bus.setPage(pageIndex(b, @intCast(i)), .{
                 .read = cart.rom.ptr + offset,
                 .write = null,
                 .speed = romSpeed(b, bus.fastrom),
-            };
+            });
         }
 
         // DSP-1 boards on carts up to 1 MiB decode the coprocessor's DR/SR
@@ -80,7 +84,7 @@ fn mapLoRom(bus: *Bus) void {
         if (cart.chip == .dsp and cart.rom.len <= 0x10_0000 and
             (bank & 0x7F) >= 0x30 and (bank & 0x7F) <= 0x3F)
         {
-            for (4..8) |i| bus.pages[pageIndex(b, @intCast(i))] = .unmapped;
+            for (4..8) |i| bus.setPage(pageIndex(b, @intCast(i)), .unmapped);
         }
 
         // Banks $70-$7D / $F0-$FF, $0000-$7FFF: SRAM. Super FX carts map
@@ -90,11 +94,11 @@ fn mapLoRom(bus: *Bus) void {
         {
             for (0..4) |i| {
                 const offset = ((bank & 0x0F) * 0x8000 + @as(u32, @intCast(i)) * page_size) & cart.sram_mask;
-                bus.pages[pageIndex(b, @intCast(i))] = .{
+                bus.setPage(pageIndex(b, @intCast(i)), .{
                     .read = @as([*]u8, &cart.sram) + offset,
                     .write = @as([*]u8, &cart.sram) + offset,
                     .speed = timing.speed_slow,
-                };
+                });
             }
         }
     }
@@ -117,19 +121,19 @@ fn mapGsuRam(bus: *Bus) void {
         if ((bank & 0x7F) == 0x70 or (bank & 0x7F) == 0x71) {
             for (0..8) |i| {
                 const offset = ((bank & 1) * 0x1_0000 + @as(u32, @intCast(i)) * page_size) & cart.sram_mask;
-                bus.pages[pageIndex(b, @intCast(i))] = .{
+                bus.setPage(pageIndex(b, @intCast(i)), .{
                     .read = ram + offset,
                     .write = ram + offset,
                     .speed = timing.speed_slow,
-                };
+                });
             }
         }
         if (bus_mod.isSystemBank(b)) {
-            bus.pages[pageIndex(b, 3)] = .{
+            bus.setPage(pageIndex(b, 3), .{
                 .read = ram,
                 .write = ram,
                 .speed = timing.speed_slow,
-            };
+            });
         }
     }
 }
@@ -153,24 +157,24 @@ fn mapSa1(bus: *Bus) void {
             for (4..8) |i| {
                 const addr: u24 = @intCast(bank << 16 | i * page_size);
                 const offset = sa1.mmcTranslate(Sa1.squashLo(addr), true);
-                bus.pages[pageIndex(b, @intCast(i))] = .{
+                bus.setPage(pageIndex(b, @intCast(i)), .{
                     .read = cart.rom.ptr + offset,
                     .write = null,
                     .speed = romSpeed(b, bus.fastrom),
-                };
+                });
             }
             // Vector page: slow path for SNV/SIV substitution.
-            if (b & 0x7F == 0) bus.pages[pageIndex(b, 7)] = .unmapped;
+            if (b & 0x7F == 0) bus.setPage(pageIndex(b, 7), .unmapped);
         } else if (b >= 0xC0) {
             // $C0-$FF: full banks through the MMC's block registers.
             for (0..8) |i| {
                 const addr: u24 = @intCast(bank << 16 | i * page_size);
                 const offset = sa1.mmcTranslate(@intCast(addr & 0x3F_FFFF), false);
-                bus.pages[pageIndex(b, @intCast(i))] = .{
+                bus.setPage(pageIndex(b, @intCast(i)), .{
                     .read = cart.rom.ptr + offset,
                     .write = null,
                     .speed = romSpeed(b, bus.fastrom),
-                };
+                });
             }
         }
         // Banks $40-$4F (BW-RAM) stay unmapped: slow path handles them.
@@ -191,21 +195,21 @@ fn mapHiRom(bus: *Bus, low_half_extra: u32) void {
 
         for (first_page..8) |i| {
             const offset = (((bank & 0x3F) << 16) + @as(u32, @intCast(i)) * page_size + extra) & cart.rom_mask;
-            bus.pages[pageIndex(b, @intCast(i))] = .{
+            bus.setPage(pageIndex(b, @intCast(i)), .{
                 .read = cart.rom.ptr + offset,
                 .write = null,
                 .speed = romSpeed(b, bus.fastrom),
-            };
+            });
         }
 
         // Banks $20-$3F / $A0-$BF, $6000-$7FFF: SRAM window (8 KiB chunks).
         if (system and (bank & 0x3F) >= 0x20 and cart.hasSram() and cart.sram_mask >= page_size - 1) {
             const offset = ((bank & 0x1F) * page_size) & cart.sram_mask;
-            bus.pages[pageIndex(b, 3)] = .{
+            bus.setPage(pageIndex(b, 3), .{
                 .read = @as([*]u8, &cart.sram) + offset,
                 .write = @as([*]u8, &cart.sram) + offset,
                 .speed = timing.speed_slow,
-            };
+            });
         }
     }
 }
