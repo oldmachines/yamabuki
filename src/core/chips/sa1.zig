@@ -525,9 +525,16 @@ pub const Sa1 = struct {
             0x2200 => { // CCNT: SA-1 control
                 if (self.sa1_resb and value & 0x20 == 0) {
                     // Release from reset: boot from CRV (the vector window
-                    // serves it to the core's reset sequence).
+                    // serves it to the core's reset sequence). CIWP is a
+                    // power-on-only default (already zero from init()'s
+                    // memset) — RESB only resets the 65816 core, not the
+                    // MMC-side write-protect latch. Re-clearing it here on
+                    // every release would blow away a program's own CIWP
+                    // unlock across a *second* reset-release (some SA-1
+                    // bootstraps toggle RESB more than once), dropping the
+                    // very next IRAM stack push and derailing the SA-1
+                    // silently while the SNES side spins forever.
                     self.cpu.reset();
-                    self.ciwp = 0x00;
                 }
                 self.smeg = @truncate(value);
                 self.sa1_nmi = value & 0x10 != 0;
@@ -970,6 +977,27 @@ test "sa1 boots from crv and runs code from rom" {
     tc.boot(500);
     try testing.expectEqual(@as(u8, 0x42), tc.sa1.iram[0]);
     try testing.expectEqual(wdc65816.ExecState.stopped, tc.sa1.cpu.state);
+}
+
+test "sa1 ciwp survives a second reset-release" {
+    var tc = try TestChip.create();
+    defer tc.destroy();
+    const s = &tc.sa1;
+    // Boot once, unlock all IRAM blocks (as any SA-1 bootstrap must before
+    // it can push to a stack living in IRAM).
+    tc.boot(200);
+    s.writeIoSa1(0x222A, 0xFF);
+    try testing.expectEqual(@as(u8, 0xFF), s.ciwp);
+    // A second RESB assert/de-assert (CCNT bit 5 high then low again) must
+    // not silently re-block IRAM writes: only the 65816 core resets, not
+    // this MMC-side latch.
+    s.mmioWrite(300, 0x2200, 0x20); // assert RESB
+    s.mmioWrite(300, 0x2200, 0x00); // release again
+    try testing.expectEqual(@as(u8, 0xFF), s.ciwp);
+    // IRAM is indeed still writable — the failure mode this guards against
+    // is a dropped stack push on the very next JSR/PHA after such a reset.
+    s.write8(0x00_0002, 0x77);
+    try testing.expectEqual(@as(u8, 0x77), s.iram[2]);
 }
 
 test "sa1 message ports and irq to snes" {
