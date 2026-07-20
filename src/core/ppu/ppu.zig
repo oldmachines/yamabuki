@@ -400,7 +400,7 @@ pub const Ppu = struct {
     }
 
     /// $213F STAT78: resets the counter-read toggles and the latch flag.
-    /// Bit6 = counters latched, bit4 = NTSC, bits0-3 = PPU2 version.
+    /// Bit6 = counters latched, bit4 = PAL (0 = NTSC), bits0-3 = PPU2 version.
     pub fn readStat78(self: *Ppu, mdr: u8) u8 {
         const v = (if (self.counters_latched) @as(u8, 0x40) else 0) |
             (if (self.pal) @as(u8, 0x10) else 0) |
