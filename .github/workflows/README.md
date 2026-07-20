@@ -22,10 +22,11 @@ The pieces:
 | Workflow | File | Trigger(s) | Role |
 | --- | --- | --- | --- |
 | **CI** | `ci.yml` | `pull_request`; push to `main` | The quality gate: build + full test/golden/bench suite. The loop keys off its result. |
-| **Claude Implement** | `claude-implement.yml` | issue labeled `ready-for-dev`; manual (issue #) | Loop 1/3: implements the issue on `claude/issue-<n>-<slug>` and opens a PR. |
+| **Claude Implement** | `claude-implement.yml` | issue labeled `ready-for-dev`; manual (issue #) | Loop 1/3: implements the issue on `claude/issue-<n>-<slug>`. Opens a **draft PR early** (right after the first push) so a timeout can't strand the branch, then marks it ready. |
 | **Claude Fix CI** | `claude-fix-ci.yml` | `CI` completed → `failure` | Loop 2/3: reads the failing logs and fixes the branch (≤3 attempts). |
 | **Claude Rebase** | `claude-rebase.yml` | cron `*/15`; manual | Loop 2b/3: rebases open `claude/issue-*` PRs that `main` made `CONFLICTING`. |
-| **Claude Auto-merge** | `claude-automerge.yml` | `CI` completed → `success` | Loop 3/3: squash-merges the green PR and closes its linked issues. |
+| **Claude Open PRs** | `claude-open-prs.yml` | cron; manual | Backstop: opens a draft PR for any `claude/issue-*` branch that has commits but no PR (rescues a stranded Implement). |
+| **Claude Auto-merge** | `claude-automerge.yml` | `CI` completed → `success` | Loop 3/3: squash-merges the green PR and closes its linked issues. **Core (`src/`) changes require an approving review; non-core PRs auto-merge on green.** |
 | **Claude Groom** | `claude-groom.yml` | cron `0 8 * * *`; manual | Daily backlog hygiene (dry-run default). |
 | **publish-site** | `publish-site.yml` | (unchanged) | Site/deck publishing. |
 
