@@ -167,6 +167,12 @@ pub const Ppu = struct {
     /// emulated.
     pal: bool,
 
+    /// $213F STAT78 bit7: the interlace field flag. Real hardware toggles it
+    /// once per frame regardless of interlace mode (it is a frame-parity
+    /// signal, not just an interlace indicator) — set by the console at the
+    /// top of every frame.
+    field: bool,
+
     /// Deterministic count of VRAM word reads performed by the renderer's tile
     /// decode. Compiled to a dead field unless the `perf_counters` build option
     /// is set (only the bench enables it), so shipping builds pay nothing. Used
@@ -241,6 +247,7 @@ pub const Ppu = struct {
         .ophct_second = false,
         .opvct_second = false,
         .pal = false,
+        .field = false,
         .perf_vram_reads = 0,
     };
 
@@ -400,9 +407,10 @@ pub const Ppu = struct {
     }
 
     /// $213F STAT78: resets the counter-read toggles and the latch flag.
-    /// Bit6 = counters latched, bit4 = PAL (0 = NTSC), bits0-3 = PPU2 version.
+    /// Bit7 = field flag, bit6 = counters latched, bit4 = PAL (0 = NTSC), bits0-3 = PPU2 version.
     pub fn readStat78(self: *Ppu, mdr: u8) u8 {
-        const v = (if (self.counters_latched) @as(u8, 0x40) else 0) |
+        const v = (if (self.field) @as(u8, 0x80) else 0) |
+            (if (self.counters_latched) @as(u8, 0x40) else 0) |
             (if (self.pal) @as(u8, 0x10) else 0) |
             (mdr & 0x20) | 0x03;
         self.counters_latched = false;
