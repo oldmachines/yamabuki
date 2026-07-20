@@ -208,6 +208,8 @@ pub const FrameSample = struct {
 /// How many distinct loops the hot table can hold before it starts dropping.
 pub const hot_slots: usize = 256;
 
+// TODO(#30): step three — WRAM working set and blockers per hot routine.
+
 // --- step two: which routines cost the frame ---------------------------------
 //
 // Step one answers "is this game CPU-bound"; step two answers "WHERE does the
