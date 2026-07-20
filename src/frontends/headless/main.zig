@@ -30,6 +30,7 @@
 const std = @import("std");
 const core = @import("snes_core");
 const profile = core.profile;
+const util = @import("util");
 
 const Args = struct {
     rom: []const u8,
@@ -142,17 +143,13 @@ pub fn main(init: std.process.Init) !void {
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
-    var drain: [4096]i16 = undefined;
     const frames = args.frames orelse 1;
     for (0..frames) |_| {
         con.runFrame();
-        while (true) {
-            const n = con.readAudio(&drain);
-            if (n == 0) break;
-            audio_hash = core.console.hashAudio(audio_hash, drain[0..n]);
-            for (drain[0..n]) |s| audio_peak = @max(audio_peak, @abs(s));
-            if (args.wav != null) try audio_all.appendSlice(drain[0..n]);
-        }
+        try util.drainAudio(con, &audio_hash, AudioSink{
+            .peak = &audio_peak,
+            .wav = if (args.wav != null) &audio_all else null,
+        }, AudioSink.collect);
     }
 
     const fb = con.framebuffer();
@@ -164,16 +161,28 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     if (args.ppm) |path| {
-        try writePpm(io, path, fb, width, @intCast(fb.len / width));
+        try util.writeFramebufferPpm(gpa, io, path, fb, width, @intCast(fb.len / width));
         try out.print("wrote {s}\n", .{path});
         try out.flush();
     }
     if (args.wav) |path| {
-        try writeWav(io, path, audio_all.items);
+        try util.writeWav(io, path, audio_all.items);
         try out.print("wrote {s} ({} stereo frames)\n", .{ path, audio_all.items.len / 2 });
         try out.flush();
     }
 }
+
+/// The `drainAudio` sink for the main run loop: track peak amplitude always,
+/// and accumulate samples for a WAV dump when one was requested.
+const AudioSink = struct {
+    peak: *u16,
+    wav: ?*std.array_list.Managed(i16),
+
+    fn collect(self: AudioSink, chunk: []const i16) !void {
+        for (chunk) |s| self.peak.* = @max(self.peak.*, @abs(s));
+        if (self.wav) |w| try w.appendSlice(chunk);
+    }
+};
 
 /// Apply `--patch`: reads the patch file, strips the ROM's copier header (the
 /// community's patches are made against unheadered images), applies, and
@@ -674,11 +683,9 @@ fn pct(part: u64, whole: u64) f64 {
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
-    // POSIX-only otherwise; Windows decodes the command line from UTF-16 and
-    // needs an allocator. Not deinit'd — the returned Args slice into it, and
-    // `gpa` is the process arena.
-    var it = try init.minimal.args.iterateAllocator(gpa);
-    _ = it.skip(); // program name
+    // Not deinit'd — the returned Args slice into it, and `gpa` is the
+    // process arena.
+    var it = try util.argIterator(init, gpa);
     var out: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
@@ -718,53 +725,4 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     }
     out.rom = rom orelse return error.NoRom;
     return out;
-}
-
-/// Write interleaved stereo i16 samples as a 32 kHz PCM WAV.
-fn writeWav(io: std.Io, path: []const u8, samples: []const i16) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    const wr = &fw.interface;
-
-    const rate: u32 = @import("snes_core").timing.dsp_sample_hz;
-    const data_len: u32 = @intCast(samples.len * 2);
-    try wr.writeAll("RIFF");
-    try wr.writeInt(u32, 36 + data_len, .little);
-    try wr.writeAll("WAVEfmt ");
-    try wr.writeInt(u32, 16, .little); // PCM chunk size
-    try wr.writeInt(u16, 1, .little); // PCM
-    try wr.writeInt(u16, 2, .little); // stereo
-    try wr.writeInt(u32, rate, .little);
-    try wr.writeInt(u32, rate * 4, .little); // byte rate
-    try wr.writeInt(u16, 4, .little); // block align
-    try wr.writeInt(u16, 16, .little); // bits per sample
-    try wr.writeAll("data");
-    try wr.writeInt(u32, data_len, .little);
-    for (samples) |s| try wr.writeInt(i16, s, .little);
-    try wr.flush();
-}
-
-/// Write an RGB565 framebuffer as a binary PPM (P6, 8-bit RGB).
-fn writePpm(io: std.Io, path: []const u8, fb: []const u16, w: u32, h: u32) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    const wr = &fw.interface;
-
-    try wr.print("P6\n{} {}\n255\n", .{ w, h });
-    for (fb) |px| {
-        const r5: u16 = (px >> 11) & 0x1F;
-        const g6: u16 = (px >> 5) & 0x3F;
-        const b5: u16 = px & 0x1F;
-        const rgb = [3]u8{
-            @intCast(r5 * 255 / 31),
-            @intCast(g6 * 255 / 63),
-            @intCast(b5 * 255 / 31),
-        };
-        try wr.writeAll(&rgb);
-    }
-    try wr.flush();
 }

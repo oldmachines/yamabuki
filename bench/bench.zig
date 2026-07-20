@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const core = @import("snes_core");
+const util = @import("util");
 
 const perf_enabled = @import("perf_options").enabled;
 
@@ -65,10 +66,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    // The allocator form, not `iterate()`: Windows decodes the command line from
-    // UTF-16 and needs one. (`gpa` is the process arena; the args outlive it.)
-    var it = try init.minimal.args.iterateAllocator(gpa);
-    _ = it.skip();
+    var it = try util.argIterator(init, gpa);
     var rom: ?[]const u8 = null;
     var frames: u32 = 600;
     var check = false;
