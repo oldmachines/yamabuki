@@ -1,6 +1,8 @@
 //! Master-clock timing constants. All component clocks divide the master
 //! clock, and all scheduling is expressed in master cycles (u64).
 
+const std = @import("std");
+
 pub const Region = enum { ntsc, pal };
 
 /// NTSC master clock: 315/88 MHz * 6 = 21.477272... MHz.
@@ -21,6 +23,20 @@ pub const render_start_dot: u64 = 22;
 
 pub const ntsc_lines_per_frame: u32 = 262;
 pub const pal_lines_per_frame: u32 = 312;
+
+/// Header region-byte codes ($xxD9) that run at 60 Hz; every other code is a
+/// PAL territory (50 Hz). Per the SNES dev manual's region table: Japan, the
+/// US, Korea, Canada, and Brazil are NTSC — the rest (Europe and other PAL
+/// territories) are PAL.
+const ntsc_region_bytes = [_]u8{ 0x00, 0x01, 0x0D, 0x0F, 0x10 };
+
+/// Map a cart header's region byte to NTSC/PAL timing.
+pub fn regionFromHeaderByte(byte: u8) Region {
+    for (ntsc_region_bytes) |b| {
+        if (b == byte) return .ntsc;
+    }
+    return .pal;
+}
 
 /// Visible scanlines with overscan off / on.
 pub const visible_lines_224: u32 = 224;
@@ -43,3 +59,17 @@ pub const speed_xslow: u8 = 12; // $4000-$41FF (controller ports)
 pub const spc700_hz: u64 = 1_024_000;
 /// S-DSP output sample rate.
 pub const dsp_sample_hz: u32 = 32_000;
+
+test "regionFromHeaderByte: NTSC codes" {
+    for ([_]u8{ 0x00, 0x01, 0x0D, 0x0F, 0x10 }) |b| {
+        try std.testing.expectEqual(Region.ntsc, regionFromHeaderByte(b));
+    }
+}
+
+test "regionFromHeaderByte: PAL codes" {
+    // 0x02 Europe (DKC2/Secret of Mana (E)), plus a scattering of the other
+    // PAL-territory codes and the unassigned tail.
+    for ([_]u8{ 0x02, 0x03, 0x09, 0x0A, 0x11, 0xFF }) |b| {
+        try std.testing.expectEqual(Region.pal, regionFromHeaderByte(b));
+    }
+}
