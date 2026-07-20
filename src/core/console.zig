@@ -79,8 +79,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.init(&self.cart);
             self.bus.beam_enabled = cfg.accuracy == .accurate;
             self.cpu = Cpu(Bus).init(&self.bus);
-            self.region = .ntsc;
+            self.region = timing.regionFromHeaderByte(self.cart.header.region);
+            self.bus.ppu.pal = self.region == .pal;
             self.reset();
+        }
+
+        /// Explicit region override (frontend `--region ntsc|pal`), replacing
+        /// the header-detected default `init` set. Must be called before the
+        /// first `runFrame`.
+        pub fn setRegion(self: *Self, r: timing.Region) void {
+            self.region = r;
+            self.bus.ppu.pal = r == .pal;
         }
 
         /// Power-on / reset: reload CPU vectors and restart the frame timeline.
@@ -465,6 +474,20 @@ pub const AnyConsole = union(Accuracy) {
         return std.meta.activeTag(self.*);
     }
 
+    pub fn region(self: *const AnyConsole) timing.Region {
+        switch (self.*) {
+            inline else => |*c| return c.region,
+        }
+    }
+
+    /// Explicit region override (frontend `--region ntsc|pal`); see
+    /// `Console.setRegion`.
+    pub fn setRegion(self: *AnyConsole, r: timing.Region) void {
+        switch (self.*) {
+            inline else => |*c| c.setRegion(r),
+        }
+    }
+
     pub fn cartridge(self: *AnyConsole) *Cartridge {
         switch (self.*) {
             inline else => |*c| return &c.cart,
@@ -615,6 +638,30 @@ test "scheduler delivers a vblank NMI and runFrame terminates" {
 
     con.runFrame();
     try std.testing.expectEqual(@as(u8, 2), con.bus.wram.data[0]);
+}
+
+test "region defaults from the header byte and setRegion overrides it" {
+    const alloc = std.testing.allocator;
+    const rom = try buildNmiRom(alloc);
+    defer alloc.free(rom);
+
+    const cart = try Cartridge.load(alloc, rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    // buildNmiRom's header region byte is 0 (Japan) -> NTSC by default.
+    try std.testing.expectEqual(timing.Region.ntsc, con.region);
+    try std.testing.expectEqual(timing.ntsc_lines_per_frame, con.linesPerFrame());
+    try std.testing.expect(!con.bus.ppu.pal);
+
+    con.setRegion(.pal);
+    try std.testing.expectEqual(timing.Region.pal, con.region);
+    try std.testing.expectEqual(timing.pal_lines_per_frame, con.linesPerFrame());
+    try std.testing.expect(con.bus.ppu.pal);
 }
 
 test "ROM-programmed backdrop appears in the framebuffer" {

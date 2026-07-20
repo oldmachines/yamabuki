@@ -161,6 +161,12 @@ pub const Ppu = struct {
     ophct_second: bool,
     opvct_second: bool,
 
+    /// STAT78 bit4: set by the console from the cart's detected/overridden
+    /// region. Games read this to self-check region (e.g. DKC2's "not
+    /// designed for this system" screen); CIC region lockout itself is not
+    /// emulated.
+    pal: bool,
+
     /// Deterministic count of VRAM word reads performed by the renderer's tile
     /// decode. Compiled to a dead field unless the `perf_counters` build option
     /// is set (only the bench enables it), so shipping builds pay nothing. Used
@@ -234,6 +240,7 @@ pub const Ppu = struct {
         .counters_latched = false,
         .ophct_second = false,
         .opvct_second = false,
+        .pal = false,
         .perf_vram_reads = 0,
     };
 
@@ -395,7 +402,9 @@ pub const Ppu = struct {
     /// $213F STAT78: resets the counter-read toggles and the latch flag.
     /// Bit6 = counters latched, bit4 = NTSC, bits0-3 = PPU2 version.
     pub fn readStat78(self: *Ppu, mdr: u8) u8 {
-        const v = (if (self.counters_latched) @as(u8, 0x40) else 0) | (mdr & 0x20) | 0x03;
+        const v = (if (self.counters_latched) @as(u8, 0x40) else 0) |
+            (if (self.pal) @as(u8, 0x10) else 0) |
+            (mdr & 0x20) | 0x03;
         self.counters_latched = false;
         self.ophct_second = false;
         self.opvct_second = false;
@@ -694,6 +703,13 @@ test "window registers latch" {
     try std.testing.expectEqual(@as(u8, 0x02), ppu.wbglog);
     try std.testing.expectEqual(@as(u8, 0x11), ppu.tmw);
     try std.testing.expectEqual(@as(u8, 0x01), ppu.tsw);
+}
+
+test "STAT78 PAL bit reads correctly per region" {
+    var ppu: Ppu = .init;
+    try std.testing.expectEqual(@as(u8, 0), ppu.readStat78(0) & 0x10);
+    ppu.pal = true;
+    try std.testing.expectEqual(@as(u8, 0x10), ppu.readStat78(0) & 0x10);
 }
 
 test "mode 7 matrix write-twice, 13-bit center, and multiply" {
