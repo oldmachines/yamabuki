@@ -22,6 +22,10 @@ const Cx4 = @import("../chips/cx4.zig").Cx4;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
+/// A page table entry, as seen by callers that still want the bundled view
+/// (mappers.zig builds pages one of these at a time). The bus itself stores
+/// the three fields in separate arrays — see `page_read`/`page_write`/
+/// `page_speed` below.
 pub const Page = struct {
     read: ?[*]const u8,
     write: ?[*]u8,
@@ -35,7 +39,7 @@ pub const page_size = 0x2000;
 pub const page_count = 0x100_0000 / page_size; // 2048
 
 pub const Bus = struct {
-    // The page table holds raw pointers into wram/cart and is rebuilt by
+    // The page tables hold raw pointers into wram/cart and are rebuilt by
     // remap() on load; the cart reference is re-supplied by the frontend.
     // `last_data_read`, `last_data_write` and `input_polled` are diagnostics,
     // not machine state; `coproc_irq_line` is derived from the chips' own
@@ -43,13 +47,18 @@ pub const Bus = struct {
     // configuration, set once at startup — it must survive a loadState
     // (skipped fields keep their in-memory value), so an old save does not
     // silently turn the option off.
-    pub const serialize_skip = .{ "pages", "cart", "last_data_read", "last_data_write", "input_polled", "coproc_irq_line", "auto_fastrom" };
+    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "coproc_irq_line", "auto_fastrom" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
     pub const no_data_access: u32 = 0x0100_0000;
 
-    pages: [page_count]Page,
+    // Split from one `[2048]Page` (48 KiB — bigger than a Cortex-A53's 32 KiB
+    // L1D) into three parallel arrays so the read-hot path only touches
+    // page_read (16 KiB) instead of the whole padded struct.
+    page_read: [page_count]?[*]const u8,
+    page_write: [page_count]?[*]u8,
+    page_speed: [page_count]u8,
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
@@ -251,15 +260,14 @@ pub const Bus = struct {
     /// no clock charge, no MDR update, no MMIO dispatch. Returns null off the
     /// fast path — code executing from an MMIO page is not worth peeking.
     pub inline fn peek8(self: *const Bus, addr: u24) ?u8 {
-        const page = &self.pages[addr >> 13];
-        if (page.read) |p| return p[addr & (page_size - 1)];
+        if (self.page_read[addr >> 13]) |p| return p[addr & (page_size - 1)];
         return null;
     }
 
     pub inline fn read8(self: *Bus, addr: u24) u8 {
-        const page = &self.pages[addr >> 13];
-        if (page.read) |p| {
-            self.clock += page.speed;
+        const idx = addr >> 13;
+        if (self.page_read[idx]) |p| {
+            self.clock += self.page_speed[idx];
             const v = p[addr & (page_size - 1)];
             self.mdr = v;
             return v;
@@ -269,9 +277,9 @@ pub const Bus = struct {
 
     pub inline fn write8(self: *Bus, addr: u24, value: u8) void {
         self.mdr = value;
-        const page = &self.pages[addr >> 13];
-        if (page.write) |p| {
-            self.clock += page.speed;
+        const idx = addr >> 13;
+        if (self.page_write[idx]) |p| {
+            self.clock += self.page_speed[idx];
             p[addr & (page_size - 1)] = value;
             return;
         }
@@ -842,20 +850,19 @@ test "auto-FastROM pins MEMSEL and remaps the upper-bank ROM pages" {
     defer tc.destroy();
 
     // A ROM page in the upper banks ($80:8000) charges SlowROM by default.
-    const upper_page = &tc.bus.pages[0x80_8000 >> 13];
-    try std.testing.expectEqual(timing.speed_slow, upper_page.speed);
+    try std.testing.expectEqual(timing.speed_slow, tc.bus.page_speed[0x80_8000 >> 13]);
 
     tc.bus.enableAutoFastrom();
     try std.testing.expect(tc.bus.fastrom);
-    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.page_speed[0x80_8000 >> 13]);
     // The mirror in the lower banks stays slow — FastROM only ever applies
     // to $80-$FF, exactly like a real MEMSEL=1.
-    try std.testing.expectEqual(timing.speed_slow, tc.bus.pages[0x00_8000 >> 13].speed);
+    try std.testing.expectEqual(timing.speed_slow, tc.bus.page_speed[0x00_8000 >> 13]);
 
     // The game clearing MEMSEL (reset code writing 0) must not undo it.
     tc.bus.write8(0x00_420D, 0);
     try std.testing.expect(tc.bus.fastrom);
-    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.page_speed[0x80_8000 >> 13]);
 
     // And the option survives a save/load: fastrom is serialized as false in
     // an old save, but the skipped in-memory option re-pins it in postLoad.
@@ -868,7 +875,7 @@ test "auto-FastROM pins MEMSEL and remaps the upper-bank ROM pages" {
     _ = try serialize.read(Bus, &tc.bus, buf);
     tc.bus.postLoad();
     try std.testing.expect(tc.bus.fastrom);
-    try std.testing.expectEqual(timing.speed_fast, tc.bus.pages[0x80_8000 >> 13].speed);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.page_speed[0x80_8000 >> 13]);
 }
 
 test "aggregated coprocessor IRQ line follows the SA-1 and survives save/load" {
