@@ -44,7 +44,7 @@ pub const Ppu = struct {
     // Derived state: the RGB565 palette and the brightness-scaled line palette
     // are rebuilt from cgram, and the framebuffer is output, so none is part of
     // the saved state.
-    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width", "perf_vram_reads" };
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width", "perf_vram_reads", "wide_margin" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -266,6 +266,7 @@ pub const Ppu = struct {
         .pal = false,
         .field = false,
         .perf_vram_reads = 0,
+        .wide_margin = 0,
     };
 
     /// Rebuild the RGB565 palette from CGRAM after deserialization. The
@@ -582,12 +583,14 @@ pub const Ppu = struct {
 
     /// Render one visible scanline into the framebuffer: force-blank/backdrop
     /// handling plus the BG and sprite compositor. The frame's row stride
-    /// starts at 256 and is promoted (with the rows already rendered doubled
-    /// in place) the first time a line renders hi-res.
+    /// starts at 256 (or `256 + 2*wide_margin` under `--wide`) and is promoted
+    /// (with the rows already rendered doubled in place) the first time a line
+    /// renders hi-res — hi-res promotion only ever happens with no margin, so a
+    /// `--wide` frame's stride never changes mid-frame.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
-        if (line == 0) self.fb_line_width = fb_width;
-        if (self.fb_line_width == fb_width and !self.force_blank and self.hiresActive()) {
+        if (line == 0) self.fb_line_width = fb_width + 2 * self.wide_margin;
+        if (self.wide_margin == 0 and self.fb_line_width == fb_width and !self.force_blank and self.hiresActive()) {
             self.promoteFrame(line);
         }
         line_render.renderLine(self, line);
