@@ -18,6 +18,13 @@ pub const fb_width: u32 = 256;
 pub const fb_width_max: u32 = 512;
 pub const fb_height: u32 = 239;
 
+/// `--wide N` (M12, fast core only): largest margin extension on each side of
+/// the standard 256-wide line, giving a 256+2*wide_margin_max = 384-wide
+/// ceiling. Kept below `fb_width_max` (512, the genuine hi-res width) so a
+/// wide frame's width can never collide with hi-res's — frontends tell the
+/// two apart by "is it exactly 512" without carrying a separate flag.
+pub const wide_margin_max: u32 = 64;
+
 /// Per-background-layer configuration latched from the register file.
 pub const BgLayer = struct {
     /// Tilemap base, in VRAM words.
@@ -179,6 +186,16 @@ pub const Ppu = struct {
     /// by `zig build bench --check` to gate memory-traffic regressions: the
     /// tile-row decode cache reduces this ~8x, and a revert would fail the gate.
     perf_vram_reads: u64,
+
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, widening `fb_line_width` to `fb_width + 2*wide_margin`. Zero
+    /// (the default) reproduces the original 256/512 behavior exactly — every
+    /// render-path formula that reads this field reduces to the unmodified
+    /// one when it is zero, so an unset `--wide` costs nothing beyond the
+    /// per-line comparison. Frontends refuse to combine `--wide` with
+    /// `--accurate`, so this stays 0 on the accurate core in practice; the
+    /// dot renderer (`renderUpTo`/`finishScanline`) never reads it.
+    wide_margin: u16,
 
     pub const init: Ppu = .{
         .vram = @splat(0),
