@@ -27,6 +27,7 @@ const sdl3 = @import("sdl3.zig");
 const gl = @import("gl.zig");
 const preset = @import("preset.zig");
 const shader = @import("shader.zig");
+const util = @import("util");
 
 const Button = core.joypad.Button;
 
@@ -109,36 +110,21 @@ const Args = struct {
     auto_fastrom: bool = false,
 };
 
-/// Write 24-bit RGB as a binary PPM — the same format the headless runner emits,
-/// so one converter handles both.
-fn writePpm(io: std.Io, path: []const u8, w: u32, h: u32, rgb: []const u8) !void {
-    var header: [64]u8 = undefined;
-    const head = try std.fmt.bufPrint(&header, "P6\n{d} {d}\n255\n", .{ w, h });
+/// The `drainAudio` sink for the main run loop: forward each chunk to the SDL
+/// audio stream, dropping it under fast-forward once the device already has
+/// `ff_max_queued_bytes` queued (the point is to skip ahead, not to queue up
+/// a backlog).
+const AudioSink = struct {
+    sdl: sdl3.Api,
+    stream: ?*sdl3.AudioStream,
+    fast_forward: bool,
 
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(head);
-    try writer.interface.writeAll(rgb);
-    try writer.interface.flush();
-}
-
-/// The console's own framebuffer, RGB565 expanded to RGB888 — what you get when
-/// no shader is loaded. The 5/6-bit channels are bit-replicated into 8 so white
-/// stays white instead of landing on 0xF8.
-fn framebufferRgb(gpa: std.mem.Allocator, fb: []const u16, w: u32, h: u32) ![]u8 {
-    const rgb = try gpa.alloc(u8, @as(usize, w) * @as(usize, h) * 3);
-    for (fb[0 .. @as(usize, w) * @as(usize, h)], 0..) |px, i| {
-        const r5: u8 = @intCast((px >> 11) & 0x1F);
-        const g6: u8 = @intCast((px >> 5) & 0x3F);
-        const b5: u8 = @intCast(px & 0x1F);
-        rgb[i * 3 + 0] = (r5 << 3) | (r5 >> 2);
-        rgb[i * 3 + 1] = (g6 << 2) | (g6 >> 4);
-        rgb[i * 3 + 2] = (b5 << 3) | (b5 >> 2);
+    fn push(self: AudioSink, chunk: []const i16) !void {
+        const stream = self.stream orelse return;
+        if (!self.fast_forward or self.sdl.SDL_GetAudioStreamQueued(stream) < ff_max_queued_bytes)
+            _ = self.sdl.SDL_PutAudioStreamData(stream, chunk.ptr, @intCast(chunk.len * 2));
     }
-    return rgb;
-}
+};
 
 const Keymap = struct { code: u32, mask: u16 };
 
@@ -419,14 +405,11 @@ pub fn main(init: std.process.Init) !void {
                 if (wantsShot(args.shot_frames, frames_run, args.frames)) {
                     const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
                     if (g.chain().capture(gpa, win)) |img| {
-                        const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
-                        writePpm(io, path, img.w, img.h, img.rgb) catch |e| {
-                            try err.print("shot failed: {s}\n", .{@errorName(e)});
-                        };
+                        try util.maybeShot(io, gpa, err, prefix, frames_run, img.w, img.h, img.rgb);
                     } else |e| {
                         try err.print("capture failed: {s}\n", .{@errorName(e)});
+                        try err.flush();
                     }
-                    try err.flush();
                 }
             }
             _ = g.sdl_gl.SDL_GL_SwapWindow(window);
@@ -465,27 +448,18 @@ pub fn main(init: std.process.Init) !void {
             // No shader: the console's framebuffer *is* the picture.
             if (args.shot) |prefix| {
                 if (wantsShot(args.shot_frames, frames_run, args.frames)) {
-                    const rgb = try framebufferRgb(gpa, fb, width, height);
-                    const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
-                    writePpm(io, path, width, height, rgb) catch |e| {
-                        try err.print("shot failed: {s}\n", .{@errorName(e)});
-                        try err.flush();
-                    };
+                    const rgb = try util.expandFramebuffer(gpa, fb, width, height);
+                    try util.maybeShot(io, gpa, err, prefix, frames_run, width, height, rgb);
                 }
             }
         }
 
         // Audio: drain the console ring into the SDL stream.
-        var drain: [4096]i16 = undefined;
-        while (true) {
-            const n = con.readAudio(&drain);
-            if (n == 0) break;
-            audio_hash = core.console.hashAudio(audio_hash, drain[0..n]);
-            if (audio) |stream| {
-                if (!fast_forward or sdl.SDL_GetAudioStreamQueued(stream) < ff_max_queued_bytes)
-                    _ = sdl.SDL_PutAudioStreamData(stream, &drain, @intCast(n * 2));
-            }
-        }
+        try util.drainAudio(con, &audio_hash, AudioSink{
+            .sdl = sdl,
+            .stream = audio,
+            .fast_forward = fast_forward,
+        }, AudioSink.push);
 
         if (args.frames != 0 and frames_run >= args.frames) running = false;
 
@@ -724,15 +698,10 @@ fn cycleShader(
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
-    // `iterate()` is POSIX-only — on Windows the command line has to be decoded
-    // from UTF-16, which needs an allocator. The allocator form works on every
-    // target, so the frontend builds and runs on a dev box as well as on the
-    // handheld it is aimed at.
     // Deliberately not deinit'd: on Windows the iterator owns the decoded
     // strings, and `Args.rom` / `Args.shader` are slices into them. `gpa` is the
     // process arena, so they live exactly as long as they need to.
-    var it = try init.minimal.args.iterateAllocator(gpa);
-    _ = it.skip(); // program name
+    var it = try util.argIterator(init, gpa);
     var args: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
