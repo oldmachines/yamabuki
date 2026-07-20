@@ -6,6 +6,11 @@ name: Claude Auto-merge
 # branch, re-confirms the PR's checks are green and it isn't a draft, then
 # squash-merges and closes the linked issues. This is an explicit
 # workflow_run-driven merge, so it works without branch-protection rules.
+#
+# Review gate: a PR that changes any file under `src/` (the emulator core) is only
+# merged once it has an approving review. Non-core PRs (docs, tests, CI, the deck,
+# shaders) still auto-merge when green. This keeps the loop hands-off for low-risk
+# changes while a human always sees core behaviour changes before they land.
 
 on:
   workflow_run:
@@ -56,9 +61,17 @@ jobs:
                have landed after this run started): `gh pr checks <n>`. If any
                required check is failing or still pending, STOP — a fresher CI run
                will handle it. Merge only when all required checks are green.
-            3. Squash-merge and delete the branch:
+            3. REVIEW GATE for core changes. List the PR's changed files:
+               `gh pr diff <n> --name-only`. If ANY changed file path starts with
+               `src/` (the emulator core), the PR needs a human approval: check
+               `gh pr view <n> --json reviewDecision`. If reviewDecision is not
+               "APPROVED", STOP — do not merge; if you haven't already, leave one
+               short comment that it's green and awaiting review, then finish. A PR
+               that touches NO `src/` files (docs, tests, CI, deck, shaders) skips
+               this gate and may merge on green.
+            4. Squash-merge and delete the branch:
                `gh pr merge <n> --squash --delete-branch`.
-            4. Close the linked issues. Parse close/fix/resolve keywords from the
+            5. Close the linked issues. Parse close/fix/resolve keywords from the
                PR body (e.g. "Closes #<n>", "Fixes #<n>", "Resolves #<n>") and,
                for each STILL-OPEN issue, close it with a short completion comment
                (`gh issue close <n> --comment "..."`). A token-made merge does not
