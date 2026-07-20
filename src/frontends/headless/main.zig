@@ -3,7 +3,7 @@
 //! whole audio stream as a WAV, both for eyeballing.
 //!
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
-//!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc]
+//!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc] [--wide N]
 //!   yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
@@ -66,6 +66,10 @@ const Args = struct {
     /// Steps two and three of the analyser: the per-routine cycle attribution
     /// table, and each hot routine's WRAM working set and blockers.
     routines: bool = false,
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
+    /// margin. Fast core only — refused together with `--accurate`.
+    wide: u32 = 0,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
@@ -79,11 +83,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = parseArgs(init, gpa) catch {
+    const args = parseArgs(init, gpa) catch |e| {
+        if (e == error.WideNeedsFast) {
+            try out.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
+        } else if (e == error.WideTooBig) {
+            try out.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
+        }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
-            \\                         [--patch-dir DIR] [--save-patched out.sfc]
+            \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
@@ -92,6 +101,8 @@ pub fn main(init: std.process.Init) !void {
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
+            \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
+            \\                (fast core only; for widescreen game patches such as wide-snes)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -154,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
         .pal => con.setRegion(.pal),
     }
     if (args.auto_fastrom) con.enableAutoFastrom();
+    if (args.wide != 0) con.setWideMargin(args.wide);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -924,10 +936,17 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--wide")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
     out.rom = rom orelse return error.NoRom;
+    if (out.wide != 0) {
+        if (out.accuracy == .accurate) return error.WideNeedsFast;
+        if (out.wide > core.ppu.wide_margin_max) return error.WideTooBig;
+    }
     return out;
 }

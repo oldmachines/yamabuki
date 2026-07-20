@@ -1,6 +1,6 @@
 //! SDL3 desktop frontend: the development-and-play UI.
 //!
-//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]
+//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate] [--wide N]
 //!
 //! Controls (RetroArch keyboard defaults):
 //!   arrows = d-pad   Z = B   X = A   A = Y   S = X   Q = L   W = R
@@ -11,9 +11,11 @@
 //!   , / .  cycle shaders (only the presets baked for this GPU's profile)
 //!
 //! Video is the console's native RGB565 framebuffer streamed into a texture
-//! (recreated when the machine switches to hi-res/overscan dimensions) and
-//! letterboxed onto a 512x(2*height) logical canvas — 256-wide frames scale
-//! by an exact 2x, hi-res frames map 1:1. Audio goes to an SDL audio stream
+//! (recreated when the machine switches to hi-res/overscan/`--wide` dimensions)
+//! and letterboxed onto a (2*width)x(2*height) logical canvas — 256-wide
+//! frames scale by an exact 2x (so does a `--wide`-widened frame, showing more
+//! picture rather than stretching it), hi-res frames map 1:1 horizontally.
+//! Audio goes to an SDL audio stream
 //! at the DSP's native 32 kHz; the device side resamples. Pacing is a
 //! nanosecond accumulator locked to the loaded cart's region frame rate
 //! (~60.0988 Hz NTSC, 50 Hz PAL — `--region` overrides the header's
@@ -116,6 +118,10 @@ const Args = struct {
     /// SlowROM game), gated by patches/fastrom-compat.zon — `broken` refuses,
     /// unknown warns loudly.
     auto_fastrom: bool = false,
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
+    /// margin. Fast core only — refused together with `--accurate`.
+    wide: u32 = 0,
 };
 
 /// The `drainAudio` sink for the main run loop: forward each chunk to the SDL
@@ -166,13 +172,19 @@ pub fn main(init: std.process.Init) !void {
     const args = parseArgs(init, gpa) catch |e| {
         if (e == error.ShotNeedsFrames) {
             try err.print("error: --shot without --shot-frames captures the last frame, which needs --frames N\n", .{});
+        } else if (e == error.WideNeedsFast) {
+            try err.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
+        } else if (e == error.WideTooBig) {
+            try err.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
         }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
                 "                    [--region ntsc|pal|auto] [--shader NAME] [--shader-dir DIR]\n" ++
-                "                    [--patch p.bps|p.ips] [--auto-fastrom]\n" ++
+                "                    [--patch p.bps|p.ips] [--auto-fastrom] [--wide N]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
                 "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
+                "  --wide N    widen the framebuffer by N columns on each side, e.g. 32 -> 320x224\n" ++
+                "              (fast core only; for widescreen game patches such as wide-snes)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -248,6 +260,7 @@ pub fn main(init: std.process.Init) !void {
         .pal => con.setRegion(.pal),
     }
     if (args.auto_fastrom) con.enableAutoFastrom();
+    if (args.wide != 0) con.setWideMargin(args.wide);
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{args.rom});
 
@@ -261,7 +274,7 @@ pub fn main(init: std.process.Init) !void {
 
     const window = sdl.SDL_CreateWindow(
         "Yamabuki",
-        @intCast(256 * args.scale),
+        @intCast((256 + 2 * args.wide) * args.scale),
         @intCast(224 * args.scale),
         sdl3.window_resizable | if (args.shader != null) sdl3.window_opengl else 0,
     ) orelse {
@@ -461,11 +474,17 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 _ = sdl.SDL_SetTextureScaleMode(texture.?, sdl3.scale_mode_nearest);
-                // 256-wide frames scale 2x onto the canvas, hi-res maps 1:1; the
-                // canvas keeps the SNES 8:7 shape and letterboxes into the window.
+                // 256-wide (or `--wide`-widened) frames scale 2x onto the
+                // canvas — a wider frame gets a proportionally wider canvas,
+                // showing more picture rather than stretching it; genuine
+                // hi-res (exactly core.ppu.fb_width_max, a width `--wide`
+                // can never reach — see `core.ppu.wide_margin_max`) maps 1:1
+                // instead. The canvas keeps the resulting shape and
+                // letterboxes into the window.
+                const canvas_w: u32 = if (width == core.ppu.fb_width_max) core.ppu.fb_width_max else width * 2;
                 _ = sdl.SDL_SetRenderLogicalPresentation(
                     r,
-                    512,
+                    @intCast(canvas_w),
                     @intCast(height * 2),
                     sdl3.logical_presentation_letterbox,
                 );
@@ -773,6 +792,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 try list.append(gpa, try std.fmt.parseInt(u32, t, 10));
             }
             args.shot_frames = try list.toOwnedSlice(gpa);
+        } else if (std.mem.eql(u8, a, "--wide")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
@@ -783,5 +805,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // silently writing nothing.
     if (args.shot != null and args.shot_frames.len == 0 and args.frames == 0)
         return error.ShotNeedsFrames;
+    if (args.wide != 0) {
+        if (args.accuracy == .accurate) return error.WideNeedsFast;
+        if (args.wide > core.ppu.wide_margin_max) return error.WideTooBig;
+    }
     return args;
 }
