@@ -146,6 +146,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // New frame: leave vblank, clear the vblank NMI flag.
                 io.in_vblank = false;
                 io.nmi_flag = false;
+                // STAT78 ($213F) bit7: hardware toggles the field flag once per
+                // frame (a frame-parity signal, not just an interlace one). A
+                // script waiting on it to change hangs forever if it never does.
+                self.bus.ppu.field = !self.bus.ppu.field;
             }
             if (line == self.vblankLine()) {
                 // The game's deadline: its main loop had until now to come
@@ -972,6 +976,42 @@ test "V-IRQ timer fires once per frame on its scanline and TIMEUP acks it" {
     con.runFrame();
     con.runFrame();
     try std.testing.expectEqual(@as(u8, 3), con.bus.wram.data[0]);
+}
+
+test "STAT78 exposes the per-frame field flag ($213F bit 7)" {
+    // Real hardware toggles STAT78's field flag once per frame — a frame-parity
+    // signal, independent of interlace mode — and a script that waits for it to
+    // change to advance (a common cutscene-timing idiom) hangs forever if it is
+    // hardwired to zero. `field` was declared nowhere and $213F never read it;
+    // the same bug class as HVBJOY's H-blank flag (`isHblank`).
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    const code = [_]u8{ 0x80, 0xFE }; // loop: BRA loop
+    @memcpy(rom[0..code.len], &code);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "FIELD TEST           ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    const f0 = con.bus.read8(0x00_213F) & 0x80;
+    con.runFrame();
+    const f1 = con.bus.read8(0x00_213F) & 0x80;
+    try std.testing.expect(f0 != f1); // toggled after one frame
+    con.runFrame();
+    try std.testing.expectEqual(f0, con.bus.read8(0x00_213F) & 0x80); // and back
 }
 
 test "HDMA indirect mode drives INIDISP per scanline" {
