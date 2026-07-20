@@ -24,7 +24,10 @@
 //!
 //! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
 //! game with the frame-budget profiler compiled in and answers the question that
-//! comes before every other one — *is this game CPU-bound at all?* See
+//! comes before every other one — *is this game CPU-bound at all?* `--routines`
+//! adds steps two and three: which routines cost the frame, and each hot
+//! routine's WRAM working set, MMIO blockers, and page-sharing with the rest —
+//! the numbers that decide whether it is worth moving to the SA-1. See
 //! `core/profile.zig` for what is being measured and why.
 
 const std = @import("std");
@@ -55,7 +58,8 @@ const Args = struct {
     json: bool = false,
     /// Dump the hottest loops and how each was classified.
     hot: bool = false,
-    /// Step two of the analyser: the per-routine cycle attribution table.
+    /// Steps two and three of the analyser: the per-routine cycle attribution
+    /// table, and each hot routine's WRAM working set and blockers.
     routines: bool = false,
 };
 
@@ -84,7 +88,8 @@ pub fn main(init: std.process.Init) !void {
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
-            \\  --routines    step two: which routines cost the frame (self/inclusive cycles per call site)
+            \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
+            \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
             \\
         , .{});
         try out.flush();
@@ -454,17 +459,32 @@ fn runReport(
         if (args.routines) {
             const rows = try routineRows(gpa, &con.prof);
             const total = attributedTotal(rows);
-            try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"routines\":[", .{
+            const verdict = wramVerdict(topCodeRows(rows));
+            try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"wram_verdict\":" ++
+                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"routines\":[", .{
                 con.prof.stack_resets, con.prof.routines_dropped,
+                verdict.union_bytes,   verdict.union_pages,
+                verdict.fits_iram,     verdict.fits_bwram,
             });
             for (rows, 0..) |r, i| {
                 if (i != 0) try out.print(",", .{});
                 switch (r.what) {
                     .waiting => try out.print("{{\"entry\":\"(waiting)\"", .{}),
                     .main => try out.print("{{\"entry\":\"(main)\"", .{}),
-                    .code => try out.print("{{\"entry\":\"{x:0>2}:{x:0>4}\",\"kind\":\"{s}\",\"calls\":{},\"incl\":{}", .{
-                        r.entry >> 16, r.entry & 0xFFFF, @tagName(r.kind), r.calls, r.incl,
-                    }),
+                    .code => {
+                        try out.print("{{\"entry\":\"{x:0>2}:{x:0>4}\",\"kind\":\"{s}\",\"calls\":{},\"incl\":{}", .{
+                            r.entry >> 16, r.entry & 0xFFFF, @tagName(r.kind), r.calls, r.incl,
+                        });
+                        try out.print(
+                            ",\"wram_min\":{},\"wram_max\":{},\"wram_exact\":{},\"touches_sram\":{},\"shared\":{},\"mmio\":[",
+                            .{ r.wram.min_bytes, r.wram.max_bytes, r.wram.exact, r.touches_sram, wramShared(rows, i) },
+                        );
+                        for (r.mmio_regs, 0..) |reg, mi| {
+                            if (mi != 0) try out.print(",", .{});
+                            try out.print("\"${x:0>4}\"", .{reg});
+                        }
+                        try out.print("]", .{});
+                    },
                 }
                 try out.print(",\"self\":{},\"self_pct\":{d:.4},\"slow\":{}}}", .{
                     r.self, pct(r.self, total), r.slow,
@@ -588,7 +608,7 @@ fn runReport(
         try out.print("     {s:<10} {s:>9} {s:>14} {s:>7} {s:>7} {s:>7}  {s}\n", .{
             "entry", "calls", "self cycles", "self%", "incl%", "slow%", "",
         });
-        for (rows[0..@min(rows.len, routine_rows_shown)]) |r| {
+        for (rows[0..@min(rows.len, routine_rows_shown)], 0..) |r, i| {
             switch (r.what) {
                 .waiting => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(waiting)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
@@ -596,12 +616,33 @@ fn runReport(
                 .main => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
                 }),
-                .code => try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
-                    r.entry >> 16,       r.entry & 0xFFFF,
-                    r.calls,             r.self,
-                    pct(r.self, total),  pct(r.incl, total),
-                    pct(r.slow, r.self), if (r.kind == .code) "" else @tagName(r.kind),
-                }),
+                .code => {
+                    try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
+                        r.entry >> 16,       r.entry & 0xFFFF,
+                        r.calls,             r.self,
+                        pct(r.self, total),  pct(r.incl, total),
+                        pct(r.slow, r.self), if (r.kind == .code) "" else @tagName(r.kind),
+                    });
+                    // Step three: what it would cost to move — its WRAM
+                    // footprint (must relocate), MMIO it cannot reach from
+                    // the SA-1, and whether another top routine shares its
+                    // WRAM (moving one would strand the other).
+                    try out.print("                wram ", .{});
+                    try printWramFootprint(out, r.wram);
+                    if (r.touches_sram) try out.print("  bw-ram/sram", .{});
+                    if (wramShared(rows, i)) try out.print("  SHARED", .{});
+                    if (r.mmio_regs.len > 0) {
+                        try out.print("  mmio", .{});
+                        for (r.mmio_regs, 0..) |reg, mi| {
+                            if (mi == 6) {
+                                try out.print(" +{} more", .{r.mmio_regs.len - mi});
+                                break;
+                            }
+                            try out.print(" ${x:0>4}", .{reg});
+                        }
+                    }
+                    try out.print("\n", .{});
+                },
             }
         }
         if (con.prof.stack_resets != 0 or con.prof.routines_dropped != 0) {
@@ -611,6 +652,28 @@ fn runReport(
         }
         if (!con.prof.attributionBalanced()) {
             try out.print("     WARNING: attribution imbalance — the table does not sum to work+idle (bug)\n", .{});
+        }
+
+        const verdict = wramVerdict(topCodeRows(rows));
+        try out.print("\n  WRAM working set of the top routines: ", .{});
+        if (verdict.union_pages == 0) {
+            try out.print("none recorded (no WRAM access seen in the top routines)\n", .{});
+        } else {
+            try printByteCount(out, verdict.union_bytes);
+            try out.print(" across {} page(s) of {} — ", .{ verdict.union_pages, profile.wram_page_count });
+            if (verdict.fits_iram) {
+                try out.print("fits I-RAM (2 KiB): a conversion has somewhere to put it.\n", .{});
+            } else if (verdict.fits_bwram) {
+                try out.print("too big for I-RAM (2 KiB) but fits cartridge BW-RAM (256 KiB).\n", .{});
+            } else {
+                try out.print("exceeds even BW-RAM (256 KiB) — would not fit as a straight port.\n", .{});
+            }
+            try out.print(
+                \\    (page-granularity upper bound: a touched 256-byte page counts as fully
+                \\    used even if only one byte of it is. SHARED above names the blocker —
+                \\    moving that routine strands whichever other one shares its page.)
+                \\
+            , .{});
         }
     }
 
@@ -640,6 +703,13 @@ const RoutineRow = struct {
     self: u64,
     incl: u64 = 0,
     slow: u64,
+    /// Step three, `.code` rows only: what its data accesses were made of.
+    wram: core.profile.WramFootprint = .{ .min_bytes = 0, .max_bytes = 0, .exact = true },
+    wram_pages: core.profile.WramPages = @splat(0),
+    /// Slices into the profiler's own `Routine` — valid as long as `prof`
+    /// (i.e. `con.prof`) outlives the report, which it does.
+    mmio_regs: []const u16 = &.{},
+    touches_sram: bool = false,
 };
 
 /// Collect and rank every routine with self time, synthetics included.
@@ -649,7 +719,7 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
         try rows.append(.{ .what = .waiting, .self = prof.waiting_self, .slow = prof.waiting_slow });
     if (prof.main_self != 0)
         try rows.append(.{ .what = .main, .self = prof.main_self, .slow = prof.main_slow });
-    for (prof.routines) |r| {
+    for (prof.routines, 0..) |r, i| {
         if (r.entry == core.profile.Routine.empty or r.self_cycles == 0) continue;
         try rows.append(.{
             .what = .code,
@@ -659,6 +729,10 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
             .self = r.self_cycles,
             .incl = r.incl_cycles,
             .slow = r.slow_cycles,
+            .wram = r.wramFootprint(),
+            .wram_pages = r.wram_pages,
+            .mmio_regs = prof.routines[i].mmio_regs[0..r.n_mmio_regs],
+            .touches_sram = r.touches_sram,
         });
     }
     std.mem.sort(RoutineRow, rows.items, {}, struct {
@@ -667,6 +741,52 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
         }
     }.gt);
     return rows.items;
+}
+
+test "routine rows carry the WRAM footprint and shared flag into the report" {
+    var p: core.profile.Profiler = .init;
+    const cyc: u64 = 6;
+    // main -> A: touches $7E:1000.
+    p.step(0x00_9000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_A000, cyc, false, 0x7E_1000, null, .{});
+    p.step(0x00_A003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212.
+    p.step(0x00_9006, cyc, false, null, null, .{ .kind = .call, .target = 0x00_B000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_B000, cyc, false, 0x7E_1005, null, .{});
+    p.step(0x00_B003, cyc, false, 0x00_4212, null, .{});
+    p.step(0x00_B006, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const rows = try routineRows(arena_state.allocator(), &p);
+
+    var a_idx: ?usize = null;
+    var b_idx: ?usize = null;
+    for (rows, 0..) |r, i| {
+        if (r.what != .code) continue;
+        if (r.entry == 0x00_A000) a_idx = i;
+        if (r.entry == 0x00_B000) b_idx = i;
+    }
+    const a = rows[a_idx.?];
+    const b = rows[b_idx.?];
+
+    try std.testing.expect(a.wram.exact);
+    try std.testing.expectEqual(@as(u32, 1), a.wram.min_bytes);
+    try std.testing.expect(b.wram.exact);
+    try std.testing.expectEqual(@as(u32, 1), b.wram.min_bytes);
+    try std.testing.expectEqual(@as(usize, 1), b.mmio_regs.len);
+    try std.testing.expectEqual(@as(u16, 0x4212), b.mmio_regs[0]);
+    try std.testing.expect(!b.touches_sram);
+
+    // Same 256-byte page ($7E1000 and $7E1005): each names the other.
+    try std.testing.expect(wramShared(rows, a_idx.?));
+    try std.testing.expect(wramShared(rows, b_idx.?));
+
+    const verdict = wramVerdict(topCodeRows(rows));
+    try std.testing.expectEqual(@as(u32, 1), verdict.union_pages);
+    try std.testing.expectEqual(@as(u32, 256), verdict.union_bytes);
+    try std.testing.expect(verdict.fits_iram);
+    try std.testing.expect(verdict.fits_bwram);
 }
 
 /// Sum of every row's self time == everything banked as work or idle: the
@@ -680,6 +800,76 @@ fn attributedTotal(rows: []const RoutineRow) u64 {
 fn pct(part: u64, whole: u64) f64 {
     if (whole == 0) return 0;
     return @as(f64, @floatFromInt(part)) * 100 / @as(f64, @floatFromInt(whole));
+}
+
+/// The `.code` rows the WRAM verdict and the report table agree on: the same
+/// top `routine_rows_shown` by self time that the table prints.
+fn topCodeRows(rows: []const RoutineRow) []const RoutineRow {
+    return rows[0..@min(rows.len, routine_rows_shown)];
+}
+
+/// Does `rows[idx]` share a WRAM page with any *other* named routine in
+/// `rows`? Moving one of them to the SA-1 would strand the other's state on
+/// the wrong side of the bus. Checked against the full set, not just what is
+/// displayed — a routine ranked outside the shown table can still be the
+/// thing a displayed routine's WRAM is shared with.
+fn wramShared(rows: []const RoutineRow, idx: usize) bool {
+    if (rows[idx].what != .code) return false;
+    for (rows, 0..) |other, j| {
+        if (j == idx or other.what != .code) continue;
+        if (core.profile.pagesOverlap(rows[idx].wram_pages, other.wram_pages)) return true;
+    }
+    return false;
+}
+
+/// The combined WRAM working set of a set of routines — the union of their
+/// touched pages, which is what actually has to fit in I-RAM or BW-RAM once
+/// they all move together. Page-granularity, so it is an upper bound: shared
+/// pages are not double-counted, but a page only one byte of which is touched
+/// still counts as a full 256 bytes.
+const WramVerdict = struct {
+    union_bytes: u32,
+    union_pages: u32,
+    fits_iram: bool,
+    fits_bwram: bool,
+};
+
+const iram_bytes: u32 = 2 * 1024;
+const bwram_bytes: u32 = 256 * 1024;
+
+fn wramVerdict(rows: []const RoutineRow) WramVerdict {
+    var union_pages: core.profile.WramPages = @splat(0);
+    for (rows) |r| {
+        if (r.what != .code) continue;
+        for (r.wram_pages, 0..) |w, i| union_pages[i] |= w;
+    }
+    const pages = core.profile.pageCount(union_pages);
+    const bytes = pages * 256;
+    return .{
+        .union_bytes = bytes,
+        .union_pages = pages,
+        .fits_iram = bytes <= iram_bytes,
+        .fits_bwram = bytes <= bwram_bytes,
+    };
+}
+
+fn printByteCount(out: *std.Io.Writer, n: u32) !void {
+    if (n >= 1024) {
+        try out.print("{d:.1} KiB", .{@as(f64, @floatFromInt(n)) / 1024.0});
+    } else {
+        try out.print("{} B", .{n});
+    }
+}
+
+fn printWramFootprint(out: *std.Io.Writer, fp: core.profile.WramFootprint) !void {
+    if (fp.exact) {
+        try printByteCount(out, fp.max_bytes);
+    } else {
+        try printByteCount(out, fp.min_bytes);
+        try out.print("+ (up to ", .{});
+        try printByteCount(out, fp.max_bytes);
+        try out.print(")", .{});
+    }
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {

@@ -178,6 +178,112 @@ pub fn isMmio(addr: u24) bool {
     return (a16 >= 0x2100 and a16 <= 0x21FF) or (a16 >= 0x4200 and a16 <= 0x43FF);
 }
 
+// --- step three: what a hot routine's accesses are made of -------------------
+//
+// Step two says WHERE the frame goes; step three says what it would cost to
+// move the code there: the SA-1 cannot see WRAM ($7E-$7F) at all, so every
+// byte a moved routine touches there has to be relocated into I-RAM (2 KiB) or
+// the cartridge's BW-RAM (up to 256 KiB) instead. Every data address a hot
+// routine reaches therefore sorts into one of four bins: WRAM (must move),
+// cartridge SRAM/BW-RAM space (already SA-1-visible, so free), MMIO (the SA-1
+// cannot reach the S-CPU's registers — a hard blocker), or ROM (fine, both
+// CPUs read it).
+
+/// One data access, sorted by what moving its routine to the SA-1 would cost.
+pub const AddrClass = enum { wram, sram, mmio, rom };
+
+/// If `addr` is WRAM — either directly (banks $7E-$7F) or through the
+/// low-page mirror every system bank carries ($00-$3F/$80-$BF, $0000-$1FFF,
+/// which is where most direct-page and stack traffic lands) — its linear
+/// offset into the 128 KiB WRAM array (0..$1FFFF). `null` otherwise.
+pub fn wramOffset(addr: u24) ?u32 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (bank == 0x7E or bank == 0x7F) return (@as(u32, bank - 0x7E) << 16) | a16;
+    if ((bank & 0x7F) <= 0x3F and a16 <= 0x1FFF) return a16;
+    return null;
+}
+
+/// Sort a data address into what it would cost an SA-1 conversion.
+///
+/// The SRAM/BW-RAM test is necessarily a heuristic — which physical space a
+/// given address hits is a mapper decision the profiler does not have (and
+/// should not need) bus access to resolve exactly — so it covers the address
+/// ranges the community's mappers actually use: the SA-1's own linear BW-RAM
+/// banks ($40-$4F), the LoROM SRAM banks ($70-$7D and their mirrors
+/// $F0-$FF), and the $6000-$7FFF window every mapper (LoROM small SRAM,
+/// HiROM SRAM, SA-1 BW-RAM) projects it through. This is the analyser's job,
+/// not the emulator's: being approximately right about a rarely-hot region is
+/// worth more here than a bus-exact classifier would cost to build.
+pub fn classify(addr: u24) AddrClass {
+    if (wramOffset(addr) != null) return .wram;
+    if (isMmio(addr)) return .mmio;
+    const bank: u8 = @truncate(addr >> 16);
+    const bank7 = bank & 0x7F;
+    const a16: u16 = @truncate(addr);
+    if (bank7 >= 0x40 and bank7 <= 0x4F) return .sram;
+    if ((bank >= 0x70 and bank <= 0x7D) or (bank >= 0xF0 and bank <= 0xFF)) return .sram;
+    if (bank7 <= 0x3F and a16 >= 0x6000 and a16 <= 0x7FFF) return .sram;
+    return .rom;
+}
+
+/// WRAM's 128 KiB in 256-byte pages — the granularity the sharing analysis
+/// and the capped-range report work at. One bit per page, packed into 64
+/// bits per word: 512 bits total, per routine.
+pub const wram_page_count: usize = 512;
+const wram_page_words: usize = wram_page_count / 64;
+
+/// A routine's WRAM footprint at page granularity: which of WRAM's 512
+/// 256-byte pages it has touched. Bounded and cheap to compare — two
+/// routines share WRAM if any word of their sets overlaps — which is what
+/// the sharing analysis needs and an exact address set would not give any
+/// more cheaply.
+pub const WramPages = [wram_page_words]u64;
+
+fn pageIndex(off: u32) u16 {
+    return @intCast(off >> 8);
+}
+
+fn setPage(pages: *WramPages, idx: u16) void {
+    pages[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+}
+
+/// Do two routines' WRAM footprints share a page? Moving one of them to the
+/// SA-1 would strand the other's state on the wrong side of the bus.
+pub fn pagesOverlap(a: WramPages, b: WramPages) bool {
+    for (a, b) |x, y| {
+        if (x & y != 0) return true;
+    }
+    return false;
+}
+
+/// How many distinct 256-byte pages a footprint touches.
+pub fn pageCount(pages: WramPages) u32 {
+    var n: u32 = 0;
+    for (pages) |w| n += @popCount(w);
+    return n;
+}
+
+/// The most distinct WRAM addresses, and separately MMIO registers, a single
+/// routine's exact set tracks before it gives up counting and falls back to
+/// the page bitmap for a bound. A routine that is actually hot in WRAM blows
+/// through this in its first few frames — that is fine: the point past which
+/// exact enumeration stops mattering is exactly the point past which "it's a
+/// lot" is the whole answer, and the page bitmap keeps giving a bound anyway.
+pub const wram_addr_cap: usize = 64;
+pub const mmio_reg_cap: usize = 32;
+
+/// A routine's WRAM footprint, as the report shows it: an exact byte count
+/// when the set never capped, otherwise the honest range between what was
+/// actually counted (a hard lower bound — the cap or more were touched) and
+/// what the touched pages *could* hold (a hard upper bound — the true count
+/// is at least `min_bytes` and cannot exceed `max_bytes`).
+pub const WramFootprint = struct {
+    min_bytes: u32,
+    max_bytes: u32,
+    exact: bool,
+};
+
 /// An iteration longer than this is not the tight loop we are looking for: the
 /// CPU has wandered off and the loop is over. Bounds how long it takes to notice
 /// that a wait has ended, and so how much real work can be mistaken for one
@@ -283,7 +389,71 @@ pub const Routine = struct {
     /// Live instances on the call stack (recursion guard for inclusive time).
     on_stack: u16,
 
+    // --- step three: what its accesses are made of ---------------------------
+    /// WRAM pages ($7E-$7F, and the low-page mirror) it has read or written
+    /// while on top of the stack — the sharing analysis and the capped-range
+    /// bound both read this.
+    wram_pages: WramPages,
+    /// Distinct WRAM addresses seen, exact up to `wram_addr_cap`.
+    wram_addrs: [wram_addr_cap]u32,
+    n_wram_addrs: u16,
+    /// The exact set overflowed: `wramFootprint` falls back to a range.
+    wram_overflow: bool,
+    /// Distinct MMIO registers touched — a list, not just a count, because
+    /// *which* registers are the blocker the report needs to name.
+    mmio_regs: [mmio_reg_cap]u16,
+    n_mmio_regs: u8,
+    mmio_overflow: bool,
+    /// It touched cartridge SRAM/BW-RAM space — already SA-1-visible, so a
+    /// conversion pays nothing to keep this access where it is.
+    touches_sram: bool,
+
     pub const empty: u32 = 0xFFFF_FFFF;
+
+    /// Record a WRAM access at linear offset `off` (0..$1FFFF). Cheap after
+    /// the exact set caps out: just the page bit, no scan.
+    fn noteWram(self: *Routine, off: u32) void {
+        setPage(&self.wram_pages, pageIndex(off));
+        if (self.wram_overflow) return;
+        for (self.wram_addrs[0..self.n_wram_addrs]) |a| {
+            if (a == off) return;
+        }
+        if (self.n_wram_addrs == wram_addr_cap) {
+            self.wram_overflow = true;
+            return;
+        }
+        self.wram_addrs[self.n_wram_addrs] = off;
+        self.n_wram_addrs += 1;
+    }
+
+    /// Record an MMIO access at 16-bit register address `reg`.
+    fn noteMmio(self: *Routine, reg: u16) void {
+        if (self.mmio_overflow) return;
+        for (self.mmio_regs[0..self.n_mmio_regs]) |r| {
+            if (r == reg) return;
+        }
+        if (self.n_mmio_regs == mmio_reg_cap) {
+            self.mmio_overflow = true;
+            return;
+        }
+        self.mmio_regs[self.n_mmio_regs] = reg;
+        self.n_mmio_regs += 1;
+    }
+
+    /// The WRAM footprint the report shows: exact while the set fits, a
+    /// bounded range once it does not.
+    pub fn wramFootprint(self: *const Routine) WramFootprint {
+        if (!self.wram_overflow) return .{
+            .min_bytes = self.n_wram_addrs,
+            .max_bytes = self.n_wram_addrs,
+            .exact = true,
+        };
+        return .{
+            .min_bytes = wram_addr_cap,
+            .max_bytes = pageCount(self.wram_pages) * 256,
+            .exact = false,
+        };
+    }
 };
 
 /// Ledger sentinel: cycles that belong to depth-0 code (no call frame).
@@ -453,6 +623,14 @@ pub const Profiler = struct {
             .slow_cycles = 0,
             .frame_cycles = 0,
             .on_stack = 0,
+            .wram_pages = @splat(0),
+            .wram_addrs = @splat(0),
+            .n_wram_addrs = 0,
+            .wram_overflow = false,
+            .mmio_regs = @splat(0),
+            .n_mmio_regs = 0,
+            .mmio_overflow = false,
+            .touches_sram = false,
         }),
         .routines_dropped = 0,
         .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0 }),
@@ -542,7 +720,27 @@ pub const Profiler = struct {
             self.ledgerAdd(self.topSlot(), cycles);
         }
 
+        // Step three: what the routine on top of the stack touched. Independent
+        // of the loop classifier above — a poll's address is real WRAM state a
+        // moved routine would still have to reach, idle or not — so this runs
+        // for every access, not just ones the wait classifier calls work.
+        if (self.depth != 0) {
+            if (read) |addr| self.noteAccess(addr);
+            if (write) |addr| self.noteAccess(addr);
+        }
+
         self.applyEvent(ev);
+    }
+
+    /// Sort one data access into the routine on top of the stack's footprint.
+    fn noteAccess(self: *Profiler, addr: u24) void {
+        const r = &self.routines[self.topSlot()];
+        switch (classify(addr)) {
+            .wram => if (wramOffset(addr)) |off| r.noteWram(off),
+            .mmio => r.noteMmio(@truncate(addr)),
+            .sram => r.touches_sram = true,
+            .rom => {},
+        }
     }
 
     // --- step two: attribution --------------------------------------------------
@@ -1694,4 +1892,125 @@ test "slow-frame correlation follows the lag flag" {
     try std.testing.expect(a.slow_cycles > 0);
     try std.testing.expect(a.slow_cycles < a.self_cycles);
     try std.testing.expect(t.p.attributionBalanced());
+}
+
+// --- step three: WRAM working set tests ---------------------------------------
+
+test "a routine's exact WRAM footprint is counted while it is on top of the stack" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, 0x7E_0010, null); // distinct address 1
+    t.run(0x00_A003, 0x7E_0011, null); // distinct address 2
+    t.run(0x00_A006, 0x7E_0010, null); // revisited: not double-counted
+    t.ret(0x00_A009, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    const fp = a.wramFootprint();
+    try std.testing.expect(fp.exact);
+    try std.testing.expectEqual(@as(u32, 2), fp.min_bytes);
+    try std.testing.expectEqual(@as(u32, 2), fp.max_bytes);
+}
+
+test "accesses at depth zero attribute to no routine" {
+    // No call frame is active, so `topSlot` would be the `(main)` sentinel —
+    // this only checks `step` does not try to index `routines[]` with it.
+    var t: Trace = .{};
+    t.run(0x00_9000, 0x7E_0010, null);
+    try std.testing.expectEqual(@as(u16, 0), t.p.depth);
+}
+
+test "a WRAM footprint past the cap reports a bound, not a wrong exact count" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    var pc: u24 = 0x00_A000;
+    var addr: u24 = 0x7E_0000;
+    for (0..wram_addr_cap + 10) |_| {
+        t.run(pc, addr, null); // a different address every pass: it walks
+        pc += 3;
+        addr += 1;
+    }
+    t.ret(pc, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    const fp = a.wramFootprint();
+    try std.testing.expect(!fp.exact);
+    try std.testing.expectEqual(@as(u32, wram_addr_cap), fp.min_bytes);
+    // All (wram_addr_cap + 10) addresses fall inside WRAM's first 256-byte
+    // page, so the page bitmap bounds it at exactly one page.
+    try std.testing.expectEqual(@as(u32, 256), fp.max_bytes);
+}
+
+test "two routines sharing a WRAM page are flagged, distant ones are not" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, 0x7E_1000, null);
+    t.ret(0x00_A003, 0x1FF);
+    t.call(0x00_9006, 0x00_B000, 0x1FF);
+    t.run(0x00_B000, 0x7E_1005, null); // same 256-byte page as $7E1000
+    t.ret(0x00_B003, 0x1FF);
+    t.call(0x00_900C, 0x00_C000, 0x1FF);
+    t.run(0x00_C000, 0x7E_4000, null); // a page neither other routine touches
+    t.ret(0x00_C003, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    const b = t.routine(0x00_B000);
+    const c = t.routine(0x00_C000);
+    try std.testing.expect(pagesOverlap(a.wram_pages, b.wram_pages));
+    try std.testing.expect(!pagesOverlap(a.wram_pages, c.wram_pages));
+    try std.testing.expect(!pagesOverlap(b.wram_pages, c.wram_pages));
+}
+
+test "MMIO classification boundaries: $2100-$21FF and $4200-$43FF only" {
+    try std.testing.expectEqual(AddrClass.mmio, classify(0x00_2100));
+    try std.testing.expectEqual(AddrClass.mmio, classify(0x00_21FF));
+    try std.testing.expectEqual(AddrClass.mmio, classify(0x00_4200));
+    try std.testing.expectEqual(AddrClass.mmio, classify(0x00_43FF));
+    try std.testing.expect(classify(0x00_20FF) != .mmio);
+    try std.testing.expect(classify(0x00_2200) != .mmio);
+    try std.testing.expect(classify(0x00_41FF) != .mmio);
+    try std.testing.expect(classify(0x00_4400) != .mmio);
+    // Not a system bank: the PPU/CPU registers only live in banks $00-$3F/$80-$BF.
+    try std.testing.expect(classify(0x40_2100) != .mmio);
+}
+
+test "a routine's MMIO accesses are recorded by register, not just counted" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, 0x00_4212, null); // read HVBJOY
+    t.run(0x00_A003, null, 0x00_2118); // write VRAM data
+    t.run(0x00_A006, 0x00_4212, null); // revisited: not double-counted
+    t.ret(0x00_A009, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u8, 2), a.n_mmio_regs);
+    var seen_4212 = false;
+    var seen_2118 = false;
+    for (a.mmio_regs[0..a.n_mmio_regs]) |r| {
+        if (r == 0x4212) seen_4212 = true;
+        if (r == 0x2118) seen_2118 = true;
+    }
+    try std.testing.expect(seen_4212 and seen_2118);
+}
+
+test "a routine touching cartridge BW-RAM space is flagged, not counted as WRAM" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, 0x40_0000, null); // SA-1's linear BW-RAM bank
+    t.ret(0x00_A003, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    try std.testing.expect(a.touches_sram);
+    try std.testing.expectEqual(@as(u16, 0), a.n_wram_addrs);
+}
+
+test "the WRAM low-page mirror in system banks counts as WRAM" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.run(0x00_A000, 0x00_0010, null); // $00:0010 mirrors $7E:0010
+    t.run(0x00_A003, 0x7E_0010, null); // the same byte, addressed directly
+    t.ret(0x00_A006, 0x1FF);
+
+    const a = t.routine(0x00_A000);
+    // Both addresses resolve to the same linear WRAM offset: one entry.
+    try std.testing.expectEqual(@as(u16, 1), a.n_wram_addrs);
 }
