@@ -15,11 +15,12 @@
 //! letterboxed onto a 512x(2*height) logical canvas — 256-wide frames scale
 //! by an exact 2x, hi-res frames map 1:1. Audio goes to an SDL audio stream
 //! at the DSP's native 32 kHz; the device side resamples. Pacing is a
-//! nanosecond accumulator locked to the NTSC frame rate (~60.0988 Hz)
-//! rather than display vsync, so a 144 Hz monitor doesn't fast-forward the
-//! game. `--frames N` runs unattended and prints the same video/audio
-//! hashes as the headless runner, which is how CI smoke-tests this frontend
-//! under SDL's dummy drivers.
+//! nanosecond accumulator locked to the loaded cart's region frame rate
+//! (~60.0988 Hz NTSC, 50 Hz PAL — `--region` overrides the header's
+//! auto-detected default) rather than display vsync, so a 144 Hz monitor
+//! doesn't fast-forward the game. `--frames N` runs unattended and prints
+//! the same video/audio hashes as the headless runner, which is how CI
+//! smoke-tests this frontend under SDL's dummy drivers.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -75,18 +76,24 @@ const profiles = [_]Profile{
     .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0 },
 };
 
-/// NTSC frame duration: 262 lines x 1364 master clocks at 21.477 MHz.
-const frame_ns: u64 =
-    core.timing.cycles_per_line * core.timing.ntsc_lines_per_frame *
-    1_000_000_000 / core.timing.ntsc_master_hz;
-
-/// If we fall further behind than this (state load, window drag), resync the
-/// pacing clock instead of sprinting to catch up.
-const max_lag_ns: u64 = 4 * frame_ns;
+/// Frame duration for the loaded cart's region: 262 lines at 21.477 MHz
+/// (NTSC, ~60.0988 Hz) or 312 lines at 21.281 MHz (PAL, 50 Hz).
+fn frameNs(region: core.timing.Region) u64 {
+    return switch (region) {
+        .ntsc => core.timing.cycles_per_line * core.timing.ntsc_lines_per_frame *
+            1_000_000_000 / core.timing.ntsc_master_hz,
+        .pal => core.timing.cycles_per_line * core.timing.pal_lines_per_frame *
+            1_000_000_000 / core.timing.pal_master_hz,
+    };
+}
 
 /// Fast-forward keeps at most this much audio queued (~1/4 s) and drops the
 /// rest — the point is to skip ahead, not to build a backlog.
 const ff_max_queued_bytes: c_int = 32 * 1024;
+
+/// `--region ntsc|pal|auto`: override the header-detected region. `auto`
+/// (the default) uses the cart header's region byte.
+const RegionArg = enum { auto, ntsc, pal };
 
 const Args = struct {
     rom: []const u8,
@@ -94,6 +101,7 @@ const Args = struct {
     frames: u32 = 0, // 0 = run until quit
     audio: bool = true,
     accuracy: core.Accuracy = .fast,
+    region: RegionArg = .auto,
     shader: ?[]const u8 = null,
     shader_dir: []const u8 = "shaders",
     /// `--shot <prefix>`: write `<prefix>-<frame>.ppm` at each frame in
@@ -161,8 +169,10 @@ pub fn main(init: std.process.Init) !void {
         }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
-                "                    [--shader NAME] [--shader-dir DIR] [--patch p.bps|p.ips] [--auto-fastrom]\n" ++
+                "                    [--region ntsc|pal|auto] [--shader NAME] [--shader-dir DIR]\n" ++
+                "                    [--patch p.bps|p.ips] [--auto-fastrom]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
+                "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -232,6 +242,11 @@ pub fn main(init: std.process.Init) !void {
     };
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    switch (args.region) {
+        .auto => {},
+        .ntsc => con.setRegion(.ntsc),
+        .pal => con.setRegion(.pal),
+    }
     if (args.auto_fastrom) con.enableAutoFastrom();
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{args.rom});
@@ -310,6 +325,14 @@ pub fn main(init: std.process.Init) !void {
     var tex_w: u32 = 0;
     var tex_h: u32 = 0;
 
+    // Region is fixed for the life of a loaded cart (repower re-detects the
+    // same header, or the CLI override above), so the frame duration is
+    // computed once here rather than re-derived every frame.
+    const frame_ns = frameNs(con.region());
+    // If we fall further behind than this (state load, window drag), resync
+    // the pacing clock instead of sprinting to catch up.
+    const max_lag_ns: u64 = 4 * frame_ns;
+
     var buttons: u16 = 0;
     var fast_forward = false;
     var running = true;
@@ -332,7 +355,16 @@ pub fn main(init: std.process.Init) !void {
                     if (key.scancode == sdl3.scancode.tab) fast_forward = key.down;
                     if (key.down and !key.repeat) switch (key.scancode) {
                         sdl3.scancode.escape => running = false,
-                        sdl3.scancode.f1 => con.repower(),
+                        sdl3.scancode.f1 => {
+                            con.repower();
+                            // repower() re-detects region from the header;
+                            // reapply an explicit CLI override.
+                            switch (args.region) {
+                                .auto => {},
+                                .ntsc => con.setRegion(.ntsc),
+                                .pal => con.setRegion(.pal),
+                            }
+                        },
                         sdl3.scancode.f5 => {
                             _ = con.saveState(state_buf);
                             if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
@@ -716,6 +748,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             args.audio = false;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             args.accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--region")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.region = std.meta.stringToEnum(RegionArg, v) orelse return error.BadRegion;
         } else if (std.mem.eql(u8, a, "--shader")) {
             args.shader = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--patch")) {

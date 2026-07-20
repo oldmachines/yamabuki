@@ -35,12 +35,17 @@ const core = @import("snes_core");
 const profile = core.profile;
 const util = @import("util");
 
+/// `--region ntsc|pal|auto`: override the header-detected region. `auto`
+/// (the default) uses the cart header's region byte.
+const RegionArg = enum { auto, ntsc, pal };
+
 const Args = struct {
     rom: []const u8,
     frames: ?u32 = null,
     ppm: ?[]const u8 = null,
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
+    region: RegionArg = .auto,
     patch: ?[]const u8 = null,
     save_patched: ?[]const u8 = null,
     /// Look the loaded ROM up in patches/registry.zon by content hash and
@@ -77,9 +82,11 @@ pub fn main(init: std.process.Init) !void {
     const args = parseArgs(init, gpa) catch {
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
-            \\                         [--patch p.bps|p.ips] [--auto-patch] [--patch-dir DIR] [--save-patched out.sfc]
+            \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
+            \\                         [--patch-dir DIR] [--save-patched out.sfc]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\
+            \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
             \\  --auto-patch  look this ROM up in patches/registry.zon and apply its registered patch
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
@@ -141,6 +148,11 @@ pub fn main(init: std.process.Init) !void {
 
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    switch (args.region) {
+        .auto => {},
+        .ntsc => con.setRegion(.ntsc),
+        .pal => con.setRegion(.pal),
+    }
     if (args.auto_fastrom) con.enableAutoFastrom();
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
@@ -891,6 +903,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             out.accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--region")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.region = std.meta.stringToEnum(RegionArg, v) orelse return error.BadRegion;
         } else if (std.mem.eql(u8, a, "--patch")) {
             out.patch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--auto-patch")) {
