@@ -340,6 +340,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
             return self.bus.ppu.fb_line_width;
         }
 
+        /// `--wide N` (M12): extend the fast core's framebuffer by `margin`
+        /// columns on each side (`frameWidth()` reports `256 + 2*margin`
+        /// after the next frame). Frontends refuse to combine this with
+        /// `--accurate` before ever calling it — the dot renderer's
+        /// piecewise render stays 256-fixed and never reads this field.
+        pub fn setWideMargin(self: *Self, margin: u32) void {
+            self.bus.ppu.wide_margin = @intCast(margin);
+        }
+
         /// Drain buffered S-DSP output into `dst` as interleaved stereo i16
         /// at 32 kHz (`timing.dsp_sample_hz`); returns i16 values copied.
         /// One video frame produces ~532 stereo frames.
@@ -519,6 +528,15 @@ pub const AnyConsole = union(Accuracy) {
     pub fn frameWidth(self: *const AnyConsole) u32 {
         switch (self.*) {
             inline else => |*c| return c.frameWidth(),
+        }
+    }
+
+    /// `--wide N` (M12, fast core only): see `Console.setWideMargin`.
+    /// Frontends must not call this on an `.accurate` console — refuse the
+    /// flag combination before `init` instead.
+    pub fn setWideMargin(self: *AnyConsole, margin: u32) void {
+        switch (self.*) {
+            inline else => |*c| c.setWideMargin(margin),
         }
     }
 
