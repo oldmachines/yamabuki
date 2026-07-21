@@ -1086,6 +1086,40 @@ test "mode 0 renders a single BG1 tile pixel" {
     try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
 }
 
+test "--wide margin renders BG content past x=255 into the widened framebuffer" {
+    // Under `--wide N` the fast renderer composes 256 + 2*N columns instead of
+    // 256, so the right margin carries screen X >= 256 — content past the
+    // normal picture edge, which is the whole point of a widescreen hack. Fill
+    // BG1 with a solid tile everywhere, set a 32-column margin, render line 0,
+    // and assert the widened stride plus that columns past x=255 carry the BG
+    // color (not the backdrop or uninitialized garbage). With margin 0 this
+    // reduces to the plain 256-wide path the other tests cover.
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1 on the main screen
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    // The tilemap is zero-initialized (every entry -> tile 0); tile 0's row 0
+    // is a solid run of color 1 across all eight pixels, so every column of
+    // scanline 0 composites to color 1 regardless of horizontal position.
+    ppu.vram[0] = 0x00FF;
+    ppu.cgram[1] = 0x7C00; // blue (BGR15) -> 0x001F in RGB565
+    ppu.postLoad();
+
+    const margin: u16 = 32;
+    ppu.wide_margin = margin;
+    ppu.renderScanline(0);
+
+    // The per-line stride widened to 256 + 2*32 = 320.
+    try std.testing.expectEqual(fb_width + 2 * @as(u32, margin), ppu.fb_line_width);
+    // Sanity: the normal picture (screen X 0, at framebuffer column `margin`).
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin)]);
+    // The right margin — screen X 256 and 287, both past x=255 — carries BG.
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin) + 256]);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin) + 287]);
+}
+
 test "flipped BG tiles keep their one-bit priority (flip bits must not leak)" {
     // Regression: priority is tilemap bit 13 only. Taking two bits pulled in
     // the X-flip bit (14), giving flipped tiles priority 2/3, which no BG
