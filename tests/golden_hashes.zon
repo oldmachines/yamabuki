@@ -18,42 +18,42 @@
 .{
     .frames = 16,
     .roms = .{
-        .{ .path = "HelloWorld/HelloWorld.sfc", .hash = 0x14ecd91531a2ca4c, .steps = 158338, .cycles = 5717916 },
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .hash = 0x3ad32cfefc54c6be, .steps = 154307, .cycles = 5717916 },
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG3Map2BPP32x328PAL/8x8BG3Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
-        .{ .path = "PPU/Rings/Rings.sfc", .hash = 0xd56d79e2377a3965, .steps = 152248, .cycles = 5717906 },
+        .{ .path = "HelloWorld/HelloWorld.sfc", .hash = 0x26bc470455aa024c, .steps = 158338, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .hash = 0x7c0d1fd2627fe91c, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG3Map2BPP32x328PAL/8x8BG3Map2BPP32x328PAL.sfc", .hash = 0xa88264a5baac3ecf, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/Rings/Rings.sfc", .hash = 0xddf99fe355da793f, .steps = 152248, .cycles = 5717906 },
         // M4.1: BG2/BG4 2bpp (mode 0 layer coverage), 4bpp (mode 1/2), 8bpp (modes 3/4).
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG2Map2BPP32x328PAL/8x8BG2Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG4Map2BPP32x328PAL/8x8BG4Map2BPP32x328PAL.sfc", .hash = 0xc9212acfe3a51a25, .steps = 154307, .cycles = 5717916 },
-        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .hash = 0xca039a735b43ef3e, .steps = 149835, .cycles = 5717904 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/32x32/8x8BGMap8BPP32x32.sfc", .hash = 0xd74dbf7e9e3fcfbc, .steps = 154031, .cycles = 5717908 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/32x64/8x8BGMap8BPP32x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 151667, .cycles = 5717914 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/64x32/8x8BGMap8BPP64x32.sfc", .hash = 0xce39d1f87fb4187e, .steps = 149934, .cycles = 5717916 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .hash = 0xce39d1f87fb4187e, .steps = 146646, .cycles = 5717932 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x440e20213d3fef25, .steps = 158610, .cycles = 5717918 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG2Map2BPP32x328PAL/8x8BG2Map2BPP32x328PAL.sfc", .hash = 0xa88264a5baac3ecf, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG4Map2BPP32x328PAL/8x8BG4Map2BPP32x328PAL.sfc", .hash = 0xa88264a5baac3ecf, .steps = 154307, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .hash = 0xae776014600d82aa, .steps = 149835, .cycles = 5717904 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/32x32/8x8BGMap8BPP32x32.sfc", .hash = 0xa9aa9790cbff0b0f, .steps = 154031, .cycles = 5717908 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/32x64/8x8BGMap8BPP32x64.sfc", .hash = 0xb40482d6f729aaac, .steps = 151667, .cycles = 5717914 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x32/8x8BGMap8BPP64x32.sfc", .hash = 0xb40482d6f729aaac, .steps = 149934, .cycles = 5717916 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .hash = 0xb40482d6f729aaac, .steps = 146646, .cycles = 5717932 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .hash = 0x434cb5aff5941f25, .steps = 158610, .cycles = 5717918 },
         // M4.2: mode-3 scene. NB: this demo's mosaic level is input-driven, so it
         // renders with mosaic off headless; the mosaic quantization itself is
         // covered by the inline unit test, not this hash.
-        .{ .path = "PPU/Mosaic/Mode3/MosaicMode3.sfc", .hash = 0x530d2729b590abaf, .steps = 140836, .cycles = 5717922 },
+        .{ .path = "PPU/Mosaic/Mode3/MosaicMode3.sfc", .hash = 0xbb6c6c229d44355a, .steps = 140836, .cycles = 5717922 },
         // M4.4: multi-window layer clipping (TMW carves the BG into regions,
         // backdrop showing through). WindowHDMA uses the color-math spotlight and
         // is deferred to the color-math slice (renders full without it).
-        .{ .path = "PPU/Window/WindowMultiHDMA/WindowMultiHDMA.sfc", .hash = 0x5b00df0115ff4a61, .steps = 146300, .cycles = 5717930 },
+        .{ .path = "PPU/Window/WindowMultiHDMA/WindowMultiHDMA.sfc", .hash = 0xe25135feeb143833, .steps = 146300, .cycles = 5717930 },
         // M4.6: Mode 7 affine plane. RotZoom (rotate+zoom) and Perspective
         // (per-scanline HDMA matrix) exercise the transform; StarWars boots to its
         // intro at frame 16 (the crawl is later) and locks that render.
         // RotZoom/Perspective/Mode7HDMA were re-minted in M6: they poll the
         // joypad, which used to read open-bus garbage (phantom presses) and
         // now correctly reads a neutral pad. `.ppm`s re-eyeballed.
-        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x8ba211f2fc899f95, .steps = 150702, .cycles = 5717926 },
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0xfc3c6d6ac634203d, .steps = 150702, .cycles = 5717926 },
         // Input-driven goldens: a neutral pad exercises none of the input
         // plumbing. RotZoom rotates under R and zooms under L (per its own
         // on-screen help), so these hashes fail if pad state ever stops
         // reaching the machine. Minted at 60 frames of held input.
-        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0xe90ad70a2bbaa4f7, .frames = 60, .buttons = 0x0010 }, // R held
-        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x2bc7bd18eeeb8517, .frames = 60, .buttons = 0x0020 }, // L held
-        .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0xca6c36e8a6140b02, .steps = 138331, .cycles = 5717928 },
-        .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0x72489634a8ee621d, .steps = 158867, .cycles = 5717910 },
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x2b2f3b106333afd8, .frames = 60, .buttons = 0x0010 }, // R held
+        .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .hash = 0x0faf56177a3a77ea, .frames = 60, .buttons = 0x0020 }, // L held
+        .{ .path = "PPU/Mode7/Perspective/Perspective.sfc", .hash = 0x91c1d212ccf0276d, .steps = 138331, .cycles = 5717928 },
+        .{ .path = "PPU/Mode7/StarWars/StarWars.sfc", .hash = 0xd6790f52d4d6221d, .steps = 158867, .cycles = 5717910 },
         // M4.5: HDMA-driven register goldens. WindowHDMA (deferred from M4.4)
         // is an *inverted* window with HDMA'd WH0/WH1 edges over a green
         // backdrop — its first band is the empty-window [1,0] edge case; the
@@ -63,18 +63,18 @@
         // plane); WaveHDMA sine-displaces BG1HOFS per line. No PeterLemon ROM
         // exercises CGADSUB color math directly (the Blend/HiColor ones need
         // pseudo-hires, M4.7), so blending itself is guarded by unit tests.
-        .{ .path = "PPU/Window/WindowHDMA/WindowHDMA.sfc", .hash = 0x7bafda0faf223f57, .steps = 146450, .cycles = 5717916 },
-        .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0xbb802b13b82f8f0e, .steps = 148719, .cycles = 5717916 },
-        .{ .path = "PPU/HDMA/WaveHDMA/WaveHDMA.sfc", .hash = 0x6d5ebfbf9af5178d, .steps = 137718, .cycles = 5717924 },
+        .{ .path = "PPU/Window/WindowHDMA/WindowHDMA.sfc", .hash = 0xccc97cd9811d3181, .steps = 146450, .cycles = 5717916 },
+        .{ .path = "PPU/HDMA/Mode7HDMA/Mode7HDMA.sfc", .hash = 0xc531bef97c0d0208, .steps = 148719, .cycles = 5717916 },
+        .{ .path = "PPU/HDMA/WaveHDMA/WaveHDMA.sfc", .hash = 0x1c23075b462f329e, .steps = 137718, .cycles = 5717924 },
         // M4.7: the Blend/HiColor set is the real CGADSUB exercise (M4.5's
         // survey missed that these blend at 256 wide, no pseudo-hires): BG1 on
         // the main screen, BG2 on the sub screen, added per pixel for hundreds
         // of apparent colors. The HDMA/HiColor*PerTileRow ROMs stay unminted:
         // they race the beam (H-IRQ + latched V-counter + mid-scanline CGRAM
         // DMA) and need the accurate core's sub-line timing (M8).
-        .{ .path = "PPU/Blend/HiColor/HiColor575Myst/HiColor575Myst.sfc", .hash = 0xfb75a1bf32e03757, .steps = 140944, .cycles = 5717918 },
-        .{ .path = "PPU/Blend/HiColor/HiColor3840/HiColor3840.sfc", .hash = 0xd7598be40b7f8ce5, .steps = 143917, .cycles = 5717904 },
-        .{ .path = "PPU/Blend/HiColor/HiColor1241DLair/HiColor1241DLair.sfc", .hash = 0xffee96ffe902ac1a, .steps = 140284, .cycles = 5717924 },
+        .{ .path = "PPU/Blend/HiColor/HiColor575Myst/HiColor575Myst.sfc", .hash = 0xb8f4d041592ac57b, .steps = 140944, .cycles = 5717918 },
+        .{ .path = "PPU/Blend/HiColor/HiColor3840/HiColor3840.sfc", .hash = 0xfc9e9d2421aeeac5, .steps = 143917, .cycles = 5717904 },
+        .{ .path = "PPU/Blend/HiColor/HiColor1241DLair/HiColor1241DLair.sfc", .hash = 0xc8d94e74d922050a, .steps = 140284, .cycles = 5717924 },
         // M4.7: mode 5 hi-res (512-wide, 16-wide tiles). InterlaceFont locks a
         // crisp hi-res font sheet; InterlaceRPG a full 512-wide scene.
         // MosaicMode5's mosaic level is input-driven (renders mosaic-off
@@ -83,22 +83,22 @@
         // Interlace{Myst,Simpsons}HDMA ROMs stay unminted: they need true
         // interlaced 448-line field rendering (the HDMA'd tile base assumes
         // field-interleaved rows), which the 224-line fast core doesn't model.
-        .{ .path = "PPU/Mosaic/Mode5/MosaicMode5.sfc", .hash = 0x048388428d8ac8d3, .steps = 153077, .cycles = 5717918 },
-        .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x2f92199a4d412900, .steps = 155006, .cycles = 5717912 },
-        .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0x048388428d8ac8d3, .steps = 153077, .cycles = 5717924 },
-        .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0xeb05fd8031f964e0, .steps = 147948, .cycles = 5717928 },
+        .{ .path = "PPU/Mosaic/Mode5/MosaicMode5.sfc", .hash = 0xdc6da5d96f5b2526, .steps = 153077, .cycles = 5717918 },
+        .{ .path = "PPU/Interlace/InterlaceFont/InterlaceFont.sfc", .hash = 0x8df8950888cad900, .steps = 155006, .cycles = 5717912 },
+        .{ .path = "PPU/Interlace/InterlaceMoogle/InterlaceMoogle.sfc", .hash = 0xdc6da5d96f5b2526, .steps = 153077, .cycles = 5717924 },
+        .{ .path = "PPU/Interlace/InterlaceRPG/InterlaceRPG.sfc", .hash = 0x9cfacc40acaa09a6, .steps = 147948, .cycles = 5717928 },
         // M5: SPC700 end-to-end. The CPUTest ROMs upload an SPC program via
         // the HLE boot handshake, run opcode self-tests on the audio CPU, and
         // hand results back through the mailbox ports — at 180 frames each
         // shows a verified PASS screen (the suites keep cycling sub-tests
         // beyond that; 180 is a deterministic mid-suite checkpoint).
-        .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0x420e94634463f1b1, .steps = 2959432, .cycles = 64326272, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/AND/SPC700AND.sfc", .hash = 0x76fd9f2391509961, .steps = 2959433, .cycles = 64326260, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x6137701a5b5fe4dd, .steps = 2960932, .cycles = 64326268, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/EOR/SPC700EOR.sfc", .hash = 0x28ee6457ca7887e5, .steps = 2959433, .cycles = 64326260, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0x82d485c6a584a90d, .steps = 2960932, .cycles = 64326268, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/ORA/SPC700ORA.sfc", .hash = 0xc3c1b3812f314f75, .steps = 2959435, .cycles = 64326270, .frames = 180 },
-        .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x563dc88db83a4ab9, .steps = 2959431, .cycles = 64326264, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/ADC/SPC700ADC.sfc", .hash = 0xf6ea5305f3ccf1b1, .steps = 2959432, .cycles = 64326272, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/AND/SPC700AND.sfc", .hash = 0x6b2f8c61f96b1961, .steps = 2959433, .cycles = 64326260, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/DEC/SPC700DEC.sfc", .hash = 0x42233f71618dd4dd, .steps = 2960932, .cycles = 64326268, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/EOR/SPC700EOR.sfc", .hash = 0x345aadbb4f1e87e5, .steps = 2959433, .cycles = 64326260, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/INC/SPC700INC.sfc", .hash = 0xddba51726469190d, .steps = 2960932, .cycles = 64326268, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/ORA/SPC700ORA.sfc", .hash = 0x55b8b40e651fcf75, .steps = 2959435, .cycles = 64326270, .frames = 180 },
+        .{ .path = "CPUTest/SPC700/SBC/SPC700SBC.sfc", .hash = 0x21eed527ad3fbab9, .steps = 2959431, .cycles = 64326264, .frames = 180 },
         // M5b: the S-DSP. These SPC700 demo ROMs render a black screen by
         // design (audio-only; the CPU side uploads a driver then spins) — the
         // shared framebuffer hash guards the boot path, and `audio` locks the
@@ -120,64 +120,69 @@
         // screen in a FAIL loop, so these hashes prove every case passed); the 27
         // plot demos exercise PLOT/RPIX bitplane rendering across 2/4/8bpp and all
         // three screen heights, and match krom's reference captures pixel-for-pixel
-        // modulo the emulator's global one-line display offset (see ROADMAP).
-        .{ .path = "CHIP/GSU/GSUTest/ADC/GSUADC.sfc", .hash = 0xc3385cd437acdc71, .steps = 3635008, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/ADD/GSUADD.sfc", .hash = 0x8e5cf4ca7d366991, .steps = 3635006, .cycles = 85768344, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/AND/GSUAND.sfc", .hash = 0x37fa50c65bd16759, .steps = 3635023, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/ASR/GSUASR.sfc", .hash = 0x1cda6e34dd6a37d1, .steps = 3735252, .cycles = 85768344, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/BIC/GSUBIC.sfc", .hash = 0xc1668331cec441ed, .steps = 3635005, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/CACHEINJECT/GSUCACHEINJECT.sfc", .hash = 0x8fb62984850d5781, .steps = 3819799, .cycles = 85768336, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/CMP/GSUCMP.sfc", .hash = 0x1a85df3e80fabe19, .steps = 3732528, .cycles = 85768338, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/DEC/GSUDEC.sfc", .hash = 0x370273a863730515, .steps = 3737956, .cycles = 85768342, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/DIV2/GSUDIV2.sfc", .hash = 0xcf15f32742c5d685, .steps = 3735253, .cycles = 85768348, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/FMULT/GSUFMULT.sfc", .hash = 0x497d4f96171ef349, .steps = 3732545, .cycles = 85768350, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/HIB/GSUHIB.sfc", .hash = 0xf193ec55b2f96aa9, .steps = 3735268, .cycles = 85768352, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/IBT/GSUIBT.sfc", .hash = 0xd85e20080397eb19, .steps = 3737958, .cycles = 85768346, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/INC/GSUINC.sfc", .hash = 0xc61cbc9fc7b64695, .steps = 3737956, .cycles = 85768342, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/IWT/GSUIWT.sfc", .hash = 0xea2e85fc09959e91, .steps = 3737964, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/LMULT/GSULMULT.sfc", .hash = 0xe7e96ee50f0e3011, .steps = 3732545, .cycles = 85768350, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/LOB/GSULOB.sfc", .hash = 0xc773b8bb58b4d371, .steps = 3735267, .cycles = 85768336, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/LSR/GSULSR.sfc", .hash = 0xb411724b776a75e1, .steps = 3735262, .cycles = 85768342, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/MERGE/GSUMERGE.sfc", .hash = 0x9d2ce27986d0f175, .steps = 3737977, .cycles = 85768340, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/MOVE/GSUMOVE.sfc", .hash = 0xd552d2ee6b704b39, .steps = 3737974, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/MOVES/GSUMOVES.sfc", .hash = 0x35fd5f945175a2f9, .steps = 3737963, .cycles = 85768350, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/MULT/GSUMULT.sfc", .hash = 0xab4a4fad34f963bd, .steps = 3635023, .cycles = 85768348, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/NOT/GSUNOT.sfc", .hash = 0xe1ead3138e2db981, .steps = 3735257, .cycles = 85768346, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/OR/GSUOR.sfc", .hash = 0x284ed09c84c00315, .steps = 3635007, .cycles = 85768356, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/ROL/GSUROL.sfc", .hash = 0x3563049c7707906d, .steps = 3735253, .cycles = 85768354, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/ROR/GSUROR.sfc", .hash = 0xf5dde632aa792e85, .steps = 3735253, .cycles = 85768350, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/SBC/GSUSBC.sfc", .hash = 0xba36e556be24f995, .steps = 3732541, .cycles = 85768348, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/SEX/GSUSEX.sfc", .hash = 0xc854decea06b5899, .steps = 3735255, .cycles = 85768336, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/SUB/GSUSUB.sfc", .hash = 0xc98e3da07bd5af95, .steps = 3635006, .cycles = 85768346, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/SWAP/GSUSWAP.sfc", .hash = 0x15f64f5a7246d51d, .steps = 3735256, .cycles = 85768346, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/UMULT/GSUUMULT.sfc", .hash = 0x3acbfe2587283e21, .steps = 3635037, .cycles = 85768336, .frames = 240 },
-        .{ .path = "CHIP/GSU/GSUTest/XOR/GSUXOR.sfc", .hash = 0x5da126261d46c455, .steps = 3634999, .cycles = 85768348, .frames = 240 },
-        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x128/GSU2BPP256x128FillPoly.sfc", .hash = 0x1d274a0d290f0ac8, .steps = 158393, .cycles = 21624376, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x160/GSU2BPP256x160FillPoly.sfc", .hash = 0x5b82846a0fd80ac8, .steps = 142234, .cycles = 21640780, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x192/GSU2BPP256x192FillPoly.sfc", .hash = 0xa6a7834a4b2896c8, .steps = 131373, .cycles = 21630062, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x128/GSU2BPP256x128PlotLine.sfc", .hash = 0x7ab566cc713ee5f1, .steps = 149147, .cycles = 21981572, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x160/GSU2BPP256x160PlotLine.sfc", .hash = 0x33510280b6cb7248, .steps = 141898, .cycles = 21640744, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x192/GSU2BPP256x192PlotLine.sfc", .hash = 0x7fff951dcafdac18, .steps = 130993, .cycles = 21630042, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x128/GSU2BPP256x128PlotPixel.sfc", .hash = 0x1e9e9322831f9948, .steps = 149063, .cycles = 21981568, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x160/GSU2BPP256x160PlotPixel.sfc", .hash = 0x5cf9cd7f69e89948, .steps = 132223, .cycles = 21997960, .frames = 60 },
-        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x192/GSU2BPP256x192PlotPixel.sfc", .hash = 0xa81ecc5fa5392548, .steps = 130898, .cycles = 21630082, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x128/GSU4BPP256x128FillPoly.sfc", .hash = 0x1d274a0d290f0ac8, .steps = 66216, .cycles = 21958750, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x160/GSU4BPP256x160FillPoly.sfc", .hash = 0x5b82846a0fd80ac8, .steps = 143146, .cycles = 21640744, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x192/GSU4BPP256x192FillPoly.sfc", .hash = 0xa6a7834a4b2896c8, .steps = 132463, .cycles = 21630110, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x128/GSU4BPP256x128PlotLine.sfc", .hash = 0x7ab566cc713ee5f1, .steps = 65917, .cycles = 21958766, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x160/GSU4BPP256x160PlotLine.sfc", .hash = 0x33510280b6cb7248, .steps = 142806, .cycles = 21640744, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x192/GSU4BPP256x192PlotLine.sfc", .hash = 0x7fff951dcafdac18, .steps = 132074, .cycles = 21629918, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x128/GSU4BPP256x128PlotPixel.sfc", .hash = 0x1e9e9322831f9948, .steps = 65818, .cycles = 21958742, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x160/GSU4BPP256x160PlotPixel.sfc", .hash = 0x5cf9cd7f69e89948, .steps = 142698, .cycles = 21640756, .frames = 60 },
-        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x192/GSU4BPP256x192PlotPixel.sfc", .hash = 0xa81ecc5fa5392548, .steps = 131963, .cycles = 21630090, .frames = 60 },
-        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x128/GSU8BPP256x128FillPoly.sfc", .hash = 0x5ef22404bf25bac8, .steps = 110561, .cycles = 21981816, .frames = 60, .hash_accurate = 0x62feb633652d6ac8 },
-        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x160/GSU8BPP256x160FillPoly.sfc", .hash = 0xeba5099a3269bac8, .steps = 135378, .cycles = 21981824, .frames = 60, .hash_accurate = 0x7d0c2eaf00716ac8 },
-        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x192/GSU8BPP256x192FillPoly.sfc", .hash = 0xee824bf3130d7ec8, .steps = 148301, .cycles = 21987118, .frames = 60, .hash_accurate = 0x8cff7525351906c8 },
-        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x128/GSU8BPP256x128PlotLine.sfc", .hash = 0xbc8040c4075595f1, .steps = 110243, .cycles = 21981808, .frames = 60, .hash_accurate = 0xc08cd2f2ad5d45f1 },
-        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x160/GSU8BPP256x160PlotLine.sfc", .hash = 0xc37387b0d95d2248, .steps = 135026, .cycles = 21981792, .frames = 60, .hash_accurate = 0x54daacc5a764d248 },
-        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x192/GSU8BPP256x192PlotLine.sfc", .hash = 0x20e89cf139fb2fb0, .steps = 147953, .cycles = 21987146, .frames = 60, .hash_accurate = 0x3df767cae8051d97 },
-        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x128/GSU8BPP256x128PlotPixel.sfc", .hash = 0x1e9e9322831f9948, .steps = 96301, .cycles = 21624626, .frames = 60 },
-        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x160/GSU8BPP256x160PlotPixel.sfc", .hash = 0xed1c52af8c7a4948, .steps = 134883, .cycles = 21981824, .frames = 60, .hash_accurate = 0x7e8377c45a81f948 },
-        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x192/GSU8BPP256x192PlotPixel.sfc", .hash = 0xeff995086d1e0d48, .steps = 147792, .cycles = 21987150, .frames = 60, .hash_accurate = 0x8e76be3a8f299548 },
+        // with NO shift since the issue-34 line-placement fix (8bpp demos at the
+        // frame where the slower 8bpp re-upload completes; the 2/4/8bpp 192-height
+        // PlotPixel references alone show two extra bright rows at the INIDISP
+        // forced-blank boundary that the demos' own 19-dark-line HDMA table cannot
+        // produce — the sibling FillPoly/PlotLine captures of the same table agree
+        // with us, so those two rows are stale captures, not a deviation).
+        .{ .path = "CHIP/GSU/GSUTest/ADC/GSUADC.sfc", .hash = 0xdd1e8230a3ebdc71, .steps = 3635008, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/ADD/GSUADD.sfc", .hash = 0x17028478401e6991, .steps = 3635006, .cycles = 85768344, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/AND/GSUAND.sfc", .hash = 0x4dbf502372fbd759, .steps = 3635023, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/ASR/GSUASR.sfc", .hash = 0xe71cb465bb4437d1, .steps = 3735252, .cycles = 85768344, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/BIC/GSUBIC.sfc", .hash = 0xebeb9259cc2fb1ed, .steps = 3635005, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/CACHEINJECT/GSUCACHEINJECT.sfc", .hash = 0x286b9c37bf58d781, .steps = 3819799, .cycles = 85768336, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/CMP/GSUCMP.sfc", .hash = 0x2610419f305b2e19, .steps = 3732528, .cycles = 85768338, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/DEC/GSUDEC.sfc", .hash = 0xa05d750ac24e8515, .steps = 3737956, .cycles = 85768342, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/DIV2/GSUDIV2.sfc", .hash = 0x440f734eff20d685, .steps = 3735253, .cycles = 85768348, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/FMULT/GSUFMULT.sfc", .hash = 0xdb3edcd5dcbde349, .steps = 3732545, .cycles = 85768350, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/HIB/GSUHIB.sfc", .hash = 0x23b447b70b135aa9, .steps = 3735268, .cycles = 85768352, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/IBT/GSUIBT.sfc", .hash = 0x56a0af7576605b19, .steps = 3737958, .cycles = 85768346, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/INC/GSUINC.sfc", .hash = 0xf6c80d40039dc695, .steps = 3737956, .cycles = 85768342, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/IWT/GSUIWT.sfc", .hash = 0xd67c7ea4b0259e91, .steps = 3737964, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/LMULT/GSULMULT.sfc", .hash = 0xab2e6ad7dd2a3011, .steps = 3732545, .cycles = 85768350, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/LOB/GSULOB.sfc", .hash = 0x4b8523f072abd371, .steps = 3735267, .cycles = 85768336, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/LSR/GSULSR.sfc", .hash = 0xc793e9022768f5e1, .steps = 3735262, .cycles = 85768342, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/MERGE/GSUMERGE.sfc", .hash = 0x95fd97f9fdcf7175, .steps = 3737977, .cycles = 85768340, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/MOVE/GSUMOVE.sfc", .hash = 0x020c709fd179bb39, .steps = 3737974, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/MOVES/GSUMOVES.sfc", .hash = 0x1e3c222bb1bd12f9, .steps = 3737963, .cycles = 85768350, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/MULT/GSUMULT.sfc", .hash = 0x187a581c14de53bd, .steps = 3635023, .cycles = 85768348, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/NOT/GSUNOT.sfc", .hash = 0xd7556de78f893981, .steps = 3735257, .cycles = 85768346, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/OR/GSUOR.sfc", .hash = 0xcc3f42dc478b8315, .steps = 3635007, .cycles = 85768356, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/ROL/GSUROL.sfc", .hash = 0x9fb896efebe7006d, .steps = 3735253, .cycles = 85768354, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/ROR/GSUROR.sfc", .hash = 0xb1536fb2b1942e85, .steps = 3735253, .cycles = 85768350, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/SBC/GSUSBC.sfc", .hash = 0xe476245a55a47995, .steps = 3732541, .cycles = 85768348, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/SEX/GSUSEX.sfc", .hash = 0xca8a6678c99fc899, .steps = 3735255, .cycles = 85768336, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/SUB/GSUSUB.sfc", .hash = 0xcaa2273005052f95, .steps = 3635006, .cycles = 85768346, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/SWAP/GSUSWAP.sfc", .hash = 0xfd9167877076c51d, .steps = 3735256, .cycles = 85768346, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/UMULT/GSUUMULT.sfc", .hash = 0x629bca1a95e8be21, .steps = 3635037, .cycles = 85768336, .frames = 240 },
+        .{ .path = "CHIP/GSU/GSUTest/XOR/GSUXOR.sfc", .hash = 0x72a52a03f89c4455, .steps = 3634999, .cycles = 85768348, .frames = 240 },
+        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x128/GSU2BPP256x128FillPoly.sfc", .hash = 0x4b26b30731992ac8, .steps = 158393, .cycles = 21624376, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x160/GSU2BPP256x160FillPoly.sfc", .hash = 0x8981ed6418622ac8, .steps = 142234, .cycles = 21640780, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/FillPoly/256x192/GSU2BPP256x192FillPoly.sfc", .hash = 0xd4a6ec4453b2b6c8, .steps = 131373, .cycles = 21630062, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x128/GSU2BPP256x128PlotLine.sfc", .hash = 0xd78841126171f125, .steps = 149147, .cycles = 21981572, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x160/GSU2BPP256x160PlotLine.sfc", .hash = 0xea511090cf273125, .steps = 141898, .cycles = 21640744, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotLine/256x192/GSU2BPP256x192PlotLine.sfc", .hash = 0x911cbd475855a264, .steps = 130993, .cycles = 21630042, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x128/GSU2BPP256x128PlotPixel.sfc", .hash = 0xaecd2ed0ed1db948, .steps = 149063, .cycles = 21981568, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x160/GSU2BPP256x160PlotPixel.sfc", .hash = 0xed28692dd3e6b948, .steps = 132223, .cycles = 21997960, .frames = 60 },
+        .{ .path = "CHIP/GSU/2BPP/PlotPixel/256x192/GSU2BPP256x192PlotPixel.sfc", .hash = 0x384d680e0f374548, .steps = 130898, .cycles = 21630082, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x128/GSU4BPP256x128FillPoly.sfc", .hash = 0x4b26b30731992ac8, .steps = 66216, .cycles = 21958750, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x160/GSU4BPP256x160FillPoly.sfc", .hash = 0x8981ed6418622ac8, .steps = 143146, .cycles = 21640744, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/FillPoly/256x192/GSU4BPP256x192FillPoly.sfc", .hash = 0xd4a6ec4453b2b6c8, .steps = 132463, .cycles = 21630110, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x128/GSU4BPP256x128PlotLine.sfc", .hash = 0xd78841126171f125, .steps = 65917, .cycles = 21958766, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x160/GSU4BPP256x160PlotLine.sfc", .hash = 0xea511090cf273125, .steps = 142806, .cycles = 21640744, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotLine/256x192/GSU4BPP256x192PlotLine.sfc", .hash = 0x911cbd475855a264, .steps = 132074, .cycles = 21629918, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x128/GSU4BPP256x128PlotPixel.sfc", .hash = 0xaecd2ed0ed1db948, .steps = 65818, .cycles = 21958742, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x160/GSU4BPP256x160PlotPixel.sfc", .hash = 0xed28692dd3e6b948, .steps = 142698, .cycles = 21640756, .frames = 60 },
+        .{ .path = "CHIP/GSU/4BPP/PlotPixel/256x192/GSU4BPP256x192PlotPixel.sfc", .hash = 0x384d680e0f374548, .steps = 131963, .cycles = 21630090, .frames = 60 },
+        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x128/GSU8BPP256x128FillPoly.sfc", .hash = 0x8cf18cfec7afdac8, .steps = 110561, .cycles = 21981816, .frames = 60, .hash_accurate = 0x90fe1f2d6db78ac8 },
+        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x160/GSU8BPP256x160FillPoly.sfc", .hash = 0x19a472943af3dac8, .steps = 135378, .cycles = 21981824, .frames = 60, .hash_accurate = 0xab0b97a908fb8ac8 },
+        .{ .path = "CHIP/GSU/8BPP/FillPoly/256x192/GSU8BPP256x192FillPoly.sfc", .hash = 0x1c81b4ed1b979ec8, .steps = 148301, .cycles = 21987118, .frames = 60, .hash_accurate = 0xbafede1f3da326c8 },
+        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x128/GSU8BPP256x128PlotLine.sfc", .hash = 0x95bd671acb5b4125, .steps = 110243, .cycles = 21981808, .frames = 60, .hash_accurate = 0x91b0d4ec25539125 },
+        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x160/GSU8BPP256x160PlotLine.sfc", .hash = 0x5a2e8b60ac958125, .steps = 135026, .cycles = 21981792, .frames = 60, .hash_accurate = 0xc8c7664bde8dd125 },
+        .{ .path = "CHIP/GSU/8BPP/PlotLine/256x192/GSU8BPP256x192PlotLine.sfc", .hash = 0x21d9c60dfa882bf3, .steps = 147953, .cycles = 21987146, .frames = 60, .hash_accurate = 0x109073656229d927 },
+        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x128/GSU8BPP256x128PlotPixel.sfc", .hash = 0xaecd2ed0ed1db948, .steps = 96301, .cycles = 21624626, .frames = 60 },
+        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x160/GSU8BPP256x160PlotPixel.sfc", .hash = 0x7d4aee5df6786948, .steps = 134883, .cycles = 21981824, .frames = 60, .hash_accurate = 0x0eb21372c4801948 },
+        .{ .path = "CHIP/GSU/8BPP/PlotPixel/256x192/GSU8BPP256x192PlotPixel.sfc", .hash = 0x802830b6d71c2d48, .steps = 147792, .cycles = 21987150, .frames = 60, .hash_accurate = 0x1ea559e8f927b548 },
     },
 }

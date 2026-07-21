@@ -9,6 +9,12 @@
 //! match (a line nothing races renders identically), but steps/cycles are
 //! reported unGated — dot-placed IRQs legitimately reorder instruction
 //! interleaving on IRQ-driven ROMs.
+//!
+//! -Drom-mint re-measures every entry (respecting -Drom-filter and
+//! -Drom-accurate) and prints one ready-to-paste line per entry instead of
+//! gating — the same workflow as -Dcommercial-mint. Every measured field is
+//! printed; when merging into golden_hashes.zon keep only the fields the
+//! entry already pinned (a 0 there means "not baselined, ungated").
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -72,6 +78,13 @@ pub fn main(init: std.process.Init) !void {
             // A per-ROM `.frames` overrides the suite default (SPC700 test
             // ROMs need time to hand results back from the audio CPU).
             const entry_frames: u32 = if (entry.frames != 0) entry.frames else frames;
+            if (options.mint) {
+                mintOne(io, gpa, out, dir, entry, entry_frames) catch |e| {
+                    try out.print("// {s}: {s}\n", .{ entry.path, @errorName(e) });
+                };
+                try out.flush();
+                continue;
+            }
             const ok = runOne(io, gpa, out, dir, entry, entry_frames) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.path, @errorName(e) });
                 break :blk false;
@@ -80,9 +93,51 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("\nrom-runner: {} ROMs, {} failed ({} frames default)\n", .{ run, failed, frames });
+    if (!options.mint) {
+        try out.print("\nrom-runner: {} ROMs, {} failed ({} frames default)\n", .{ run, failed, frames });
+    }
     try out.flush();
     if (failed > 0) std.process.exit(1);
+}
+
+/// Re-measure one entry and print it as a ready-to-paste golden line. All
+/// measured fields are printed (with the entry's own `frames`/`buttons`
+/// echoed back); the merger decides which stay pinned.
+fn mintOne(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    dir: std.Io.Dir,
+    entry: Entry,
+    frames: u32,
+) !void {
+    const image = try dir.readFileAlloc(io, entry.path, gpa, .limited(16 * 1024 * 1024));
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.AnyConsole);
+    con.init(if (options.accurate) .accurate else .fast, cart);
+
+    var audio = core.console.audio_hash_init;
+    var drain: [4096]i16 = undefined;
+    for (0..frames) |_| {
+        con.setButtons(0, entry.buttons);
+        con.runFrame();
+        while (true) {
+            const n = con.readAudio(&drain);
+            if (n == 0) break;
+            audio = core.console.hashAudio(audio, drain[0..n]);
+        }
+    }
+
+    const steps = switch (con.*) {
+        inline else => |*c| c.steps,
+    };
+    const cycles = switch (con.*) {
+        inline else => |*c| c.bus.clock,
+    };
+    try out.print(
+        ".{{ .path = \"{s}\", .hash = 0x{x:0>16}, .steps = {d}, .cycles = {d}, .frames = {d}, .audio = 0x{x:0>16}, .buttons = 0x{x:0>4} }},\n",
+        .{ entry.path, core.console.hashFrame(con.framebuffer()), steps, cycles, frames, audio, entry.buttons },
+    );
 }
 
 fn runOne(

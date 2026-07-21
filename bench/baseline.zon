@@ -13,12 +13,17 @@
 // Mode 7 affine scene. Paths are relative to test-data/snes-roms/ (fetched by
 // tools/fetch_test_data.sh; the ROMs are never committed). Re-mint by running
 // `zig build bench -- test-data/snes-roms/<path> --frames 120` per ROM.
+//
+// vram_reads for the three BGMAP ROMs were re-pinned (-0.2%) with the issue-34
+// line-placement fix: screen rows now fetch BG picture lines 1..224 instead of
+// 0..223, which changes how the per-line tile-row decode cache hits across the
+// frame. steps/cycles were untouched (the fix is render-only).
 .{
     .frames = 120,
     .roms = .{
-        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .steps = 1699632, .cycles = 42884194, .vram_reads = 1652435 },
-        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .steps = 1694016, .cycles = 42884186, .vram_reads = 2455332 },
-        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .steps = 1576414, .cycles = 42884178, .vram_reads = 3301440 },
+        .{ .path = "PPU/BGMAP/8x8/2BPP/8x8BG1Map2BPP32x328PAL/8x8BG1Map2BPP32x328PAL.sfc", .steps = 1699632, .cycles = 42884194, .vram_reads = 1648870 },
+        .{ .path = "PPU/BGMAP/8x8/4BPP/8x8BGMap4BPP32x328PAL/8x8BGMap4BPP32x328PAL.sfc", .steps = 1694016, .cycles = 42884186, .vram_reads = 2448264 },
+        .{ .path = "PPU/BGMAP/8x8/8BPP/64x64/8x8BGMap8BPP64x64.sfc", .steps = 1576414, .cycles = 42884178, .vram_reads = 3293232 },
         .{ .path = "PPU/BGMAP/8x8/8BPP/TileFlip/8x8BGMapTileFlip.sfc", .steps = 1703934, .cycles = 42884178, .vram_reads = 931500 },
         .{ .path = "PPU/Rings/Rings.sfc", .steps = 1582245, .cycles = 42884192, .vram_reads = 3180828 },
         .{ .path = "PPU/Mode7/RotZoom/RotZoom.sfc", .steps = 1580214, .cycles = 42884198, .vram_reads = 13233152 },
