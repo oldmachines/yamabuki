@@ -31,6 +31,7 @@ const gl = @import("gl.zig");
 const preset = @import("preset.zig");
 const shader = @import("shader.zig");
 const util = @import("util");
+const osd = @import("osd.zig");
 
 const Button = core.joypad.Button;
 
@@ -55,6 +56,11 @@ const GlVideo = struct {
     /// Every preset in that directory, sorted — the cycle order.
     names: [][]const u8,
     index: usize,
+    /// The shader-name toast. Null means it failed to compile — never fatal,
+    /// by the same rule a shader itself follows: a nice-to-have UI element
+    /// must not cost the user the emulator, or the shader chain it is
+    /// supposed to be announcing.
+    osd: ?osd.Osd,
 
     fn chain(self: *GlVideo) *shader.Chain {
         return &self.chains[self.active];
@@ -70,12 +76,15 @@ const Profile = struct {
     profile_mask: c_int,
     major: c_int,
     minor: c_int,
+    /// Which GLSL dialect the OSD's own tiny program should be compiled in —
+    /// this ladder and the shader chain's both land on the same rung.
+    dialect: osd.Dialect,
 };
 
 const profiles = [_]Profile{
-    .{ .dir = "essl300", .profile_mask = sdl3.gl_profile_es, .major = 3, .minor = 0 },
-    .{ .dir = "glsl330", .profile_mask = sdl3.gl_profile_core, .major = 3, .minor = 3 },
-    .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0 },
+    .{ .dir = "essl300", .profile_mask = sdl3.gl_profile_es, .major = 3, .minor = 0, .dialect = .essl300 },
+    .{ .dir = "glsl330", .profile_mask = sdl3.gl_profile_core, .major = 3, .minor = 3, .dialect = .glsl330 },
+    .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0, .dialect = .essl100 },
 };
 
 /// Frame duration for the loaded cart's region: 262 lines at 21.477 MHz
@@ -297,6 +306,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (glv) |g| {
+        if (g.osd) |*o| o.deinit();
         g.chain().deinit();
         _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
     };
@@ -429,6 +439,7 @@ pub fn main(init: std.process.Init) !void {
                 // This frame's video is lost; emulation and audio are not.
                 try err.print("shader render failed ({s}); falling back to the software renderer\n", .{@errorName(e)});
                 try err.flush();
+                if (g.osd) |*o| o.deinit();
                 g.chain().deinit();
                 _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
                 glv = null;
@@ -456,6 +467,11 @@ pub fn main(init: std.process.Init) !void {
                         try err.flush();
                     }
                 }
+            }
+            if (g.osd) |*o| {
+                const window_size: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
+                const lb = shader.Chain.letterbox(window_size, g.chain().source_size);
+                o.draw(window_size, .{ .x = lb.x, .y = lb.y, .w = lb.w, .h = lb.h });
             }
             _ = g.sdl_gl.SDL_GL_SwapWindow(window);
         } else {
@@ -631,10 +647,15 @@ fn initGl(
             .profile_dir = profile_dir,
             .names = names,
             .index = start,
+            .osd = null,
         };
         buildChain(io, gpa, g, start, g.chain(), err) catch |e| {
             _ = sdl_gl.SDL_GL_DestroyContext(ctx);
             return e;
+        };
+        g.osd = osd.Osd.init(api, prof.dialect) catch |e| blk: {
+            err.print("osd unavailable ({s}) — shader-switch messages disabled\n", .{@errorName(e)}) catch {};
+            break :blk null;
         };
 
         try err.print("shader: {s} ({s}, {s}) — {} of {} presets, ',' / '.' to cycle\n", .{
@@ -736,6 +757,7 @@ fn cycleShader(
     g.chain().deinit();
     g.active = spare;
     g.index = next;
+    if (g.osd) |*o| o.show(g.names[next]);
 
     err.print("shader: {s} ({} of {}, {} pass{s}, {s} tier)\n", .{
         g.chain().p.name_str(),
