@@ -49,9 +49,18 @@ OUT = ROOT / "shaders"
 TOOLS = ROOT / ".shader-tools"
 
 # Emitted GLSL profile -> (spirv-cross args, subdirectory).
+#
+# glsl330 gets --no-420pack-extension: without it, SPIRV-Cross emits
+# layout(binding=N) guarded by "#ifdef GL_ARB_shading_language_420pack" --
+# but the qualifier itself is unconditional, so on a driver that lacks the
+# extension (e.g. macOS's OpenGL, capped at a 4.1 core profile) the shader
+# fails to compile rather than falling back. The runtime never needed the
+# qualifier anyway: it binds both UBOs (glUniformBlockBinding) and sampler
+# units (glUniform1i) explicitly at link time from the manifest, so dropping
+# the in-shader binding is free.
 PROFILES = {
     "essl300": ["--version", "300", "--es"],
-    "glsl330": ["--version", "330", "--no-es"],
+    "glsl330": ["--version", "330", "--no-es", "--no-420pack-extension"],
     "essl100": ["--version", "100", "--es"],
 }
 
