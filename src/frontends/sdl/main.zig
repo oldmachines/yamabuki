@@ -1,6 +1,6 @@
 //! SDL3 desktop frontend: the development-and-play UI.
 //!
-//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]
+//!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate] [--wide N]
 //!
 //! Controls (RetroArch keyboard defaults):
 //!   arrows = d-pad   Z = B   X = A   A = Y   S = X   Q = L   W = R
@@ -11,15 +11,18 @@
 //!   , / .  cycle shaders (only the presets baked for this GPU's profile)
 //!
 //! Video is the console's native RGB565 framebuffer streamed into a texture
-//! (recreated when the machine switches to hi-res/overscan dimensions) and
-//! letterboxed onto a 512x(2*height) logical canvas — 256-wide frames scale
-//! by an exact 2x, hi-res frames map 1:1. Audio goes to an SDL audio stream
+//! (recreated when the machine switches to hi-res/overscan/`--wide` dimensions)
+//! and letterboxed onto a (2*width)x(2*height) logical canvas — 256-wide
+//! frames scale by an exact 2x (so does a `--wide`-widened frame, showing more
+//! picture rather than stretching it), hi-res frames map 1:1 horizontally.
+//! Audio goes to an SDL audio stream
 //! at the DSP's native 32 kHz; the device side resamples. Pacing is a
-//! nanosecond accumulator locked to the NTSC frame rate (~60.0988 Hz)
-//! rather than display vsync, so a 144 Hz monitor doesn't fast-forward the
-//! game. `--frames N` runs unattended and prints the same video/audio
-//! hashes as the headless runner, which is how CI smoke-tests this frontend
-//! under SDL's dummy drivers.
+//! nanosecond accumulator locked to the loaded cart's region frame rate
+//! (~60.0988 Hz NTSC, 50 Hz PAL — `--region` overrides the header's
+//! auto-detected default) rather than display vsync, so a 144 Hz monitor
+//! doesn't fast-forward the game. `--frames N` runs unattended and prints
+//! the same video/audio hashes as the headless runner, which is how CI
+//! smoke-tests this frontend under SDL's dummy drivers.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -27,6 +30,8 @@ const sdl3 = @import("sdl3.zig");
 const gl = @import("gl.zig");
 const preset = @import("preset.zig");
 const shader = @import("shader.zig");
+const util = @import("util");
+const osd = @import("osd.zig");
 
 const Button = core.joypad.Button;
 
@@ -51,6 +56,11 @@ const GlVideo = struct {
     /// Every preset in that directory, sorted — the cycle order.
     names: [][]const u8,
     index: usize,
+    /// The shader-name toast. Null means it failed to compile — never fatal,
+    /// by the same rule a shader itself follows: a nice-to-have UI element
+    /// must not cost the user the emulator, or the shader chain it is
+    /// supposed to be announcing.
+    osd: ?osd.Osd,
 
     fn chain(self: *GlVideo) *shader.Chain {
         return &self.chains[self.active];
@@ -66,26 +76,35 @@ const Profile = struct {
     profile_mask: c_int,
     major: c_int,
     minor: c_int,
+    /// Which GLSL dialect the OSD's own tiny program should be compiled in —
+    /// this ladder and the shader chain's both land on the same rung.
+    dialect: osd.Dialect,
 };
 
 const profiles = [_]Profile{
-    .{ .dir = "essl300", .profile_mask = sdl3.gl_profile_es, .major = 3, .minor = 0 },
-    .{ .dir = "glsl330", .profile_mask = sdl3.gl_profile_core, .major = 3, .minor = 3 },
-    .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0 },
+    .{ .dir = "essl300", .profile_mask = sdl3.gl_profile_es, .major = 3, .minor = 0, .dialect = .essl300 },
+    .{ .dir = "glsl330", .profile_mask = sdl3.gl_profile_core, .major = 3, .minor = 3, .dialect = .glsl330 },
+    .{ .dir = "essl100", .profile_mask = sdl3.gl_profile_es, .major = 2, .minor = 0, .dialect = .essl100 },
 };
 
-/// NTSC frame duration: 262 lines x 1364 master clocks at 21.477 MHz.
-const frame_ns: u64 =
-    core.timing.cycles_per_line * core.timing.ntsc_lines_per_frame *
-    1_000_000_000 / core.timing.ntsc_master_hz;
-
-/// If we fall further behind than this (state load, window drag), resync the
-/// pacing clock instead of sprinting to catch up.
-const max_lag_ns: u64 = 4 * frame_ns;
+/// Frame duration for the loaded cart's region: 262 lines at 21.477 MHz
+/// (NTSC, ~60.0988 Hz) or 312 lines at 21.281 MHz (PAL, 50 Hz).
+fn frameNs(region: core.timing.Region) u64 {
+    return switch (region) {
+        .ntsc => core.timing.cycles_per_line * core.timing.ntsc_lines_per_frame *
+            1_000_000_000 / core.timing.ntsc_master_hz,
+        .pal => core.timing.cycles_per_line * core.timing.pal_lines_per_frame *
+            1_000_000_000 / core.timing.pal_master_hz,
+    };
+}
 
 /// Fast-forward keeps at most this much audio queued (~1/4 s) and drops the
 /// rest — the point is to skip ahead, not to build a backlog.
 const ff_max_queued_bytes: c_int = 32 * 1024;
+
+/// `--region ntsc|pal|auto`: override the header-detected region. `auto`
+/// (the default) uses the cart header's region byte.
+const RegionArg = enum { auto, ntsc, pal };
 
 const Args = struct {
     rom: []const u8,
@@ -93,6 +112,7 @@ const Args = struct {
     frames: u32 = 0, // 0 = run until quit
     audio: bool = true,
     accuracy: core.Accuracy = .fast,
+    region: RegionArg = .auto,
     shader: ?[]const u8 = null,
     shader_dir: []const u8 = "shaders",
     /// `--shot <prefix>`: write `<prefix>-<frame>.ppm` at each frame in
@@ -107,38 +127,27 @@ const Args = struct {
     /// SlowROM game), gated by patches/fastrom-compat.zon — `broken` refuses,
     /// unknown warns loudly.
     auto_fastrom: bool = false,
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
+    /// margin. Fast core only — refused together with `--accurate`.
+    wide: u32 = 0,
 };
 
-/// Write 24-bit RGB as a binary PPM — the same format the headless runner emits,
-/// so one converter handles both.
-fn writePpm(io: std.Io, path: []const u8, w: u32, h: u32, rgb: []const u8) !void {
-    var header: [64]u8 = undefined;
-    const head = try std.fmt.bufPrint(&header, "P6\n{d} {d}\n255\n", .{ w, h });
+/// The `drainAudio` sink for the main run loop: forward each chunk to the SDL
+/// audio stream, dropping it under fast-forward once the device already has
+/// `ff_max_queued_bytes` queued (the point is to skip ahead, not to queue up
+/// a backlog).
+const AudioSink = struct {
+    sdl: sdl3.Api,
+    stream: ?*sdl3.AudioStream,
+    fast_forward: bool,
 
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(head);
-    try writer.interface.writeAll(rgb);
-    try writer.interface.flush();
-}
-
-/// The console's own framebuffer, RGB565 expanded to RGB888 — what you get when
-/// no shader is loaded. The 5/6-bit channels are bit-replicated into 8 so white
-/// stays white instead of landing on 0xF8.
-fn framebufferRgb(gpa: std.mem.Allocator, fb: []const u16, w: u32, h: u32) ![]u8 {
-    const rgb = try gpa.alloc(u8, @as(usize, w) * @as(usize, h) * 3);
-    for (fb[0 .. @as(usize, w) * @as(usize, h)], 0..) |px, i| {
-        const r5: u8 = @intCast((px >> 11) & 0x1F);
-        const g6: u8 = @intCast((px >> 5) & 0x3F);
-        const b5: u8 = @intCast(px & 0x1F);
-        rgb[i * 3 + 0] = (r5 << 3) | (r5 >> 2);
-        rgb[i * 3 + 1] = (g6 << 2) | (g6 >> 4);
-        rgb[i * 3 + 2] = (b5 << 3) | (b5 >> 2);
+    fn push(self: AudioSink, chunk: []const i16) !void {
+        const stream = self.stream orelse return;
+        if (!self.fast_forward or self.sdl.SDL_GetAudioStreamQueued(stream) < ff_max_queued_bytes)
+            _ = self.sdl.SDL_PutAudioStreamData(stream, chunk.ptr, @intCast(chunk.len * 2));
     }
-    return rgb;
-}
+};
 
 const Keymap = struct { code: u32, mask: u16 };
 
@@ -172,11 +181,19 @@ pub fn main(init: std.process.Init) !void {
     const args = parseArgs(init, gpa) catch |e| {
         if (e == error.ShotNeedsFrames) {
             try err.print("error: --shot without --shot-frames captures the last frame, which needs --frames N\n", .{});
+        } else if (e == error.WideNeedsFast) {
+            try err.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
+        } else if (e == error.WideTooBig) {
+            try err.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
         }
         try err.print(
             "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
-                "                    [--shader NAME] [--shader-dir DIR] [--patch p.bps|p.ips] [--auto-fastrom]\n" ++
+                "                    [--region ntsc|pal|auto] [--shader NAME] [--shader-dir DIR]\n" ++
+                "                    [--patch p.bps|p.ips] [--auto-fastrom] [--wide N]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
+                "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
+                "  --wide N    widen the framebuffer by N columns on each side, e.g. 32 -> 320x224\n" ++
+                "              (fast core only; for widescreen game patches such as wide-snes)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -246,7 +263,13 @@ pub fn main(init: std.process.Init) !void {
     };
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    switch (args.region) {
+        .auto => {},
+        .ntsc => con.setRegion(.ntsc),
+        .pal => con.setRegion(.pal),
+    }
     if (args.auto_fastrom) con.enableAutoFastrom();
+    if (args.wide != 0) con.setWideMargin(args.wide);
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{args.rom});
 
@@ -260,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
 
     const window = sdl.SDL_CreateWindow(
         "Yamabuki",
-        @intCast(256 * args.scale),
+        @intCast((256 + 2 * args.wide) * args.scale),
         @intCast(224 * args.scale),
         sdl3.window_resizable | if (args.shader != null) sdl3.window_opengl else 0,
     ) orelse {
@@ -283,6 +306,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (glv) |g| {
+        if (g.osd) |*o| o.deinit();
         g.chain().deinit();
         _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
     };
@@ -324,6 +348,14 @@ pub fn main(init: std.process.Init) !void {
     var tex_w: u32 = 0;
     var tex_h: u32 = 0;
 
+    // Region is fixed for the life of a loaded cart (repower re-detects the
+    // same header, or the CLI override above), so the frame duration is
+    // computed once here rather than re-derived every frame.
+    const frame_ns = frameNs(con.region());
+    // If we fall further behind than this (state load, window drag), resync
+    // the pacing clock instead of sprinting to catch up.
+    const max_lag_ns: u64 = 4 * frame_ns;
+
     var buttons: u16 = 0;
     var fast_forward = false;
     var running = true;
@@ -346,7 +378,16 @@ pub fn main(init: std.process.Init) !void {
                     if (key.scancode == sdl3.scancode.tab) fast_forward = key.down;
                     if (key.down and !key.repeat) switch (key.scancode) {
                         sdl3.scancode.escape => running = false,
-                        sdl3.scancode.f1 => con.repower(),
+                        sdl3.scancode.f1 => {
+                            con.repower();
+                            // repower() re-detects region from the header;
+                            // reapply an explicit CLI override.
+                            switch (args.region) {
+                                .auto => {},
+                                .ntsc => con.setRegion(.ntsc),
+                                .pal => con.setRegion(.pal),
+                            }
+                        },
                         sdl3.scancode.f5 => {
                             _ = con.saveState(state_buf);
                             if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
@@ -398,6 +439,7 @@ pub fn main(init: std.process.Init) !void {
                 // This frame's video is lost; emulation and audio are not.
                 try err.print("shader render failed ({s}); falling back to the software renderer\n", .{@errorName(e)});
                 try err.flush();
+                if (g.osd) |*o| o.deinit();
                 g.chain().deinit();
                 _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
                 glv = null;
@@ -419,15 +461,17 @@ pub fn main(init: std.process.Init) !void {
                 if (wantsShot(args.shot_frames, frames_run, args.frames)) {
                     const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
                     if (g.chain().capture(gpa, win)) |img| {
-                        const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
-                        writePpm(io, path, img.w, img.h, img.rgb) catch |e| {
-                            try err.print("shot failed: {s}\n", .{@errorName(e)});
-                        };
+                        try util.maybeShot(io, gpa, err, prefix, frames_run, img.w, img.h, img.rgb);
                     } else |e| {
                         try err.print("capture failed: {s}\n", .{@errorName(e)});
+                        try err.flush();
                     }
-                    try err.flush();
                 }
+            }
+            if (g.osd) |*o| {
+                const window_size: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
+                const lb = shader.Chain.letterbox(window_size, g.chain().source_size);
+                o.draw(window_size, .{ .x = lb.x, .y = lb.y, .w = lb.w, .h = lb.h });
             }
             _ = g.sdl_gl.SDL_GL_SwapWindow(window);
         } else {
@@ -446,11 +490,17 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 _ = sdl.SDL_SetTextureScaleMode(texture.?, sdl3.scale_mode_nearest);
-                // 256-wide frames scale 2x onto the canvas, hi-res maps 1:1; the
-                // canvas keeps the SNES 8:7 shape and letterboxes into the window.
+                // 256-wide (or `--wide`-widened) frames scale 2x onto the
+                // canvas — a wider frame gets a proportionally wider canvas,
+                // showing more picture rather than stretching it; genuine
+                // hi-res (exactly core.ppu.fb_width_max, a width `--wide`
+                // can never reach — see `core.ppu.wide_margin_max`) maps 1:1
+                // instead. The canvas keeps the resulting shape and
+                // letterboxes into the window.
+                const canvas_w: u32 = if (width == core.ppu.fb_width_max) core.ppu.fb_width_max else width * 2;
                 _ = sdl.SDL_SetRenderLogicalPresentation(
                     r,
-                    512,
+                    @intCast(canvas_w),
                     @intCast(height * 2),
                     sdl3.logical_presentation_letterbox,
                 );
@@ -465,27 +515,18 @@ pub fn main(init: std.process.Init) !void {
             // No shader: the console's framebuffer *is* the picture.
             if (args.shot) |prefix| {
                 if (wantsShot(args.shot_frames, frames_run, args.frames)) {
-                    const rgb = try framebufferRgb(gpa, fb, width, height);
-                    const path = try std.fmt.allocPrint(gpa, "{s}-{d:0>5}.ppm", .{ prefix, frames_run });
-                    writePpm(io, path, width, height, rgb) catch |e| {
-                        try err.print("shot failed: {s}\n", .{@errorName(e)});
-                        try err.flush();
-                    };
+                    const rgb = try util.expandFramebuffer(gpa, fb, width, height);
+                    try util.maybeShot(io, gpa, err, prefix, frames_run, width, height, rgb);
                 }
             }
         }
 
         // Audio: drain the console ring into the SDL stream.
-        var drain: [4096]i16 = undefined;
-        while (true) {
-            const n = con.readAudio(&drain);
-            if (n == 0) break;
-            audio_hash = core.console.hashAudio(audio_hash, drain[0..n]);
-            if (audio) |stream| {
-                if (!fast_forward or sdl.SDL_GetAudioStreamQueued(stream) < ff_max_queued_bytes)
-                    _ = sdl.SDL_PutAudioStreamData(stream, &drain, @intCast(n * 2));
-            }
-        }
+        try util.drainAudio(con, &audio_hash, AudioSink{
+            .sdl = sdl,
+            .stream = audio,
+            .fast_forward = fast_forward,
+        }, AudioSink.push);
 
         if (args.frames != 0 and frames_run >= args.frames) running = false;
 
@@ -606,10 +647,15 @@ fn initGl(
             .profile_dir = profile_dir,
             .names = names,
             .index = start,
+            .osd = null,
         };
         buildChain(io, gpa, g, start, g.chain(), err) catch |e| {
             _ = sdl_gl.SDL_GL_DestroyContext(ctx);
             return e;
+        };
+        g.osd = osd.Osd.init(api, prof.dialect) catch |e| blk: {
+            err.print("osd unavailable ({s}) — shader-switch messages disabled\n", .{@errorName(e)}) catch {};
+            break :blk null;
         };
 
         try err.print("shader: {s} ({s}, {s}) — {} of {} presets, ',' / '.' to cycle\n", .{
@@ -711,6 +757,7 @@ fn cycleShader(
     g.chain().deinit();
     g.active = spare;
     g.index = next;
+    if (g.osd) |*o| o.show(g.names[next]);
 
     err.print("shader: {s} ({} of {}, {} pass{s}, {s} tier)\n", .{
         g.chain().p.name_str(),
@@ -724,15 +771,10 @@ fn cycleShader(
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
-    // `iterate()` is POSIX-only — on Windows the command line has to be decoded
-    // from UTF-16, which needs an allocator. The allocator form works on every
-    // target, so the frontend builds and runs on a dev box as well as on the
-    // handheld it is aimed at.
     // Deliberately not deinit'd: on Windows the iterator owns the decoded
     // strings, and `Args.rom` / `Args.shader` are slices into them. `gpa` is the
     // process arena, so they live exactly as long as they need to.
-    var it = try init.minimal.args.iterateAllocator(gpa);
-    _ = it.skip(); // program name
+    var it = try util.argIterator(init, gpa);
     var args: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
@@ -747,6 +789,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             args.audio = false;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             args.accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--region")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.region = std.meta.stringToEnum(RegionArg, v) orelse return error.BadRegion;
         } else if (std.mem.eql(u8, a, "--shader")) {
             args.shader = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--patch")) {
@@ -769,6 +814,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 try list.append(gpa, try std.fmt.parseInt(u32, t, 10));
             }
             args.shot_frames = try list.toOwnedSlice(gpa);
+        } else if (std.mem.eql(u8, a, "--wide")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
@@ -779,5 +827,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // silently writing nothing.
     if (args.shot != null and args.shot_frames.len == 0 and args.frames == 0)
         return error.ShotNeedsFrames;
+    if (args.wide != 0) {
+        if (args.accuracy == .accurate) return error.WideNeedsFast;
+        if (args.wide > core.ppu.wide_margin_max) return error.WideTooBig;
+    }
     return args;
 }

@@ -400,13 +400,16 @@ pub const Chain = struct {
         return .{ .w = box.w, .h = box.h, .rgb = rgb };
     }
 
-    /// The letterboxed on-screen rectangle: the SNES 8:7 shape fitted into the
-    /// window, matching the software path's logical presentation exactly.
+    /// The letterboxed on-screen rectangle: the SNES shape (or, under
+    /// `--wide`, its widened shape) fitted into the window, matching the
+    /// software path's logical presentation exactly.
     pub fn letterbox(window: Size, frame: Size) struct { x: i32, y: i32, w: u32, h: u32 } {
-        // The software path presents onto a 512 x (2*h) canvas, so a 256-wide
-        // frame doubles and a hi-res frame maps 1:1 — both land on the same
-        // aspect.
-        const aspect_w: f32 = 512.0;
+        // The software path presents onto a (2*frame.w) x (2*h) canvas, so a
+        // 256-wide (or `--wide`-widened) frame doubles — showing more picture
+        // rather than stretching it — and a genuine hi-res frame (exactly
+        // 512, the width core.ppu.wide_margin_max keeps `--wide` from ever
+        // reaching) maps 1:1 instead.
+        const aspect_w: f32 = if (frame.w == 512) 512.0 else @floatFromInt(frame.w * 2);
         const aspect_h: f32 = @floatFromInt(@max(1, frame.h * 2));
         const want = aspect_w / aspect_h;
         const have = @as(f32, @floatFromInt(window.w)) / @as(f32, @floatFromInt(@max(1, window.h)));

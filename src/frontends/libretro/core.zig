@@ -94,6 +94,7 @@ pub export fn retro_get_system_info(info: *api.SystemInfo) void {
 }
 
 pub export fn retro_get_system_av_info(info: *api.SystemAvInfo) void {
+    const region: core.timing.Region = if (console) |con| con.region() else .ntsc;
     info.* = .{
         .geometry = .{
             .base_width = 256,
@@ -103,7 +104,10 @@ pub export fn retro_get_system_av_info(info: *api.SystemAvInfo) void {
             .aspect_ratio = 4.0 / 3.0,
         },
         .timing = .{
-            .fps = 60.0988,
+            .fps = switch (region) {
+                .ntsc => 60.0988,
+                .pal => 50.0070,
+            },
             .sample_rate = @floatFromInt(core.timing.dsp_sample_hz),
         },
     };
@@ -226,7 +230,11 @@ pub export fn retro_unload_game() void {
 }
 
 pub export fn retro_get_region() c_uint {
-    return api.region_ntsc;
+    const con = console orelse return api.region_ntsc;
+    return switch (con.region()) {
+        .ntsc => api.region_ntsc,
+        .pal => api.region_pal,
+    };
 }
 
 pub export fn retro_load_game_special(game_type: c_uint, info: ?[*]const api.GameInfo, num_info: usize) bool {

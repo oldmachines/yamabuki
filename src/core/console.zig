@@ -79,8 +79,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.init(&self.cart);
             self.bus.beam_enabled = cfg.accuracy == .accurate;
             self.cpu = Cpu(Bus).init(&self.bus);
-            self.region = .ntsc;
+            self.region = timing.regionFromHeaderByte(self.cart.header.region);
+            self.bus.ppu.pal = self.region == .pal;
             self.reset();
+        }
+
+        /// Explicit region override (frontend `--region ntsc|pal`), replacing
+        /// the header-detected default `init` set. Must be called before the
+        /// first `runFrame`.
+        pub fn setRegion(self: *Self, r: timing.Region) void {
+            self.region = r;
+            self.bus.ppu.pal = r == .pal;
         }
 
         /// Power-on / reset: reload CPU vectors and restart the frame timeline.
@@ -137,6 +146,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // New frame: leave vblank, clear the vblank NMI flag.
                 io.in_vblank = false;
                 io.nmi_flag = false;
+                // STAT78 ($213F) bit7: hardware toggles the field flag once per
+                // frame (a frame-parity signal, not just an interlace one). A
+                // script waiting on it to change hangs forever if it never does.
+                self.bus.ppu.field = !self.bus.ppu.field;
             }
             if (line == self.vblankLine()) {
                 // The game's deadline: its main loop had until now to come
@@ -327,6 +340,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
             return self.bus.ppu.fb_line_width;
         }
 
+        /// `--wide N` (M12): extend the fast core's framebuffer by `margin`
+        /// columns on each side (`frameWidth()` reports `256 + 2*margin`
+        /// after the next frame). Frontends refuse to combine this with
+        /// `--accurate` before ever calling it — the dot renderer's
+        /// piecewise render stays 256-fixed and never reads this field.
+        pub fn setWideMargin(self: *Self, margin: u32) void {
+            self.bus.ppu.wide_margin = @intCast(margin);
+        }
+
         /// Drain buffered S-DSP output into `dst` as interleaved stereo i16
         /// at 32 kHz (`timing.dsp_sample_hz`); returns i16 values copied.
         /// One video frame produces ~532 stereo frames.
@@ -465,6 +487,20 @@ pub const AnyConsole = union(Accuracy) {
         return std.meta.activeTag(self.*);
     }
 
+    pub fn region(self: *const AnyConsole) timing.Region {
+        switch (self.*) {
+            inline else => |*c| return c.region,
+        }
+    }
+
+    /// Explicit region override (frontend `--region ntsc|pal`); see
+    /// `Console.setRegion`.
+    pub fn setRegion(self: *AnyConsole, r: timing.Region) void {
+        switch (self.*) {
+            inline else => |*c| c.setRegion(r),
+        }
+    }
+
     pub fn cartridge(self: *AnyConsole) *Cartridge {
         switch (self.*) {
             inline else => |*c| return &c.cart,
@@ -492,6 +528,15 @@ pub const AnyConsole = union(Accuracy) {
     pub fn frameWidth(self: *const AnyConsole) u32 {
         switch (self.*) {
             inline else => |*c| return c.frameWidth(),
+        }
+    }
+
+    /// `--wide N` (M12, fast core only): see `Console.setWideMargin`.
+    /// Frontends must not call this on an `.accurate` console — refuse the
+    /// flag combination before `init` instead.
+    pub fn setWideMargin(self: *AnyConsole, margin: u32) void {
+        switch (self.*) {
+            inline else => |*c| c.setWideMargin(margin),
         }
     }
 
@@ -615,6 +660,30 @@ test "scheduler delivers a vblank NMI and runFrame terminates" {
 
     con.runFrame();
     try std.testing.expectEqual(@as(u8, 2), con.bus.wram.data[0]);
+}
+
+test "region defaults from the header byte and setRegion overrides it" {
+    const alloc = std.testing.allocator;
+    const rom = try buildNmiRom(alloc);
+    defer alloc.free(rom);
+
+    const cart = try Cartridge.load(alloc, rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    // buildNmiRom's header region byte is 0 (Japan) -> NTSC by default.
+    try std.testing.expectEqual(timing.Region.ntsc, con.region);
+    try std.testing.expectEqual(timing.ntsc_lines_per_frame, con.linesPerFrame());
+    try std.testing.expect(!con.bus.ppu.pal);
+
+    con.setRegion(.pal);
+    try std.testing.expectEqual(timing.Region.pal, con.region);
+    try std.testing.expectEqual(timing.pal_lines_per_frame, con.linesPerFrame());
+    try std.testing.expect(con.bus.ppu.pal);
 }
 
 test "ROM-programmed backdrop appears in the framebuffer" {
@@ -925,6 +994,42 @@ test "V-IRQ timer fires once per frame on its scanline and TIMEUP acks it" {
     con.runFrame();
     con.runFrame();
     try std.testing.expectEqual(@as(u8, 3), con.bus.wram.data[0]);
+}
+
+test "STAT78 exposes the per-frame field flag ($213F bit 7)" {
+    // Real hardware toggles STAT78's field flag once per frame — a frame-parity
+    // signal, independent of interlace mode — and a script that waits for it to
+    // change to advance (a common cutscene-timing idiom) hangs forever if it is
+    // hardwired to zero. `field` was declared nowhere and $213F never read it;
+    // the same bug class as HVBJOY's H-blank flag (`isHblank`).
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    @memset(rom, 0);
+    const code = [_]u8{ 0x80, 0xFE }; // loop: BRA loop
+    @memcpy(rom[0..code.len], &code);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "FIELD TEST           ");
+    h[0x15] = 0x20;
+    h[0x17] = 5;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    defer alloc.free(rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    const f0 = con.bus.read8(0x00_213F) & 0x80;
+    con.runFrame();
+    const f1 = con.bus.read8(0x00_213F) & 0x80;
+    try std.testing.expect(f0 != f1); // toggled after one frame
+    con.runFrame();
+    try std.testing.expectEqual(f0, con.bus.read8(0x00_213F) & 0x80); // and back
 }
 
 test "HDMA indirect mode drives INIDISP per scanline" {

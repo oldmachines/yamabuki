@@ -18,6 +18,13 @@ pub const fb_width: u32 = 256;
 pub const fb_width_max: u32 = 512;
 pub const fb_height: u32 = 239;
 
+/// `--wide N` (M12, fast core only): largest margin extension on each side of
+/// the standard 256-wide line, giving a 256+2*wide_margin_max = 384-wide
+/// ceiling. Kept below `fb_width_max` (512, the genuine hi-res width) so a
+/// wide frame's width can never collide with hi-res's — frontends tell the
+/// two apart by "is it exactly 512" without carrying a separate flag.
+pub const wide_margin_max: u32 = 64;
+
 /// Per-background-layer configuration latched from the register file.
 pub const BgLayer = struct {
     /// Tilemap base, in VRAM words.
@@ -37,7 +44,7 @@ pub const Ppu = struct {
     // Derived state: the RGB565 palette and the brightness-scaled line palette
     // are rebuilt from cgram, and the framebuffer is output, so none is part of
     // the saved state.
-    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width", "perf_vram_reads" };
+    pub const serialize_skip = .{ "palette", "lpal", "lpal_dirty", "fb", "fb_line_width", "perf_vram_reads", "wide_margin" };
 
     // --- video memories ---------------------------------------------------
     /// 64 KiB VRAM as 32768 words.
@@ -161,12 +168,34 @@ pub const Ppu = struct {
     ophct_second: bool,
     opvct_second: bool,
 
+    /// STAT78 bit4: set by the console from the cart's detected/overridden
+    /// region. Games read this to self-check region (e.g. DKC2's "not
+    /// designed for this system" screen); CIC region lockout itself is not
+    /// emulated.
+    pal: bool,
+
+    /// $213F STAT78 bit7: the interlace field flag. Real hardware toggles it
+    /// once per frame regardless of interlace mode (it is a frame-parity
+    /// signal, not just an interlace indicator) — set by the console at the
+    /// top of every frame.
+    field: bool,
+
     /// Deterministic count of VRAM word reads performed by the renderer's tile
     /// decode. Compiled to a dead field unless the `perf_counters` build option
     /// is set (only the bench enables it), so shipping builds pay nothing. Used
     /// by `zig build bench --check` to gate memory-traffic regressions: the
     /// tile-row decode cache reduces this ~8x, and a revert would fail the gate.
     perf_vram_reads: u64,
+
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, widening `fb_line_width` to `fb_width + 2*wide_margin`. Zero
+    /// (the default) reproduces the original 256/512 behavior exactly — every
+    /// render-path formula that reads this field reduces to the unmodified
+    /// one when it is zero, so an unset `--wide` costs nothing beyond the
+    /// per-line comparison. Frontends refuse to combine `--wide` with
+    /// `--accurate`, so this stays 0 on the accurate core in practice; the
+    /// dot renderer (`renderUpTo`/`finishScanline`) never reads it.
+    wide_margin: u16,
 
     pub const init: Ppu = .{
         .vram = @splat(0),
@@ -234,7 +263,10 @@ pub const Ppu = struct {
         .counters_latched = false,
         .ophct_second = false,
         .opvct_second = false,
+        .pal = false,
+        .field = false,
         .perf_vram_reads = 0,
+        .wide_margin = 0,
     };
 
     /// Rebuild the RGB565 palette from CGRAM after deserialization. The
@@ -393,9 +425,12 @@ pub const Ppu = struct {
     }
 
     /// $213F STAT78: resets the counter-read toggles and the latch flag.
-    /// Bit6 = counters latched, bit4 = NTSC, bits0-3 = PPU2 version.
+    /// Bit7 = field flag, bit6 = counters latched, bit4 = PAL (0 = NTSC), bits0-3 = PPU2 version.
     pub fn readStat78(self: *Ppu, mdr: u8) u8 {
-        const v = (if (self.counters_latched) @as(u8, 0x40) else 0) | (mdr & 0x20) | 0x03;
+        const v = (if (self.field) @as(u8, 0x80) else 0) |
+            (if (self.counters_latched) @as(u8, 0x40) else 0) |
+            (if (self.pal) @as(u8, 0x10) else 0) |
+            (mdr & 0x20) | 0x03;
         self.counters_latched = false;
         self.ophct_second = false;
         self.opvct_second = false;
@@ -548,12 +583,14 @@ pub const Ppu = struct {
 
     /// Render one visible scanline into the framebuffer: force-blank/backdrop
     /// handling plus the BG and sprite compositor. The frame's row stride
-    /// starts at 256 and is promoted (with the rows already rendered doubled
-    /// in place) the first time a line renders hi-res.
+    /// starts at 256 (or `256 + 2*wide_margin` under `--wide`) and is promoted
+    /// (with the rows already rendered doubled in place) the first time a line
+    /// renders hi-res — hi-res promotion only ever happens with no margin, so a
+    /// `--wide` frame's stride never changes mid-frame.
     pub fn renderScanline(self: *Ppu, line: u32) void {
         if (line >= fb_height) return;
-        if (line == 0) self.fb_line_width = fb_width;
-        if (self.fb_line_width == fb_width and !self.force_blank and self.hiresActive()) {
+        if (line == 0) self.fb_line_width = fb_width + 2 * self.wide_margin;
+        if (self.wide_margin == 0 and self.fb_line_width == fb_width and !self.force_blank and self.hiresActive()) {
             self.promoteFrame(line);
         }
         line_render.renderLine(self, line);
@@ -694,6 +731,13 @@ test "window registers latch" {
     try std.testing.expectEqual(@as(u8, 0x02), ppu.wbglog);
     try std.testing.expectEqual(@as(u8, 0x11), ppu.tmw);
     try std.testing.expectEqual(@as(u8, 0x01), ppu.tsw);
+}
+
+test "STAT78 PAL bit reads correctly per region" {
+    var ppu: Ppu = .init;
+    try std.testing.expectEqual(@as(u8, 0), ppu.readStat78(0) & 0x10);
+    ppu.pal = true;
+    try std.testing.expectEqual(@as(u8, 0x10), ppu.readStat78(0) & 0x10);
 }
 
 test "mode 7 matrix write-twice, 13-bit center, and multiply" {

@@ -22,6 +22,20 @@ pub fn build(b: *std.Build) void {
     core_mod.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
     core_mod.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
 
+    // Shared frontend/test-runner helpers (RGB565 expansion, PPM/WAV writers,
+    // audio drain+hash, --shot capture, arg-iterator setup): imported by the
+    // frontends and the test runners ONLY — never by snes_core, which stays
+    // freestanding.
+    const frontend_util_mod = b.createModule(.{
+        .root_source_file = b.path("src/frontends/util.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snes_core", .module = core_mod },
+        },
+    });
+    const frontend_util_tests = b.addTest(.{ .root_module = frontend_util_mod });
+
     // Headless frontend: runs a ROM for N frames, dumps framebuffer as .ppm
     // and prints a hash. Primary development/verification tool.
     const headless = b.addExecutable(.{
@@ -32,6 +46,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -65,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -75,6 +91,7 @@ pub fn build(b: *std.Build) void {
     const run_core_tests = b.addRunArtifact(core_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&b.addRunArtifact(frontend_util_tests).step);
 
     // The SDL frontend's shader pipeline: the preset parser, the pass geometry,
     // and the uniform encoding are pure logic and are tested on the host. They
@@ -100,6 +117,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -114,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -194,6 +213,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
                 .{ .name = "rom_options", .module = rom_opts.createModule() },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -317,6 +337,18 @@ pub fn build(b: *std.Build) void {
     bench_core.addImport("perf_options", perf_on);
     bench_core.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
     bench_core.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
+    // A file can only be the root of one module per compilation, so the bench
+    // gets its own util module bound to `bench_core` rather than reusing
+    // `frontend_util_mod` (bound to `core_mod`) — the two `core.zig` module
+    // instances can't both appear in the same build graph.
+    const bench_util_mod = b.createModule(.{
+        .root_source_file = b.path("src/frontends/util.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snes_core", .module = bench_core },
+        },
+    });
     const bench = b.addExecutable(.{
         .name = "yamabuki-bench",
         .root_module = b.createModule(.{
@@ -326,6 +358,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "snes_core", .module = bench_core },
                 .{ .name = "perf_options", .module = perf_on },
+                .{ .name = "util", .module = bench_util_mod },
             },
         }),
     });

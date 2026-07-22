@@ -3,7 +3,7 @@
 //! whole audio stream as a WAV, both for eyeballing.
 //!
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
-//!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc]
+//!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc] [--wide N]
 //!   yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
@@ -24,12 +24,20 @@
 //!
 //! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
 //! game with the frame-budget profiler compiled in and answers the question that
-//! comes before every other one — *is this game CPU-bound at all?* See
+//! comes before every other one — *is this game CPU-bound at all?* `--routines`
+//! adds steps two and three: which routines cost the frame, and each hot
+//! routine's WRAM working set, MMIO blockers, and page-sharing with the rest —
+//! the numbers that decide whether it is worth moving to the SA-1. See
 //! `core/profile.zig` for what is being measured and why.
 
 const std = @import("std");
 const core = @import("snes_core");
 const profile = core.profile;
+const util = @import("util");
+
+/// `--region ntsc|pal|auto`: override the header-detected region. `auto`
+/// (the default) uses the cart header's region byte.
+const RegionArg = enum { auto, ntsc, pal };
 
 const Args = struct {
     rom: []const u8,
@@ -37,6 +45,7 @@ const Args = struct {
     ppm: ?[]const u8 = null,
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
+    region: RegionArg = .auto,
     patch: ?[]const u8 = null,
     save_patched: ?[]const u8 = null,
     /// Look the loaded ROM up in patches/registry.zon by content hash and
@@ -54,8 +63,13 @@ const Args = struct {
     json: bool = false,
     /// Dump the hottest loops and how each was classified.
     hot: bool = false,
-    /// Step two of the analyser: the per-routine cycle attribution table.
+    /// Steps two and three of the analyser: the per-routine cycle attribution
+    /// table, and each hot routine's WRAM working set and blockers.
     routines: bool = false,
+    /// `--wide N` (M12): extra columns rendered on each side of the standard
+    /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
+    /// margin. Fast core only — refused together with `--accurate`.
+    wide: u32 = 0,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
@@ -69,21 +83,31 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = parseArgs(init, gpa) catch {
+    const args = parseArgs(init, gpa) catch |e| {
+        if (e == error.WideNeedsFast) {
+            try out.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
+        } else if (e == error.WideTooBig) {
+            try out.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
+        }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
-            \\                         [--patch p.bps|p.ips] [--auto-patch] [--patch-dir DIR] [--save-patched out.sfc]
+            \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
+            \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\
+            \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
             \\  --auto-patch  look this ROM up in patches/registry.zon and apply its registered patch
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
+            \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
+            \\                (fast core only; for widescreen game patches such as wide-snes)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
-            \\  --routines    step two: which routines cost the frame (self/inclusive cycles per call site)
+            \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
+            \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
             \\
         , .{});
         try out.flush();
@@ -135,24 +159,26 @@ pub fn main(init: std.process.Init) !void {
 
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
+    switch (args.region) {
+        .auto => {},
+        .ntsc => con.setRegion(.ntsc),
+        .pal => con.setRegion(.pal),
+    }
     if (args.auto_fastrom) con.enableAutoFastrom();
+    if (args.wide != 0) con.setWideMargin(args.wide);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
-    var drain: [4096]i16 = undefined;
     const frames = args.frames orelse 1;
     for (0..frames) |_| {
         con.runFrame();
-        while (true) {
-            const n = con.readAudio(&drain);
-            if (n == 0) break;
-            audio_hash = core.console.hashAudio(audio_hash, drain[0..n]);
-            for (drain[0..n]) |s| audio_peak = @max(audio_peak, @abs(s));
-            if (args.wav != null) try audio_all.appendSlice(drain[0..n]);
-        }
+        try util.drainAudio(con, &audio_hash, AudioSink{
+            .peak = &audio_peak,
+            .wav = if (args.wav != null) &audio_all else null,
+        }, AudioSink.collect);
     }
 
     const fb = con.framebuffer();
@@ -164,16 +190,28 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     if (args.ppm) |path| {
-        try writePpm(io, path, fb, width, @intCast(fb.len / width));
+        try util.writeFramebufferPpm(gpa, io, path, fb, width, @intCast(fb.len / width));
         try out.print("wrote {s}\n", .{path});
         try out.flush();
     }
     if (args.wav) |path| {
-        try writeWav(io, path, audio_all.items);
+        try util.writeWav(io, path, audio_all.items);
         try out.print("wrote {s} ({} stereo frames)\n", .{ path, audio_all.items.len / 2 });
         try out.flush();
     }
 }
+
+/// The `drainAudio` sink for the main run loop: track peak amplitude always,
+/// and accumulate samples for a WAV dump when one was requested.
+const AudioSink = struct {
+    peak: *u16,
+    wav: ?*std.array_list.Managed(i16),
+
+    fn collect(self: AudioSink, chunk: []const i16) !void {
+        for (chunk) |s| self.peak.* = @max(self.peak.*, @abs(s));
+        if (self.wav) |w| try w.appendSlice(chunk);
+    }
+};
 
 /// Apply `--patch`: reads the patch file, strips the ROM's copier header (the
 /// community's patches are made against unheadered images), applies, and
@@ -445,17 +483,32 @@ fn runReport(
         if (args.routines) {
             const rows = try routineRows(gpa, &con.prof);
             const total = attributedTotal(rows);
-            try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"routines\":[", .{
+            const verdict = wramVerdict(topCodeRows(rows));
+            try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"wram_verdict\":" ++
+                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"routines\":[", .{
                 con.prof.stack_resets, con.prof.routines_dropped,
+                verdict.union_bytes,   verdict.union_pages,
+                verdict.fits_iram,     verdict.fits_bwram,
             });
             for (rows, 0..) |r, i| {
                 if (i != 0) try out.print(",", .{});
                 switch (r.what) {
                     .waiting => try out.print("{{\"entry\":\"(waiting)\"", .{}),
                     .main => try out.print("{{\"entry\":\"(main)\"", .{}),
-                    .code => try out.print("{{\"entry\":\"{x:0>2}:{x:0>4}\",\"kind\":\"{s}\",\"calls\":{},\"incl\":{}", .{
-                        r.entry >> 16, r.entry & 0xFFFF, @tagName(r.kind), r.calls, r.incl,
-                    }),
+                    .code => {
+                        try out.print("{{\"entry\":\"{x:0>2}:{x:0>4}\",\"kind\":\"{s}\",\"calls\":{},\"incl\":{}", .{
+                            r.entry >> 16, r.entry & 0xFFFF, @tagName(r.kind), r.calls, r.incl,
+                        });
+                        try out.print(
+                            ",\"wram_min\":{},\"wram_max\":{},\"wram_exact\":{},\"touches_sram\":{},\"shared\":{},\"mmio\":[",
+                            .{ r.wram.min_bytes, r.wram.max_bytes, r.wram.exact, r.touches_sram, wramShared(rows, i) },
+                        );
+                        for (r.mmio_regs, 0..) |reg, mi| {
+                            if (mi != 0) try out.print(",", .{});
+                            try out.print("\"${x:0>4}\"", .{reg});
+                        }
+                        try out.print("]", .{});
+                    },
                 }
                 try out.print(",\"self\":{},\"self_pct\":{d:.4},\"slow\":{}}}", .{
                     r.self, pct(r.self, total), r.slow,
@@ -579,7 +632,7 @@ fn runReport(
         try out.print("     {s:<10} {s:>9} {s:>14} {s:>7} {s:>7} {s:>7}  {s}\n", .{
             "entry", "calls", "self cycles", "self%", "incl%", "slow%", "",
         });
-        for (rows[0..@min(rows.len, routine_rows_shown)]) |r| {
+        for (rows[0..@min(rows.len, routine_rows_shown)], 0..) |r, i| {
             switch (r.what) {
                 .waiting => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(waiting)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
@@ -587,12 +640,33 @@ fn runReport(
                 .main => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
                 }),
-                .code => try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
-                    r.entry >> 16,       r.entry & 0xFFFF,
-                    r.calls,             r.self,
-                    pct(r.self, total),  pct(r.incl, total),
-                    pct(r.slow, r.self), if (r.kind == .code) "" else @tagName(r.kind),
-                }),
+                .code => {
+                    try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
+                        r.entry >> 16,       r.entry & 0xFFFF,
+                        r.calls,             r.self,
+                        pct(r.self, total),  pct(r.incl, total),
+                        pct(r.slow, r.self), if (r.kind == .code) "" else @tagName(r.kind),
+                    });
+                    // Step three: what it would cost to move — its WRAM
+                    // footprint (must relocate), MMIO it cannot reach from
+                    // the SA-1, and whether another top routine shares its
+                    // WRAM (moving one would strand the other).
+                    try out.print("                wram ", .{});
+                    try printWramFootprint(out, r.wram);
+                    if (r.touches_sram) try out.print("  bw-ram/sram", .{});
+                    if (wramShared(rows, i)) try out.print("  SHARED", .{});
+                    if (r.mmio_regs.len > 0) {
+                        try out.print("  mmio", .{});
+                        for (r.mmio_regs, 0..) |reg, mi| {
+                            if (mi == 6) {
+                                try out.print(" +{} more", .{r.mmio_regs.len - mi});
+                                break;
+                            }
+                            try out.print(" ${x:0>4}", .{reg});
+                        }
+                    }
+                    try out.print("\n", .{});
+                },
             }
         }
         if (con.prof.stack_resets != 0 or con.prof.routines_dropped != 0) {
@@ -602,6 +676,28 @@ fn runReport(
         }
         if (!con.prof.attributionBalanced()) {
             try out.print("     WARNING: attribution imbalance — the table does not sum to work+idle (bug)\n", .{});
+        }
+
+        const verdict = wramVerdict(topCodeRows(rows));
+        try out.print("\n  WRAM working set of the top routines: ", .{});
+        if (verdict.union_pages == 0) {
+            try out.print("none recorded (no WRAM access seen in the top routines)\n", .{});
+        } else {
+            try printByteCount(out, verdict.union_bytes);
+            try out.print(" across {} page(s) of {} — ", .{ verdict.union_pages, profile.wram_page_count });
+            if (verdict.fits_iram) {
+                try out.print("fits I-RAM (2 KiB): a conversion has somewhere to put it.\n", .{});
+            } else if (verdict.fits_bwram) {
+                try out.print("too big for I-RAM (2 KiB) but fits cartridge BW-RAM (256 KiB).\n", .{});
+            } else {
+                try out.print("exceeds even BW-RAM (256 KiB) — would not fit as a straight port.\n", .{});
+            }
+            try out.print(
+                \\    (page-granularity upper bound: a touched 256-byte page counts as fully
+                \\    used even if only one byte of it is. SHARED above names the blocker —
+                \\    moving that routine strands whichever other one shares its page.)
+                \\
+            , .{});
         }
     }
 
@@ -631,6 +727,13 @@ const RoutineRow = struct {
     self: u64,
     incl: u64 = 0,
     slow: u64,
+    /// Step three, `.code` rows only: what its data accesses were made of.
+    wram: core.profile.WramFootprint = .{ .min_bytes = 0, .max_bytes = 0, .exact = true },
+    wram_pages: core.profile.WramPages = @splat(0),
+    /// Slices into the profiler's own `Routine` — valid as long as `prof`
+    /// (i.e. `con.prof`) outlives the report, which it does.
+    mmio_regs: []const u16 = &.{},
+    touches_sram: bool = false,
 };
 
 /// Collect and rank every routine with self time, synthetics included.
@@ -640,7 +743,7 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
         try rows.append(.{ .what = .waiting, .self = prof.waiting_self, .slow = prof.waiting_slow });
     if (prof.main_self != 0)
         try rows.append(.{ .what = .main, .self = prof.main_self, .slow = prof.main_slow });
-    for (prof.routines) |r| {
+    for (prof.routines, 0..) |r, i| {
         if (r.entry == core.profile.Routine.empty or r.self_cycles == 0) continue;
         try rows.append(.{
             .what = .code,
@@ -650,6 +753,10 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
             .self = r.self_cycles,
             .incl = r.incl_cycles,
             .slow = r.slow_cycles,
+            .wram = r.wramFootprint(),
+            .wram_pages = r.wram_pages,
+            .mmio_regs = prof.routines[i].mmio_regs[0..r.n_mmio_regs],
+            .touches_sram = r.touches_sram,
         });
     }
     std.mem.sort(RoutineRow, rows.items, {}, struct {
@@ -658,6 +765,52 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
         }
     }.gt);
     return rows.items;
+}
+
+test "routine rows carry the WRAM footprint and shared flag into the report" {
+    var p: core.profile.Profiler = .init;
+    const cyc: u64 = 6;
+    // main -> A: touches $7E:1000.
+    p.step(0x00_9000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_A000, cyc, false, 0x7E_1000, null, .{});
+    p.step(0x00_A003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212.
+    p.step(0x00_9006, cyc, false, null, null, .{ .kind = .call, .target = 0x00_B000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_B000, cyc, false, 0x7E_1005, null, .{});
+    p.step(0x00_B003, cyc, false, 0x00_4212, null, .{});
+    p.step(0x00_B006, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const rows = try routineRows(arena_state.allocator(), &p);
+
+    var a_idx: ?usize = null;
+    var b_idx: ?usize = null;
+    for (rows, 0..) |r, i| {
+        if (r.what != .code) continue;
+        if (r.entry == 0x00_A000) a_idx = i;
+        if (r.entry == 0x00_B000) b_idx = i;
+    }
+    const a = rows[a_idx.?];
+    const b = rows[b_idx.?];
+
+    try std.testing.expect(a.wram.exact);
+    try std.testing.expectEqual(@as(u32, 1), a.wram.min_bytes);
+    try std.testing.expect(b.wram.exact);
+    try std.testing.expectEqual(@as(u32, 1), b.wram.min_bytes);
+    try std.testing.expectEqual(@as(usize, 1), b.mmio_regs.len);
+    try std.testing.expectEqual(@as(u16, 0x4212), b.mmio_regs[0]);
+    try std.testing.expect(!b.touches_sram);
+
+    // Same 256-byte page ($7E1000 and $7E1005): each names the other.
+    try std.testing.expect(wramShared(rows, a_idx.?));
+    try std.testing.expect(wramShared(rows, b_idx.?));
+
+    const verdict = wramVerdict(topCodeRows(rows));
+    try std.testing.expectEqual(@as(u32, 1), verdict.union_pages);
+    try std.testing.expectEqual(@as(u32, 256), verdict.union_bytes);
+    try std.testing.expect(verdict.fits_iram);
+    try std.testing.expect(verdict.fits_bwram);
 }
 
 /// Sum of every row's self time == everything banked as work or idle: the
@@ -673,12 +826,80 @@ fn pct(part: u64, whole: u64) f64 {
     return @as(f64, @floatFromInt(part)) * 100 / @as(f64, @floatFromInt(whole));
 }
 
+/// The `.code` rows the WRAM verdict and the report table agree on: the same
+/// top `routine_rows_shown` by self time that the table prints.
+fn topCodeRows(rows: []const RoutineRow) []const RoutineRow {
+    return rows[0..@min(rows.len, routine_rows_shown)];
+}
+
+/// Does `rows[idx]` share a WRAM page with any *other* named routine in
+/// `rows`? Moving one of them to the SA-1 would strand the other's state on
+/// the wrong side of the bus. Checked against the full set, not just what is
+/// displayed — a routine ranked outside the shown table can still be the
+/// thing a displayed routine's WRAM is shared with.
+fn wramShared(rows: []const RoutineRow, idx: usize) bool {
+    if (rows[idx].what != .code) return false;
+    for (rows, 0..) |other, j| {
+        if (j == idx or other.what != .code) continue;
+        if (core.profile.pagesOverlap(rows[idx].wram_pages, other.wram_pages)) return true;
+    }
+    return false;
+}
+
+/// The combined WRAM working set of a set of routines — the union of their
+/// touched pages, which is what actually has to fit in I-RAM or BW-RAM once
+/// they all move together. Page-granularity, so it is an upper bound: shared
+/// pages are not double-counted, but a page only one byte of which is touched
+/// still counts as a full 256 bytes.
+const WramVerdict = struct {
+    union_bytes: u32,
+    union_pages: u32,
+    fits_iram: bool,
+    fits_bwram: bool,
+};
+
+const iram_bytes: u32 = 2 * 1024;
+const bwram_bytes: u32 = 256 * 1024;
+
+fn wramVerdict(rows: []const RoutineRow) WramVerdict {
+    var union_pages: core.profile.WramPages = @splat(0);
+    for (rows) |r| {
+        if (r.what != .code) continue;
+        for (r.wram_pages, 0..) |w, i| union_pages[i] |= w;
+    }
+    const pages = core.profile.pageCount(union_pages);
+    const bytes = pages * 256;
+    return .{
+        .union_bytes = bytes,
+        .union_pages = pages,
+        .fits_iram = bytes <= iram_bytes,
+        .fits_bwram = bytes <= bwram_bytes,
+    };
+}
+
+fn printByteCount(out: *std.Io.Writer, n: u32) !void {
+    if (n >= 1024) {
+        try out.print("{d:.1} KiB", .{@as(f64, @floatFromInt(n)) / 1024.0});
+    } else {
+        try out.print("{} B", .{n});
+    }
+}
+
+fn printWramFootprint(out: *std.Io.Writer, fp: core.profile.WramFootprint) !void {
+    if (fp.exact) {
+        try printByteCount(out, fp.max_bytes);
+    } else {
+        try printByteCount(out, fp.min_bytes);
+        try out.print("+ (up to ", .{});
+        try printByteCount(out, fp.max_bytes);
+        try out.print(")", .{});
+    }
+}
+
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
-    // POSIX-only otherwise; Windows decodes the command line from UTF-16 and
-    // needs an allocator. Not deinit'd — the returned Args slice into it, and
-    // `gpa` is the process arena.
-    var it = try init.minimal.args.iterateAllocator(gpa);
-    _ = it.skip(); // program name
+    // Not deinit'd — the returned Args slice into it, and `gpa` is the
+    // process arena.
+    var it = try util.argIterator(init, gpa);
     var out: Args = .{ .rom = undefined };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
@@ -694,6 +915,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
             out.accuracy = .accurate;
+        } else if (std.mem.eql(u8, a, "--region")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.region = std.meta.stringToEnum(RegionArg, v) orelse return error.BadRegion;
         } else if (std.mem.eql(u8, a, "--patch")) {
             out.patch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--auto-patch")) {
@@ -712,59 +936,17 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--wide")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
     out.rom = rom orelse return error.NoRom;
-    return out;
-}
-
-/// Write interleaved stereo i16 samples as a 32 kHz PCM WAV.
-fn writeWav(io: std.Io, path: []const u8, samples: []const i16) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    const wr = &fw.interface;
-
-    const rate: u32 = @import("snes_core").timing.dsp_sample_hz;
-    const data_len: u32 = @intCast(samples.len * 2);
-    try wr.writeAll("RIFF");
-    try wr.writeInt(u32, 36 + data_len, .little);
-    try wr.writeAll("WAVEfmt ");
-    try wr.writeInt(u32, 16, .little); // PCM chunk size
-    try wr.writeInt(u16, 1, .little); // PCM
-    try wr.writeInt(u16, 2, .little); // stereo
-    try wr.writeInt(u32, rate, .little);
-    try wr.writeInt(u32, rate * 4, .little); // byte rate
-    try wr.writeInt(u16, 4, .little); // block align
-    try wr.writeInt(u16, 16, .little); // bits per sample
-    try wr.writeAll("data");
-    try wr.writeInt(u32, data_len, .little);
-    for (samples) |s| try wr.writeInt(i16, s, .little);
-    try wr.flush();
-}
-
-/// Write an RGB565 framebuffer as a binary PPM (P6, 8-bit RGB).
-fn writePpm(io: std.Io, path: []const u8, fb: []const u16, w: u32, h: u32) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    const wr = &fw.interface;
-
-    try wr.print("P6\n{} {}\n255\n", .{ w, h });
-    for (fb) |px| {
-        const r5: u16 = (px >> 11) & 0x1F;
-        const g6: u16 = (px >> 5) & 0x3F;
-        const b5: u16 = px & 0x1F;
-        const rgb = [3]u8{
-            @intCast(r5 * 255 / 31),
-            @intCast(g6 * 255 / 63),
-            @intCast(b5 * 255 / 31),
-        };
-        try wr.writeAll(&rgb);
+    if (out.wide != 0) {
+        if (out.accuracy == .accurate) return error.WideNeedsFast;
+        if (out.wide > core.ppu.wide_margin_max) return error.WideTooBig;
     }
-    try wr.flush();
+    return out;
 }

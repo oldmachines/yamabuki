@@ -1,0 +1,70 @@
+name: Claude Rebase
+
+# Build Loop 2b/3 — rebase green-but-stale loop PRs.
+#
+# Closes a gap the event-driven loop can't: a claude/issue-* PR that is green but
+# has gone CONFLICTING behind main wakes no CI event (Fix CI only fires on a
+# FAILING build), so nothing ever touches it. This cron finds those and rebases
+# them; the force-push retriggers CI -> Auto-merge. CI (ci.yml) re-verifies the
+# rebased result, so this job never needs to build.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # GitHub may delay scheduled runs under load
+  workflow_dispatch: {}
+
+concurrency:
+  group: claude-rebase
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  id-token: write
+  actions: read
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase stale claude PRs
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          # A prior merge to main (usually by the auto-merge bot) is what makes
+          # these stale; allow the agent to run on this bot-driven trigger.
+          allowed_bots: "claude"
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh api:*),Bash(git:*),Read,Glob,Grep,Edit,Write"
+          prompt: |
+            You are Build Loop step 2b/3 (Rebase) for oldmachines/yamabuki. Some
+            claude/issue-* PRs may be green but stale behind main, which no CI
+            event wakes. Find and rebase the genuinely CONFLICTING ones.
+
+            1. List open, non-draft PRs whose head branch starts with
+               `claude/issue-`:
+               `gh pr list --state open --json number,headRefName,isDraft,mergeable`.
+               Act only on mergeable == "CONFLICTING". GitHub returns "UNKNOWN"
+               for a few seconds right after main moves — if you see UNKNOWN,
+               wait and re-query; do not act on it. A PR that is merely behind
+               ("MERGEABLE") squash-merges cleanly — LEAVE IT ALONE.
+            2. For each CONFLICTING PR: check out its branch,
+               `git rebase origin/main`, and resolve conflicts by KEEPING BOTH
+               SIDES' intent (never drop a feature or a test to win a merge).
+               Then `git push --force-with-lease` (this retriggers CI ->
+               Auto-merge). Do NOT edit tests/goldens to sidestep a conflict.
+            3. If a conflict cannot be resolved mechanically: `git rebase --abort`,
+               convert the PR to a draft (`gh pr ready <n> --undo`), and comment
+               exactly what a human must resolve. A draft is skipped by this
+               workflow and by Auto-merge, so it can't loop.
+
+            Handle at most a few PRs this run; if nothing is CONFLICTING, finish
+            quietly.

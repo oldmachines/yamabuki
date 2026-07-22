@@ -1,0 +1,63 @@
+name: Claude Open PRs
+
+# Rescue for stranded loop branches. If Claude Implement pushes a
+# claude/issue-<n> branch but never opens a PR (e.g. it ran low on turns before
+# reaching `gh pr create`), no CI event ever fires for it and it just sits there.
+# This cron finds such branches — commits ahead of main, no open PR — and opens a
+# DRAFT PR for each, which triggers CI and hands the branch back to the loop.
+# (Implement now opens its PR early, so this is a backstop, not the main path.)
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"   # a few times an hour; offset off :00 under load
+  workflow_dispatch: {}
+
+concurrency:
+  group: claude-open-prs
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  open-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Open PRs for stranded claude branches
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          allowed_bots: "claude"
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh api:*),Bash(git:*),Read,Glob,Grep"
+          prompt: |
+            You are the stranded-branch rescue for oldmachines/yamabuki. Find
+            claude/issue-* branches that carry real work but have no PR, and open a
+            draft PR for each so the loop can pick them up.
+
+            1. List remote branches: `git ls-remote --heads origin 'refs/heads/claude/issue-*'`.
+            2. For each branch, skip it unless it has commits ahead of main
+               (`git log --oneline origin/main..origin/<branch>` is non-empty) AND
+               has no PR at all (`gh pr list --head <branch> --state all --json number`
+               returns []). A branch already merged, closed, or with an open PR is
+               left alone.
+            3. For each qualifying branch, derive the issue number <n> from the
+               branch name (claude/issue-<n>-...), read the issue title, and open a
+               DRAFT PR base main:
+               `gh pr create --draft --base main --head <branch> --title "<issue title>" --body "Rescued stranded branch (implemented but no PR was opened).\n\nCloses #<n>"`.
+               Then comment the PR link on issue <n>.
+
+            Open a draft (never ready-for-review) so a human un-drafts it after a
+            look, and Auto-merge's core-review gate still applies. If nothing
+            qualifies, finish quietly.

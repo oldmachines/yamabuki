@@ -204,24 +204,33 @@ pub fn renderLine(ppu: *Ppu, line: u32) void {
     // Brightness-scaled palette (index 0 is the backdrop).
     ensureLpal(ppu);
 
-    // Content composes at 256 pixels; on a 512-stride frame (a mixed-width
-    // frame whose earlier lines were hi-res) it is pixel-doubled into the row.
+    // `--wide N` (M12): the margin extends the composed content width past
+    // 256 on each side. Zero margin is the original 256-pixel content width,
+    // so every formula below that reads `margin`/`content_width` reduces to
+    // the unmodified one when it's 0.
+    const margin: u32 = ppu.wide_margin;
+    const content_width = fb_width + 2 * margin;
+
+    // Content composes at `content_width` pixels; on a 512-stride frame (a
+    // mixed-width frame whose earlier lines were hi-res — never true together
+    // with a margin, since `--wide` and hi-res promotion are mutually
+    // exclusive, see `renderScanline`) it is pixel-doubled into the row.
     var tmp: [fb_width]u16 = undefined;
-    const dest: []u16 = if (width == fb_width) row else &tmp;
+    const dest: []u16 = if (width == content_width) row else &tmp;
 
     var bgbuf: [4][fb_width_max]Cell = undefined;
-    var objbuf: [fb_width]Cell = undefined;
+    var objbuf: [fb_width_max]Cell = undefined;
 
     // Runtime-select the mode, then run a body comptime-specialized on its
     // descriptor so each layer's bit depth stays comptime.
     inline for (mode_table, 0..) |md, m| {
         if (ppu.bg_mode == m) {
-            if (width != fb_width and ppu.hiresActive()) {
+            if (margin == 0 and width != fb_width and ppu.hiresActive()) {
                 // A genuine hi-res line: sub/main interleave at 512.
                 renderModeHires(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, row);
             } else {
-                renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, dest);
-                if (width != fb_width) {
+                renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, dest, margin);
+                if (width != content_width) {
                     // A 256-wide line on a promoted frame: pixel-double it.
                     for (0..fb_width) |x| {
                         row[2 * x] = tmp[x];
@@ -255,10 +264,12 @@ pub fn renderSpan(ppu: *Ppu, line: u32, x0: u32, x1_in: u32) void {
 
     var tmp: [fb_width]u16 = undefined;
     var bgbuf: [4][fb_width_max]Cell = undefined;
-    var objbuf: [fb_width]Cell = undefined;
+    var objbuf: [fb_width_max]Cell = undefined;
     inline for (mode_table, 0..) |md, m| {
         if (ppu.bg_mode == m) {
-            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, &tmp);
+            // The accurate core never sets `wide_margin` (frontends refuse to
+            // combine `--wide` with `--accurate`), so margin is always 0 here.
+            renderMode(ppu, line, md, &bgbuf, &objbuf, &ppu.lpal, &tmp, 0);
             if (width == fb_width) {
                 @memcpy(row[x0..x1], tmp[x0..x1]);
             } else {
@@ -284,16 +295,17 @@ fn ensureLpal(ppu: *Ppu) void {
     }
 }
 
-/// Decode a mode's BG layers and the OBJ layer into the line buffers.
-fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, bgbuf: *[4][fb_width_max]Cell, objbuf: *[fb_width]Cell) void {
+/// Decode a mode's BG layers and the OBJ layer into the line buffers. `margin`
+/// is always 0 for a hi-res line (hi-res and `--wide` never combine).
+fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, margin: u32, bgbuf: *[4][fb_width_max]Cell, objbuf: *[fb_width_max]Cell) void {
     if (md.kind == .affine) {
-        fillMode7(ppu, line, bgbuf);
+        fillMode7(ppu, line, margin, bgbuf);
     } else {
         inline for (md.layers) |ld| {
-            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, md.hires, line, &bgbuf[ld.bg]);
+            fillBg(ppu, ld.bg, ld.bpp, ld.cgram_base, md.opt, md.hires, line, margin, &bgbuf[ld.bg]);
         }
     }
-    fillObj(ppu, line, objbuf);
+    fillObj(ppu, line, margin, objbuf);
 }
 
 /// The mode's priority order, honoring the mode-1 BG3-priority alternate and
@@ -323,23 +335,24 @@ fn renderMode(
     line: u32,
     comptime md: ModeDesc,
     bgbuf: *[4][fb_width_max]Cell,
-    objbuf: *[fb_width]Cell,
+    objbuf: *[fb_width_max]Cell,
     lpal: *const [256]u16,
     row: []u16,
+    margin: u32,
 ) void {
     if (md.order.len == 0) {
         @memset(row, lpal[0]);
         return;
     }
-    fillLayers(ppu, line, md, bgbuf, objbuf);
+    fillLayers(ppu, line, md, margin, bgbuf, objbuf);
     const order = selectOrder(ppu, md);
     const math = mathActive(ppu);
 
     // Windows matter when a layer is masked on the main screen ($212E TMW) or
     // color math is active (sub-screen masks + the color window). Otherwise the
     // compositor short-circuits and the mask is never read.
-    var winmask: [6][fb_width]bool = undefined;
-    if (ppu.tmw != 0 or math) computeWindows(ppu, &winmask);
+    var winmask: [6][fb_width_max]bool = undefined;
+    if (ppu.tmw != 0 or math) computeWindows(ppu, &winmask, margin, @intCast(row.len));
 
     if (math) {
         compositeMath(ppu, order, bgbuf, objbuf, row, &winmask, .full, .full);
@@ -360,7 +373,7 @@ fn renderModeHires(
     line: u32,
     comptime md: ModeDesc,
     bgbuf: *[4][fb_width_max]Cell,
-    objbuf: *[fb_width]Cell,
+    objbuf: *[fb_width_max]Cell,
     lpal: *const [256]u16,
     row: []u16,
 ) void {
@@ -368,12 +381,13 @@ fn renderModeHires(
         @memset(row, lpal[0]);
         return;
     }
-    fillLayers(ppu, line, md, bgbuf, objbuf);
+    // A hi-res line never has a margin (`--wide` and hi-res don't combine).
+    fillLayers(ppu, line, md, 0, bgbuf, objbuf);
     const order = selectOrder(ppu, md);
     const math = mathActive(ppu);
 
-    var winmask: [6][fb_width]bool = undefined;
-    if ((ppu.tmw | ppu.tsw) != 0 or math) computeWindows(ppu, &winmask);
+    var winmask: [6][fb_width_max]bool = undefined;
+    if ((ppu.tmw | ppu.tsw) != 0 or math) computeWindows(ppu, &winmask, 0, fb_width);
 
     const main_hd: HalfDot = comptime if (md.hires) .odd else .full;
     const sub_hd: HalfDot = comptime if (md.hires) .even else .full;
@@ -399,7 +413,7 @@ fn renderModeHires(
 /// two combine by the layer's logic op (OR/AND/XOR/XNOR). A layer with no
 /// enabled window is never masked. Recomputed per line, so HDMA'd window edges
 /// take effect per scanline.
-fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
+fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width_max]bool, margin: u32, width: u32) void {
     for (0..6) |layer| {
         const sel: u8 = switch (layer) {
             0 => ppu.w12sel & 0x0F,
@@ -424,15 +438,20 @@ fn computeWindows(ppu: *const Ppu, mask: *[6][fb_width]bool) void {
         // window one or two layers, so this saves the bulk of the sweep on any
         // line where windows or color math are active at all.
         if (!w1_en and !w2_en) {
-            @memset(&mask[layer], false);
+            @memset(mask[layer][0..width], false);
             continue;
         }
 
-        for (0..fb_width) |x| {
-            const xi: u8 = @intCast(x);
-            var a = xi >= ppu.wh0 and xi <= ppu.wh1;
+        for (0..width) |x| {
+            // `lx` is the hardware screen coordinate (0-255 in the base
+            // region; negative or >255 in a `--wide` margin, where WH0-WH3 —
+            // 8-bit hardware registers — can never match, so a margin column
+            // is never inside a window unless inversion makes "outside"
+            // match everywhere). Reduces to the original `x` when margin=0.
+            const lx: i32 = @as(i32, @intCast(x)) - @as(i32, @intCast(margin));
+            var a = lx >= @as(i32, ppu.wh0) and lx <= @as(i32, ppu.wh1);
             if (w1_inv) a = !a;
-            var b = xi >= ppu.wh2 and xi <= ppu.wh3;
+            var b = lx >= @as(i32, ppu.wh2) and lx <= @as(i32, ppu.wh3);
             if (w2_inv) b = !b;
             mask[layer][x] = if (w1_en and w2_en)
                 switch (logic) {
@@ -474,11 +493,11 @@ inline fn bgX(comptime hd: HalfDot, x: usize) usize {
 inline fn resolvePixel(
     order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
-    objbuf: *const [fb_width]Cell,
+    objbuf: *const [fb_width_max]Cell,
     comptime hd: HalfDot,
     x: usize,
     screens: u8,
-    winmask: *const [6][fb_width]bool,
+    winmask: *const [6][fb_width_max]bool,
     tw: u8,
 ) Resolved {
     for (order) |e| {
@@ -500,15 +519,15 @@ inline fn resolvePixel(
 fn composite(
     order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
-    objbuf: *const [fb_width]Cell,
+    objbuf: *const [fb_width_max]Cell,
     lpal: *const [256]u16,
     row: []u16,
-    winmask: *const [6][fb_width]bool,
+    winmask: *const [6][fb_width_max]bool,
     tmw: u8,
     screens: u8,
     comptime hd: HalfDot,
 ) void {
-    for (0..fb_width) |x| {
+    for (0..row.len) |x| {
         row[x] = lpal[resolvePixel(order, bgbuf, objbuf, hd, x, screens, winmask, tmw).abs];
     }
 }
@@ -551,9 +570,9 @@ fn compositeMath(
     ppu: *const Ppu,
     order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
-    objbuf: *const [fb_width]Cell,
+    objbuf: *const [fb_width_max]Cell,
     row: []u16,
-    winmask: *const [6][fb_width]bool,
+    winmask: *const [6][fb_width_max]bool,
     comptime main_hd: HalfDot,
     comptime sub_hd: HalfDot,
 ) void {
@@ -563,7 +582,7 @@ fn compositeMath(
     const clip_region: u2 = @truncate(ppu.cgwsel >> 6);
     const prevent_region: u2 = @truncate(ppu.cgwsel >> 4);
 
-    for (0..fb_width) |x| {
+    for (0..row.len) |x| {
         const main = resolvePixel(order, bgbuf, objbuf, main_hd, x, ppu.main_screen, winmask, ppu.tmw);
         const in_cw = winmask[5][x];
         const clipped = regionActive(clip_region, in_cw);
@@ -604,12 +623,16 @@ fn clearLine(buf: []Cell) void {
 }
 
 /// Decode one BG layer's contribution to the scanline. `comptime bpp` folds the
-/// bitplane math; `cgram_base` is the mode-dependent palette offset for this BG.
-fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, comptime hires: bool, line: u32, buf: *[fb_width_max]Cell) void {
+/// bitplane math; `cgram_base` is the mode-dependent palette offset for this
+/// BG. `margin` (always 0 for a hi-res layer — hi-res and `--wide` never
+/// combine) extends the decoded range by that many columns on each side.
+fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptime opt: OptMode, comptime hires: bool, line: u32, margin: u32, buf: *[fb_width_max]Cell) void {
+    const out_w: u32 = if (hires) fb_width_max else fb_width + 2 * margin;
+
     // Decode when the layer is on either screen; the compositor's TM/TS enable
     // mask decides which resolve pass actually sees it.
     if ((ppu.main_screen | ppu.sub_screen) & (@as(u8, 1) << @intCast(bg_index)) == 0) {
-        clearLine(buf);
+        clearLine(buf[0..out_w]);
         return;
     }
 
@@ -659,12 +682,22 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     var cached_xflip = false;
     var cached_yflip = false;
 
-    const out_w = if (hires) fb_width_max else fb_width;
     for (0..out_w) |x| {
-        const xi: u32 = @intCast(x);
-        const mx: u32 = if (mosaic_on) xi - xi % msize else xi;
+        // `lx` is the hardware screen coordinate: 0-255 in the base region,
+        // negative or >255 in a `--wide` margin (always 0 here for a hi-res
+        // layer, so `lx` stays the non-negative original `x` then). Wrapping
+        // it into BG space is exactly the un-margined math, just done in a
+        // signed-then-bitcast form so a negative `lx` wraps the same way an
+        // unsigned one already did — reduces to the original for margin=0.
+        const lx: i32 = @as(i32, @intCast(x)) - @as(i32, @intCast(margin));
+        const msize_i: i32 = @intCast(msize);
+        const mx: i32 = if (mosaic_on) lx - @mod(lx, msize_i) else lx;
+        const mx_u: u32 = @bitCast(mx);
 
         // Offset-per-tile (modes 2/4/6): BG3's map replaces this column's scroll.
+        // A margin column has no hardware OPT column to read (the offset map
+        // only covers the base 32 columns); it wraps mod-32 like any other
+        // out-of-range column instead of a hardware-exact lookup.
         const scroll = if (opt == .none)
             .{ .h = layer.hofs, .sy = base_sy, .tile_row = base_tile_row }
         else blk: {
@@ -672,7 +705,7 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
             var eff_vofs = layer.vofs;
             // In hi-res mode 6 the offset column granularity stays one map
             // tile, which is 8 output pixels on the 256 basis.
-            const col_x: u16 = @intCast(if (hires) mx >> 1 else mx);
+            const col_x: u16 = @truncate(@as(u32, @bitCast(if (hires) mx >> 1 else mx)));
             offsetPerTile(ppu, bg_index, opt, layer.hofs, col_x, &eff_hofs, &eff_vofs);
             const oy: u16 = @intCast((my + eff_vofs) & (bg_h - 1));
             break :blk .{ .h = eff_hofs, .sy = oy, .tile_row = oy / tile_ph };
@@ -680,7 +713,7 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
         const sy = scroll.sy;
         const tile_row = scroll.tile_row;
 
-        const sx: u16 = @intCast((mx + scroll.h) & (bg_w - 1));
+        const sx: u16 = @intCast((mx_u +% scroll.h) & (bg_w - 1));
         const tile_col = sx / tile_pw;
 
         var screen: u16 = 0;
@@ -743,13 +776,14 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 /// bytes, char = high bytes). M7SEL selects screen flip and out-of-area handling.
 /// With EXTBG (SETINI bit6) the same plane also feeds BG2: the pixel's low 7
 /// bits are its color and bit7 its priority.
-fn fillMode7(ppu: *Ppu, line: u32, bgbuf: *[4][fb_width_max]Cell) void {
+fn fillMode7(ppu: *Ppu, line: u32, margin: u32, bgbuf: *[4][fb_width_max]Cell) void {
+    const width = fb_width + 2 * margin;
     const buf = &bgbuf[0];
     const extbg = ppu.setini & 0x40 != 0;
     const enable_mask: u8 = if (extbg) 0x03 else 0x01;
     if ((ppu.main_screen | ppu.sub_screen) & enable_mask == 0) {
-        clearLine(buf); // the mode-7 layers are disabled on both screens
-        if (extbg) clearLine(&bgbuf[1]);
+        clearLine(buf[0..width]); // the mode-7 layers are disabled on both screens
+        if (extbg) clearLine(bgbuf[1][0..width]);
         return;
     }
 
@@ -776,8 +810,13 @@ fn fillMode7(ppu: *Ppu, line: u32, bgbuf: *[4][fb_width_max]Cell) void {
     const ox = a * hc + b * vc;
     const oy = c * hc + d * vc;
 
-    for (0..fb_width) |x| {
-        const sx: i32 = if (hflip) 255 - @as(i32, @intCast(x)) else @intCast(x);
+    for (0..width) |x| {
+        // `lx` is the screen column; 0-255 in the base region, negative or
+        // >255 in a `--wide` margin (extending the affine sample linearly —
+        // not hardware-verified out there, but deterministic). Reduces to
+        // the original `x` when margin=0.
+        const lx: i32 = @as(i32, @intCast(x)) - @as(i32, @intCast(margin));
+        const sx: i32 = if (hflip) 255 - lx else lx;
         var tx = ((ox + a * sx) >> 8) + cx;
         var ty = ((oy + c * sx) >> 8) + cy;
 
@@ -880,14 +919,18 @@ const obj_sizes = [8][4]u8{
 };
 
 /// Evaluate the 128 sprites against this scanline into the OBJ line buffer,
-/// honoring the 32-sprite and 34-tile-per-line hardware limits.
+/// honoring the 32-sprite and 34-tile-per-line hardware limits (unaffected by
+/// `margin` — those are per-line VRAM-fetch limits, not a screen-position
+/// concept). `margin` extends the X range sprites can land in by that many
+/// columns on each side.
 ///
 /// No V=1 shift here, deliberately: hardware shows a sprite's first row on
 /// scanline V = OAM Y + 1 (the Y+1 quirk), and framebuffer row `line` is
 /// scanline V = line + 1, so covering rows [Y, Y+h) is already exact. Adding
 /// the BG's +1 would push sprites one row below where hardware puts them.
-fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
-    clearLine(buf);
+fn fillObj(ppu: *Ppu, line: u32, margin: u32, buf: *[fb_width_max]Cell) void {
+    const width = fb_width + 2 * margin;
+    clearLine(buf[0..width]);
     if ((ppu.main_screen | ppu.sub_screen) & 0x10 == 0) return; // OBJ off on both screens
 
     const sz = obj_sizes[ppu.obj_size];
@@ -955,13 +998,15 @@ fn fillObj(ppu: *Ppu, line: u32, buf: *[fb_width]Cell) void {
             // re-reading both planar words per pixel through decodePlanar.
             const row = decodeRow(ppu, 4, char_word +% fine_y);
             const px0 = xpos + @as(i32, @intCast(col * 8));
+            const lo: i32 = -@as(i32, @intCast(margin));
+            const hi: i32 = @as(i32, fb_width) + @as(i32, @intCast(margin));
             for (0..8) |p| {
                 const sx = px0 + @as(i32, @intCast(p));
-                if (sx < 0 or sx >= fb_width) continue;
+                if (sx < lo or sx >= hi) continue;
                 const fx: u3 = @intCast(if (xflip) 7 - p else p);
                 const color = row[fx];
                 if (color == 0) continue;
-                const ux: usize = @intCast(sx);
+                const ux: usize = @intCast(sx + @as(i32, @intCast(margin)));
                 if (buf[ux].solid) continue; // lower OAM index already claimed this pixel
                 buf[ux] = .{ .abs = @intCast(128 + pal * 16 + color), .prio = oprio, .solid = true };
             }
@@ -1075,6 +1120,41 @@ test "screen row 0 fetches BG picture line 1 (the picture starts at V=1)" {
     ppu.bg[0].vofs = 0x3FF; // VOFS = -1: row 0 now fetches picture line 0
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]);
+}
+
+test "--wide margin renders BG content past x=255 into the widened framebuffer" {
+    // Under `--wide N` the fast renderer composes 256 + 2*N columns instead of
+    // 256, so the right margin carries screen X >= 256 — content past the
+    // normal picture edge, which is the whole point of a widescreen hack. Fill
+    // BG1 with a solid tile everywhere, set a 32-column margin, render line 0,
+    // and assert the widened stride plus that columns past x=255 carry the BG
+    // color (not the backdrop or uninitialized garbage). With margin 0 this
+    // reduces to the plain 256-wide path the other tests cover.
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01; // BG1 on the main screen
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    // The tilemap is zero-initialized (every entry -> tile 0); tile 0's row 1
+    // (screen row 0's picture line) is a solid run of color 1 across all eight
+    // pixels, so every column of scanline 0 composites to color 1 regardless
+    // of horizontal position.
+    ppu.vram[1] = 0x00FF;
+    ppu.cgram[1] = 0x7C00; // blue (BGR15) -> 0x001F in RGB565
+    ppu.postLoad();
+
+    const margin: u16 = 32;
+    ppu.wide_margin = margin;
+    ppu.renderScanline(0);
+
+    // The per-line stride widened to 256 + 2*32 = 320.
+    try std.testing.expectEqual(fb_width + 2 * @as(u32, margin), ppu.fb_line_width);
+    // Sanity: the normal picture (screen X 0, at framebuffer column `margin`).
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin)]);
+    // The right margin — screen X 256 and 287, both past x=255 — carries BG.
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin) + 256]);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[@as(usize, margin) + 287]);
 }
 
 test "flipped BG tiles keep their one-bit priority (flip bits must not leak)" {

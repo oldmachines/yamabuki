@@ -19,6 +19,7 @@
 const std = @import("std");
 const core = @import("snes_core");
 const options = @import("rom_options");
+const util = @import("util");
 
 /// One golden ROM. Optional gates default to 0 = "not baselined, ungated";
 /// `frames` 0 means the suite default applies. `audio` is the FNV-1a of the
@@ -164,16 +165,11 @@ fn runOne(
     const half = frames / 2;
     const state = try gpa.alloc(u8, core.AnyConsole.state_size);
     var got_audio = core.console.audio_hash_init;
-    var drain: [4096]i16 = undefined;
     for (0..frames) |i| {
         if (i == half) _ = con.saveState(state);
         con.setButtons(0, entry.buttons);
         con.runFrame();
-        while (true) {
-            const n = con.readAudio(&drain);
-            if (n == 0) break;
-            got_audio = core.console.hashAudio(got_audio, drain[0..n]);
-        }
+        try util.drainAudio(con, &got_audio, {}, null);
     }
 
     const got_hash = core.console.hashFrame(con.framebuffer());
@@ -190,7 +186,7 @@ fn runOne(
     for (half..frames) |_| {
         con.setButtons(0, entry.buttons);
         con.runFrame();
-        while (con.readAudio(&drain) != 0) {}
+        util.drainAudioDiscard(con);
     }
     const replay_hash = core.console.hashFrame(con.framebuffer());
     const roundtrip_ok = replay_hash == got_hash;
