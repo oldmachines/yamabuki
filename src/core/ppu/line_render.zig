@@ -654,7 +654,11 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
     const msize: u32 = (@as(u32, ppu.mosaic) & 0x0F) + 1;
     const mosaic_on = msize > 1 and (ppu.mosaic >> @intCast(4 + bg_index)) & 1 != 0;
 
-    const my: u32 = if (mosaic_on) line - line % msize else line;
+    // Hardware starts the visible picture at V=1, so screen row `line` shows
+    // BG picture line `line + 1` (with VOFS=0). Mosaic quantizes in screen
+    // space first — the block grid anchors at the top visible row — and the
+    // quantized row then maps to *its* picture line.
+    const my: u32 = (if (mosaic_on) line - line % msize else line) + 1;
     // Without offset-per-tile the vertical scroll (and tile row) is constant.
     const base_sy: u16 = @intCast((my + layer.vofs) & (bg_h - 1));
     const base_tile_row = base_sy / tile_ph;
@@ -796,7 +800,10 @@ fn fillMode7(ppu: *Ppu, line: u32, margin: u32, bgbuf: *[4][fb_width_max]Cell) v
     const vflip = ppu.m7sel & 0x02 != 0;
     const over: u2 = @truncate(ppu.m7sel >> 6);
 
-    const sy: i32 = if (vflip) 255 - @as(i32, @intCast(line)) else @intCast(line);
+    // Same V=1 anchor as fillBg: the matrix walks the hardware V counter,
+    // which is `line + 1` for framebuffer row `line` (flip inverts V).
+    const hw_v: i32 = @intCast(line + 1);
+    const sy: i32 = if (vflip) 255 - hw_v else hw_v;
     // Row-constant terms; the per-pixel part adds A*Sx (Tx) and C*Sx (Ty).
     const hc = hofs - cx;
     const vc = sy + vofs - cy;
@@ -916,6 +923,11 @@ const obj_sizes = [8][4]u8{
 /// `margin` — those are per-line VRAM-fetch limits, not a screen-position
 /// concept). `margin` extends the X range sprites can land in by that many
 /// columns on each side.
+///
+/// No V=1 shift here, deliberately: hardware shows a sprite's first row on
+/// scanline V = OAM Y + 1 (the Y+1 quirk), and framebuffer row `line` is
+/// scanline V = line + 1, so covering rows [Y, Y+h) is already exact. Adding
+/// the BG's +1 would push sprites one row below where hardware puts them.
 fn fillObj(ppu: *Ppu, line: u32, margin: u32, buf: *[fb_width_max]Cell) void {
     const width = fb_width + 2 * margin;
     clearLine(buf[0..width]);
@@ -1076,7 +1088,7 @@ test "mode 0 renders a single BG1 tile pixel" {
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
     ppu.vram[0x400] = 0x0000;
-    ppu.vram[0] = 0x0080; // pixel x=0 -> color 1
+    ppu.vram[1] = 0x0080; // tile row 1 (screen row 0's picture line), x=0 -> color 1
     ppu.cgram[0] = 0x0000;
     ppu.cgram[1] = 0x7C00; // blue
     ppu.postLoad();
@@ -1084,6 +1096,30 @@ test "mode 0 renders a single BG1 tile pixel" {
     ppu.renderScanline(0);
     try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]);
     try std.testing.expectEqual(@as(u16, 0x0000), ppu.fb[1]);
+}
+
+test "screen row 0 fetches BG picture line 1 (the picture starts at V=1)" {
+    // Issue #34: with VOFS=0 hardware shows BG line y+1 on screen row y. Tile
+    // row 0 holds color 1 and tile row 1 holds color 3 — the frame's top row
+    // must show row 1's color, and VOFS=-1 must bring row 0's back.
+    var ppu: Ppu = .init;
+    ppu.bg_mode = 0;
+    ppu.main_screen = 0x01;
+    ppu.force_blank = false;
+    ppu.brightness = 15;
+    ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
+    ppu.vram[0] = 0x0080; // tile row 0: x=0 -> color 1
+    ppu.vram[1] = 0x8080; // tile row 1: x=0 -> color 3
+    ppu.cgram[1] = 0x001F; // red
+    ppu.cgram[3] = 0x7C00; // blue
+    ppu.postLoad();
+
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0x001F), ppu.fb[0]); // picture line 1, not 0
+
+    ppu.bg[0].vofs = 0x3FF; // VOFS = -1: row 0 now fetches picture line 0
+    ppu.renderScanline(0);
+    try std.testing.expectEqual(@as(u16, 0xF800), ppu.fb[0]);
 }
 
 test "--wide margin renders BG content past x=255 into the widened framebuffer" {
@@ -1100,10 +1136,11 @@ test "--wide margin renders BG content past x=255 into the widened framebuffer" 
     ppu.force_blank = false;
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
-    // The tilemap is zero-initialized (every entry -> tile 0); tile 0's row 0
-    // is a solid run of color 1 across all eight pixels, so every column of
-    // scanline 0 composites to color 1 regardless of horizontal position.
-    ppu.vram[0] = 0x00FF;
+    // The tilemap is zero-initialized (every entry -> tile 0); tile 0's row 1
+    // (screen row 0's picture line) is a solid run of color 1 across all eight
+    // pixels, so every column of scanline 0 composites to color 1 regardless
+    // of horizontal position.
+    ppu.vram[1] = 0x00FF;
     ppu.cgram[1] = 0x7C00; // blue (BGR15) -> 0x001F in RGB565
     ppu.postLoad();
 
@@ -1132,8 +1169,7 @@ test "flipped BG tiles keep their one-bit priority (flip bits must not leak)" {
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
     ppu.vram[0x400] = 0xC000; // tile 0, prio 0, X+Y flip
     ppu.vram[0x401] = 0xE000; // tile 0, prio 1, X+Y flip
-    ppu.vram[0] = 0x0080; // pixel x=0 -> color 1 (x=7 when flipped)
-    ppu.vram[7] = 0x0080; // last row, for the Y flip
+    ppu.vram[6] = 0x0080; // row 6 = Y-flip of picture line 1; x=0 -> x=7 flipped
     ppu.cgram[1] = 0x7C00; // blue
     ppu.postLoad();
 
@@ -1153,7 +1189,7 @@ test "mode 3 renders an 8bpp BG1 pixel and ignores the tilemap palette group" {
     // must ignore it, so the color index is the raw 8-bit pixel value. If it were
     // wrongly applied, abs = 7*256+1 would overflow the u8 index and panic.
     ppu.vram[0x400] = 0x1C00;
-    ppu.vram[0] = 0x0080; // plane 0 leftmost bit -> pixel value 1
+    ppu.vram[1] = 0x0080; // tile row 1: plane 0 leftmost bit -> pixel value 1
     ppu.cgram[1] = 0x7C00; // blue
     ppu.postLoad();
 
@@ -1170,7 +1206,7 @@ test "mosaic quantizes BG pixels into blocks" {
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0, .map_size = 0 };
     ppu.vram[0x400] = 0x0000; // tile 0
-    ppu.vram[0] = 0x4080; // 2bpp row: px0 -> color 1, px1 -> color 2
+    ppu.vram[1] = 0x4080; // 2bpp tile row 1: px0 -> color 1, px1 -> color 2
     ppu.cgram[1] = 0x001F; // color 1
     ppu.cgram[2] = 0x03E0; // color 2 (distinct)
     ppu.writeReg(0x2106, 0x11); // MOSAIC: size 2 (block=2), BG1 enabled
@@ -1199,8 +1235,8 @@ test "offset-per-tile shifts a BG1 column from BG3's offset map" {
     ppu.bg[2] = .{ .map_base = 0x1000 }; // BG3 = offset source (scroll 0)
 
     // Two solid 4bpp tiles: tile 0 = color 1, tile 1 = color 2.
-    ppu.vram[0] = 0x00FF; // tile 0 row 0: plane0 all set -> color 1
-    ppu.vram[16] = 0xFF00; // tile 1 row 0: plane1 all set -> color 2
+    ppu.vram[1] = 0x00FF; // tile 0 row 1: plane0 all set -> color 1
+    ppu.vram[17] = 0xFF00; // tile 1 row 1: plane1 all set -> color 2
     // BG1 map row 0: columns 0,1 -> tile 0; column 2 -> tile 1.
     ppu.vram[0x402] = 0x0001;
     ppu.cgram[1] = 0x001F;
@@ -1230,19 +1266,20 @@ test "mode 7 samples the affine field with identity and out-of-area transparency
     ppu.m7a = 0x0100; // identity matrix (1.0, 0; 0, 1.0)
     ppu.m7d = 0x0100;
 
-    // VRAM is byte-interleaved: low byte = tilemap entry, high byte = 8bpp pixel.
-    ppu.vram[0] = 0x0500; // tilemap[0]=tile 0; tile 0 pixel (0,0) = color 5
-    ppu.vram[2] = 0x0600; // tile 0 pixel (2,0) = color 6
+    // VRAM is byte-interleaved: low byte = tilemap entry, high byte = 8bpp
+    // pixel. Screen row 0 samples texel row 1 (the picture starts at V=1).
+    ppu.vram[8] = 0x0500; // tile 0 pixel (0,1) = color 5
+    ppu.vram[10] = 0x0600; // tile 0 pixel (2,1) = color 6
     ppu.cgram[5] = 0x001F;
     ppu.cgram[6] = 0x03E0;
     ppu.postLoad();
 
     ppu.renderScanline(0);
-    // Identity: screen (x,0) samples texel (x,0).
-    try std.testing.expect(ppu.fb[0] != 0); // texel (0,0) = color 5
-    try std.testing.expect(ppu.fb[2] != 0); // texel (2,0) = color 6
+    // Identity: screen (x,0) samples texel (x,1).
+    try std.testing.expect(ppu.fb[0] != 0); // texel (0,1) = color 5
+    try std.testing.expect(ppu.fb[2] != 0); // texel (2,1) = color 6
     try std.testing.expect(ppu.fb[0] != ppu.fb[2]); // distinct texels
-    try std.testing.expectEqual(@as(u16, 0), ppu.fb[1]); // texel (1,0) = color 0 -> backdrop
+    try std.testing.expectEqual(@as(u16, 0), ppu.fb[1]); // texel (1,1) = color 0 -> backdrop
 
     // Push the sample outside the 1024-texel field with M7SEL out-of-area = 2
     // (transparent): the whole line becomes backdrop.
@@ -1259,7 +1296,7 @@ test "window masks a BG layer inside its region (and inverts)" {
     ppu.force_blank = false;
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
-    ppu.vram[0] = 0x00FF; // tile 0 solid color 1 across the row
+    ppu.vram[1] = 0x00FF; // tile row 1 solid color 1 across the row
     ppu.cgram[0] = 0x0000; // backdrop black
     ppu.cgram[1] = 0x001F;
 
@@ -1289,7 +1326,7 @@ test "color math adds the fixed color (halved) and subtract floors at zero" {
     ppu.force_blank = false;
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
-    ppu.vram[0] = 0x00FF; // tile 0 row 0: solid color 1
+    ppu.vram[1] = 0x00FF; // tile 0 row 1: solid color 1
     ppu.cgram[1] = 0x001F; // red 31
     ppu.writeReg(0x2132, 0x9E); // fixed color: blue 30
     ppu.writeReg(0x2131, 0x41); // CGADSUB: half + BG1 (addend = fixed color)
@@ -1314,8 +1351,8 @@ test "color math blends the sub screen, falling back unhalved to the fixed color
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
     ppu.bg[1] = .{ .map_base = 0x500, .char_base = 0x100 };
-    ppu.vram[0] = 0x00FF; // BG1 tile: solid color 1 across the row
-    ppu.vram[0x100] = 0x0080; // BG2 tile: color 1 at x=0 only, transparent after
+    ppu.vram[1] = 0x00FF; // BG1 tile row 1: solid color 1 across the row
+    ppu.vram[0x101] = 0x0080; // BG2 tile row 1: color 1 at x=0 only, transparent after
     ppu.cgram[1] = 0x001F; // BG1 red 31
     ppu.cgram[33] = 0x03E0; // BG2 (mode-0 base 32) green 31
     ppu.writeReg(0x2130, 0x02); // CGWSEL: addend = sub screen
@@ -1336,7 +1373,7 @@ test "color window clips the main screen to black and prevents math" {
     ppu.force_blank = false;
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
-    ppu.vram[0] = 0x00FF; // solid color 1
+    ppu.vram[1] = 0x00FF; // tile row 1: solid color 1
     ppu.cgram[1] = 0x001F; // red 31
     ppu.writeReg(0x2125, 0x20); // WOBJSEL: color window = window 1
     ppu.writeReg(0x2126, 40); // WH0
@@ -1414,8 +1451,8 @@ test "pseudo-hires interleaves the sub and main screens" {
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 };
     ppu.bg[1] = .{ .map_base = 0x500, .char_base = 0x100 };
-    ppu.vram[0] = 0x00FF; // BG1 tile: solid color 1
-    ppu.vram[0x100] = 0x00FF; // BG2 tile: solid color 1
+    ppu.vram[1] = 0x00FF; // BG1 tile row 1: solid color 1
+    ppu.vram[0x101] = 0x00FF; // BG2 tile row 1: solid color 1
     ppu.cgram[1] = 0x001F; // BG1 red
     ppu.cgram[33] = 0x03E0; // BG2 (mode-0 base 32) green
     ppu.writeReg(0x2133, 0x08); // SETINI: pseudo-hires
@@ -1439,10 +1476,11 @@ test "EXTBG shows mode 7 BG2 with the pixel high bit as priority" {
     ppu.m7d = 0x0100;
     ppu.writeReg(0x2133, 0x40); // SETINI: EXTBG
 
-    // Texel (0,0) = 0x85: BG2 color 5, priority 1. Texel (2,0) = 0x05: color 5,
+    // Texel (0,1) = 0x85: BG2 color 5, priority 1. Texel (2,1) = 0x05: color 5,
     // priority 0 — still visible here (nothing else on the layer stack).
-    ppu.vram[0] = 0x8500;
-    ppu.vram[2] = 0x0500;
+    // Screen row 0 samples texel row 1 (the picture starts at V=1).
+    ppu.vram[8] = 0x8500;
+    ppu.vram[10] = 0x0500;
     ppu.cgram[5] = 0x001F; // red
     ppu.postLoad();
 
@@ -1465,8 +1503,8 @@ test "mode 5 renders a 16-wide hi-res tile across sub/main half-dots" {
     ppu.force_blank = false;
     ppu.brightness = 15;
     ppu.bg[0] = .{ .map_base = 0x400, .char_base = 0 }; // BG1 4bpp, map all tile 0
-    // Tile 0 (left half of every 16-wide tile): color 1 at its first pixel.
-    ppu.vram[0] = 0x0080;
+    // Tile 0 (left half of every 16-wide tile): color 1 at row 1's first pixel.
+    ppu.vram[1] = 0x0080;
     ppu.cgram[1] = 0x001F; // red
     ppu.postLoad();
 
@@ -1491,8 +1529,8 @@ test "higher priority tile wins the composite" {
     ppu.bg[1] = .{ .map_base = 0x500, .char_base = 0x0100 };
     ppu.vram[0x400] = 0x0000; // BG1 prio 0
     ppu.vram[0x500] = 0x2000; // BG2 prio 1
-    ppu.vram[0x0000] = 0x0080;
-    ppu.vram[0x0100] = 0x0080;
+    ppu.vram[0x0001] = 0x0080;
+    ppu.vram[0x0101] = 0x0080;
     ppu.cgram[0] = 0;
     ppu.cgram[1] = 0x001F;
     ppu.postLoad();

@@ -30,7 +30,7 @@ const axelf_frames = 60;
 const axelf_hash: u64 = 0x045b5aaabee52325;
 const axelf_audio: u64 = 0xe2fbd615d2d54f15;
 const rotzoom_frames = 16;
-const rotzoom_hash: u64 = 0x8ba211f2fc899f95;
+const rotzoom_hash: u64 = 0xfc3c6d6ac634203d;
 
 // --- frontend-side callback state --------------------------------------------
 

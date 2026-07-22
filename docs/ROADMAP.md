@@ -99,13 +99,13 @@ matrix walk; hi-res uses a 512-wide buffer only when active. The accurate dot
 renderer (M8) reuses the same register state and decoders with a real per-dot
 fetch pipeline so mid-scanline register writes render correctly.
 
-Known deviation (both cores): the renderer maps BG line N to screen row N,
-while hardware starts the visible picture at V=1 — with VOFS=0 the real PPU
-shows BG line y+1 on screen row y, so the whole picture sits one line higher
-on hardware (spotted comparing the M9 GSU plot demos against krom's reference
-captures, which match pixel-for-pixel once shifted). Fixing it is a deliberate
-follow-up slice: it re-mints every golden hash at once and needs the OBJ Y+1
-and HDMA application-line quirks decided together.
+Line placement matches hardware: the visible picture starts at V=1, so screen
+row y fetches BG picture line y+1 (with VOFS=0) in both cores — krom reference
+captures diff pixel-identical with no shift (fixed in the issue-34 slice,
+re-minting every golden hash at once). OBJ needed no change: covering rows
+[Y, Y+h) already realizes the hardware Y+1 sprite quirk once row 0 is V=1, and
+HDMA stays keyed to the render row (the transfer at the end of scanline V
+affects V+1, which is exactly framebuffer row V).
 
 ### APU
 
