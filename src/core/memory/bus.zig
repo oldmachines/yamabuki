@@ -947,3 +947,33 @@ test "HVBJOY exposes the H-blank flag ($4212 bit 6)" {
     tc.bus.clock = tc.bus.hv_line_start + 280 * timing.cycles_per_dot;
     try std.testing.expect(tc.bus.read8(0x00_4212) & 0x40 != 0);
 }
+
+test "Super FX linear banks $40-$5F map ROM for the SNES CPU" {
+    // The Super FX board decodes banks $40-$5F (and $C0-$DF) as linear ROM —
+    // bank $40+n covers ROM offset n*64K across the whole bank. Only the
+    // LoROM windows were mapped, so Yoshi's Island reading its sound driver
+    // from $50:0342 got open bus (a constant $50, the bank byte) and uploaded
+    // 3 KiB of it to the APU, then waited forever for a driver that was never
+    // there. The GSU side always had the ROM; this is the SNES-side view.
+    const tc = try TestConsole.createChip(0x20, 3, 0x15); // LoROM + Super FX
+    defer tc.destroy();
+    try std.testing.expectEqual(@import("../cart/cartridge.zig").ChipKind.superfx, tc.cart.chip);
+
+    // Bank $40 starts at ROM offset 0; the pattern byte is (offset >> 8).
+    try std.testing.expectEqual(tc.cart.rom[0x0000], tc.bus.read8(0x40_0000));
+    // Bank $41 -> linear offset $12345.
+    try std.testing.expectEqual(tc.cart.rom[0x12345], tc.bus.read8(0x41_2345));
+    // The upper half of a linear bank is the same linear stream, not the
+    // LoROM window's contents.
+    try std.testing.expectEqual(tc.cart.rom[0x1A000], tc.bus.read8(0x41_A000));
+    // FastROM mirror at $C0+.
+    try std.testing.expectEqual(tc.cart.rom[0x12345], tc.bus.read8(0xC1_2345));
+    // ROM is read-only there: the write must not land.
+    tc.bus.write8(0x40_0000, 0x77);
+    try std.testing.expectEqual(tc.cart.rom[0x0000], tc.bus.read8(0x40_0000));
+
+    // A plain LoROM cart must NOT map those banks (they are open bus).
+    const plain = try TestConsole.create(0x20, 3);
+    defer plain.destroy();
+    try std.testing.expectEqual(@as(?[*]const u8, null), plain.bus.page_read[0x41_2345 >> 13]);
+}

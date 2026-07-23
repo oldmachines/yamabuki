@@ -11,9 +11,13 @@
 //! ROM, the documented port protocol is implemented directly — the APU
 //! signals ready ($AA/$BB), accepts indexed block uploads into ARAM, and
 //! jumps the SPC700 to the entry point on the P1=0 command. From then on the
-//! uploaded program executes natively. Approximations: $FFC0-$FFFF reads
-//! return ARAM (the IPL image is not mapped), and re-entering the boot ROM
-//! (CONTROL bit7 + jump to $FFC0) is not supported.
+//! uploaded program executes natively. Re-entering the boot ROM is HLE'd the
+//! same way: executing at $FFC0-$FFFF with CONTROL bit7 set (the IPL mapped
+//! — on hardware those fetches ARE the IPL) parks the SMP and re-arms the
+//! ready handshake, which is how games upload a new module after their
+//! driver is already running (Top Gear, Wild Guns, Maximum Carnage, and
+//! Yoshi's Island all hung waiting for $AA/$BB here). Approximation:
+//! $FFC0-$FFFF *data* reads return ARAM (the IPL image is not mapped).
 
 const std = @import("std");
 
@@ -212,16 +216,40 @@ pub const Apu = struct {
         self.spc_target += self.master_acc / spc_den;
         self.master_acc %= spc_den;
 
+        if (self.boot == .done) {
+            while (self.spc_clock < self.spc_target) {
+                // Executing at $FFC0+ with the IPL mapped (CONTROL bit7) is
+                // the boot-ROM re-entry: park the SMP and re-arm the ready
+                // handshake — the HLE protocol takes over again, and the
+                // next P1=0 execute command restarts the SMP.
+                if (self.control & 0x80 != 0 and self.smp.regs.pc >= 0xFFC0) {
+                    self.bootReenter();
+                    break;
+                }
+                self.smp.step();
+            }
+        }
         if (self.boot != .done) {
-            // The SPC has no program yet, but the DSP samples from power-on:
-            // emit one sample per 32-cycle grid point the jump skips over, so
-            // the stream stays exactly spc_clock/32 samples long.
+            // The SPC has no program (first boot or an IPL re-entry parked
+            // it), but the DSP samples from power-on: emit one sample per
+            // 32-cycle grid point the jump skips over, so the stream stays
+            // exactly spc_clock/32 samples long.
             var next = (self.spc_clock | (cycles_per_sample - 1)) + 1;
             while (next <= self.spc_target) : (next += cycles_per_sample) self.dspSample();
             self.spc_clock = self.spc_target;
-            return;
         }
-        while (self.spc_clock < self.spc_target) self.smp.step();
+    }
+
+    /// HLE of the IPL's reset path, entered when the SPC jumps back to the
+    /// mapped boot ROM: present the $AA/$BB ready signature and wait for a
+    /// $CC upload exactly like power-on. Uses only existing boot fields, so
+    /// the save-state layout is unchanged.
+    fn bootReenter(self: *Apu) void {
+        self.boot = .ready;
+        self.boot_pending = false;
+        self.boot_addr = 0;
+        self.boot_index = 0;
+        self.cpu_out = .{ 0xAA, 0xBB, 0, 0 };
     }
 
     // --- audio output ------------------------------------------------------
@@ -580,4 +608,88 @@ test "mailbox ports carry both directions once booted" {
     uploadAndRun(apu, 0x0300, &program);
     apu.cpuWrite(0, 3, 0x5A);
     try std.testing.expectEqual(@as(u8, 0x5A), apu.cpuRead(2100, 1));
+}
+
+test "IPL re-entry: jumping to $FFC0 with the ROM mapped re-arms the handshake" {
+    // The standard Nintendo flow for uploading a new module: the game tells
+    // its running driver to jump back to the boot ROM, which re-signals
+    // $AA/$BB and accepts a fresh upload. Top Gear, Wild Guns, and Maximum
+    // Carnage all waited forever for that $AA/$BB before this was HLE'd.
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    // MOV $F1,#$80 (CONTROL: IPL mapped); JMP !$FFC0.
+    const program = [_]u8{ 0x8F, 0x80, 0xF1, 0x5F, 0xC0, 0xFF };
+    uploadAndRun(apu, 0x0200, &program);
+    try std.testing.expectEqual(BootState.done, apu.boot);
+
+    // Let the SMP run into the boot ROM: the handshake must be re-armed.
+    apu.catchUp(100_000);
+    try std.testing.expectEqual(BootState.ready, apu.boot);
+    try std.testing.expectEqual(@as(u8, 0xAA), apu.cpuRead(100_000, 0));
+    try std.testing.expectEqual(@as(u8, 0xBB), apu.cpuRead(100_000, 1));
+
+    // And a second upload through the same protocol must boot again.
+    // MOV A,#$55; MOV $F4,A; BRA -2 — replies $55 on port 0.
+    const second = [_]u8{ 0xE8, 0x55, 0xC4, 0xF4, 0x2F, 0xFE };
+    uploadAndRun(apu, 0x0300, &second);
+    try std.testing.expectEqual(BootState.done, apu.boot);
+    try std.testing.expectEqual(@as(u16, 0x0300), apu.smp.regs.pc);
+    try std.testing.expectEqual(@as(u8, 0x55), apu.cpuRead(200_000, 0));
+}
+
+test "IPL re-entry does not trigger with CONTROL bit7 clear (ARAM executes)" {
+    // With the IPL unmapped, $FFC0-$FFFF is ordinary ARAM: a driver placed
+    // there must run, not re-enter boot.
+    const gpa = std.testing.allocator;
+    const apu = try gpa.create(Apu);
+    defer gpa.destroy(apu);
+    apu.init();
+
+    // MOV $F1,#$00 (IPL unmapped); JMP !$FFC0. At $FFC0 (uploaded too):
+    // MOV A,#$66; MOV $F4,A; BRA -2.
+    const low = [_]u8{ 0x8F, 0x00, 0xF1, 0x5F, 0xC0, 0xFF };
+    const high = [_]u8{ 0xE8, 0x66, 0xC4, 0xF4, 0x2F, 0xFE };
+    // Upload the $FFC0 payload as the first block, the entry stub second.
+    std.debug.assert(apu.cpuRead(0, 0) == 0xAA);
+    apu.cpuWrite(0, 2, 0xC0);
+    apu.cpuWrite(0, 3, 0xFF);
+    apu.cpuWrite(0, 1, 0xCC);
+    apu.cpuWrite(0, 0, 0xCC);
+    std.debug.assert(apu.cpuRead(0, 0) == 0xCC);
+    var index: u8 = 0;
+    for (high) |byte| {
+        apu.cpuWrite(0, 1, byte);
+        apu.cpuWrite(0, 0, index);
+        std.debug.assert(apu.cpuRead(0, 0) == index);
+        index +%= 1;
+    }
+    // New block at $0200 (index jump: P1 nonzero).
+    apu.cpuWrite(0, 2, 0x00);
+    apu.cpuWrite(0, 3, 0x02);
+    apu.cpuWrite(0, 1, 1);
+    index +%= 2;
+    apu.cpuWrite(0, 0, index);
+    std.debug.assert(apu.cpuRead(0, 0) == index);
+    index = 0;
+    for (low) |byte| {
+        apu.cpuWrite(0, 1, byte);
+        apu.cpuWrite(0, 0, index);
+        std.debug.assert(apu.cpuRead(0, 0) == index);
+        index +%= 1;
+    }
+    // Execute at $0200.
+    apu.cpuWrite(0, 2, 0x00);
+    apu.cpuWrite(0, 3, 0x02);
+    apu.cpuWrite(0, 1, 0);
+    apu.cpuWrite(0, 0, index +% 2);
+    _ = apu.cpuRead(0, 0);
+    try std.testing.expectEqual(BootState.done, apu.boot);
+
+    apu.catchUp(200_000);
+    // Still done — and the $FFC0-resident driver actually ran.
+    try std.testing.expectEqual(BootState.done, apu.boot);
+    try std.testing.expectEqual(@as(u8, 0x66), apu.cpuRead(200_000, 0));
 }
