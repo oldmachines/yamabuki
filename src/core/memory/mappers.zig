@@ -108,7 +108,34 @@ fn mapLoRom(bus: *Bus) void {
             }
         }
     }
-    if (cart.chip == .superfx) mapGsuRam(bus);
+    if (cart.chip == .superfx) {
+        mapGsuLinearRom(bus);
+        mapGsuRam(bus);
+    }
+}
+
+/// Super FX boards decode banks $40-$5F (and $C0-$DF) as linear ROM: bank
+/// $40+n covers ROM offset n*64K across the whole bank, $0000-$FFFF. The
+/// LoROM windows the generic loop just installed for those banks are both
+/// incomplete (no lower half) and wrongly offset (the board is linear here,
+/// not mirrored-LoROM) — Yoshi's Island uploads its sound driver from
+/// $50:0342 and hung forever on open bus without this.
+fn mapGsuLinearRom(bus: *Bus) void {
+    const cart = bus.cart;
+    var bank: u32 = 0x40;
+    while (bank <= 0x5F) : (bank += 1) {
+        for ([2]u32{ bank, bank + 0x80 }) |b32| {
+            const b: u8 = @intCast(b32);
+            for (0..8) |i| {
+                const offset = ((bank - 0x40) * 0x1_0000 + @as(u32, @intCast(i)) * page_size) & cart.rom_mask;
+                setPage(bus, pageIndex(b, @intCast(i)), .{
+                    .read = cart.rom.ptr + offset,
+                    .write = null,
+                    .speed = romSpeed(b, bus.fastrom),
+                });
+            }
+        }
+    }
 }
 
 /// Super FX work RAM (in cart.sram): banks $70-$71 (and $F0-$F1) map the
