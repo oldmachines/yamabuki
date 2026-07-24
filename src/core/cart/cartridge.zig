@@ -15,6 +15,7 @@ pub const ChipKind = enum(u8) {
     sa1,
     superfx,
     cx4,
+    sdd1,
     other, // recognized as present but not yet identified/supported
 };
 
@@ -96,6 +97,9 @@ fn identifyChip(h: Header) ChipKind {
         0x03, 0x04, 0x05 => .dsp,
         0x13...0x1A => .superfx,
         0x33...0x35 => .sa1,
+        // Coprocessor nibble 4 is the S-DD1; only the two shipped
+        // configurations exist (ROM+chip, and +RAM+battery for Star Ocean).
+        0x43, 0x45 => .sdd1,
         0xF3 => .cx4,
         else => .other,
     };

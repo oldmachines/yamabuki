@@ -19,6 +19,7 @@ const Gsu = @import("../chips/gsu.zig").Gsu;
 const Dsp1 = @import("../chips/dsp1.zig").Dsp1;
 const Sa1 = @import("../chips/sa1.zig").Sa1;
 const Cx4 = @import("../chips/cx4.zig").Cx4;
+const Sdd1 = @import("../chips/sdd1.zig").Sdd1;
 const Cartridge = @import("../cart/cartridge.zig").Cartridge;
 const timing = @import("../timing.zig");
 
@@ -116,6 +117,11 @@ pub const Bus = struct {
     sa1: Sa1,
     /// Cx4 coprocessor (HLE); inert unless the cartridge chip is `.cx4`.
     cx4: Cx4,
+    /// S-DD1 graphics decompressor; inert unless the chip is `.sdd1`. Unlike
+    /// the GSU/SA-1 it has no processor of its own, so it never appears in
+    /// `coprocIrqGuard` and nothing catches it up — its work happens inside
+    /// the DMA transfer that consumes the data.
+    sdd1: Sdd1,
     /// The coprocessor IRQ lines (GSU, SA-1), aggregated. The per-instruction
     /// scheduler loop reads this one bool instead of reaching into two large
     /// chip structs by name — those loads were pure overhead on a plain cart.
@@ -154,10 +160,12 @@ pub const Bus = struct {
         self.dsp1 = .init;
         self.sa1.init();
         self.cx4.init();
+        self.sdd1 = .init;
         self.coproc_irq_line = false;
         self.attachGsu();
         self.attachSa1();
         self.attachCx4();
+        self.attachSdd1();
         self.remap();
     }
 
@@ -177,6 +185,12 @@ pub const Bus = struct {
     fn attachCx4(self: *Bus) void {
         if (self.cart.chip != .cx4) return;
         self.cx4.attach(self.cart.rom, self.cart.rom_mask);
+    }
+
+    /// Wire the S-DD1 to the cartridge's ROM (after init or load).
+    fn attachSdd1(self: *Bus) void {
+        if (self.cart.chip != .sdd1) return;
+        self.sdd1.attach(self.cart.rom, self.cart.rom_mask);
     }
 
     /// Rebuild the page table (after init, deserialize, or MEMSEL change).
@@ -203,6 +217,7 @@ pub const Bus = struct {
         self.remap();
         self.attachGsu();
         self.attachCx4();
+        self.attachSdd1();
         self.syncCoprocIrq(); // derived from the chips' serialized lines
         inline for (@typeInfo(Bus).@"struct".fields) |f| {
             if (comptime @typeInfo(f.type) == .@"struct" and @hasDecl(f.type, "postLoad")) {
@@ -383,6 +398,10 @@ pub const Bus = struct {
                 break :blk self.joy.readAuto(@truncate(a16 & 7));
             },
             0x4300...0x437F => self.dma.readReg(a16),
+            0x4800...0x4807 => if (self.cart.chip == .sdd1)
+                self.sdd1.mmioRead(a16, self.mdr)
+            else
+                self.mdr,
             else => {
                 if (self.dsp1Port(bank, a16)) |sr| {
                     self.mdr = if (sr) self.dsp1.readStatus() else self.dsp1.readData();
@@ -475,6 +494,11 @@ pub const Bus = struct {
             0x420B => self.dma.startGpDma(self, value),
             0x420C => self.dma.hdmaen = value,
             0x4300...0x437F => self.dma.writeReg(a16, value),
+            0x4800...0x4807 => if (self.cart.chip == .sdd1) {
+                // Only a slice-select change needs the page table rebuilt,
+                // and only banks $C0-$FF move.
+                if (self.sdd1.mmioWrite(a16, value)) mappers.mapSdd1Window(self);
+            },
             0x420D => {
                 // Auto-FastROM pins MEMSEL: a game clearing it (usually just
                 // its own reset code writing 0) must not undo the option.
@@ -976,4 +1000,121 @@ test "Super FX linear banks $40-$5F map ROM for the SNES CPU" {
     const plain = try TestConsole.create(0x20, 3);
     defer plain.destroy();
     try std.testing.expectEqual(@as(?[*]const u8, null), plain.bus.page_read[0x41_2345 >> 13]);
+}
+
+test "S-DD1 windows banks $C0-$FF through the page table" {
+    // Star Ocean's reset code ends in `JML $C0:8001`, so the window has to be
+    // right from power-on: quarter 0 selects slice 0, and $C0:8001 is ROM
+    // offset $008001 — not the LoROM mirror a plain cart would put there.
+    const tc = try TestConsole.createChip(0x20, 3, 0x45); // LoROM + S-DD1
+    defer tc.destroy();
+    try std.testing.expectEqual(@import("../cart/cartridge.zig").ChipKind.sdd1, tc.cart.chip);
+
+    try std.testing.expectEqual(tc.cart.rom[0x00_8001], tc.bus.read8(0xC0_8001));
+    // The window is linear across a whole bank, unlike LoROM's 32 KiB halves.
+    try std.testing.expectEqual(tc.cart.rom[0x00_1234], tc.bus.read8(0xC0_1234));
+    try std.testing.expectEqual(tc.cart.rom[0x01_0000 & tc.cart.rom_mask], tc.bus.read8(0xC1_0000));
+
+    // Point the first quarter at slice 1: $C0-$CF moves, $D0+ does not.
+    const d0_before = tc.bus.read8(0xD0_0000);
+    tc.bus.write8(0x00_4804, 1);
+    try std.testing.expectEqual(tc.cart.rom[0x10_0000 & tc.cart.rom_mask], tc.bus.read8(0xC0_0000));
+    try std.testing.expectEqual(d0_before, tc.bus.read8(0xD0_0000));
+    // ...and the register reads back.
+    try std.testing.expectEqual(@as(u8, 1), tc.bus.read8(0x00_4804));
+
+    // The window is read-only.
+    const before = tc.bus.read8(0xC0_0100);
+    tc.bus.write8(0xC0_0100, before ^ 0xFF);
+    try std.testing.expectEqual(before, tc.bus.read8(0xC0_0100));
+
+    // A plain LoROM cart ignores $4804 and keeps its own mirror: $C0:8001 is
+    // the 32 KiB LoROM window of bank $40, a different byte entirely from the
+    // one the S-DD1 window serves at the same address.
+    const plain = try TestConsole.create(0x20, 3);
+    defer plain.destroy();
+    plain.bus.write8(0x00_4804, 1);
+    const lorom_offset = (0x40 * 0x8000 + 1) & plain.cart.rom_mask;
+    try std.testing.expectEqual(plain.cart.rom[lorom_offset], plain.bus.read8(0xC0_8001));
+    try std.testing.expect(plain.cart.rom[lorom_offset] != plain.cart.rom[0x00_8001]);
+}
+
+test "an armed DMA channel reads decompressed bytes instead of ROM" {
+    // The wiring that matters: $4800 enables a channel, $4801 arms it, and
+    // the next A→B transfer on that channel takes the decompressor's output.
+    // The arm is one-shot, so the transfer after it reads plain ROM again.
+    const tc = try TestConsole.createChip(0x20, 3, 0x45);
+    defer tc.destroy();
+
+    // What the chip produces for this source, computed directly.
+    var expect: [8]u8 = undefined;
+    tc.bus.sdd1.dma_enable = 0xFF;
+    tc.bus.sdd1.xfer_enable = 0xFF;
+    tc.bus.sdd1.beginTransfer(0, 0xC0_8000);
+    for (&expect) |*b| b.* = tc.bus.sdd1.nextByte();
+    tc.bus.sdd1.dma_enable = 0;
+    tc.bus.sdd1.xfer_enable = 0;
+
+    // Channel 0: $C0:8000 -> $2180 (the WRAM port), 8 bytes, A→B.
+    const setup = struct {
+        fn go(bus: *Bus) void {
+            bus.write8(0x00_4300, 0x00); // 1 byte/unit, A→B, increment
+            bus.write8(0x00_4301, 0x80); // B-bus $2180
+            bus.write8(0x00_4302, 0x00);
+            bus.write8(0x00_4303, 0x80);
+            bus.write8(0x00_4304, 0xC0); // A-bus $C0:8000
+            bus.write8(0x00_4305, 0x08);
+            bus.write8(0x00_4306, 0x00); // 8 bytes
+            bus.write8(0x00_2181, 0x00); // WRAM port address 0
+            bus.write8(0x00_2182, 0x00);
+            bus.write8(0x00_2183, 0x00);
+            bus.write8(0x00_420B, 0x01); // trigger channel 0
+        }
+    };
+
+    // Unarmed: plain ROM bytes land in WRAM.
+    setup.go(&tc.bus);
+    for (0..8) |i| {
+        try std.testing.expectEqual(tc.cart.rom[0x00_8000 + i], tc.bus.wram.data[i]);
+    }
+
+    // Armed: the decompressor's bytes land instead, and they differ from ROM.
+    tc.bus.write8(0x00_4800, 0x01);
+    tc.bus.write8(0x00_4801, 0x01);
+    try std.testing.expect(tc.bus.sdd1.channelArmed(0));
+    setup.go(&tc.bus);
+    try std.testing.expectEqualSlices(u8, &expect, tc.bus.wram.data[0..8]);
+    try std.testing.expect(!std.mem.eql(u8, tc.cart.rom[0x00_8000..][0..8], &expect));
+
+    // One-shot: the arm bit is consumed, so the next transfer is plain again.
+    try std.testing.expect(!tc.bus.sdd1.channelArmed(0));
+    setup.go(&tc.bus);
+    try std.testing.expectEqual(tc.cart.rom[0x00_8000], tc.bus.wram.data[0]);
+}
+
+test "S-DD1 bank selection survives a save state" {
+    const tc = try TestConsole.createChip(0x20, 3, 0x45);
+    defer tc.destroy();
+    tc.bus.write8(0x00_4804, 2);
+    tc.bus.write8(0x00_4805, 5);
+    tc.bus.write8(0x00_4800, 0x03);
+
+    const serialize = @import("../serialize.zig");
+    const buf = try std.testing.allocator.alloc(u8, comptime serialize.byteSize(Bus));
+    defer std.testing.allocator.free(buf);
+    _ = serialize.write(Bus, &tc.bus, buf);
+
+    const other = try TestConsole.createChip(0x20, 3, 0x45);
+    defer other.destroy();
+    _ = try serialize.read(Bus, &other.bus, buf);
+    other.bus.postLoad();
+
+    try std.testing.expectEqual(@as(u8, 2), other.bus.sdd1.bank[0]);
+    try std.testing.expectEqual(@as(u8, 5), other.bus.sdd1.bank[1]);
+    try std.testing.expectEqual(@as(u8, 0x03), other.bus.sdd1.dma_enable);
+    // postLoad must have rebuilt the window, not just the register values.
+    try std.testing.expectEqual(
+        other.cart.rom[0x20_0000 & other.cart.rom_mask],
+        other.bus.read8(0xC0_0000),
+    );
 }
