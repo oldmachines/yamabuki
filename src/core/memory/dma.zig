@@ -145,6 +145,12 @@ pub const Dma = struct {
         // (a non-system bank) skips the per-byte aBusValid range check.
         const a_guarded = (ch.a_bank & 0x7F) < 0x40;
 
+        // S-DD1: a channel armed through $4800/$4801 takes its A-side bytes
+        // from the decompressor instead of ROM. Only A→B can decompress —
+        // the chip has no path back into the cartridge.
+        const decompress = bus.cart.chip == .sdd1 and !b_to_a and bus.sdd1.channelArmed(i);
+        if (decompress) bus.sdd1.beginTransfer(i, (@as(u24, ch.a_bank) << 16) | ch.a_addr);
+
         var remaining = total;
         var p: usize = 0;
         while (remaining > 0) : (remaining -= 1) {
@@ -158,6 +164,8 @@ pub const Dma = struct {
             const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             if (b_to_a) {
                 if (a_guarded) aWrite(bus, a, bus.read8(b)) else bus.write8(a, bus.read8(b));
+            } else if (decompress) {
+                bus.write8(b, bus.sdd1.nextByte());
             } else {
                 bus.write8(b, if (a_guarded) aRead(bus, a) else bus.read8(a));
             }

@@ -33,5 +33,12 @@
         // after the execute command): the gate's first catch, pinned at last.
         .{ .sha256 = "740646f3535bfb365ca44e70d46ab433467b142bd84010393070bd0b141af853", .title = "SUPER MARIO RPG", .region = 1, .checksum = 0x3bb4, .frames = 900, .fb = 0x192b198ad9f7f6d8, .audio = 0x763bf57147a27638 },
         .{ .sha256 = "06d1c2b06b716052c5596aaa0c2e5632a027fee1a9a28439e509f813c30829a9", .title = "CHRONO TRIGGER", .region = 1, .checksum = 0x788c, .frames = 600, .fb = 0x2fe8f0b31f5ca9bb, .audio = 0xe9276e1f0b6a7860 },
+        // The S-DD1 gate: every byte of graphics this game shows comes out of
+        // the decompressor, so a wrong bit anywhere moves this hash. NB this
+        // is the DeJap English translation of Star Ocean (J) — the dump the
+        // chip was developed against, no retail dump being to hand; the
+        // Japanese original has a different sha256 and is not pinned. Frame
+        // 900 is the title screen over its animated starfield.
+        .{ .sha256 = "504050fcbcf1b6768448aed48298ad388b76271412a8cb9659937cddbe8e1385", .title = "Star Ocean", .region = 0, .checksum = 0x13b8, .frames = 900, .fb = 0x076701ad915b2caf, .audio = 0x66a0bbf71b7eafef },
     },
 }

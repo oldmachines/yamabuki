@@ -33,7 +33,11 @@ pub fn buildPages(bus: *Bus) void {
     @memset(&bus.page_speed, timing.speed_slow);
 
     switch (bus.cart.header.mapping) {
-        .lorom => if (bus.cart.chip == .sa1) mapSa1(bus) else mapLoRom(bus),
+        .lorom => switch (bus.cart.chip) {
+            .sa1 => mapSa1(bus),
+            .sdd1 => mapSdd1(bus),
+            else => mapLoRom(bus),
+        },
         .hirom => mapHiRom(bus, 0),
         .exhirom => mapHiRom(bus, 0x40_0000),
     }
@@ -166,6 +170,34 @@ fn mapGsuRam(bus: *Bus) void {
                 .read = ram,
                 .write = ram,
                 .speed = timing.speed_slow,
+            });
+        }
+    }
+}
+
+/// S-DD1 carts: a LoROM base plus the chip's own 4 MiB window over banks
+/// $C0-$FF, which is where these games actually live (Star Ocean's reset code
+/// ends in `JML $C0:8001`). The window is four 1 MiB slices, each selected by
+/// one of $4804-$4807, so a register write re-runs `mapSdd1Window` alone.
+fn mapSdd1(bus: *Bus) void {
+    mapLoRom(bus);
+    mapSdd1Window(bus);
+}
+
+/// Rebuild banks $C0-$FF from the chip's current slice selection. Cheap
+/// enough (512 pages) to run on every $4804-$4807 write.
+pub fn mapSdd1Window(bus: *Bus) void {
+    const cart = bus.cart;
+    var bank: u32 = 0xC0;
+    while (bank < 0x100) : (bank += 1) {
+        const b: u8 = @intCast(bank);
+        for (0..pages_per_bank) |i| {
+            const addr: u24 = @intCast((bank << 16) | (i * page_size));
+            const offset = bus.sdd1.windowOffset(addr) & cart.rom_mask;
+            setPage(bus, pageIndex(b, @intCast(i)), .{
+                .read = cart.rom.ptr + offset,
+                .write = null,
+                .speed = romSpeed(b, bus.fastrom),
             });
         }
     }

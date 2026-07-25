@@ -70,6 +70,10 @@ const Args = struct {
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
+    /// Pad-1 buttons held for the whole run (core.joypad.Button bits, e.g.
+    /// 0x1000 = Start). A title screen that waits for input renders the same
+    /// frame forever otherwise, so this is what gets a game past it.
+    buttons: u16 = 0,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
@@ -101,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
+            \\  --buttons M   pad-1 buttons held all run, as a hex mask (0x1000 = Start)
             \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
             \\                (fast core only; for widescreen game patches such as wide-snes)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
@@ -174,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
     const frames = args.frames orelse 1;
     for (0..frames) |_| {
+        if (args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
@@ -939,6 +945,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--buttons")) {
+            const v = it.next() orelse return error.MissingValue;
+            const digits = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
+            out.buttons = try std.fmt.parseInt(u16, digits, 16);
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
