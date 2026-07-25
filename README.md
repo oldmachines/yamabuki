@@ -507,4 +507,8 @@ repo does not already pin. See [Shaders](#shaders).
 Super FX is low-level (real prefetch pipeline, code cache, PLOT bitplane
 pipeline) because games depend on its behaviour cycle by cycle; DSP-1 and Cx4
 are command-level HLE because they do not. SA-1 gets the cheapest treatment of
-all: it *is* the 65816 core, instantiated a second time on its own bus.
+all: it *is* the 65816 core, instantiated a second time on its own bus. The
+S-DD1 splits the question: its *data* has to be exact to the bit — one wrong
+bit in the entropy decoder turns Star Ocean's title screen into noise, which
+no unit test would notice — while its *timing* is unobservable, so a
+decompressing DMA simply expands as the transfer runs.
