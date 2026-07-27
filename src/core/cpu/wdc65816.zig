@@ -66,6 +66,9 @@ pub fn Cpu(comptime BusT: type) type {
         regs: Regs,
         state: ExecState,
         nmi_pending: bool,
+        /// One-instruction service grace for an NMI asserted at an
+        /// instruction boundary (see setNmi).
+        nmi_delay: bool,
         irq_line: bool,
 
         pub fn init(bus: *BusT) Self {
@@ -74,6 +77,7 @@ pub fn Cpu(comptime BusT: type) type {
                 .regs = .power,
                 .state = .running,
                 .nmi_pending = false,
+                .nmi_delay = false,
                 .irq_line = false,
             };
         }
@@ -83,11 +87,22 @@ pub fn Cpu(comptime BusT: type) type {
             self.regs = .power;
             self.state = .running;
             self.nmi_pending = false;
+            self.nmi_delay = false;
             self.regs.pc = self.read16(0x00FFFC);
         }
 
         pub fn setNmi(self: *Self) void {
             self.nmi_pending = true;
+            // Hardware samples interrupts in an instruction's second-to-last
+            // cycle, so an edge that lands at an instruction boundary — which
+            // is where the line-based scheduler always raises vblank — lets
+            // one more instruction finish before the service sequence. That
+            // instruction is the window in which a `LDA $4210` edge-wait can
+            // win the race against the NMI handler's own $4210 ack; SFA2's
+            // boot spins forever without it (issue #88). WAI is the opposite:
+            // it exists to remove the sampling latency, so a waiting CPU
+            // services the NMI immediately on wake.
+            self.nmi_delay = self.state == .running;
             if (self.state == .waiting) self.state = .running;
         }
 
@@ -118,9 +133,15 @@ pub fn Cpu(comptime BusT: type) type {
             self.fixStackE();
 
             if (self.nmi_pending) {
-                self.nmi_pending = false;
-                self.interrupt(if (self.regs.e) 0xFFFA else 0xFFEA);
-                return;
+                if (self.nmi_delay) {
+                    // The one-instruction sampling grace (see setNmi): fall
+                    // through and execute this instruction; service next.
+                    self.nmi_delay = false;
+                } else {
+                    self.nmi_pending = false;
+                    self.interrupt(if (self.regs.e) 0xFFFA else 0xFFEA);
+                    return;
+                }
             }
             if (self.irq_line and (self.regs.p & Flags.i) == 0) {
                 self.interrupt(if (self.regs.e) 0xFFFE else 0xFFEE);
@@ -405,4 +426,48 @@ test "stack push/pull roundtrip in native mode" {
     cpu.regs.pc = 0x8000;
     for (0..6) |_| cpu.step();
     try std.testing.expectEqual(@as(u8, 0x42), cpu.al());
+}
+
+test "an NMI asserted while running is serviced after exactly one instruction" {
+    // Hardware samples interrupts in an instruction's second-to-last cycle:
+    // an edge at an instruction boundary lets one more instruction complete.
+    // The line scheduler always asserts vblank at a boundary, so without this
+    // grace the NMI handler's $4210 ack deterministically beats any main-loop
+    // RDNMI edge-wait — SFA2 boots into a permanent black screen (issue #88).
+    var bus: FlatBus = .{};
+    bus.mem[0xFFFC] = 0x00;
+    bus.mem[0xFFFD] = 0x80; // reset -> $8000
+    bus.mem[0xFFFA] = 0x00;
+    bus.mem[0xFFFB] = 0x90; // emulation NMI vector -> $9000
+    bus.mem[0x8000] = 0xEA; // NOP
+    bus.mem[0x8001] = 0xEA; // NOP
+    var cpu = Cpu(FlatBus).init(&bus);
+    cpu.reset();
+
+    cpu.setNmi();
+    cpu.step(); // the grace instruction: the first NOP runs...
+    try std.testing.expectEqual(@as(u16, 0x8001), cpu.regs.pc);
+    cpu.step(); // ...and only then the service sequence
+    try std.testing.expectEqual(@as(u16, 0x9000), cpu.regs.pc);
+    try std.testing.expect(!cpu.nmi_pending);
+}
+
+test "an NMI that wakes WAI is serviced with no grace instruction" {
+    // WAI exists to remove the sampling latency: the woken CPU services the
+    // interrupt immediately rather than executing the following instruction.
+    var bus: FlatBus = .{};
+    bus.mem[0xFFFC] = 0x00;
+    bus.mem[0xFFFD] = 0x80;
+    bus.mem[0xFFFA] = 0x00;
+    bus.mem[0xFFFB] = 0x90;
+    bus.mem[0x8000] = 0xCB; // WAI
+    bus.mem[0x8001] = 0xEA; // NOP (must NOT run before the handler)
+    var cpu = Cpu(FlatBus).init(&bus);
+    cpu.reset();
+
+    cpu.step(); // WAI
+    try std.testing.expectEqual(ExecState.waiting, cpu.state);
+    cpu.setNmi();
+    cpu.step(); // straight into the service sequence
+    try std.testing.expectEqual(@as(u16, 0x9000), cpu.regs.pc);
 }

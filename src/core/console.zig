@@ -1229,3 +1229,79 @@ test "save states are tied to the accuracy that wrote them" {
     b.init(.accurate, try Cartridge.load(alloc, rom));
     try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }
+
+test "a $4210 edge-wait can win the race against the NMI handler's own ack" {
+    // Street Fighter Alpha 2's boot (issue #88): the main thread spins in
+    //   wait: LDA $4210 / BPL wait
+    // with NMI enabled, while the NMI handler ALSO reads $4210 — clearing
+    // the flag. On hardware the poll's read races the NMI delivery and wins
+    // ~40% of frames (the interrupt-sampling grace); the game exits within a
+    // few frames. Without the grace the handler acks first on every frame,
+    // deterministically, and the wait never ends.
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 0x8000);
+    defer alloc.free(rom);
+    @memset(rom, 0);
+
+    // Reset at $00:8000: enable NMI, drain the flag, then edge-wait; store
+    // the winning read to WRAM $00 and spin.
+    const reset_code = [_]u8{
+        0xA9, 0x80, // LDA #$80
+        0x8D, 0x00, 0x42, // STA $4200
+        0xAD, 0x10, 0x42, // wait0: LDA $4210
+        0x30, 0xFB, // BMI wait0 (drain while set)
+        0xAD, 0x10, 0x42, // wait1: LDA $4210
+        0x10, 0xFB, // BPL wait1 (spin until set)
+        0x85, 0x00, // STA $00 (bit7 must be set here)
+        0x80, 0xFE, // spin: BRA spin
+    };
+    @memcpy(rom[0..reset_code.len], &reset_code);
+    // NMI handler at $00:8020: count it, burn a frame-varying number of
+    // cycles, ack $4210 (the thieving read), RTI. The variable delay is what
+    // real handlers do naturally; a fixed-length handler phase-locks the
+    // poll loop against the exactly periodic frame and the race never moves.
+    const nmi_code = [_]u8{
+        0x48, // PHA (a real handler preserves registers; the win
+        0xDA, // PHX  depends on A surviving the service sequence)
+        0xE6, 0x01, // INC $01
+        0xA5, 0x01, // LDA $01
+        0x29, 0x07, // AND #$07
+        0xAA, // TAX
+        0xF0, 0x03, // BEQ +3 (skip delay when zero)
+        0xCA, // delay: DEX
+        0xD0, 0xFD, // BNE delay
+        0xAD, 0x10, 0x42, // LDA $4210 (ack)
+        0xFA, // PLX
+        0x68, // PLA
+        0x40, // RTI
+    };
+    @memcpy(rom[0x20..][0..nmi_code.len], &nmi_code);
+
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "NMI RACE TEST        ");
+    h[0x15] = 0x20;
+    h[0x16] = 0x00;
+    h[0x17] = 5;
+    h[0x18] = 0;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, rom[0x7FFA..0x7FFC], 0x8020, .little);
+    std.mem.writeInt(u16, rom[0x7FFC..0x7FFE], 0x8000, .little);
+
+    const cart = try Cartridge.load(alloc, rom);
+    const con = try alloc.create(FastConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+
+    // The win is phase-dependent frame to frame, exactly like hardware; it
+    // must land well within a second.
+    var frames: u32 = 0;
+    while (frames < 60 and con.bus.wram.data[0] == 0) : (frames += 1) {
+        con.runFrame();
+    }
+    try std.testing.expect(con.bus.wram.data[0] & 0x80 != 0); // the wait exited
+    try std.testing.expect(con.bus.wram.data[1] > 0); // and the handler kept running
+}

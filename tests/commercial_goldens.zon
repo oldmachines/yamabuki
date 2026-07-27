@@ -17,22 +17,22 @@
     .roms = .{
         .{ .sha256 = "0838e531fe22c077528febe14cb3ff7c492f1f5fa8de354192bdff7137c27f5b", .title = "SUPER MARIOWORLD", .region = 1, .checksum = 0xa0da, .frames = 600, .fb = 0x59baa1b3cadc398e, .audio = 0x235c34a91079b6d8 },
         .{ .sha256 = "12b77c4bc9c1832cee8881244659065ee1d84c70c3d29e6eaf92e6798cc2ca72", .title = "Super Metroid", .region = 0, .checksum = 0xf8df, .frames = 600, .fb = 0x19971e34d8aaaaea, .audio = 0xd9008a1ac7ace4ba },
-        .{ .sha256 = "4e095fbbdec4a16b075d7140385ff68b259870ca9e3357f076dfff7f3d1c4a62", .title = "KIRBY SUPER DELUXE", .region = 1, .checksum = 0xc6aa, .frames = 600, .fb = 0x9a85ad9c7abeac3d, .audio = 0x98e804938e1fcb42 },
+        .{ .sha256 = "4e095fbbdec4a16b075d7140385ff68b259870ca9e3357f076dfff7f3d1c4a62", .title = "KIRBY SUPER DELUXE", .region = 1, .checksum = 0xc6aa, .frames = 600, .fb = 0xc898e1a3986c721b, .audio = 0x98e804938e1fcb42 },
         .{ .sha256 = "628147468c3539283197f58f03b94df49758a332831857481ea9cc31645f0527", .title = "DONKEY KONG COUNTRY", .region = 1, .checksum = 0x2bcc, .frames = 600, .fb = 0x353c2544ba7b1f2a, .audio = 0x9ccdb27a53e261cd },
         .{ .sha256 = "a8fe2226728002786d68c27ddddf0b90a894db52e4dfe268fdf72a68cae5f02e", .title = "EARTH BOUND", .region = 1, .checksum = 0x4048, .frames = 600, .fb = 0x1018a1275f8fc6ec, .audio = 0xae155d55539b0f95 },
         // Frame 600 lands on the shared Konami logo for both Konami games (their
         // framebuffer hashes collide!) and on black for Mega Man X; 900 lands on
         // real, distinct content for all three.
         .{ .sha256 = "0ef6f4cce5a2273fa49fe1ce724e0048a8e39c91da6b00dbb693fe1ba909177d", .title = "SUPER CASTLEVANIA 4", .region = 1, .checksum = 0x0325, .frames = 900, .fb = 0xdec19ce19d4b34a0, .audio = 0x4c2bef72573ad7a2 },
-        .{ .sha256 = "a93ea87fc835c530b5135c5294433d15eef6dbf656144b387e89ac19cf864996", .title = "CONTRA3 THE ALIEN WAR", .region = 1, .checksum = 0x0c3c, .frames = 900, .fb = 0xa550132ccf8194c6, .audio = 0x26a620e6b8e534f8 },
-        .{ .sha256 = "b8f70a6e7fb93819f79693578887e2c11e196bdf1ac6ddc7cb924b1ad0be2d32", .title = "MEGAMAN X", .region = 1, .checksum = 0x4cc2, .frames = 900, .fb = 0x34ac5ea3c54f99ce, .audio = 0x559694849329c4d6 },
+        .{ .sha256 = "a93ea87fc835c530b5135c5294433d15eef6dbf656144b387e89ac19cf864996", .title = "CONTRA3 THE ALIEN WAR", .region = 1, .checksum = 0x0c3c, .frames = 900, .fb = 0xa550132ccf8194c6, .audio = 0xbae0244bdf1ad01a },
+        .{ .sha256 = "b8f70a6e7fb93819f79693578887e2c11e196bdf1ac6ddc7cb924b1ad0be2d32", .title = "MEGAMAN X", .region = 1, .checksum = 0x4cc2, .frames = 900, .fb = 0x34ac5ea3c54f99ce, .audio = 0xa31e4cb9c1a97743 },
         // The two that gate the HVBJOY H-blank fix: both passed every homebrew
         // golden while never rendering a frame.
         .{ .sha256 = "bf16c3c867c58e2ab061c70de9295b6930d63f29f81cc986f5ecae03e0ad18d2", .title = "F-ZERO", .region = 1, .checksum = 0xc92e, .frames = 600, .fb = 0xf7f9bac4809cb37a, .audio = 0x3c520f3d59a43eea },
         // Minted after PR #64 fixed the APU HLE boot (the game polls ports 2/3
         // after the execute command): the gate's first catch, pinned at last.
         .{ .sha256 = "740646f3535bfb365ca44e70d46ab433467b142bd84010393070bd0b141af853", .title = "SUPER MARIO RPG", .region = 1, .checksum = 0x3bb4, .frames = 900, .fb = 0x192b198ad9f7f6d8, .audio = 0x763bf57147a27638 },
-        .{ .sha256 = "06d1c2b06b716052c5596aaa0c2e5632a027fee1a9a28439e509f813c30829a9", .title = "CHRONO TRIGGER", .region = 1, .checksum = 0x788c, .frames = 600, .fb = 0x2fe8f0b31f5ca9bb, .audio = 0xe9276e1f0b6a7860 },
+        .{ .sha256 = "06d1c2b06b716052c5596aaa0c2e5632a027fee1a9a28439e509f813c30829a9", .title = "CHRONO TRIGGER", .region = 1, .checksum = 0x788c, .frames = 600, .fb = 0x2fe8f0b31f5ca9bb, .audio = 0x1c19a4e861b8badc },
         // The S-DD1 gate: every byte of graphics this game shows comes out of
         // the decompressor, so a wrong bit anywhere moves this hash. NB this
         // is the DeJap English translation of Star Ocean (J) — the dump the
@@ -40,5 +40,10 @@
         // Japanese original has a different sha256 and is not pinned. Frame
         // 900 is the title screen over its animated starfield.
         .{ .sha256 = "504050fcbcf1b6768448aed48298ad388b76271412a8cb9659937cddbe8e1385", .title = "Star Ocean", .region = 0, .checksum = 0x13b8, .frames = 900, .fb = 0x076701ad915b2caf, .audio = 0x66a0bbf71b7eafef },
+        // The second S-DD1 board (chipset $43, no SRAM) and a PAL cart. It
+        // needed the NMI sampling grace on top of the chip (issue #88): its
+        // boot spins in a $4210 edge-wait that races its own NMI handler's
+        // ack. Frame 900 is the intro; by 1800 the attract demo is fighting.
+        .{ .sha256 = "4001418ceb26f38efbea10b7bcc8233adc7bfcaa7e11dfb401d820f3254f06ef", .title = "STREET FIGHTER ALPHA2", .region = 2, .checksum = 0x535a, .frames = 900, .fb = 0x3f1d235d4b130a97, .audio = 0x52d937ac9745dfae },
     },
 }
