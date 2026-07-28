@@ -22,6 +22,10 @@ pub const Config = struct {
     rewind: RewindCfg = .{},
     library: LibraryCfg = .{},
     input: input.InputConfig = .{},
+    /// Per-game overrides, keyed by the save layer's game_id. A null field
+    /// inherits the global setting; precedence overall is
+    /// defaults ← global ← per-game ← CLI flag.
+    per_game: []PerGame = &.{},
 
     pub const Video = struct {
         /// Window scale factor, same meaning and 1..8 range as `--scale`.
@@ -52,6 +56,36 @@ pub const Config = struct {
         /// `.rom_dirs = .{ "D:\\Games\\Snes Games" }`.
         rom_dirs: []const []const u8 = &.{},
     };
+
+    pub const PerGame = struct {
+        game_id: []const u8,
+        shader: ?[]const u8 = null,
+        region: ?enum { ntsc, pal } = null,
+        accuracy: ?enum { fast, accurate } = null,
+        /// Widescreen margin (columns per side); non-null implies the fast
+        /// core, and a conflicting accuracy override is refused at boot.
+        wide: ?u32 = null,
+        rewind: ?bool = null,
+    };
+
+    pub fn perGame(self: *const Config, game_id: []const u8) ?*const PerGame {
+        for (self.per_game) |*e| {
+            if (std.mem.eql(u8, e.game_id, game_id)) return e;
+        }
+        return null;
+    }
+
+    /// The override entry for `game_id`, created on first edit.
+    pub fn perGameMut(self: *Config, gpa: std.mem.Allocator, game_id: []const u8) !*PerGame {
+        for (self.per_game) |*e| {
+            if (std.mem.eql(u8, e.game_id, game_id)) return e;
+        }
+        const grown = try gpa.alloc(PerGame, self.per_game.len + 1);
+        @memcpy(grown[0..self.per_game.len], self.per_game);
+        grown[self.per_game.len] = .{ .game_id = try gpa.dupe(u8, game_id) };
+        self.per_game = grown;
+        return &grown[self.per_game.len - 1];
+    }
 
     /// `video.scale` with the same validation `--scale` gets at parse time —
     /// a hand-edited out-of-range value warns and falls back rather than
@@ -123,8 +157,29 @@ test "config: a fully populated config survives the roundtrip" {
     cfg.input.p1_keys.b = "space";
     cfg.input.hotkeys.fast_forward = "key:tab";
     cfg.input.swap_pads = true;
+    const pg = try cfg.perGameMut(a, "0123456789abcdef-star-ocean");
+    pg.region = .pal;
+    pg.rewind = false;
+    pg.shader = "crt-royale";
     const back = try parseText(a, try serializeText(a, cfg));
     try std.testing.expectEqualDeep(cfg, back);
+}
+
+test "config: per-game lookup and find-or-create semantics" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cfg: Config = .{};
+    try std.testing.expectEqual(@as(?*const Config.PerGame, null), cfg.perGame("nope"));
+
+    const e1 = try cfg.perGameMut(a, "aaaa-game");
+    e1.accuracy = .accurate;
+    // A second edit finds the same entry rather than duplicating it.
+    const e2 = try cfg.perGameMut(a, "aaaa-game");
+    try std.testing.expectEqual(@as(usize, 1), cfg.per_game.len);
+    try std.testing.expectEqual(@as(?@TypeOf(e2.accuracy.?), .accurate), e2.accuracy);
+    try std.testing.expect(cfg.perGame("aaaa-game") != null);
 }
 
 test "config: unknown fields are ignored, known siblings still land" {

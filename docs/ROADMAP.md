@@ -16,7 +16,8 @@ across x86_64 and aarch64.
 - **Portable.** A pure-Zig core with no external dependencies; cross-compiles to
   x86_64 and aarch64 (glibc and musl) and armv7 with `zig build` alone.
 - **Deployable.** A libretro core for RetroArch-based handheld firmware, an SDL3
-  desktop app for development, and a headless runner for CI/verification.
+  desktop app that plays standalone (M14: overlay menu, gamepads, saves, rewind,
+  ROM library), and a headless runner for CI/verification.
 
 ## Repository layout
 
@@ -37,6 +38,10 @@ src/frontends/
     headless/main.zig    # run N frames, dump .ppm, print framebuffer hash
     libretro/api.zig core.zig    # hand-ported libretro ABI, callconv(.c) exports, zero deps
     sdl/main.zig         # SDL3 desktop app (sdl3.zig: dlopen'd ABI port)
+    sdl/app.zig          # the session loop + library picker; menu.zig ui.zig font.zig
+    sdl/input.zig        # bindings model (keyboard + gamepads, both players)
+    sdl/config.zig       # config.zon via std.zon; paths.zig saves.zig rewind.zig
+    sdl/library.zig      # ROM scanner + metadata cache; png.zig screenshot encoder
 tests/  sst_65816.zig sst_spc700.zig rom_runner.zig
 bench/  bench.zig        # headless FPS benchmark
 ```
@@ -156,7 +161,14 @@ serialize/unserialize.
   fast-forward, and NTSC-rate pacing independent of display refresh.
   `--frames N` prints the same video/audio hashes as the headless runner —
   CI smoke-tests the whole frontend under SDL's dummy drivers against the
-  golden hashes. Frame-advance and layer toggles are deferred (M10 polish).
+  golden hashes. M14 grew it into a standalone player: an overlay menu
+  (custom-drawn 5x7 UI composited into the RGB565 frame, so the CRT shader
+  chain shades it too), remappable gamepads for two players, `.srm` battery
+  saves with debounced autosave, 8 save-state slots, PNG screenshots,
+  hold-to-rewind on an XOR+RLE delta ring, a scanned ROM library, and
+  per-game overrides — all persisted under `SDL_GetPrefPath` with zero new
+  build dependencies. Frame-advance and layer toggles are deferred (M10
+  polish).
 - **headless** — runs N frames, dumps `.ppm`, and prints a framebuffer hash;
   the primary development and CI verification tool.
 
@@ -211,6 +223,8 @@ serialize/unserialize.
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | In progress — tile-row decode cache for both BG (memoized by char address) and sprites (once per tile column); each plane word read once per row instead of per pixel; bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs and ~+13% on the sprite-heavy Rings ROM. Bench gate hardened: a comptime-gated VRAM-word counter (`vram_reads`, compiled out of shipping builds) feeds `zig build bench-check`, a deterministic per-ROM baseline that fails CI on any steps/cycles/traffic drift — locking the decode cache in. Static-musl handheld packaging (`tools/package_handheld.sh`) with a CI assertion that every musl artifact has no dynamic libc / NEEDED shared object. The ≥60 FPS target is measured on-device |
 | M11 | CRT shaders: GL ES pipeline in the SDL frontend, libretro presets transpiled ahead of time | Presets render on-device; the bake gate holds the promised set | In progress — the SDL frontend had no GPU path at all (an `SDL_Renderer` blit of the RGB565 frame). Now: a GL ES context with the entry points resolved through `SDL_GL_GetProcAddress` (the same hand-ported-ABI, no-link-time-dependency stance as `sdl3.zig`), a multi-pass FBO chain with pass aliases, double-buffered feedback targets, an input-frame history ring, and LUT textures, plus a fallback ladder — **GL ES 3 → GL 3.3 → GL ES 2 → the existing software blit** — where every rung prints why it fell through, so a missing shader never costs the user the emulator. **The binary contains no shader compiler.** The presets are libretro *slang* (Vulkan GLSL); `tools/transpile_shaders.py` drives glslang and SPIRV-Cross on the *build host* and emits plain GLSL plus a manifest of reflected uniform offsets, and the phosphor-mask PNGs are decoded to raw RGBA there too — so the runtime holds no SPIR-V, no C++, and no image decoder, and the pure-Zig core, the dependency-free `zig build`, and the static-musl package all survive. The tools are themselves built by `zig c++`, so the bake needs no toolchain the repo does not already pin. Two uniform paths, because SPIRV-Cross emits different forms per profile: a real std140 block on ES3/desktop, plain per-member uniforms on ES2 (which has no uniform blocks); `--flatten-ubo` is unusable because it demands one basic type per block and the slang UBO mixes `mat4 MVP` with `uint FrameCount`. A preset is written for a profile only if it transpiled **and** every uniform mapped to a semantic the runtime supplies, so a shader that cannot work is *absent* rather than broken: 31 of 36 (preset, profile) pairs bake — crt-royale on all three, crt-guest-advanced on ES3 + desktop — and the 5 skips are printed with their reason (crt-geom/crt-hyllian use multidimensional array constructors, absent below ESSL 310; crt-guest-advanced needs `textureSize`, absent in ESSL 100). CI asserts the promised set still bakes. Presets are tagged `handheld` or `desktop` and the tag prints at startup — a claim about a Cortex-A53, not a rating. **Gap: not yet run on a GPU.** The pipeline is compile-verified on all targets and the fallible logic (pass geometry, manifest parsing, uniform encoding, feedback flipping, letterboxing) is unit-tested, but no lit pixel has been observed; expect first-run bugs |
 | M12 | ROM patch layer: soft-patching, a hash-keyed patch registry, auto-FastROM, and the SA-1 candidacy analyser | Patched ROMs boot and match the patch author's reference; `--save-patched` round-trips; auto-FastROM gated by a compat list | In progress — **step one of the analyser is done**: `--sa1-report` runs a game and answers the question that comes before every other one, *is it CPU-bound at all*. It cannot be measured directly (the SNES CPU burns the same cycles every frame whatever happens), so it is measured by its complement — the time the CPU spends **waiting** — and a loop counts as waiting if it *changes nothing*: writes nothing, and watches a fixed handful of addresses rather than walking memory (which is what tells a vblank spin from a checksum). Getting there took four corrections, every one of them a bug a *game* found rather than reasoning: a loop is found by **return**, not by proximity (Contra III's wait is a `JSL` inside a `BRA` loop spread over 6 KiB, and a program-counter *span* test called it 100% busy on every frame including its title screen); **stack traffic is not a side effect** (that same `JSL` pushes three bytes a pass, which a naive "writes nothing" test counts as a write); **a wait is allowed to write** (Tetris & Dr. Mario stirs an RNG seed while it spins — the classic way a game seeds randomness from how long you took to press Start — and read 100% busy until writes were permitted; what a wait may never do is poke a hardware register, which is what keeps a DMA-kicking loop out); and the unit of judgement is one **pass**, not one window (else a memory clear that merely precedes a wait condemns it, and Super Mario World's idle time disappears). Reports slowdown separately from **stalls** — an unbroken run of dropped frames is a level load, not a game failing to keep up, and conflating them recommends conversions nobody needs. Utilisation is honestly an *upper* bound (a wait it fails to spot reads as work) and dropped frames a *lower* one (a game polling the pad in its NMI handler can never register a lag frame); the two errors point opposite ways and bracket the truth, and the tool prints both caveats every run. Compiled in as a third comptime instantiation (`ProfilingConsole`), so the shipped core carries no branch for it; emulation under it is bit-identical (5.12M SST cases, 100 goldens, bench baselines all unchanged). Next: cycles per routine, then the WRAM working set of each hot routine — the number that actually decides a conversion |
+| M13 | Commercial-boot golden gate: opt-in, local ROMs only, sha256-keyed | `zig build test-commercial -Dcommercial-roms=<dir>`; 13 pinned games | **Done** — see build.zig and tests/commercial_goldens.zon; every stuck-cart fix in the M9-M13 arc landed with a pinned boot |
+| M14 | End-user UI: the SDL app becomes a standalone player — overlay menu over the paused game, gamepads + remapping (2 players, hotplug), .srm battery saves, 8 save-state slots, PNG screenshots, hold-to-rewind, scanned ROM library, per-game overrides | Plays gamepad-only end to end; config/data in OS per-user dirs; zero new dependencies (menu is a custom-drawn 5x7 UI composited into the RGB565 frame, so CRT shaders shade it too); every slice kept all gates green | In progress — landed as a stacked PR series (#91-#97); deferred: .zip ROMs via std.zip, boxart, in-menu ROM-dir picker (needs a text widget), core dirty-page serialize for handheld-class rewind (needs core sign-off) |
 
 ## M12 — the ROM patch layer
 

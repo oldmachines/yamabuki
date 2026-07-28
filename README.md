@@ -14,8 +14,10 @@ on underpowered ARM handhelds.
   per game.
 - **Portable**: pure-Zig core with no external dependencies; cross-compiles
   to x86_64 and aarch64 (glibc and musl) with `zig build` alone.
-- **Deployable**: libretro core for RetroArch-based handheld firmware, plus
-  an SDL3 desktop app for development, and a headless runner for CI.
+- **Deployable**: libretro core for RetroArch-based handheld firmware, an
+  SDL3 desktop app that plays standalone — overlay menu, gamepads with
+  remapping, battery saves, save-state slots, rewind, a scanned ROM library,
+  per-game settings — and a headless runner for CI.
 
 ## Building
 
@@ -64,12 +66,26 @@ the build has no SDL dependency, the library is dlopen'd):
 
 ```sh
 ./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N] [--shader crt-lottes]
+./zig-out/bin/yamabuki-sdl           # no argument: open the ROM library
 ```
 
-Keyboard follows the RetroArch defaults — arrows = d-pad, `Z`=B, `X`=A,
+The desktop app is a complete player, no RetroArch required. `Esc` (or a
+pad's guide button) opens an overlay menu over the paused game — settings,
+input remapping for two players (keyboard and gamepads, hotplugged), state
+slots, per-game overrides, quit. Battery saves persist as `.srm` files,
+`F12` takes a PNG screenshot, holding `Backspace` rewinds, and launching
+with no ROM argument opens a library scanned from the directories in
+`config.zon`'s `library.rom_dirs`. Everything lives in the OS's per-user
+data directory (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki` on
+Windows, `~/.local/share/yamabuki/yamabuki` on Linux), and every binding
+and setting is editable both in-menu and in `config.zon`.
+
+Keyboard defaults follow RetroArch — arrows = d-pad, `Z`=B, `X`=A,
 `A`=Y, `S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
-save/load state, `F1` reset, hold `Tab` to fast-forward, `Esc` to quit, and
-`,` / `.` to cycle shaders.
+save/load state, `F6`/`F7` state slot, `F1` reset, `P` pause, hold `Tab`
+(or the right trigger) to fast-forward, and `,` / `.` to cycle shaders.
+Gamepads use the positional map every controller era agrees on: south=B,
+east=A, west=Y, north=X.
 
 ## Shaders
 
