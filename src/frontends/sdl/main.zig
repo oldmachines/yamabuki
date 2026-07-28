@@ -171,7 +171,8 @@ pub fn main(init: std.process.Init) !void {
             sdl,
             args.scale orelse cfg.effectiveScale(err),
             &lib,
-            cfg.library.rom_dirs,
+            &cfg,
+            config_path,
             if (user_paths) |p| p.library else null,
             err,
         ) orelse break;

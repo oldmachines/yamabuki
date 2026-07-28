@@ -23,6 +23,7 @@ const saves = @import("saves.zig");
 const png = @import("png.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
+const dirpicker = @import("dirpicker.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -717,6 +718,10 @@ pub fn run(
 
 /// The library picker: its own small SDL session (window, software blit,
 /// fixed navigation) that scans incrementally while the list is browsed.
+/// Row 0 is always "ADD ROM FOLDER", which opens an in-app folder browser
+/// (`dirpicker.zig`) instead of requiring a hand-edit of config.zon; picking
+/// a folder appends it to `cfg.library.rom_dirs`, persists `cfg` (when
+/// `config_path` is set), and restarts the scan to pick it up immediately.
 /// Returns the selected entry's path (duped into `gpa`), or null to quit.
 pub fn runLibrary(
     io: std.Io,
@@ -724,7 +729,8 @@ pub fn runLibrary(
     sdl: sdl3.Api,
     scale: u32,
     lib: *library.Library,
-    rom_dirs: []const []const u8,
+    cfg: *config.Config,
+    config_path: ?[]const u8,
     cache_path: ?[]const u8,
     err: *std.Io.Writer,
 ) !?[]const u8 {
@@ -778,10 +784,18 @@ pub fn runLibrary(
     defer if (pad_api) |papi| for (open_pads.items) |p| papi.SDL_CloseGamepad(p);
 
     var canvas: [256 * 224]u16 = undefined;
-    var scanner = library.Scanner.begin(gpa, io, rom_dirs, err);
+    var scanner = library.Scanner.begin(gpa, io, cfg.library.rom_dirs, err);
     var cursor: usize = 0;
     var scroll: usize = 0;
     const visible_rows = 17;
+
+    // Row 0 of the list is always the ADD ROM FOLDER action, so the browser
+    // never depends on a hand-edited config.zon. `.picker` owns the folder
+    // browser while it's open; `.list` is the game list.
+    const Mode = enum { list, picker };
+    var mode: Mode = .list;
+    var picker: ?dirpicker.Picker = null;
+    defer if (picker) |*pk| pk.deinit();
 
     while (true) {
         var ev: sdl3.Event = undefined;
@@ -808,7 +822,10 @@ pub fn runLibrary(
                 },
                 else => continue,
             };
-            const n = lib.entries.items.len;
+            const n = switch (mode) {
+                .list => lib.entries.items.len + 1,
+                .picker => picker.?.rowCount(),
+            };
             switch (menu.navFromEvent(nev) orelse continue) {
                 .up => if (n != 0) {
                     cursor = if (cursor == 0) n - 1 else cursor - 1;
@@ -820,10 +837,45 @@ pub fn runLibrary(
                 .right => if (n != 0) {
                     cursor = @min(cursor + visible_rows, n - 1);
                 },
-                .confirm => if (cursor < n) {
-                    picked = cursor;
+                .confirm => switch (mode) {
+                    .list => if (cursor == 0) {
+                        picker = dirpicker.Picker.init(gpa, io);
+                        mode = .picker;
+                        cursor = 0;
+                        scroll = 0;
+                    } else if (cursor - 1 < lib.entries.items.len) {
+                        picked = cursor - 1;
+                    },
+                    .picker => switch (picker.?.activate(io, cursor)) {
+                        .use_folder => |path| {
+                            cfg.addRomDir(gpa, path) catch {};
+                            if (config_path) |p| config.save(io, gpa, cfg.*, p) catch |e| {
+                                err.print("warning: cannot write {s}: {s}\n", .{ p, @errorName(e) }) catch {};
+                                err.flush() catch {};
+                            };
+                            picker.?.deinit();
+                            picker = null;
+                            mode = .list;
+                            scanner = library.Scanner.begin(gpa, io, cfg.library.rom_dirs, err);
+                            cursor = 0;
+                            scroll = 0;
+                        },
+                        .none => {
+                            cursor = 0;
+                            scroll = 0;
+                        },
+                    },
                 },
-                .back, .close => return null,
+                .back, .close => switch (mode) {
+                    .list => return null,
+                    .picker => {
+                        picker.?.deinit();
+                        picker = null;
+                        mode = .list;
+                        cursor = 0;
+                        scroll = 0;
+                    },
+                },
             }
         }
 
@@ -837,12 +889,19 @@ pub fn runLibrary(
                 if (cache_path) |p| lib.saveCache(io, gpa, p) catch {};
             }
         }
-        if (cursor >= lib.entries.items.len and lib.entries.items.len != 0)
-            cursor = lib.entries.items.len - 1;
+
+        const total = switch (mode) {
+            .list => lib.entries.items.len + 1,
+            .picker => picker.?.rowCount(),
+        };
+        if (cursor >= total and total != 0) cursor = total - 1;
         if (cursor < scroll) scroll = cursor;
         if (cursor >= scroll + visible_rows) scroll = cursor - visible_rows + 1;
 
-        drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, rom_dirs.len == 0, if (scanner.done) null else scanner.remaining());
+        switch (mode) {
+            .list => drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, cfg.library.rom_dirs.len == 0, if (scanner.done) null else scanner.remaining()),
+            .picker => drawPickerScreen(&canvas, &picker.?, cursor, scroll, visible_rows),
+        }
 
         _ = sdl.SDL_UpdateTexture(texture, null, &canvas, 256 * 2);
         _ = sdl.SDL_RenderClear(renderer);
@@ -852,9 +911,10 @@ pub fn runLibrary(
     }
 }
 
-/// The picker's whole frame, drawn into a 256x224 canvas — pure pixels, so
+/// The library's whole frame, drawn into a 256x224 canvas — pure pixels, so
 /// the layout is testable and eyeballable without SDL. `scanning_left` is
-/// null once the scan has completed.
+/// null once the scan has completed. Row 0 is always the ADD ROM FOLDER
+/// action; rows 1.. are `lib.entries` shifted by one.
 fn drawLibraryScreen(
     canvas: *[256 * 224]u16,
     lib: *const library.Library,
@@ -872,21 +932,25 @@ fn drawLibraryScreen(
     ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(count_txt))), 6, count_txt, ui.color.text_dim);
 
     if (no_dirs) {
-        ui.drawTextCentered(&surf, 90, "NO ROM FOLDERS CONFIGURED", ui.color.text);
-        ui.drawTextCentered(&surf, 104, "ADD LIBRARY.ROM_DIRS TO CONFIG.ZON", ui.color.text_dim);
-        ui.drawTextCentered(&surf, 114, "IN THE YAMABUKI DATA FOLDER", ui.color.text_dim);
+        ui.drawTextCentered(&surf, 100, "NO ROM FOLDERS YET", ui.color.text);
+        ui.drawTextCentered(&surf, 114, "SELECT ADD ROM FOLDER BELOW", ui.color.text_dim);
     } else if (lib.entries.items.len == 0 and scanning_left == null) {
         ui.drawTextCentered(&surf, 100, "NO SNES ROMS FOUND", ui.color.text);
     }
 
+    const total = lib.entries.items.len + 1;
     for (0..visible_rows) |row| {
         const i = scroll + row;
-        if (i >= lib.entries.items.len) break;
-        const e = lib.entries.items[i];
+        if (i >= total) break;
         const y: i32 = @intCast(20 + row * ui.line_h);
         const selected = i == cursor;
         if (selected) ui.drawText(&surf, 2, y, ">", ui.color.accent);
         const fg = if (selected) ui.color.text else ui.color.text_dim;
+        if (i == 0) {
+            ui.drawText(&surf, 10, y, "+ ADD ROM FOLDER", if (selected) ui.color.accent else ui.color.text_dim);
+            continue;
+        }
+        const e = lib.entries.items[i - 1];
         const max_title = 32;
         ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, max_title)], fg);
         var tag: [16]u8 = undefined;
@@ -902,7 +966,41 @@ fn drawLibraryScreen(
         const t = std.fmt.bufPrint(&foot, "SCANNING... {d} LEFT", .{left}) catch "";
         ui.drawText(&surf, 8, 212, t, ui.color.accent);
     } else {
-        ui.drawText(&surf, 8, 212, "ENTER/A PLAY  ESC/B QUIT", ui.color.text_dim);
+        ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B QUIT", ui.color.text_dim);
+    }
+}
+
+/// The folder browser's whole frame — same pure-pixel shape as
+/// `drawLibraryScreen`, so it rides the same test pattern.
+fn drawPickerScreen(
+    canvas: *[256 * 224]u16,
+    pk: *const dirpicker.Picker,
+    cursor: usize,
+    scroll: usize,
+    visible_rows: usize,
+) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "ADD ROM FOLDER", ui.color.accent);
+
+    const path_txt = if (pk.at_root) "SELECT A DRIVE" else pk.path.items;
+    ui.drawText(&surf, 8, 18, path_txt, ui.color.text_dim);
+
+    const total = pk.rowCount();
+    for (0..visible_rows) |row| {
+        const i = scroll + row;
+        if (i >= total) break;
+        const y: i32 = @intCast(30 + row * ui.line_h);
+        const selected = i == cursor;
+        if (selected) ui.drawText(&surf, 2, y, ">", ui.color.accent);
+        const fg = if (selected) ui.color.text else ui.color.text_dim;
+        ui.drawText(&surf, 10, y, pk.rowLabel(i), fg);
+    }
+
+    if (pk.err_msg) |msg| {
+        ui.drawText(&surf, 8, 212, msg, ui.color.accent);
+    } else {
+        ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B CANCEL", ui.color.text_dim);
     }
 }
 
@@ -928,6 +1026,29 @@ test "library screen: every state draws without out-of-bounds writes" {
         });
     }
     drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null);
+}
+
+test "picker screen: drive list, a real listing, and an error message all draw cleanly" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const canvas = try a.create([256 * 224]u16);
+
+    const root = ".app-picker-screen-test";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root ++ "/sub");
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var pk = dirpicker.Picker.initAt(a, io, root);
+    defer pk.deinit();
+    drawPickerScreen(canvas, &pk, 0, 0, 17);
+    drawPickerScreen(canvas, &pk, 2, 0, 17); // cursor on the "sub" row
+
+    _ = pk.activate(io, 2); // descend, then fail to go somewhere bogus
+    pk.err_msg = "CANNOT OPEN THAT FOLDER";
+    drawPickerScreen(canvas, &pk, 0, 0, 17);
 }
 
 /// Is `frame` one of the moments we were asked to capture? An empty list means

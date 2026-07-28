@@ -404,6 +404,15 @@ pub fn rows(c: u8) [glyph_h]u8 {
             \\#....
             \\#....
         ),
+        '\\' => parseGlyph(
+            \\#....
+            \\#....
+            \\.#...
+            \\..#..
+            \\...#.
+            \\....#
+            \\....#
+        ),
         '!' => parseGlyph(
             \\..#..
             \\..#..
@@ -566,7 +575,7 @@ test "rows: the menu's punctuation set is present" {
     // Every character the overlay menu's labels and values lean on must
     // produce at least one lit pixel — a silently blank ':' would turn
     // "SCALE: 3" into "SCALE 3" with no test noticing.
-    for (".:,/!?'()[]<>+=_*") |c| {
+    for (".:,/\\!?'()[]<>+=_*") |c| {
         var lit = false;
         for (rows(c)) |b| lit = lit or b != 0;
         try testing.expect(lit);

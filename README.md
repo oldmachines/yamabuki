@@ -75,7 +75,9 @@ input remapping for two players (keyboard and gamepads, hotplugged), state
 slots, per-game overrides, quit. Battery saves persist as `.srm` files,
 `F12` takes a PNG screenshot, holding `Backspace` rewinds, and launching
 with no ROM argument opens a library scanned from the directories in
-`config.zon`'s `library.rom_dirs`. Everything lives in the OS's per-user
+`config.zon`'s `library.rom_dirs` — added from the library screen's own
+"+ ADD ROM FOLDER" row (an in-app folder browser), or by hand-editing
+`config.zon`. Everything lives in the OS's per-user
 data directory (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki` on
 Windows, `~/.local/share/yamabuki/yamabuki` on Linux), and every binding
 and setting is editable both in-menu and in `config.zon`.
