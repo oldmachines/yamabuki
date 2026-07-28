@@ -249,6 +249,10 @@ pub const Menu = struct {
                     if (!shader_active) return .none;
                     return if (inc) .shader_next else .shader_prev;
                 },
+                3 => {
+                    cfg.rewind.enabled = !cfg.rewind.enabled;
+                    return .config_dirty;
+                },
                 else => {},
             },
             .input_menu => {
@@ -362,7 +366,7 @@ pub fn navFromEvent(ev: input.Ev) ?NavEvent {
 pub fn itemCount(page: Page) usize {
     return switch (page) {
         .main => 8,
-        .settings => 3,
+        .settings => 4,
         .input_menu => 6,
         .map => input.n_snes_buttons,
         .hotkeys => input.n_hotkeys,
@@ -372,7 +376,7 @@ pub fn itemCount(page: Page) usize {
 fn itemLabel(page: Page, i: usize) []const u8 {
     return switch (page) {
         .main => ([_][]const u8{ "RESUME", "SAVE STATE", "LOAD STATE", "STATE SLOT", "SETTINGS", "INPUT", "RESET", "QUIT" })[i],
-        .settings => ([_][]const u8{ "SCALE", "AUDIO", "SHADER" })[i],
+        .settings => ([_][]const u8{ "SCALE", "AUDIO", "SHADER", "REWIND" })[i],
         .input_menu => ([_][]const u8{ "PLAYER 1 KEYBOARD", "PLAYER 1 PAD", "PLAYER 2 KEYBOARD", "PLAYER 2 PAD", "HOTKEYS", "SWAP PADS" })[i],
         .map => @tagName(@as(input.SnesButton, @enumFromInt(i))),
         .hotkeys => @tagName(@as(input.Hotkey, @enumFromInt(i))),
@@ -386,6 +390,7 @@ fn itemValue(page: Page, i: usize, cfg: *const config.Config, shader_name: ?[]co
             0 => return std.fmt.bufPrint(buf, "{d}", .{cfg.video.scale}) catch "",
             1 => return if (cfg.audio.enabled) "ON" else "OFF",
             2 => return shader_name orelse "(NONE)",
+            3 => return if (cfg.rewind.enabled) "ON" else "OFF",
             else => return "",
         },
         .input_menu => switch (i) {

@@ -21,6 +21,7 @@ const ui = @import("ui.zig");
 const config = @import("config.zig");
 const saves = @import("saves.zig");
 const png = @import("png.zig");
+const rewind = @import("rewind.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -53,6 +54,9 @@ pub const Options = struct {
     saves_dir: ?[]const u8,
     states_dir: ?[]const u8,
     shots_dir: ?[]const u8,
+    /// Rewind ring, resolved from the config; off in `--frames` CI runs.
+    rewind_enabled: bool,
+    rewind_budget_mib: u32,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -289,6 +293,19 @@ pub fn run(
         }
     }
 
+    // Rewind history. The one number the whole design leans on — the real
+    // state size — is printed rather than assumed.
+    var rw: ?rewind.Rewind = null;
+    if (opts.rewind_enabled) {
+        rw = rewind.Rewind.init(gpa, @as(usize, opts.rewind_budget_mib) * 1024 * 1024) catch null;
+        if (rw != null) {
+            try err.print("rewind: {d} KiB per state, {d} MiB budget\n", .{
+                core.AnyConsole.state_size / 1024, opts.rewind_budget_mib,
+            });
+            try err.flush();
+        }
+    }
+
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
@@ -382,6 +399,7 @@ pub fn run(
                             .ntsc => con.setRegion(.ntsc),
                             .pal => con.setRegion(.pal),
                         }
+                        if (rw) |*r| r.clear();
                         mnu = null;
                     },
                     .save_state => {
@@ -393,6 +411,8 @@ pub fn run(
                             // The state carried its own SRAM; make the .srm
                             // agree with what the machine now holds.
                             if (sram) |*s| s.flush(io, con, err);
+                            // History no longer leads to this present.
+                            if (rw) |*r| r.clear();
                         }
                         mnu = null;
                     },
@@ -402,6 +422,10 @@ pub fn run(
                         persistConfig(io, gpa, &opts, err);
                         binds = input.resolve(&opts.cfg.input, err);
                         audio_on = opts.cfg.audio.enabled;
+                        // Toggling rewind off drops its history at once.
+                        if (!opts.cfg.rewind.enabled) {
+                            if (rw) |*r| r.clear();
+                        }
                     },
                     .shader_next, .shader_prev => if (glv) |g| {
                         cycleShader(io, gpa, g, if (req == .shader_next) 1 else -1, err);
@@ -442,11 +466,13 @@ pub fn run(
                         .ntsc => con.setRegion(.ntsc),
                         .pal => con.setRegion(.pal),
                     }
+                    if (rw) |*r| r.clear();
                 },
                 .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
+                        if (rw) |*r| r.clear();
                     }
                 },
                 .slot_next => {
@@ -473,14 +499,23 @@ pub fn run(
             }
         }
 
-        const halted = paused or mnu != null;
-        fast_forward = inp.ffHeld() and mnu == null;
+        // Holding rewind freezes forward time and steps history back one
+        // capture per displayed frame (~real-time backwards); at the end
+        // of history it just holds the oldest frame.
+        const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
+        const halted = paused or mnu != null or rewinding;
+        fast_forward = inp.ffHeld() and !halted;
         con.setButtons(0, inp.masks[0]);
         con.setButtons(1, inp.masks[1]);
-        if (!halted) {
+        if (rewinding) {
+            _ = rw.?.rewindStep(con);
+        } else if (!halted) {
             con.runFrame();
             frames_run += 1;
             if (sram) |*s| s.tick(io, con, err);
+            if (opts.cfg.rewind.enabled) {
+                if (rw) |*r| r.onFrame(con);
+            }
         }
 
         // Video: native RGB565, either through the shader chain or straight
@@ -496,6 +531,11 @@ pub fn run(
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.dimAll(&surf);
             m.draw(&surf, opts.cfg, if (glv) |g| g.names[g.index] else null, slot);
+            break :blk compose[0..fb.len];
+        } else if (rewinding) blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            ui.drawText(&surf, 4, 4, "<< REWIND", ui.color.accent);
             break :blk compose[0..fb.len];
         } else fb;
 
@@ -616,8 +656,9 @@ pub fn run(
 
         // Audio: drain the console ring into the SDL stream. A menu toggle
         // of `audio_on` mutes by dropping the chunks; the ring still drains
-        // so nothing backs up.
-        try util.drainAudio(con, &audio_hash, AudioSink{
+        // so nothing backs up. During rewind the ring's contents belong to
+        // whichever restored state holds it — leave it alone entirely.
+        if (!rewinding) try util.drainAudio(con, &audio_hash, AudioSink{
             .sdl = sdl,
             .stream = if (audio_on) audio else null,
             .fast_forward = fast_forward,

@@ -19,6 +19,7 @@ pub const Config = struct {
     version: u32 = 1,
     video: Video = .{},
     audio: Audio = .{},
+    rewind: RewindCfg = .{},
     input: input.InputConfig = .{},
 
     pub const Video = struct {
@@ -31,6 +32,18 @@ pub const Config = struct {
     pub const Audio = struct {
         enabled: bool = true,
     };
+
+    pub const RewindCfg = struct {
+        enabled: bool = true,
+        /// History memory. 64 MiB holds minutes of typical play at ~450
+        /// KiB/state and 30 captures/s of mostly-zero deltas.
+        budget_mib: u32 = 64,
+    };
+
+    /// `rewind.budget_mib` with hand-edit protection.
+    pub fn effectiveRewindBudgetMib(self: Config) u32 {
+        return std.math.clamp(self.rewind.budget_mib, 8, 1024);
+    }
 
     /// `video.scale` with the same validation `--scale` gets at parse time —
     /// a hand-edited out-of-range value warns and falls back rather than
