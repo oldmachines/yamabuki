@@ -390,10 +390,15 @@ pub fn run(
             if (mnu) |*m| {
                 // Menu path: raw events feed a pending capture; otherwise
                 // the fixed navigation map steers.
+                const mctx: menu.Ctx = .{
+                    .gpa = gpa,
+                    .game_id = opts.game_id,
+                    .shader_name = if (glv) |g| g.names[g.index] else null,
+                };
                 const req: menu.Request = if (m.capturing())
                     m.feedCapture(gpa, opts.cfg, nev)
                 else if (menu.navFromEvent(nev)) |nav|
-                    m.handleNav(opts.cfg, nav, glv != null)
+                    m.handleNav(opts.cfg, nav, mctx)
                 else
                     .none;
                 switch (req) {
@@ -542,7 +547,11 @@ pub fn run(
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.dimAll(&surf);
-            m.draw(&surf, opts.cfg, if (glv) |g| g.names[g.index] else null, slot);
+            m.draw(&surf, opts.cfg, .{
+                .gpa = gpa,
+                .game_id = opts.game_id,
+                .shader_name = if (glv) |g| g.names[g.index] else null,
+            }, slot);
             break :blk compose[0..fb.len];
         } else if (rewinding) blk: {
             @memcpy(compose[0..fb.len], fb);

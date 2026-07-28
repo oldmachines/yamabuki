@@ -152,8 +152,8 @@ pub fn main(init: std.process.Init) !void {
     const bindings = input.resolve(&cfg.input, err);
     if (args.rom) |rom_path| {
         // Classic direct launch: boot failures are fatal, CLOSE GAME quits.
-        const b = bootConsole(io, gpa, rom_path, args, err) catch std.process.exit(1);
-        _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b.game_id, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        const b = bootConsole(io, gpa, rom_path, args, &cfg, err) catch std.process.exit(1);
+        _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
         return;
     }
 
@@ -175,8 +175,8 @@ pub fn main(init: std.process.Init) !void {
             if (user_paths) |p| p.library else null,
             err,
         ) orelse break;
-        const b = bootConsole(io, gpa, picked, args, err) catch continue;
-        const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b.game_id, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        const b = bootConsole(io, gpa, picked, args, &cfg, err) catch continue;
+        const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
         lib.touch(picked, result.frames / 60);
         if (user_paths) |p| lib.saveCache(io, gpa, p.library) catch {};
         if (result.reason == .quit) break;
@@ -185,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn makeOptions(
     rom_path: []const u8,
-    game_id: []const u8,
+    booted: Booted,
     args: Args,
     cfg: *config.Config,
     config_path: ?[]const u8,
@@ -193,38 +193,115 @@ fn makeOptions(
     bindings: input.Resolved,
     err: *std.Io.Writer,
 ) app.Options {
-    // Defaults ← config ← CLI, resolved here once; app.zig never sees the
-    // difference between a configured and a flagged setting.
+    // Defaults ← config ← per-game ← CLI, resolved here once; app.zig never
+    // sees where a setting came from. `booted` carries the per-game merges
+    // that had to happen at console-build time (region/accuracy/wide) plus
+    // the session-level ones (shader, rewind).
     return .{
         .rom = rom_path,
         .scale = args.scale orelse cfg.effectiveScale(err),
         .frames = args.frames,
         .audio = args.audio and cfg.audio.enabled,
-        .region = args.region,
-        .shader = args.shader orelse cfg.video.shader,
+        .region = booted.region,
+        .shader = args.shader orelse booted.shader orelse cfg.video.shader,
         .shader_dir = args.shader_dir,
         .shot = args.shot,
         .shot_frames = args.shot_frames,
-        .wide = args.wide,
+        .wide = booted.wide,
         .bindings = bindings,
         .cfg = cfg,
         .config_path = config_path,
-        .game_id = game_id,
+        .game_id = booted.game_id,
         .saves_dir = if (user_paths) |p| p.saves else null,
         .states_dir = if (user_paths) |p| p.states else null,
         .shots_dir = if (user_paths) |p| p.screenshots else null,
-        .rewind_enabled = args.frames == 0 and cfg.rewind.enabled,
+        .rewind_enabled = args.frames == 0 and (booted.rewind orelse cfg.rewind.enabled),
         .rewind_budget_mib = cfg.effectiveRewindBudgetMib(),
     };
 }
 
-const Booted = struct { con: *core.AnyConsole, game_id: []const u8 };
+const MergedBoot = struct { accuracy: core.Accuracy, region: app.RegionArg, wide: u32 };
+
+/// The console-build precedence: an explicit CLI flag wins its field, a
+/// per-game override beats the global default. Pure, so the whole matrix
+/// is unit-tested.
+fn mergeBootSettings(args: Args, pg: ?*const config.Config.PerGame) error{ WideNeedsFast, WideTooBig }!MergedBoot {
+    const accuracy: core.Accuracy = blk: {
+        if (args.accuracy == .accurate) break :blk .accurate;
+        if (pg) |p| if (p.accuracy) |a| break :blk switch (a) {
+            .fast => .fast,
+            .accurate => .accurate,
+        };
+        break :blk .fast;
+    };
+    const wide: u32 = if (args.wide != 0) args.wide else if (pg) |p| p.wide orelse 0 else 0;
+    if (wide != 0) {
+        if (accuracy == .accurate) return error.WideNeedsFast;
+        if (wide > core.ppu.wide_margin_max) return error.WideTooBig;
+    }
+    const region: app.RegionArg = blk: {
+        if (args.region != .auto) break :blk args.region;
+        if (pg) |p| if (p.region) |r| break :blk switch (r) {
+            .ntsc => .ntsc,
+            .pal => .pal,
+        };
+        break :blk .auto;
+    };
+    return .{ .accuracy = accuracy, .region = region, .wide = wide };
+}
+
+test "boot-settings merge: CLI beats per-game beats default, conflicts refused" {
+    const pg: config.Config.PerGame = .{
+        .game_id = "x",
+        .region = .pal,
+        .accuracy = .accurate,
+        .wide = 16,
+    };
+
+    // Defaults alone.
+    const plain = try mergeBootSettings(.{}, null);
+    try std.testing.expectEqual(core.Accuracy.fast, plain.accuracy);
+    try std.testing.expectEqual(app.RegionArg.auto, plain.region);
+    try std.testing.expectEqual(@as(u32, 0), plain.wide);
+
+    // Per-game wins over defaults — but its accurate+wide combination is
+    // the same conflict the flags would be.
+    try std.testing.expectError(error.WideNeedsFast, mergeBootSettings(.{}, &pg));
+    var pg_fast = pg;
+    pg_fast.accuracy = .fast;
+    const merged = try mergeBootSettings(.{}, &pg_fast);
+    try std.testing.expectEqual(app.RegionArg.pal, merged.region);
+    try std.testing.expectEqual(@as(u32, 16), merged.wide);
+
+    // CLI wins over per-game.
+    const cli = try mergeBootSettings(.{ .region = .ntsc, .wide = 32 }, &pg_fast);
+    try std.testing.expectEqual(app.RegionArg.ntsc, cli.region);
+    try std.testing.expectEqual(@as(u32, 32), cli.wide);
+
+    // An absurd hand-edited margin is refused.
+    var pg_huge = pg_fast;
+    pg_huge.wide = 9999;
+    try std.testing.expectError(error.WideTooBig, mergeBootSettings(.{}, &pg_huge));
+}
+
+const Booted = struct {
+    con: *core.AnyConsole,
+    game_id: []const u8,
+    /// Merged (CLI ← per-game ← default) session settings the console was
+    /// built with, echoed so `makeOptions` and F1's region reapply agree.
+    region: app.RegionArg,
+    wide: u32,
+    /// Per-game values for settings the session applies itself; null
+    /// inherits the global config.
+    shader: ?[]const u8,
+    rewind: ?bool,
+};
 
 /// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
-/// load, region/wide setup, save-file identity. Every failure prints its
-/// reason and returns an error — the direct-launch path exits on it, the
-/// library path goes back to the list.
-fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, err: *std.Io.Writer) !Booted {
+/// load, per-game merge, region/wide setup, save-file identity. Every
+/// failure prints its reason and returns an error — the direct-launch path
+/// exits on it, the library path goes back to the list.
+fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, err: *std.Io.Writer) !Booted {
     var image = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read ROM '{s}'\n", .{rom_path});
         try err.flush();
@@ -279,16 +356,43 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
     // states won't load into the original anyway.
     const sha_hex = core.registry.sha256Hex(core.header.stripCopierHeader(image));
     const game_id = try saves.gameId(gpa, &sha_hex, &cart.header.title);
+
+    const pg = cfg.perGame(game_id);
+    const merged = mergeBootSettings(args, pg) catch |e| {
+        // The same refusals parseArgs makes for the flags, because a
+        // hand-edited override can produce the same conflicts.
+        switch (e) {
+            error.WideNeedsFast => try err.print("error: per-game wide needs the fast core (accuracy override conflicts)\n", .{}),
+            error.WideTooBig => try err.print("error: per-game wide margin exceeds {d}\n", .{core.ppu.wide_margin_max}),
+        }
+        try err.flush();
+        return error.BootFailed;
+    };
+    if (pg != null) {
+        try err.print("per-game overrides active for {s}\n", .{game_id});
+        try err.flush();
+    }
+    const accuracy = merged.accuracy;
+    const wide = merged.wide;
+    const region = merged.region;
+
     const con = try gpa.create(core.AnyConsole);
-    con.init(args.accuracy, cart);
-    switch (args.region) {
+    con.init(accuracy, cart);
+    switch (region) {
         .auto => {},
         .ntsc => con.setRegion(.ntsc),
         .pal => con.setRegion(.pal),
     }
     if (args.auto_fastrom) con.enableAutoFastrom();
-    if (args.wide != 0) con.setWideMargin(args.wide);
-    return .{ .con = con, .game_id = game_id };
+    if (wide != 0) con.setWideMargin(wide);
+    return .{
+        .con = con,
+        .game_id = game_id,
+        .region = region,
+        .wide = wide,
+        .shader = if (pg) |p| p.shader else null,
+        .rewind = if (pg) |p| p.rewind else null,
+    };
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
