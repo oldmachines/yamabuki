@@ -15,8 +15,7 @@ const preset = @import("preset.zig");
 const shader = @import("shader.zig");
 const util = @import("util");
 const osd = @import("osd.zig");
-
-const Button = core.joypad.Button;
+const input = @import("input.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -35,6 +34,9 @@ pub const Options = struct {
     shot: ?[]const u8,
     shot_frames: []const u32,
     wide: u32,
+    /// The resolved input bindings (config's `input` section, or the
+    /// defaults — which reproduce the frontend's historical layout).
+    bindings: input.Resolved,
 };
 
 /// A GL context plus the loaded shader chain. Absent means the software blit.
@@ -120,24 +122,6 @@ const AudioSink = struct {
     }
 };
 
-const Keymap = struct { code: u32, mask: u16 };
-
-/// RetroArch's default keyboard layout for a SNES pad.
-const keymap = [_]Keymap{
-    .{ .code = sdl3.scancode.up, .mask = Button.up },
-    .{ .code = sdl3.scancode.down, .mask = Button.down },
-    .{ .code = sdl3.scancode.left, .mask = Button.left },
-    .{ .code = sdl3.scancode.right, .mask = Button.right },
-    .{ .code = sdl3.scancode.z, .mask = Button.b },
-    .{ .code = sdl3.scancode.x, .mask = Button.a },
-    .{ .code = sdl3.scancode.a, .mask = Button.y },
-    .{ .code = sdl3.scancode.s, .mask = Button.x },
-    .{ .code = sdl3.scancode.q, .mask = Button.l },
-    .{ .code = sdl3.scancode.w, .mask = Button.r },
-    .{ .code = sdl3.scancode.ret, .mask = Button.start },
-    .{ .code = sdl3.scancode.rshift, .mask = Button.select },
-};
-
 /// Run the whole SDL session to completion. Fatal SDL failures print and
 /// exit, matching what the code did when it lived in `main`.
 pub fn run(
@@ -159,6 +143,22 @@ pub fn run(
         std.process.exit(1);
     }
     defer sdl.SDL_Quit();
+
+    // Gamepads are best-effort on the shader model: a missing symbol or a
+    // failed subsystem costs pads (the keyboard still plays), never the
+    // emulator.
+    var pad_api: ?sdl3.PadApi = null;
+    if (sdl3.loadPad()) |papi| {
+        if (papi.SDL_InitSubSystem(sdl3.init_gamepad)) {
+            pad_api = papi;
+        } else {
+            try err.print("warning: gamepad subsystem unavailable ({s}) — keyboard only\n", .{sdl.SDL_GetError()});
+            try err.flush();
+        }
+    } else |_| {
+        try err.print("warning: gamepad symbols missing from this SDL — keyboard only\n", .{});
+        try err.flush();
+    }
 
     const window = sdl.SDL_CreateWindow(
         "Yamabuki",
@@ -235,8 +235,15 @@ pub fn run(
     // the pacing clock instead of sprinting to catch up.
     const max_lag_ns: u64 = 4 * frame_ns;
 
-    var buttons: u16 = 0;
+    var inp: input.State = .{};
+    var pads: [2]?*sdl3.Gamepad = .{ null, null };
+    defer if (pad_api) |papi| {
+        for (pads) |maybe| {
+            if (maybe) |p| papi.SDL_CloseGamepad(p);
+        }
+    };
     var fast_forward = false;
+    var paused = false;
     var running = true;
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
@@ -245,59 +252,104 @@ pub fn run(
     while (running) {
         var ev: sdl3.Event = undefined;
         while (sdl.SDL_PollEvent(&ev)) {
-            switch (ev.type) {
-                sdl3.event_quit => running = false,
-                sdl3.event_key_down, sdl3.event_key_up => {
+            const action: input.Action = switch (ev.type) {
+                sdl3.event_quit => blk: {
+                    running = false;
+                    break :blk .none;
+                },
+                sdl3.event_key_down, sdl3.event_key_up => blk: {
                     const key = ev.key;
-                    for (keymap) |k| {
-                        if (k.code == key.scancode) {
-                            if (key.down) buttons |= k.mask else buttons &= ~k.mask;
+                    // Shader cycling stays on fixed keys, outside the
+                    // remappable model: it is a dev affordance, and the keys
+                    // must survive any config. A no-op on the software path.
+                    if (key.down and !key.repeat) {
+                        if (key.scancode == sdl3.scancode.comma) {
+                            if (glv) |g| cycleShader(io, gpa, g, -1, err);
+                        } else if (key.scancode == sdl3.scancode.period) {
+                            if (glv) |g| cycleShader(io, gpa, g, 1, err);
                         }
                     }
-                    if (key.scancode == sdl3.scancode.tab) fast_forward = key.down;
-                    if (key.down and !key.repeat) switch (key.scancode) {
-                        sdl3.scancode.escape => running = false,
-                        sdl3.scancode.f1 => {
-                            con.repower();
-                            // repower() re-detects region from the header;
-                            // reapply an explicit CLI override.
-                            switch (opts.region) {
-                                .auto => {},
-                                .ntsc => con.setRegion(.ntsc),
-                                .pal => con.setRegion(.pal),
-                            }
-                        },
-                        sdl3.scancode.f5 => {
-                            _ = con.saveState(state_buf);
-                            if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
-                                try err.print("state saved: {s}\n", .{state_path});
-                            } else |e| {
-                                try err.print("state save failed: {s}\n", .{@errorName(e)});
-                            }
-                            try err.flush();
-                        },
-                        sdl3.scancode.f9 => {
-                            if (loadStateFile(io, con, state_path, state_buf)) {
-                                try err.print("state loaded: {s}\n", .{state_path});
-                            } else |e| {
-                                try err.print("state load failed: {s}\n", .{@errorName(e)});
-                            }
-                            try err.flush();
-                        },
-                        // Walk the presets baked for this GPU's profile. A no-op
-                        // on the software path — there is nothing to cycle.
-                        sdl3.scancode.comma => if (glv) |g| cycleShader(io, gpa, g, -1, err),
-                        sdl3.scancode.period => if (glv) |g| cycleShader(io, gpa, g, 1, err),
-                        else => {},
-                    };
+                    break :blk inp.handle(&opts.bindings, .{ .key = .{
+                        .scancode = key.scancode,
+                        .down = key.down,
+                        .repeat = key.repeat,
+                    } });
                 },
-                else => {},
+                sdl3.event_gamepad_button_down, sdl3.event_gamepad_button_up => inp.handle(&opts.bindings, .{ .pad_button = .{
+                    .pad = ev.gbutton.which,
+                    .button = ev.gbutton.button,
+                    .down = ev.gbutton.down,
+                } }),
+                sdl3.event_gamepad_axis_motion => inp.handle(&opts.bindings, .{ .pad_axis = .{
+                    .pad = ev.gaxis.which,
+                    .axis = ev.gaxis.axis,
+                    .value = ev.gaxis.value,
+                } }),
+                // ADDED fires for already-connected pads too, so startup
+                // enumeration and hotplug are one code path.
+                sdl3.event_gamepad_added => inp.handle(&opts.bindings, .{ .pad_added = .{ .pad = ev.gdevice.which } }),
+                sdl3.event_gamepad_removed => inp.handle(&opts.bindings, .{ .pad_removed = .{ .pad = ev.gdevice.which } }),
+                else => .none,
+            };
+            switch (action) {
+                .none => {},
+                // The overlay menu is the next M14 slice; until it exists
+                // the hotkey keeps Esc's historical meaning.
+                .menu => running = false,
+                .pause => paused = !paused,
+                .reset => {
+                    con.repower();
+                    // repower() re-detects region from the header; reapply
+                    // an explicit CLI override.
+                    switch (opts.region) {
+                        .auto => {},
+                        .ntsc => con.setRegion(.ntsc),
+                        .pal => con.setRegion(.pal),
+                    }
+                },
+                .save_state => {
+                    _ = con.saveState(state_buf);
+                    if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
+                        try err.print("state saved: {s}\n", .{state_path});
+                    } else |e| {
+                        try err.print("state save failed: {s}\n", .{@errorName(e)});
+                    }
+                    try err.flush();
+                },
+                .load_state => {
+                    if (loadStateFile(io, con, state_path, state_buf)) {
+                        try err.print("state loaded: {s}\n", .{state_path});
+                    } else |e| {
+                        try err.print("state load failed: {s}\n", .{@errorName(e)});
+                    }
+                    try err.flush();
+                },
+                .pad_opened => |o| if (pad_api) |papi| {
+                    pads[o.slot] = papi.SDL_OpenGamepad(o.pad);
+                    if (pads[o.slot]) |p| {
+                        const name = if (papi.SDL_GetGamepadName(p)) |n| std.mem.span(n) else "gamepad";
+                        try err.print("gamepad: {s} is player {d}\n", .{ name, @as(u32, o.slot) + 1 });
+                    } else {
+                        try err.print("warning: SDL_OpenGamepad: {s}\n", .{sdl.SDL_GetError()});
+                    }
+                    try err.flush();
+                },
+                .pad_closed => |c| if (pad_api) |papi| {
+                    if (pads[c.slot]) |p| papi.SDL_CloseGamepad(p);
+                    pads[c.slot] = null;
+                    try err.print("gamepad: player {d} disconnected\n", .{@as(u32, c.slot) + 1});
+                    try err.flush();
+                },
             }
         }
 
-        con.setButtons(0, buttons);
-        con.runFrame();
-        frames_run += 1;
+        fast_forward = inp.ffHeld();
+        con.setButtons(0, inp.masks[0]);
+        con.setButtons(1, inp.masks[1]);
+        if (!paused) {
+            con.runFrame();
+            frames_run += 1;
+        }
 
         // Video: native RGB565, either through the shader chain or straight
         // into a streaming texture.
@@ -337,7 +389,9 @@ pub fn run(
             // Grab the rendered frame *before* the swap, while the back buffer
             // still holds it.
             if (opts.shot) |prefix| {
-                if (wantsShot(opts.shot_frames, frames_run, opts.frames)) {
+                // `!paused`: a paused loop re-presents the same frame number
+                // every iteration and must not re-capture it.
+                if (!paused and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
                     const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
                     if (g.chain().capture(gpa, win)) |img| {
                         try util.maybeShot(io, gpa, err, prefix, frames_run, img.w, img.h, img.rgb);
@@ -393,7 +447,7 @@ pub fn run(
 
             // No shader: the console's framebuffer *is* the picture.
             if (opts.shot) |prefix| {
-                if (wantsShot(opts.shot_frames, frames_run, opts.frames)) {
+                if (!paused and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
                     const rgb = try util.expandFramebuffer(gpa, fb, width, height);
                     try util.maybeShot(io, gpa, err, prefix, frames_run, width, height, rgb);
                 }

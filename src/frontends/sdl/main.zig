@@ -2,13 +2,16 @@
 //!
 //!   yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate] [--wide N]
 //!
-//! Controls (RetroArch keyboard defaults):
+//! Controls — all remappable via the config's `input` section (see
+//! `input.zig` for the token grammar); the defaults are:
 //!   arrows = d-pad   Z = B   X = A   A = Y   S = X   Q = L   W = R
 //!   Enter = Start    RShift = Select
-//! Hotkeys:
-//!   F5 save state (<rom>.state)   F9 load state   F1 reset
-//!   Tab (hold) fast-forward       Esc quit
-//!   , / .  cycle shaders (only the presets baked for this GPU's profile)
+//!   gamepads: positional SNES map (south=B east=A west=Y north=X), d-pad +
+//!   left stick, both players, hotplugged in connection order
+//! Hotkeys (also remappable):
+//!   F5 save state (<rom>.state)   F9 load state   F1 reset   P pause
+//!   Tab or right trigger (hold) fast-forward      Esc quit
+//!   , / .  cycle shaders (fixed keys; only presets baked for this GPU)
 //!
 //! Settings persist in `config.zon` under the OS's per-user data directory
 //! (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki\` on Windows,
@@ -34,6 +37,7 @@ const sdl3 = @import("sdl3.zig");
 const util = @import("util");
 const app = @import("app.zig");
 const config = @import("config.zig");
+const input = @import("input.zig");
 const paths = @import("paths.zig");
 
 const Args = struct {
@@ -208,6 +212,7 @@ pub fn main(init: std.process.Init) !void {
         .shot = args.shot,
         .shot_frames = args.shot_frames,
         .wide = args.wide,
+        .bindings = input.resolve(&cfg.input, err),
     }, err, out);
 }
 
@@ -278,9 +283,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
 
 test {
     // The session module (and, through it, the shared helpers) carries its
-    // own tests — `wantsShot`, the config roundtrips. Reference them so the
-    // `sdl_main_tests` build keeps collecting them from this root.
+    // own tests — `wantsShot`, the config roundtrips, the input model.
+    // Reference them so the `sdl_main_tests` build keeps collecting them
+    // from this root.
     _ = app;
     _ = config;
+    _ = input;
     _ = paths;
 }

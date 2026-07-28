@@ -17,6 +17,7 @@ pub const Renderer = opaque {};
 pub const Texture = opaque {};
 pub const AudioStream = opaque {};
 pub const GlContext = opaque {};
+pub const Gamepad = opaque {};
 
 pub const AudioSpec = extern struct {
     format: c_uint,
@@ -42,16 +43,54 @@ pub const KeyboardEvent = extern struct {
     repeat: bool,
 };
 
+/// SDL_GamepadButtonEvent (SDL_events.h); `which` is the SDL_JoystickID.
+pub const GamepadButtonEvent = extern struct {
+    type: u32,
+    reserved: u32,
+    timestamp: u64,
+    which: u32,
+    button: u8,
+    down: bool,
+    padding1: u8,
+    padding2: u8,
+};
+
+/// SDL_GamepadAxisEvent (SDL_events.h).
+pub const GamepadAxisEvent = extern struct {
+    type: u32,
+    reserved: u32,
+    timestamp: u64,
+    which: u32,
+    axis: u8,
+    padding1: u8,
+    padding2: u8,
+    padding3: u8,
+    value: i16,
+    padding4: u16,
+};
+
+/// SDL_GamepadDeviceEvent (SDL_events.h).
+pub const GamepadDeviceEvent = extern struct {
+    type: u32,
+    reserved: u32,
+    timestamp: u64,
+    which: u32,
+};
+
 /// SDL_Event: a 128-byte union; only the members we read are typed.
 pub const Event = extern union {
     type: u32,
     key: KeyboardEvent,
+    gbutton: GamepadButtonEvent,
+    gaxis: GamepadAxisEvent,
+    gdevice: GamepadDeviceEvent,
     padding: [128]u8 align(8),
 };
 
 // SDL_init.h
 pub const init_audio: u32 = 0x10;
 pub const init_video: u32 = 0x20;
+pub const init_gamepad: u32 = 0x2000;
 
 // SDL_video.h
 pub const window_opengl: u64 = 0x02;
@@ -87,6 +126,11 @@ pub const audio_device_default_playback: u32 = 0xFFFF_FFFF;
 pub const event_quit: u32 = 0x100;
 pub const event_key_down: u32 = 0x300;
 pub const event_key_up: u32 = 0x301;
+pub const event_gamepad_axis_motion: u32 = 0x650;
+pub const event_gamepad_button_down: u32 = 0x651;
+pub const event_gamepad_button_up: u32 = 0x652;
+pub const event_gamepad_added: u32 = 0x653;
+pub const event_gamepad_removed: u32 = 0x654;
 
 /// SDL_scancode.h (USB HID usage values; stable).
 pub const scancode = struct {
@@ -156,6 +200,17 @@ pub const ExtApi = struct {
     /// (created if absent); free with `SDL_free`.
     SDL_GetPrefPath: *const fn (org: [*:0]const u8, app: [*:0]const u8) callconv(.c) ?[*:0]u8,
     SDL_free: *const fn (mem: ?*anyopaque) callconv(.c) void,
+};
+
+/// The gamepad entry points, an optional table on the `GlApi`/`ExtApi`
+/// pattern: everything exists since 3.2.0, but a resolve failure costs the
+/// user gamepads (the keyboard still plays), never the emulator.
+pub const PadApi = struct {
+    SDL_InitSubSystem: *const fn (flags: u32) callconv(.c) bool,
+    SDL_OpenGamepad: *const fn (instance_id: u32) callconv(.c) ?*Gamepad,
+    SDL_CloseGamepad: *const fn (pad: *Gamepad) callconv(.c) void,
+    SDL_GetGamepadName: *const fn (pad: *Gamepad) callconv(.c) ?[*:0]const u8,
+    SDL_GetGamepadID: *const fn (pad: *Gamepad) callconv(.c) u32,
 };
 
 /// The GL entry points, resolved separately from `Api` and on demand.
@@ -232,4 +287,10 @@ pub fn loadGl() LoadError!GlApi {
 /// per-user data directory".
 pub fn loadExt() LoadError!ExtApi {
     return resolve(ExtApi, try open());
+}
+
+/// Resolve the gamepad entry points. Callers treat any error as
+/// "keyboard-only session".
+pub fn loadPad() LoadError!PadApi {
+    return resolve(PadApi, try open());
 }
