@@ -43,6 +43,9 @@ pub const Request = enum {
     /// Step the shader chain (the app owns the GL side).
     shader_prev,
     shader_next,
+    /// Step the active save-state slot (session state, owned by the app).
+    slot_prev,
+    slot_next,
 };
 
 const Entry = struct { page: Page, cursor: usize };
@@ -191,10 +194,11 @@ pub const Menu = struct {
                 0 => return .resume_game,
                 1 => return .save_state,
                 2 => return .load_state,
-                3 => self.push(.settings),
-                4 => self.push(.input_menu),
-                5 => return .reset,
-                6 => return .quit,
+                3 => return .slot_next,
+                4 => self.push(.settings),
+                5 => self.push(.input_menu),
+                6 => return .reset,
+                7 => return .quit,
                 else => {},
             },
             .settings => return self.adjust(cfg, true, true),
@@ -228,6 +232,9 @@ pub const Menu = struct {
     fn adjust(self: *Menu, cfg: *config.Config, inc: bool, shader_active: bool) Request {
         const e = self.top();
         switch (e.page) {
+            .main => {
+                if (e.cursor == 3) return if (inc) .slot_next else .slot_prev;
+            },
             .settings => switch (e.cursor) {
                 0 => { // scale 1..8, saturating
                     const s = cfg.video.scale;
@@ -258,8 +265,9 @@ pub const Menu = struct {
     // --- rendering ---------------------------------------------------------
 
     /// Draw the whole menu over an already-dimmed frame. `shader_name` is
-    /// the active preset (null = software blit).
-    pub fn draw(self: *Menu, s: *const ui.Surface, cfg: *const config.Config, shader_name: ?[]const u8) void {
+    /// the active preset (null = software blit); `slot` the active
+    /// save-state slot.
+    pub fn draw(self: *Menu, s: *const ui.Surface, cfg: *const config.Config, shader_name: ?[]const u8, slot: u32) void {
         const e = self.top();
         const n = itemCount(e.page);
 
@@ -280,7 +288,7 @@ pub const Menu = struct {
             if (selected) ui.drawText(s, px + 4, y, ">", ui.color.accent);
             const fg = if (selected) ui.color.text else ui.color.text_dim;
             ui.drawText(s, px + 14, y, itemLabel(e.page, i), fg);
-            const value = itemValue(e.page, i, cfg, shader_name, &buf);
+            const value = itemValue(e.page, i, cfg, shader_name, slot, &buf);
             if (value.len != 0) {
                 const vx = px + @as(i32, @intCast(panel_w)) - 8 - @as(i32, @intCast(ui.textWidth(value)));
                 ui.drawText(s, vx, y, value, fg);
@@ -353,7 +361,7 @@ pub fn navFromEvent(ev: input.Ev) ?NavEvent {
 
 pub fn itemCount(page: Page) usize {
     return switch (page) {
-        .main => 7,
+        .main => 8,
         .settings => 3,
         .input_menu => 6,
         .map => input.n_snes_buttons,
@@ -363,7 +371,7 @@ pub fn itemCount(page: Page) usize {
 
 fn itemLabel(page: Page, i: usize) []const u8 {
     return switch (page) {
-        .main => ([_][]const u8{ "RESUME", "SAVE STATE", "LOAD STATE", "SETTINGS", "INPUT", "RESET", "QUIT" })[i],
+        .main => ([_][]const u8{ "RESUME", "SAVE STATE", "LOAD STATE", "STATE SLOT", "SETTINGS", "INPUT", "RESET", "QUIT" })[i],
         .settings => ([_][]const u8{ "SCALE", "AUDIO", "SHADER" })[i],
         .input_menu => ([_][]const u8{ "PLAYER 1 KEYBOARD", "PLAYER 1 PAD", "PLAYER 2 KEYBOARD", "PLAYER 2 PAD", "HOTKEYS", "SWAP PADS" })[i],
         .map => @tagName(@as(input.SnesButton, @enumFromInt(i))),
@@ -371,9 +379,9 @@ fn itemLabel(page: Page, i: usize) []const u8 {
     };
 }
 
-fn itemValue(page: Page, i: usize, cfg: *const config.Config, shader_name: ?[]const u8, buf: []u8) []const u8 {
+fn itemValue(page: Page, i: usize, cfg: *const config.Config, shader_name: ?[]const u8, slot: u32, buf: []u8) []const u8 {
     switch (page) {
-        .main => return "",
+        .main => return if (i == 3) std.fmt.bufPrint(buf, "{d}", .{slot}) catch "" else "",
         .settings => switch (i) {
             0 => return std.fmt.bufPrint(buf, "{d}", .{cfg.video.scale}) catch "",
             1 => return if (cfg.audio.enabled) "ON" else "OFF",
@@ -432,9 +440,9 @@ test "menu: navigation wraps, submenus push, back pops, top-level back resumes" 
     var m = Menu.init();
 
     try testing.expectEqual(Request.none, m.handleNav(&cfg, .up, false));
-    try testing.expectEqual(@as(usize, 6), m.top().cursor); // wrapped to QUIT
+    try testing.expectEqual(@as(usize, 7), m.top().cursor); // wrapped to QUIT
 
-    m.top().cursor = 3; // SETTINGS
+    m.top().cursor = 4; // SETTINGS
     try testing.expectEqual(Request.none, m.handleNav(&cfg, .confirm, false));
     try testing.expectEqual(Page.settings, m.top().page);
 
@@ -448,14 +456,17 @@ test "menu: main-page actions map to their requests" {
     var m = Menu.init();
     m.top().cursor = 1;
     try testing.expectEqual(Request.save_state, m.handleNav(&cfg, .confirm, false));
-    m.top().cursor = 6;
+    m.top().cursor = 3;
+    try testing.expectEqual(Request.slot_next, m.handleNav(&cfg, .right, false));
+    try testing.expectEqual(Request.slot_prev, m.handleNav(&cfg, .left, false));
+    m.top().cursor = 7;
     try testing.expectEqual(Request.quit, m.handleNav(&cfg, .confirm, false));
 }
 
 test "menu: settings edit the config and report dirty" {
     var cfg: config.Config = .{};
     var m = Menu.init();
-    m.top().cursor = 3;
+    m.top().cursor = 4;
     _ = m.handleNav(&cfg, .confirm, false); // into settings
 
     // Scale saturates at both ends.
@@ -484,7 +495,7 @@ test "menu: remap capture rewrites the map and auto-swaps conflicts" {
 
     var cfg: config.Config = .{};
     var m = Menu.init();
-    m.top().cursor = 4;
+    m.top().cursor = 5;
     _ = m.handleNav(&cfg, .confirm, false); // input menu
     _ = m.handleNav(&cfg, .confirm, false); // P1 keyboard map
     try testing.expectEqual(Page{ .map = .{ .player = 0, .device = .keys } }, m.top().page);
@@ -519,7 +530,7 @@ test "menu: remap capture rewrites the map and auto-swaps conflicts" {
 test "menu: capture times out back to browsing" {
     var cfg: config.Config = .{};
     var m = Menu.init();
-    m.top().cursor = 4;
+    m.top().cursor = 5;
     _ = m.handleNav(&cfg, .confirm, false);
     _ = m.handleNav(&cfg, .confirm, false);
     _ = m.handleNav(&cfg, .confirm, false); // start capture on UP
@@ -534,17 +545,21 @@ test "menu: draw renders every page without touching out-of-bounds pixels" {
     const s = ui.Surface.init(buf[0 .. 256 * 224], 256, 224);
 
     var m = Menu.init();
-    m.draw(&s, &cfg, null);
+    m.draw(&s, &cfg, null, 1); // main
     m.top().cursor = 4;
     _ = m.handleNav(&cfg, .confirm, false);
-    m.draw(&s, &cfg, "crt-royale");
+    m.draw(&s, &cfg, "crt-royale", 1); // settings
+    _ = m.handleNav(&cfg, .back, false);
+    m.top().cursor = 5;
     _ = m.handleNav(&cfg, .confirm, false);
-    m.draw(&s, &cfg, null); // remap page, with a capture bar
+    m.draw(&s, &cfg, null, 8); // input menu
     _ = m.handleNav(&cfg, .confirm, false);
-    m.draw(&s, &cfg, null);
+    m.draw(&s, &cfg, null, 1); // P1 keyboard remap page
+    _ = m.handleNav(&cfg, .confirm, false);
+    m.draw(&s, &cfg, null, 1); // with the capture bar up
 
     // A 239-line overscan frame and a hi-res frame lay out cleanly too.
     var big: [512 * 239]u16 = @splat(0);
     const hs = ui.Surface.init(big[0 .. 512 * 239], 512, 239);
-    m.draw(&hs, &cfg, null);
+    m.draw(&hs, &cfg, null, 1);
 }

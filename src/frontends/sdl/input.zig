@@ -253,6 +253,9 @@ pub const Hotkey = enum(u4) {
     pause,
     save_state,
     load_state,
+    slot_next,
+    slot_prev,
+    screenshot,
     reset,
 };
 
@@ -325,6 +328,9 @@ pub const HotkeyStrings = struct {
     pause: []const u8 = "key:p",
     save_state: []const u8 = "key:f5",
     load_state: []const u8 = "key:f9",
+    slot_next: []const u8 = "key:f7",
+    slot_prev: []const u8 = "key:f6",
+    screenshot: []const u8 = "key:f12",
     reset: []const u8 = "key:f1",
 
     pub fn get(self: *const HotkeyStrings, hk: Hotkey) []const u8 {
@@ -437,6 +443,9 @@ pub const Action = union(enum) {
     pause,
     save_state,
     load_state,
+    slot_next,
+    slot_prev,
+    screenshot,
     reset,
     /// A pad was assigned to a player slot — open it and keep the handle.
     pad_opened: struct { pad: u32, slot: u1 },
@@ -600,6 +609,9 @@ fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
                 .pause => .pause,
                 .save_state => .save_state,
                 .load_state => .load_state,
+                .slot_next => .slot_next,
+                .slot_prev => .slot_prev,
+                .screenshot => .screenshot,
                 .reset => .reset,
                 .fast_forward => unreachable,
             };

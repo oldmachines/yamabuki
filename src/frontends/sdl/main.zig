@@ -39,6 +39,7 @@ const app = @import("app.zig");
 const config = @import("config.zig");
 const input = @import("input.zig");
 const paths = @import("paths.zig");
+const saves = @import("saves.zig");
 
 const Args = struct {
     rom: []const u8,
@@ -118,8 +119,10 @@ pub fn main(init: std.process.Init) !void {
     // mode, and its golden hashes must not depend on this machine's settings.
     var cfg: config.Config = .{};
     var config_path: ?[]const u8 = null;
+    var user_paths: ?paths.Paths = null;
     if (args.frames == 0) {
-        if (paths.Paths.init(gpa)) |p| {
+        user_paths = paths.Paths.init(gpa);
+        if (user_paths) |p| {
             config_path = p.config;
             switch (config.load(io, gpa, p.config)) {
                 .loaded => |c| cfg = c,
@@ -190,6 +193,11 @@ pub fn main(init: std.process.Init) !void {
         try err.flush();
         std.process.exit(1);
     };
+    // Save files are keyed by content hash + title. Computed after
+    // patching on purpose: a patched game is a different game, and its
+    // states won't load into the original anyway.
+    const sha_hex = core.registry.sha256Hex(core.header.stripCopierHeader(image));
+    const game_id = try saves.gameId(gpa, &sha_hex, &cart.header.title);
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
     switch (args.region) {
@@ -217,6 +225,10 @@ pub fn main(init: std.process.Init) !void {
         .bindings = input.resolve(&cfg.input, err),
         .cfg = &cfg,
         .config_path = config_path,
+        .game_id = game_id,
+        .saves_dir = if (user_paths) |p| p.saves else null,
+        .states_dir = if (user_paths) |p| p.states else null,
+        .shots_dir = if (user_paths) |p| p.screenshots else null,
     }, err, out);
 }
 
@@ -293,7 +305,9 @@ test {
     _ = config;
     _ = input;
     _ = paths;
+    _ = saves;
     _ = @import("menu.zig");
     _ = @import("ui.zig");
     _ = @import("font.zig");
+    _ = @import("png.zig");
 }

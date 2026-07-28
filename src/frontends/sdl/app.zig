@@ -19,6 +19,8 @@ const input = @import("input.zig");
 const menu = @import("menu.zig");
 const ui = @import("ui.zig");
 const config = @import("config.zig");
+const saves = @import("saves.zig");
+const png = @import("png.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -44,6 +46,13 @@ pub const Options = struct {
     cfg: *config.Config,
     /// Where to persist it, when there is a data directory to persist to.
     config_path: ?[]const u8,
+    /// `<sha16>-<title>` identity for save files; see `saves.gameId`.
+    game_id: []const u8,
+    /// Per-user data directories; null (no pref path, or a `--frames` CI
+    /// run) means that kind of persistence is off for the session.
+    saves_dir: ?[]const u8,
+    states_dir: ?[]const u8,
+    shots_dir: ?[]const u8,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -151,7 +160,18 @@ pub fn run(
     out: *std.Io.Writer,
 ) !void {
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
-    const state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{opts.rom});
+    // Slot files live under states/<gameid>/; without a data dir the legacy
+    // `<rom>.state` stands in for every slot, exactly as F5 always worked.
+    const legacy_state_path = try std.fmt.allocPrint(gpa, "{s}.state", .{opts.rom});
+    var slot: u32 = 1;
+    var slot_paths: [9]?[]const u8 = @splat(null); // 1..8 used
+    if (opts.states_dir) |dir| {
+        for (1..9) |n| slot_paths[n] = try saves.slotPath(gpa, dir, opts.game_id, @intCast(n));
+        if (saves.migrateLegacyState(io, legacy_state_path, slot_paths[1].?, state_buf)) {
+            try err.print("state migrated: {s} -> {s}\n", .{ legacy_state_path, slot_paths[1].? });
+            try err.flush();
+        }
+    }
 
     // --- SDL ----------------------------------------------------------------
     if (!sdl.SDL_Init(sdl3.init_video | sdl3.init_audio)) {
@@ -259,6 +279,16 @@ pub fn run(
             if (maybe) |p| papi.SDL_CloseGamepad(p);
         }
     };
+    // Battery save: restored before the first frame, autosaved on a
+    // debounced dirty check, flushed at menu-open/state-load/quit.
+    var sram: ?saves.Sram = null;
+    if (opts.saves_dir) |dir| {
+        if (con.cartridge().hasSram()) {
+            sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
+            if (sram) |*s| s.load(io, con, err);
+        }
+    }
+
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
@@ -269,6 +299,7 @@ pub fn run(
     var audio_on = true;
     var fast_forward = false;
     var paused = false;
+    var shot_requested = false;
     var running = true;
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
@@ -354,24 +385,19 @@ pub fn run(
                         mnu = null;
                     },
                     .save_state => {
-                        _ = con.saveState(state_buf);
-                        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
-                            try err.print("state saved: {s}\n", .{state_path});
-                        } else |e| {
-                            try err.print("state save failed: {s}\n", .{@errorName(e)});
-                        }
-                        try err.flush();
+                        saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
                         mnu = null;
                     },
                     .load_state => {
-                        if (loadStateFile(io, con, state_path, state_buf)) {
-                            try err.print("state loaded: {s}\n", .{state_path});
-                        } else |e| {
-                            try err.print("state load failed: {s}\n", .{@errorName(e)});
+                        if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
+                            // The state carried its own SRAM; make the .srm
+                            // agree with what the machine now holds.
+                            if (sram) |*s| s.flush(io, con, err);
                         }
-                        try err.flush();
                         mnu = null;
                     },
+                    .slot_next => slot = if (slot == 8) 1 else slot + 1,
+                    .slot_prev => slot = if (slot == 1) 8 else slot - 1,
                     .config_dirty => {
                         persistConfig(io, gpa, &opts, err);
                         binds = input.resolve(&opts.cfg.input, err);
@@ -403,6 +429,8 @@ pub fn run(
                     // The menu eats the release events, so drop anything
                     // held right now — nothing may stay pressed forever.
                     inp.clearTransient();
+                    // A natural save point: the player just stepped away.
+                    if (sram) |*s| s.flush(io, con, err);
                 },
                 .pause => paused = !paused,
                 .reset => {
@@ -415,22 +443,29 @@ pub fn run(
                         .pal => con.setRegion(.pal),
                     }
                 },
-                .save_state => {
-                    _ = con.saveState(state_buf);
-                    if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
-                        try err.print("state saved: {s}\n", .{state_path});
-                    } else |e| {
-                        try err.print("state save failed: {s}\n", .{@errorName(e)});
+                .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
+                .load_state => {
+                    if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
+                        if (sram) |*s| s.flush(io, con, err);
                     }
+                },
+                .slot_next => {
+                    slot = if (slot == 8) 1 else slot + 1;
+                    try err.print("state slot {d}\n", .{slot});
                     try err.flush();
                 },
-                .load_state => {
-                    if (loadStateFile(io, con, state_path, state_buf)) {
-                        try err.print("state loaded: {s}\n", .{state_path});
-                    } else |e| {
-                        try err.print("state load failed: {s}\n", .{@errorName(e)});
-                    }
+                .slot_prev => {
+                    slot = if (slot == 1) 8 else slot - 1;
+                    try err.print("state slot {d}\n", .{slot});
                     try err.flush();
+                },
+                .screenshot => {
+                    if (opts.shots_dir != null) {
+                        shot_requested = true;
+                    } else {
+                        try err.print("screenshot unavailable: no per-user data directory\n", .{});
+                        try err.flush();
+                    }
                 },
                 // Hotplug actions can only come from pad_added/removed,
                 // which the branch above consumed.
@@ -445,6 +480,7 @@ pub fn run(
         if (!halted) {
             con.runFrame();
             frames_run += 1;
+            if (sram) |*s| s.tick(io, con, err);
         }
 
         // Video: native RGB565, either through the shader chain or straight
@@ -459,7 +495,7 @@ pub fn run(
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.dimAll(&surf);
-            m.draw(&surf, opts.cfg, if (glv) |g| g.names[g.index] else null);
+            m.draw(&surf, opts.cfg, if (glv) |g| g.names[g.index] else null, slot);
             break :blk compose[0..fb.len];
         } else fb;
 
@@ -506,6 +542,17 @@ pub fn run(
                         try err.flush();
                     }
                 }
+            }
+            if (shot_requested) shot_gl: {
+                shot_requested = false;
+                const dir = opts.shots_dir orelse break :shot_gl;
+                const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
+                const img = g.chain().capture(gpa, win) catch |e| {
+                    try err.print("screenshot capture failed: {s}\n", .{@errorName(e)});
+                    try err.flush();
+                    break :shot_gl;
+                };
+                writeScreenshot(io, gpa, dir, opts.game_id, img.rgb, img.w, img.h, err);
             }
             if (g.osd) |*o| {
                 const window_size: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
@@ -558,6 +605,13 @@ pub fn run(
                     try util.maybeShot(io, gpa, err, prefix, frames_run, width, height, rgb);
                 }
             }
+            if (shot_requested) shot_sw: {
+                shot_requested = false;
+                const dir = opts.shots_dir orelse break :shot_sw;
+                const rgb = util.expandFramebuffer(gpa, fb, width, height) catch break :shot_sw;
+                defer gpa.free(rgb);
+                writeScreenshot(io, gpa, dir, opts.game_id, rgb, width, height, err);
+            }
         }
 
         // Audio: drain the console ring into the SDL stream. A menu toggle
@@ -581,6 +635,9 @@ pub fn run(
             if (now > next_deadline + max_lag_ns) next_deadline = now + frame_ns;
         }
     }
+
+    // The battery save's last chance before the process ends.
+    if (sram) |*s| s.flush(io, con, err);
 
     // Same report format as the headless runner so smoke tests can assert
     // the golden hashes through the SDL path.
@@ -623,9 +680,66 @@ test "wantsShot: an explicit list is unchanged" {
     try std.testing.expect(!wantsShot(&list, 15, 60));
 }
 
+fn saveStateTo(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, buf: []u8, err: *std.Io.Writer) void {
+    _ = con.saveState(buf);
+    if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
+    if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf })) {
+        err.print("state saved: slot {d} ({s})\n", .{ slot, path }) catch {};
+    } else |e| {
+        err.print("state save failed: {s}\n", .{@errorName(e)}) catch {};
+    }
+    err.flush() catch {};
+}
+
+fn loadStateFrom(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, buf: []u8, err: *std.Io.Writer) bool {
+    if (loadStateFile(io, con, path, buf)) {
+        err.print("state loaded: slot {d} ({s})\n", .{ slot, path }) catch {};
+        err.flush() catch {};
+        return true;
+    } else |e| {
+        err.print("state load failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return false;
+    }
+}
+
 fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8) !void {
     const data = try std.Io.Dir.cwd().readFile(io, path, buf);
     try con.loadState(data);
+}
+
+/// Encode and write one screenshot, named by the first free index — no
+/// wall-clock dependency, and the names sort in capture order.
+fn writeScreenshot(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    dir: []const u8,
+    game_id: []const u8,
+    rgb: []const u8,
+    w: u32,
+    h: u32,
+    err: *std.Io.Writer,
+) void {
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var path_buf: [512]u8 = undefined;
+    var n: u32 = 1;
+    const path = while (n <= 9999) : (n += 1) {
+        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}-{d:0>4}.png", .{ dir, game_id, n }) catch return;
+        std.Io.Dir.cwd().access(io, p, .{}) catch break p;
+    } else return;
+    const data = png.encode(gpa, rgb, w, h) catch |e| {
+        err.print("screenshot failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    defer gpa.free(data);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch |e| {
+        err.print("screenshot failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    err.print("screenshot: {s}\n", .{path}) catch {};
+    err.flush() catch {};
 }
 
 const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu };
