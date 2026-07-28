@@ -16,6 +16,9 @@ const shader = @import("shader.zig");
 const util = @import("util");
 const osd = @import("osd.zig");
 const input = @import("input.zig");
+const menu = @import("menu.zig");
+const ui = @import("ui.zig");
+const config = @import("config.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -37,7 +40,21 @@ pub const Options = struct {
     /// The resolved input bindings (config's `input` section, or the
     /// defaults — which reproduce the frontend's historical layout).
     bindings: input.Resolved,
+    /// The live config, edited in place by the overlay menu.
+    cfg: *config.Config,
+    /// Where to persist it, when there is a data directory to persist to.
+    config_path: ?[]const u8,
 };
+
+/// Persist the config after a menu edit. Failure warns and plays on — a
+/// read-only disk must not cost the session.
+fn persistConfig(io: std.Io, gpa: std.mem.Allocator, opts: *const Options, err: *std.Io.Writer) void {
+    const path = opts.config_path orelse return;
+    config.save(io, gpa, opts.cfg.*, path) catch |e| {
+        err.print("warning: cannot write {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+        err.flush() catch {};
+    };
+}
 
 /// A GL context plus the loaded shader chain. Absent means the software blit.
 ///
@@ -242,6 +259,14 @@ pub fn run(
             if (maybe) |p| papi.SDL_CloseGamepad(p);
         }
     };
+    // Live bindings: a copy, because a remap in the menu re-resolves them.
+    var binds = opts.bindings;
+    var mnu: ?menu.Menu = null;
+    // The overlay composes into this and the normal video path presents it —
+    // so the CRT shader shades the menu too. Sized for the largest frame the
+    // PPU produces (512-wide hi-res, 239-line overscan).
+    const compose = try gpa.alloc(u16, core.ppu.fb_width_max * 240);
+    var audio_on = true;
     var fast_forward = false;
     var paused = false;
     var running = true;
@@ -250,52 +275,135 @@ pub fn run(
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
 
     while (running) {
+        if (mnu) |*m| m.tick();
         var ev: sdl3.Event = undefined;
         while (sdl.SDL_PollEvent(&ev)) {
-            const action: input.Action = switch (ev.type) {
-                sdl3.event_quit => blk: {
-                    running = false;
-                    break :blk .none;
-                },
-                sdl3.event_key_down, sdl3.event_key_up => blk: {
-                    const key = ev.key;
-                    // Shader cycling stays on fixed keys, outside the
-                    // remappable model: it is a dev affordance, and the keys
-                    // must survive any config. A no-op on the software path.
-                    if (key.down and !key.repeat) {
-                        if (key.scancode == sdl3.scancode.comma) {
-                            if (glv) |g| cycleShader(io, gpa, g, -1, err);
-                        } else if (key.scancode == sdl3.scancode.period) {
-                            if (glv) |g| cycleShader(io, gpa, g, 1, err);
-                        }
-                    }
-                    break :blk inp.handle(&opts.bindings, .{ .key = .{
-                        .scancode = key.scancode,
-                        .down = key.down,
-                        .repeat = key.repeat,
-                    } });
-                },
-                sdl3.event_gamepad_button_down, sdl3.event_gamepad_button_up => inp.handle(&opts.bindings, .{ .pad_button = .{
+            if (ev.type == sdl3.event_quit) {
+                running = false;
+                continue;
+            }
+            // Normalize once; the menu and the game share the same shape.
+            const nev: input.Ev = switch (ev.type) {
+                sdl3.event_key_down, sdl3.event_key_up => .{ .key = .{
+                    .scancode = ev.key.scancode,
+                    .down = ev.key.down,
+                    .repeat = ev.key.repeat,
+                } },
+                sdl3.event_gamepad_button_down, sdl3.event_gamepad_button_up => .{ .pad_button = .{
                     .pad = ev.gbutton.which,
                     .button = ev.gbutton.button,
                     .down = ev.gbutton.down,
-                } }),
-                sdl3.event_gamepad_axis_motion => inp.handle(&opts.bindings, .{ .pad_axis = .{
+                } },
+                sdl3.event_gamepad_axis_motion => .{ .pad_axis = .{
                     .pad = ev.gaxis.which,
                     .axis = ev.gaxis.axis,
                     .value = ev.gaxis.value,
-                } }),
+                } },
                 // ADDED fires for already-connected pads too, so startup
                 // enumeration and hotplug are one code path.
-                sdl3.event_gamepad_added => inp.handle(&opts.bindings, .{ .pad_added = .{ .pad = ev.gdevice.which } }),
-                sdl3.event_gamepad_removed => inp.handle(&opts.bindings, .{ .pad_removed = .{ .pad = ev.gdevice.which } }),
-                else => .none,
+                sdl3.event_gamepad_added => .{ .pad_added = .{ .pad = ev.gdevice.which } },
+                sdl3.event_gamepad_removed => .{ .pad_removed = .{ .pad = ev.gdevice.which } },
+                else => continue,
             };
-            switch (action) {
+
+            // Hotplug is screen-independent: pads connect and disconnect
+            // whether the menu is up or not.
+            if (nev == .pad_added or nev == .pad_removed) {
+                switch (inp.handle(&binds, nev)) {
+                    .pad_opened => |o| if (pad_api) |papi| {
+                        pads[o.slot] = papi.SDL_OpenGamepad(o.pad);
+                        if (pads[o.slot]) |p| {
+                            const name = if (papi.SDL_GetGamepadName(p)) |n| std.mem.span(n) else "gamepad";
+                            try err.print("gamepad: {s} is player {d}\n", .{ name, @as(u32, o.slot) + 1 });
+                        } else {
+                            try err.print("warning: SDL_OpenGamepad: {s}\n", .{sdl.SDL_GetError()});
+                        }
+                        try err.flush();
+                    },
+                    .pad_closed => |c| if (pad_api) |papi| {
+                        if (pads[c.slot]) |p| papi.SDL_CloseGamepad(p);
+                        pads[c.slot] = null;
+                        try err.print("gamepad: player {d} disconnected\n", .{@as(u32, c.slot) + 1});
+                        try err.flush();
+                    },
+                    else => {},
+                }
+                continue;
+            }
+
+            if (mnu) |*m| {
+                // Menu path: raw events feed a pending capture; otherwise
+                // the fixed navigation map steers.
+                const req: menu.Request = if (m.capturing())
+                    m.feedCapture(gpa, opts.cfg, nev)
+                else if (menu.navFromEvent(nev)) |nav|
+                    m.handleNav(opts.cfg, nav, glv != null)
+                else
+                    .none;
+                switch (req) {
+                    .none => {},
+                    .resume_game => mnu = null,
+                    .quit => running = false,
+                    .reset => {
+                        con.repower();
+                        switch (opts.region) {
+                            .auto => {},
+                            .ntsc => con.setRegion(.ntsc),
+                            .pal => con.setRegion(.pal),
+                        }
+                        mnu = null;
+                    },
+                    .save_state => {
+                        _ = con.saveState(state_buf);
+                        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = state_buf })) {
+                            try err.print("state saved: {s}\n", .{state_path});
+                        } else |e| {
+                            try err.print("state save failed: {s}\n", .{@errorName(e)});
+                        }
+                        try err.flush();
+                        mnu = null;
+                    },
+                    .load_state => {
+                        if (loadStateFile(io, con, state_path, state_buf)) {
+                            try err.print("state loaded: {s}\n", .{state_path});
+                        } else |e| {
+                            try err.print("state load failed: {s}\n", .{@errorName(e)});
+                        }
+                        try err.flush();
+                        mnu = null;
+                    },
+                    .config_dirty => {
+                        persistConfig(io, gpa, &opts, err);
+                        binds = input.resolve(&opts.cfg.input, err);
+                        audio_on = opts.cfg.audio.enabled;
+                    },
+                    .shader_next, .shader_prev => if (glv) |g| {
+                        cycleShader(io, gpa, g, if (req == .shader_next) 1 else -1, err);
+                        opts.cfg.video.shader = g.names[g.index];
+                        persistConfig(io, gpa, &opts, err);
+                    },
+                }
+                continue;
+            }
+
+            // Game path. Shader cycling stays on fixed keys, outside the
+            // remappable model: it is a dev affordance, and the keys must
+            // survive any config. A no-op on the software path.
+            if (nev == .key and nev.key.down and !nev.key.repeat) {
+                if (nev.key.scancode == sdl3.scancode.comma) {
+                    if (glv) |g| cycleShader(io, gpa, g, -1, err);
+                } else if (nev.key.scancode == sdl3.scancode.period) {
+                    if (glv) |g| cycleShader(io, gpa, g, 1, err);
+                }
+            }
+            switch (inp.handle(&binds, nev)) {
                 .none => {},
-                // The overlay menu is the next M14 slice; until it exists
-                // the hotkey keeps Esc's historical meaning.
-                .menu => running = false,
+                .menu => {
+                    mnu = menu.Menu.init();
+                    // The menu eats the release events, so drop anything
+                    // held right now — nothing may stay pressed forever.
+                    inp.clearTransient();
+                },
                 .pause => paused = !paused,
                 .reset => {
                     con.repower();
@@ -324,41 +432,39 @@ pub fn run(
                     }
                     try err.flush();
                 },
-                .pad_opened => |o| if (pad_api) |papi| {
-                    pads[o.slot] = papi.SDL_OpenGamepad(o.pad);
-                    if (pads[o.slot]) |p| {
-                        const name = if (papi.SDL_GetGamepadName(p)) |n| std.mem.span(n) else "gamepad";
-                        try err.print("gamepad: {s} is player {d}\n", .{ name, @as(u32, o.slot) + 1 });
-                    } else {
-                        try err.print("warning: SDL_OpenGamepad: {s}\n", .{sdl.SDL_GetError()});
-                    }
-                    try err.flush();
-                },
-                .pad_closed => |c| if (pad_api) |papi| {
-                    if (pads[c.slot]) |p| papi.SDL_CloseGamepad(p);
-                    pads[c.slot] = null;
-                    try err.print("gamepad: player {d} disconnected\n", .{@as(u32, c.slot) + 1});
-                    try err.flush();
-                },
+                // Hotplug actions can only come from pad_added/removed,
+                // which the branch above consumed.
+                .pad_opened, .pad_closed => unreachable,
             }
         }
 
-        fast_forward = inp.ffHeld();
+        const halted = paused or mnu != null;
+        fast_forward = inp.ffHeld() and mnu == null;
         con.setButtons(0, inp.masks[0]);
         con.setButtons(1, inp.masks[1]);
-        if (!paused) {
+        if (!halted) {
             con.runFrame();
             frames_run += 1;
         }
 
         // Video: native RGB565, either through the shader chain or straight
-        // into a streaming texture.
+        // into a streaming texture. With the menu up, the frame is copied
+        // into the compose buffer, dimmed, and drawn over — then presented
+        // through the very same path, so shaders and letterboxing never
+        // know the difference.
         const fb = con.framebuffer();
         const width = con.frameWidth();
         const height: u32 = @intCast(fb.len / width);
+        const src_px: []const u16 = if (mnu) |*m| blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            ui.dimAll(&surf);
+            m.draw(&surf, opts.cfg, if (glv) |g| g.names[g.index] else null);
+            break :blk compose[0..fb.len];
+        } else fb;
 
         if (glv) |g| gl_path: {
-            g.chain().upload(fb, width, height);
+            g.chain().upload(src_px, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
@@ -389,9 +495,9 @@ pub fn run(
             // Grab the rendered frame *before* the swap, while the back buffer
             // still holds it.
             if (opts.shot) |prefix| {
-                // `!paused`: a paused loop re-presents the same frame number
+                // `!halted`: a paused loop re-presents the same frame number
                 // every iteration and must not re-capture it.
-                if (!paused and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
+                if (!halted and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
                     const win: preset.Size = .{ .w = @intCast(@max(1, win_w)), .h = @intCast(@max(1, win_h)) };
                     if (g.chain().capture(gpa, win)) |img| {
                         try util.maybeShot(io, gpa, err, prefix, frames_run, img.w, img.h, img.rgb);
@@ -440,24 +546,26 @@ pub fn run(
                 tex_w = width;
                 tex_h = height;
             }
-            _ = sdl.SDL_UpdateTexture(texture.?, null, fb.ptr, @intCast(width * 2));
+            _ = sdl.SDL_UpdateTexture(texture.?, null, src_px.ptr, @intCast(width * 2));
             _ = sdl.SDL_RenderClear(r);
             _ = sdl.SDL_RenderTexture(r, texture.?, null, null);
             _ = sdl.SDL_RenderPresent(r);
 
             // No shader: the console's framebuffer *is* the picture.
             if (opts.shot) |prefix| {
-                if (!paused and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
+                if (!halted and wantsShot(opts.shot_frames, frames_run, opts.frames)) {
                     const rgb = try util.expandFramebuffer(gpa, fb, width, height);
                     try util.maybeShot(io, gpa, err, prefix, frames_run, width, height, rgb);
                 }
             }
         }
 
-        // Audio: drain the console ring into the SDL stream.
+        // Audio: drain the console ring into the SDL stream. A menu toggle
+        // of `audio_on` mutes by dropping the chunks; the ring still drains
+        // so nothing backs up.
         try util.drainAudio(con, &audio_hash, AudioSink{
             .sdl = sdl,
-            .stream = audio,
+            .stream = if (audio_on) audio else null,
             .fast_forward = fast_forward,
         }, AudioSink.push);
 
