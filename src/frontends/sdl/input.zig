@@ -250,6 +250,7 @@ pub fn parseHotkeyToken(tok: []const u8) ?Binding {
 pub const Hotkey = enum(u4) {
     menu,
     fast_forward,
+    rewind,
     pause,
     save_state,
     load_state,
@@ -325,6 +326,7 @@ pub const HotkeyStrings = struct {
     /// see it; start+select stays unbound so games that ask for it keep it.
     menu: []const u8 = "key:escape pad:guide",
     fast_forward: []const u8 = "key:tab axis:+rt",
+    rewind: []const u8 = "key:backspace",
     pause: []const u8 = "key:p",
     save_state: []const u8 = "key:f5",
     load_state: []const u8 = "key:f9",
@@ -461,12 +463,19 @@ pub const State = struct {
     slots: [2]?u32 = .{ null, null },
     /// Half-axis engagement, for hysteresis: [player][axis][positive].
     axis_on: [2][6][2]bool = @splat(@splat(@splat(false))),
-    /// Per-source fast-forward holds, OR-combined into the reported state.
+    /// Per-source holds for the held hotkeys, OR-combined per hotkey.
     ff_key: bool = false,
+    ff_pad: bool = false,
     ff_axis: bool = false,
+    rw_key: bool = false,
+    rw_pad: bool = false,
 
     pub fn ffHeld(self: *const State) bool {
-        return self.ff_key or self.ff_axis;
+        return self.ff_key or self.ff_pad or self.ff_axis;
+    }
+
+    pub fn rewindHeld(self: *const State) bool {
+        return self.rw_key or self.rw_pad;
     }
 
     /// Drop everything held but keep the pad slots: the overlay menu eats
@@ -476,7 +485,10 @@ pub const State = struct {
         self.masks = .{ 0, 0 };
         self.axis_on = @splat(@splat(@splat(false)));
         self.ff_key = false;
+        self.ff_pad = false;
         self.ff_axis = false;
+        self.rw_key = false;
+        self.rw_pad = false;
     }
 
     /// Feed one event through the bindings. Returns at most one action —
@@ -492,9 +504,11 @@ pub const State = struct {
                         }
                     }
                 }
-                // The held hotkey tracks both edges; the rest fire on down.
+                // The held hotkeys track both edges; the rest fire on down.
                 if (!k.repeat and bound(r, .fast_forward, .{ .key = k.scancode }))
                     self.ff_key = k.down;
+                if (!k.repeat and bound(r, .rewind, .{ .key = k.scancode }))
+                    self.rw_key = k.down;
                 if (k.down and !k.repeat) {
                     if (matchHotkey(r, .{ .key = k.scancode })) |a| return a;
                 }
@@ -511,6 +525,10 @@ pub const State = struct {
                         }
                     }
                 }
+                if (bound(r, .fast_forward, .{ .pad_button = pb.button }))
+                    self.ff_pad = pb.down;
+                if (bound(r, .rewind, .{ .pad_button = pb.button }))
+                    self.rw_pad = pb.down;
                 if (pb.down) {
                     if (matchHotkey(r, .{ .pad_button = pb.button })) |a| return a;
                 }
@@ -565,6 +583,10 @@ pub const State = struct {
                 self.masks[p] = 0;
                 self.axis_on[p] = @splat(@splat(false));
                 self.ff_axis = self.anyFfAxisEngaged(r);
+                // Single flags cover both pads; releasing on any unplug is
+                // the safe direction for a held hotkey.
+                self.ff_pad = false;
+                self.rw_pad = false;
                 return .{ .pad_closed = .{ .pad = pr.pad, .slot = p } };
             },
         }
@@ -603,7 +625,7 @@ pub const State = struct {
 fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
     inline for (@typeInfo(Hotkey).@"enum".fields) |f| {
         const hk: Hotkey = @enumFromInt(f.value);
-        if (hk != .fast_forward and bound(r, hk, b)) {
+        if (hk != .fast_forward and hk != .rewind and bound(r, hk, b)) {
             return switch (hk) {
                 .menu => .menu,
                 .pause => .pause,
@@ -613,7 +635,7 @@ fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
                 .slot_prev => .slot_prev,
                 .screenshot => .screenshot,
                 .reset => .reset,
-                .fast_forward => unreachable,
+                .fast_forward, .rewind => unreachable,
             };
         }
     }

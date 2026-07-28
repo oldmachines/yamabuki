@@ -229,6 +229,8 @@ pub fn main(init: std.process.Init) !void {
         .saves_dir = if (user_paths) |p| p.saves else null,
         .states_dir = if (user_paths) |p| p.states else null,
         .shots_dir = if (user_paths) |p| p.screenshots else null,
+        .rewind_enabled = args.frames == 0 and cfg.rewind.enabled,
+        .rewind_budget_mib = cfg.effectiveRewindBudgetMib(),
     }, err, out);
 }
 
@@ -310,4 +312,5 @@ test {
     _ = @import("ui.zig");
     _ = @import("font.zig");
     _ = @import("png.zig");
+    _ = @import("rewind.zig");
 }
