@@ -27,6 +27,8 @@ pub const Paths = struct {
     states: []const u8,
     /// PNG screenshots.
     screenshots: []const u8,
+    /// `<root>library.zon` — the ROM scanner's metadata cache.
+    library: []const u8,
 
     /// Resolve the per-user data directory. Requires the SDL3 runtime `load`
     /// already found — the extra symbols come from the same library.
@@ -42,6 +44,7 @@ pub const Paths = struct {
             .saves = std.fmt.allocPrint(gpa, "{s}saves", .{root}) catch return null,
             .states = std.fmt.allocPrint(gpa, "{s}states", .{root}) catch return null,
             .screenshots = std.fmt.allocPrint(gpa, "{s}screenshots", .{root}) catch return null,
+            .library = std.fmt.allocPrint(gpa, "{s}library.zon", .{root}) catch return null,
         };
     }
 };

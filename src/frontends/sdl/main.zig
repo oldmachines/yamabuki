@@ -40,9 +40,11 @@ const config = @import("config.zig");
 const input = @import("input.zig");
 const paths = @import("paths.zig");
 const saves = @import("saves.zig");
+const library = @import("library.zig");
 
 const Args = struct {
-    rom: []const u8,
+    /// Null = no ROM argument: launch into the library picker.
+    rom: ?[]const u8 = null,
     /// Null means "not given on the CLI" — the config's video.scale (default
     /// 3) applies. Same 1..8 validation either way.
     scale: ?u32 = null,
@@ -84,13 +86,16 @@ pub fn main(init: std.process.Init) !void {
     const args = parseArgs(init, gpa) catch |e| {
         if (e == error.ShotNeedsFrames) {
             try err.print("error: --shot without --shot-frames captures the last frame, which needs --frames N\n", .{});
+        } else if (e == error.NeedsRom) {
+            try err.print("error: --frames/--shot/--patch/--auto-fastrom need an explicit ROM argument\n", .{});
         } else if (e == error.WideNeedsFast) {
             try err.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
         } else if (e == error.WideTooBig) {
             try err.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
         }
         try err.print(
-            "usage: yamabuki-sdl <rom.sfc> [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
+            "usage: yamabuki-sdl [rom.sfc] [--scale N] [--frames N] [--no-audio] [--accurate]\n" ++
+                "  (no ROM argument opens the library: config.zon's library.rom_dirs, scanned)\n" ++
                 "                    [--region ntsc|pal|auto] [--shader NAME] [--shader-dir DIR]\n" ++
                 "                    [--patch p.bps|p.ips] [--auto-fastrom] [--wide N]\n" ++
                 "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
@@ -143,17 +148,93 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // --- console ------------------------------------------------------------
-    var image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
-        try err.print("error: cannot read ROM '{s}'\n", .{args.rom});
+    // --- sessions -----------------------------------------------------------
+    const bindings = input.resolve(&cfg.input, err);
+    if (args.rom) |rom_path| {
+        // Classic direct launch: boot failures are fatal, CLOSE GAME quits.
+        const b = bootConsole(io, gpa, rom_path, args, err) catch std.process.exit(1);
+        _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b.game_id, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        return;
+    }
+
+    // Library mode: browse → play → back to browsing, until the picker or
+    // the in-game menu quits. A broken pick prints its reason and returns
+    // to the list rather than killing the app.
+    var lib = if (user_paths) |p|
+        library.Library.loadCache(io, gpa, p.library)
+    else
+        library.Library{ .gpa = gpa };
+    while (true) {
+        const picked = try app.runLibrary(
+            io,
+            gpa,
+            sdl,
+            args.scale orelse cfg.effectiveScale(err),
+            &lib,
+            cfg.library.rom_dirs,
+            if (user_paths) |p| p.library else null,
+            err,
+        ) orelse break;
+        const b = bootConsole(io, gpa, picked, args, err) catch continue;
+        const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b.game_id, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        lib.touch(picked, result.frames / 60);
+        if (user_paths) |p| lib.saveCache(io, gpa, p.library) catch {};
+        if (result.reason == .quit) break;
+    }
+}
+
+fn makeOptions(
+    rom_path: []const u8,
+    game_id: []const u8,
+    args: Args,
+    cfg: *config.Config,
+    config_path: ?[]const u8,
+    user_paths: ?paths.Paths,
+    bindings: input.Resolved,
+    err: *std.Io.Writer,
+) app.Options {
+    // Defaults ← config ← CLI, resolved here once; app.zig never sees the
+    // difference between a configured and a flagged setting.
+    return .{
+        .rom = rom_path,
+        .scale = args.scale orelse cfg.effectiveScale(err),
+        .frames = args.frames,
+        .audio = args.audio and cfg.audio.enabled,
+        .region = args.region,
+        .shader = args.shader orelse cfg.video.shader,
+        .shader_dir = args.shader_dir,
+        .shot = args.shot,
+        .shot_frames = args.shot_frames,
+        .wide = args.wide,
+        .bindings = bindings,
+        .cfg = cfg,
+        .config_path = config_path,
+        .game_id = game_id,
+        .saves_dir = if (user_paths) |p| p.saves else null,
+        .states_dir = if (user_paths) |p| p.states else null,
+        .shots_dir = if (user_paths) |p| p.screenshots else null,
+        .rewind_enabled = args.frames == 0 and cfg.rewind.enabled,
+        .rewind_budget_mib = cfg.effectiveRewindBudgetMib(),
+    };
+}
+
+const Booted = struct { con: *core.AnyConsole, game_id: []const u8 };
+
+/// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
+/// load, region/wide setup, save-file identity. Every failure prints its
+/// reason and returns an error — the direct-launch path exits on it, the
+/// library path goes back to the list.
+fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, err: *std.Io.Writer) !Booted {
+    var image = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try err.print("error: cannot read ROM '{s}'\n", .{rom_path});
         try err.flush();
-        std.process.exit(1);
+        return error.BootFailed;
     };
     if (args.patch) |patch_path| {
         const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
             try err.print("error: cannot read patch '{s}'\n", .{patch_path});
             try err.flush();
-            std.process.exit(1);
+            return error.BootFailed;
         };
         var mm: core.patch.CrcMismatch = .{};
         const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
@@ -165,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
                 else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
             }
             try err.flush();
-            std.process.exit(1);
+            return error.BootFailed;
         };
         if (!res.verified) {
             try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
@@ -180,7 +261,7 @@ pub fn main(init: std.process.Init) !void {
             .broken => {
                 try err.print("error: auto-fastrom: {s} is known BROKEN with FastROM timing: {s}\n", .{ e.title, e.note });
                 try err.flush();
-                std.process.exit(1);
+                return error.BootFailed;
             },
             .untested => try err.print("auto-fastrom: WARNING: {s} is untested with FastROM timing ({s})\n", .{ e.title, e.note }),
         } else {
@@ -191,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
     const cart = core.Cartridge.load(gpa, image) catch |e| {
         try err.print("error: cannot load ROM: {s}\n", .{@errorName(e)});
         try err.flush();
-        std.process.exit(1);
+        return error.BootFailed;
     };
     // Save files are keyed by content hash + title. Computed after
     // patching on purpose: a patched game is a different game, and its
@@ -207,31 +288,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
-
-    // --- session ------------------------------------------------------------
-    // Defaults ← config ← CLI, resolved here once; app.zig never sees the
-    // difference between a configured and a flagged setting.
-    try app.run(io, gpa, sdl, con, .{
-        .rom = args.rom,
-        .scale = args.scale orelse cfg.effectiveScale(err),
-        .frames = args.frames,
-        .audio = args.audio and cfg.audio.enabled,
-        .region = args.region,
-        .shader = args.shader orelse cfg.video.shader,
-        .shader_dir = args.shader_dir,
-        .shot = args.shot,
-        .shot_frames = args.shot_frames,
-        .wide = args.wide,
-        .bindings = input.resolve(&cfg.input, err),
-        .cfg = &cfg,
-        .config_path = config_path,
-        .game_id = game_id,
-        .saves_dir = if (user_paths) |p| p.saves else null,
-        .states_dir = if (user_paths) |p| p.states else null,
-        .shots_dir = if (user_paths) |p| p.screenshots else null,
-        .rewind_enabled = args.frames == 0 and cfg.rewind.enabled,
-        .rewind_budget_mib = cfg.effectiveRewindBudgetMib(),
-    }, err, out);
+    return .{ .con = con, .game_id = game_id };
 }
 
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
@@ -239,7 +296,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // strings, and `Args.rom` / `Args.shader` are slices into them. `gpa` is the
     // process arena, so they live exactly as long as they need to.
     var it = try util.argIterator(init, gpa);
-    var args: Args = .{ .rom = undefined };
+    var args: Args = .{};
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--scale")) {
@@ -286,7 +343,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             rom = a;
         } else return error.TooManyArgs;
     }
-    args.rom = rom orelse return error.NoRom;
+    args.rom = rom;
+    // These flags act on one specific ROM; the library picker has none.
+    if (rom == null and (args.frames != 0 or args.shot != null or args.patch != null or args.auto_fastrom))
+        return error.NeedsRom;
     // A bare `--shot` captures the final frame — which only exists when the
     // run has one. Refuse the run-until-quit combination up front instead of
     // silently writing nothing.
@@ -313,4 +373,5 @@ test {
     _ = @import("font.zig");
     _ = @import("png.zig");
     _ = @import("rewind.zig");
+    _ = @import("library.zig");
 }

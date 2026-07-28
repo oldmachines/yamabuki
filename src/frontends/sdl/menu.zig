@@ -46,6 +46,9 @@ pub const Request = enum {
     /// Step the active save-state slot (session state, owned by the app).
     slot_prev,
     slot_next,
+    /// End the session and return to the library picker (or quit when the
+    /// session was launched with an explicit ROM).
+    close_game,
 };
 
 const Entry = struct { page: Page, cursor: usize };
@@ -198,7 +201,8 @@ pub const Menu = struct {
                 4 => self.push(.settings),
                 5 => self.push(.input_menu),
                 6 => return .reset,
-                7 => return .quit,
+                7 => return .close_game,
+                8 => return .quit,
                 else => {},
             },
             .settings => return self.adjust(cfg, true, true),
@@ -365,7 +369,7 @@ pub fn navFromEvent(ev: input.Ev) ?NavEvent {
 
 pub fn itemCount(page: Page) usize {
     return switch (page) {
-        .main => 8,
+        .main => 9,
         .settings => 4,
         .input_menu => 6,
         .map => input.n_snes_buttons,
@@ -375,7 +379,7 @@ pub fn itemCount(page: Page) usize {
 
 fn itemLabel(page: Page, i: usize) []const u8 {
     return switch (page) {
-        .main => ([_][]const u8{ "RESUME", "SAVE STATE", "LOAD STATE", "STATE SLOT", "SETTINGS", "INPUT", "RESET", "QUIT" })[i],
+        .main => ([_][]const u8{ "RESUME", "SAVE STATE", "LOAD STATE", "STATE SLOT", "SETTINGS", "INPUT", "RESET", "CLOSE GAME", "QUIT" })[i],
         .settings => ([_][]const u8{ "SCALE", "AUDIO", "SHADER", "REWIND" })[i],
         .input_menu => ([_][]const u8{ "PLAYER 1 KEYBOARD", "PLAYER 1 PAD", "PLAYER 2 KEYBOARD", "PLAYER 2 PAD", "HOTKEYS", "SWAP PADS" })[i],
         .map => @tagName(@as(input.SnesButton, @enumFromInt(i))),
@@ -445,7 +449,7 @@ test "menu: navigation wraps, submenus push, back pops, top-level back resumes" 
     var m = Menu.init();
 
     try testing.expectEqual(Request.none, m.handleNav(&cfg, .up, false));
-    try testing.expectEqual(@as(usize, 7), m.top().cursor); // wrapped to QUIT
+    try testing.expectEqual(@as(usize, 8), m.top().cursor); // wrapped to QUIT
 
     m.top().cursor = 4; // SETTINGS
     try testing.expectEqual(Request.none, m.handleNav(&cfg, .confirm, false));
@@ -465,6 +469,8 @@ test "menu: main-page actions map to their requests" {
     try testing.expectEqual(Request.slot_next, m.handleNav(&cfg, .right, false));
     try testing.expectEqual(Request.slot_prev, m.handleNav(&cfg, .left, false));
     m.top().cursor = 7;
+    try testing.expectEqual(Request.close_game, m.handleNav(&cfg, .confirm, false));
+    m.top().cursor = 8;
     try testing.expectEqual(Request.quit, m.handleNav(&cfg, .confirm, false));
 }
 
