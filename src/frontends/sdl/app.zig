@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const saves = @import("saves.zig");
 const png = @import("png.zig");
 const rewind = @import("rewind.zig");
+const library = @import("library.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -152,6 +153,12 @@ const AudioSink = struct {
     }
 };
 
+pub const RunResult = struct {
+    reason: enum { quit, to_library },
+    /// Emulated frames this session, for the library's playtime metadata.
+    frames: u32,
+};
+
 /// Run the whole SDL session to completion. Fatal SDL failures print and
 /// exit, matching what the code did when it lived in `main`.
 pub fn run(
@@ -162,7 +169,7 @@ pub fn run(
     opts: Options,
     err: *std.Io.Writer,
     out: *std.Io.Writer,
-) !void {
+) !RunResult {
     const state_buf = try gpa.alloc(u8, core.AnyConsole.state_size);
     // Slot files live under states/<gameid>/; without a data dir the legacy
     // `<rom>.state` stands in for every slot, exactly as F5 always worked.
@@ -318,6 +325,7 @@ pub fn run(
     var paused = false;
     var shot_requested = false;
     var running = true;
+    var exit_to_library = false;
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
@@ -392,6 +400,10 @@ pub fn run(
                     .none => {},
                     .resume_game => mnu = null,
                     .quit => running = false,
+                    .close_game => {
+                        exit_to_library = true;
+                        running = false;
+                    },
                     .reset => {
                         con.repower();
                         switch (opts.region) {
@@ -688,6 +700,225 @@ pub fn run(
         opts.rom, frames_run, width, fb.len / width, core.console.hashFrame(fb), audio_hash,
     });
     try out.flush();
+    return .{
+        .reason = if (exit_to_library) .to_library else .quit,
+        .frames = frames_run,
+    };
+}
+
+/// The library picker: its own small SDL session (window, software blit,
+/// fixed navigation) that scans incrementally while the list is browsed.
+/// Returns the selected entry's path (duped into `gpa`), or null to quit.
+pub fn runLibrary(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    sdl: sdl3.Api,
+    scale: u32,
+    lib: *library.Library,
+    rom_dirs: []const []const u8,
+    cache_path: ?[]const u8,
+    err: *std.Io.Writer,
+) !?[]const u8 {
+    if (!sdl.SDL_Init(sdl3.init_video | sdl3.init_audio)) {
+        try err.print("error: SDL_Init: {s}\n", .{sdl.SDL_GetError()});
+        try err.flush();
+        std.process.exit(1);
+    }
+    defer sdl.SDL_Quit();
+
+    var pad_api: ?sdl3.PadApi = null;
+    if (sdl3.loadPad()) |papi| {
+        if (papi.SDL_InitSubSystem(sdl3.init_gamepad)) pad_api = papi;
+    } else |_| {}
+
+    const window = sdl.SDL_CreateWindow(
+        "Yamabuki",
+        @intCast(256 * scale),
+        @intCast(224 * scale),
+        sdl3.window_resizable,
+    ) orelse {
+        try err.print("error: SDL_CreateWindow: {s}\n", .{sdl.SDL_GetError()});
+        try err.flush();
+        std.process.exit(1);
+    };
+    defer sdl.SDL_DestroyWindow(window);
+    const renderer = sdl.SDL_CreateRenderer(window, null) orelse {
+        try err.print("error: SDL_CreateRenderer: {s}\n", .{sdl.SDL_GetError()});
+        try err.flush();
+        std.process.exit(1);
+    };
+    defer sdl.SDL_DestroyRenderer(renderer);
+    _ = sdl.SDL_SetRenderVSync(renderer, 0);
+    const texture = sdl.SDL_CreateTexture(
+        renderer,
+        sdl3.pixel_format_rgb565,
+        sdl3.texture_access_streaming,
+        256,
+        224,
+    ) orelse {
+        try err.print("error: SDL_CreateTexture: {s}\n", .{sdl.SDL_GetError()});
+        try err.flush();
+        std.process.exit(1);
+    };
+    defer sdl.SDL_DestroyTexture(texture);
+    _ = sdl.SDL_SetTextureScaleMode(texture, sdl3.scale_mode_nearest);
+    _ = sdl.SDL_SetRenderLogicalPresentation(renderer, 512, 448, sdl3.logical_presentation_letterbox);
+
+    // Any connected pad can drive the picker — no player slots here.
+    var open_pads: std.ArrayList(*sdl3.Gamepad) = .empty;
+    defer if (pad_api) |papi| for (open_pads.items) |p| papi.SDL_CloseGamepad(p);
+
+    var canvas: [256 * 224]u16 = undefined;
+    var scanner = library.Scanner.begin(gpa, io, rom_dirs, err);
+    var cursor: usize = 0;
+    var scroll: usize = 0;
+    const visible_rows = 17;
+
+    while (true) {
+        var ev: sdl3.Event = undefined;
+        var picked: ?usize = null;
+        while (sdl.SDL_PollEvent(&ev)) {
+            if (ev.type == sdl3.event_quit) return null;
+            const nev: input.Ev = switch (ev.type) {
+                sdl3.event_key_down, sdl3.event_key_up => .{ .key = .{
+                    .scancode = ev.key.scancode,
+                    .down = ev.key.down,
+                    .repeat = ev.key.repeat,
+                } },
+                sdl3.event_gamepad_button_down, sdl3.event_gamepad_button_up => .{ .pad_button = .{
+                    .pad = ev.gbutton.which,
+                    .button = ev.gbutton.button,
+                    .down = ev.gbutton.down,
+                } },
+                sdl3.event_gamepad_added => blk: {
+                    if (pad_api) |papi| {
+                        if (papi.SDL_OpenGamepad(ev.gdevice.which)) |p|
+                            open_pads.append(gpa, p) catch {};
+                    }
+                    break :blk .{ .pad_added = .{ .pad = ev.gdevice.which } };
+                },
+                else => continue,
+            };
+            const n = lib.entries.items.len;
+            switch (menu.navFromEvent(nev) orelse continue) {
+                .up => if (n != 0) {
+                    cursor = if (cursor == 0) n - 1 else cursor - 1;
+                },
+                .down => if (n != 0) {
+                    cursor = if (cursor + 1 >= n) 0 else cursor + 1;
+                },
+                .left => cursor -|= visible_rows,
+                .right => if (n != 0) {
+                    cursor = @min(cursor + visible_rows, n - 1);
+                },
+                .confirm => if (cursor < n) {
+                    picked = cursor;
+                },
+                .back, .close => return null,
+            }
+        }
+
+        if (picked) |i| return try gpa.dupe(u8, lib.entries.items[i].path);
+
+        // Scan under a per-frame time budget so the list fills while the
+        // screen stays live; persist the cache the moment it completes.
+        const deadline = sdl.SDL_GetTicksNS() + 6 * std.time.ns_per_ms;
+        while (!scanner.done and sdl.SDL_GetTicksNS() < deadline) {
+            if (scanner.stepOne(io, lib)) {
+                if (cache_path) |p| lib.saveCache(io, gpa, p) catch {};
+            }
+        }
+        if (cursor >= lib.entries.items.len and lib.entries.items.len != 0)
+            cursor = lib.entries.items.len - 1;
+        if (cursor < scroll) scroll = cursor;
+        if (cursor >= scroll + visible_rows) scroll = cursor - visible_rows + 1;
+
+        drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, rom_dirs.len == 0, if (scanner.done) null else scanner.remaining());
+
+        _ = sdl.SDL_UpdateTexture(texture, null, &canvas, 256 * 2);
+        _ = sdl.SDL_RenderClear(renderer);
+        _ = sdl.SDL_RenderTexture(renderer, texture, null, null);
+        _ = sdl.SDL_RenderPresent(renderer);
+        sdl.SDL_DelayNS(16 * std.time.ns_per_ms);
+    }
+}
+
+/// The picker's whole frame, drawn into a 256x224 canvas — pure pixels, so
+/// the layout is testable and eyeballable without SDL. `scanning_left` is
+/// null once the scan has completed.
+fn drawLibraryScreen(
+    canvas: *[256 * 224]u16,
+    lib: *const library.Library,
+    cursor: usize,
+    scroll: usize,
+    visible_rows: usize,
+    no_dirs: bool,
+    scanning_left: ?usize,
+) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "YAMABUKI", ui.color.accent);
+    var hdr: [40]u8 = undefined;
+    const count_txt = std.fmt.bufPrint(&hdr, "{d} GAMES", .{lib.entries.items.len}) catch "";
+    ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(count_txt))), 6, count_txt, ui.color.text_dim);
+
+    if (no_dirs) {
+        ui.drawTextCentered(&surf, 90, "NO ROM FOLDERS CONFIGURED", ui.color.text);
+        ui.drawTextCentered(&surf, 104, "ADD LIBRARY.ROM_DIRS TO CONFIG.ZON", ui.color.text_dim);
+        ui.drawTextCentered(&surf, 114, "IN THE YAMABUKI DATA FOLDER", ui.color.text_dim);
+    } else if (lib.entries.items.len == 0 and scanning_left == null) {
+        ui.drawTextCentered(&surf, 100, "NO SNES ROMS FOUND", ui.color.text);
+    }
+
+    for (0..visible_rows) |row| {
+        const i = scroll + row;
+        if (i >= lib.entries.items.len) break;
+        const e = lib.entries.items[i];
+        const y: i32 = @intCast(20 + row * ui.line_h);
+        const selected = i == cursor;
+        if (selected) ui.drawText(&surf, 2, y, ">", ui.color.accent);
+        const fg = if (selected) ui.color.text else ui.color.text_dim;
+        const max_title = 32;
+        ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, max_title)], fg);
+        var tag: [16]u8 = undefined;
+        const tag_txt = if (e.chip.len != 0)
+            std.fmt.bufPrint(&tag, "{s} {s}", .{ e.chip, e.region }) catch e.region
+        else
+            e.region;
+        ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(tag_txt))), y, tag_txt, ui.color.text_dim);
+    }
+
+    if (scanning_left) |left| {
+        var foot: [40]u8 = undefined;
+        const t = std.fmt.bufPrint(&foot, "SCANNING... {d} LEFT", .{left}) catch "";
+        ui.drawText(&surf, 8, 212, t, ui.color.accent);
+    } else {
+        ui.drawText(&surf, 8, 212, "ENTER/A PLAY  ESC/B QUIT", ui.color.text_dim);
+    }
+}
+
+test "library screen: every state draws without out-of-bounds writes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const canvas = try a.create([256 * 224]u16);
+    var lib: library.Library = .{ .gpa = a };
+    // Onboarding, empty-result, and scanning states.
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, true, null);
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, null);
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, 42);
+    // A list longer than the window, cursor at the end, scrolled.
+    for (0..40) |i| {
+        var name: [16]u8 = undefined;
+        try lib.entries.append(a, .{
+            .path = "x",
+            .title = try a.dupe(u8, std.fmt.bufPrint(&name, "GAME {d}", .{i}) catch "G"),
+            .region = "NTSC",
+            .chip = if (i % 3 == 0) "SA-1" else "",
+        });
+    }
+    drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null);
 }
 
 /// Is `frame` one of the moments we were asked to capture? An empty list means

@@ -20,6 +20,7 @@ pub const Config = struct {
     video: Video = .{},
     audio: Audio = .{},
     rewind: RewindCfg = .{},
+    library: LibraryCfg = .{},
     input: input.InputConfig = .{},
 
     pub const Video = struct {
@@ -44,6 +45,13 @@ pub const Config = struct {
     pub fn effectiveRewindBudgetMib(self: Config) u32 {
         return std.math.clamp(self.rewind.budget_mib, 8, 1024);
     }
+
+    pub const LibraryCfg = struct {
+        /// Directories scanned (recursively) for .sfc/.smc when the app
+        /// launches with no ROM argument. Edited by hand for now, e.g.
+        /// `.rom_dirs = .{ "D:\\Games\\Snes Games" }`.
+        rom_dirs: []const []const u8 = &.{},
+    };
 
     /// `video.scale` with the same validation `--scale` gets at parse time —
     /// a hand-edited out-of-range value warns and falls back rather than
