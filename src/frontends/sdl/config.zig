@@ -12,12 +12,14 @@
 //! settings.
 
 const std = @import("std");
+const input = @import("input.zig");
 
 pub const Config = struct {
     /// For future semantic migrations; unknown *fields* are already tolerated.
     version: u32 = 1,
     video: Video = .{},
     audio: Audio = .{},
+    input: input.InputConfig = .{},
 
     pub const Video = struct {
         /// Window scale factor, same meaning and 1..8 range as `--scale`.
@@ -93,10 +95,13 @@ test "config: a fully populated config survives the roundtrip" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cfg: Config = .{
+    var cfg: Config = .{
         .video = .{ .scale = 5, .shader = "crt-royale" },
         .audio = .{ .enabled = false },
     };
+    cfg.input.p1_keys.b = "space";
+    cfg.input.hotkeys.fast_forward = "key:tab";
+    cfg.input.swap_pads = true;
     const back = try parseText(a, try serializeText(a, cfg));
     try std.testing.expectEqualDeep(cfg, back);
 }
