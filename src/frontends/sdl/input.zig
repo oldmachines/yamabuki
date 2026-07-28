@@ -185,6 +185,43 @@ pub fn parsePadToken(tok: []const u8) ?Binding {
     return null;
 }
 
+fn padButtonName(code: u8) ?[]const u8 {
+    for (pad_button_names) |b| {
+        if (b.code == code) return b.name;
+    }
+    return null;
+}
+
+fn axisName(code: u8) ?[]const u8 {
+    for (axis_names) |a| {
+        if (a.code == code) return a.name;
+    }
+    return null;
+}
+
+/// The reverse of the map-token grammar, for the remap capture: a key by
+/// name (or `#N` when unnamed — capture must never produce an unparseable
+/// config), a pad button by name, a half-axis with its sign.
+pub fn formatMapToken(gpa: std.mem.Allocator, b: Binding) ![]const u8 {
+    return switch (b) {
+        .key => |code| if (keyName(code)) |n| n else std.fmt.allocPrint(gpa, "#{d}", .{code}),
+        .pad_button => |code| padButtonName(code) orelse std.fmt.allocPrint(gpa, "#{d}", .{code}),
+        .pad_axis => |ax| std.fmt.allocPrint(gpa, "{c}{s}", .{
+            @as(u8, if (ax.positive) '+' else '-'),
+            axisName(ax.axis) orelse "leftx",
+        }),
+    };
+}
+
+/// The reverse of the hotkey-token grammar.
+pub fn formatHotkeyToken(gpa: std.mem.Allocator, b: Binding) ![]const u8 {
+    return switch (b) {
+        .key => std.fmt.allocPrint(gpa, "key:{s}", .{try formatMapToken(gpa, b)}),
+        .pad_button => std.fmt.allocPrint(gpa, "pad:{s}", .{try formatMapToken(gpa, b)}),
+        .pad_axis => std.fmt.allocPrint(gpa, "axis:{s}", .{try formatMapToken(gpa, b)}),
+    };
+}
+
 /// A hotkey token carries its device: `key:f5`, `pad:guide`, `axis:+rt`.
 pub fn parseHotkeyToken(tok: []const u8) ?Binding {
     if (std.mem.startsWith(u8, tok, "key:")) {
@@ -280,10 +317,10 @@ pub const MapStrings = struct {
 };
 
 pub const HotkeyStrings = struct {
-    /// PR 3 turns this into the overlay menu; until then it quits, exactly
-    /// as Esc always has. Deliberately *not* bound to pad start+select or
-    /// guide yet — a bare "quit" on those would eat real gameplay input.
-    menu: []const u8 = "key:escape",
+    /// Opens the overlay menu (which is where quitting lives now). The
+    /// guide button is safe to bind by default because no SNES game can
+    /// see it; start+select stays unbound so games that ask for it keep it.
+    menu: []const u8 = "key:escape pad:guide",
     fast_forward: []const u8 = "key:tab axis:+rt",
     pause: []const u8 = "key:p",
     save_state: []const u8 = "key:f5",
@@ -421,6 +458,16 @@ pub const State = struct {
 
     pub fn ffHeld(self: *const State) bool {
         return self.ff_key or self.ff_axis;
+    }
+
+    /// Drop everything held but keep the pad slots: the overlay menu eats
+    /// the release events while it is open, so anything still "down" when
+    /// it opened would stay down forever without this.
+    pub fn clearTransient(self: *State) void {
+        self.masks = .{ 0, 0 };
+        self.axis_on = @splat(@splat(@splat(false)));
+        self.ff_key = false;
+        self.ff_axis = false;
     }
 
     /// Feed one event through the bindings. Returns at most one action —
@@ -737,6 +784,31 @@ test "input: swap_pads reverses slot assignment order" {
 
     try testing.expectEqual(Action{ .pad_opened = .{ .pad = 1, .slot = 1 } }, st.handle(&r, .{ .pad_added = .{ .pad = 1 } }));
     try testing.expectEqual(Action{ .pad_opened = .{ .pad = 2, .slot = 0 } }, st.handle(&r, .{ .pad_added = .{ .pad = 2 } }));
+}
+
+test "input: capture tokens roundtrip through the parser" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Named key, unnamed key, pad button, both axis signs.
+    try testing.expectEqualStrings("z", try formatMapToken(a, .{ .key = 29 }));
+    try testing.expectEqualStrings("#105", try formatMapToken(a, .{ .key = 105 }));
+    try testing.expectEqual(@as(?u32, 105), parseKeyName("#105"));
+    try testing.expectEqualStrings("south", try formatMapToken(a, .{ .pad_button = 0 }));
+    try testing.expectEqualStrings("+rt", try formatMapToken(a, .{ .pad_axis = .{ .axis = 5, .positive = true } }));
+    try testing.expectEqualStrings("-lefty", try formatMapToken(a, .{ .pad_axis = .{ .axis = 1, .positive = false } }));
+
+    // Every hotkey form parses back to the binding it came from.
+    const samples = [_]Binding{
+        .{ .key = 62 },
+        .{ .pad_button = 5 },
+        .{ .pad_axis = .{ .axis = 4, .positive = true } },
+    };
+    for (samples) |b| {
+        const tok = try formatHotkeyToken(a, b);
+        try testing.expectEqual(b, parseHotkeyToken(tok).?);
+    }
 }
 
 test "input: unknown tokens are skipped with the rest of the list intact" {

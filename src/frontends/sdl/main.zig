@@ -117,8 +117,10 @@ pub fn main(init: std.process.Init) !void {
     // Interactive runs only: an unattended `--frames N` run is CI's smoke
     // mode, and its golden hashes must not depend on this machine's settings.
     var cfg: config.Config = .{};
+    var config_path: ?[]const u8 = null;
     if (args.frames == 0) {
         if (paths.Paths.init(gpa)) |p| {
+            config_path = p.config;
             switch (config.load(io, gpa, p.config)) {
                 .loaded => |c| cfg = c,
                 // First run: write the defaults so the file exists to be
@@ -213,6 +215,8 @@ pub fn main(init: std.process.Init) !void {
         .shot_frames = args.shot_frames,
         .wide = args.wide,
         .bindings = input.resolve(&cfg.input, err),
+        .cfg = &cfg,
+        .config_path = config_path,
     }, err, out);
 }
 
@@ -282,12 +286,14 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
 }
 
 test {
-    // The session module (and, through it, the shared helpers) carries its
-    // own tests — `wantsShot`, the config roundtrips, the input model.
-    // Reference them so the `sdl_main_tests` build keeps collecting them
-    // from this root.
+    // Every UI module carries its own tests; reference each one explicitly
+    // so the `sdl_main_tests` build collects them from this root — an
+    // import alone does not analyze a file's test declarations.
     _ = app;
     _ = config;
     _ = input;
     _ = paths;
+    _ = @import("menu.zig");
+    _ = @import("ui.zig");
+    _ = @import("font.zig");
 }
