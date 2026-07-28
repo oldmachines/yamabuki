@@ -146,6 +146,18 @@ pub const Api = struct {
     SDL_DelayNS: *const fn (ns: u64) callconv(.c) void,
 };
 
+/// The persistence entry points, resolved separately from `Api` on the same
+/// reasoning as `GlApi`: everything here exists since 3.2.0, but keeping the
+/// required table frozen keeps `SdlTooOld` meaning exactly "this is not
+/// SDL3". A failure here costs the user persistence (config, saves), never
+/// the emulator.
+pub const ExtApi = struct {
+    /// Returns a malloc'd, separator-terminated per-user data directory
+    /// (created if absent); free with `SDL_free`.
+    SDL_GetPrefPath: *const fn (org: [*:0]const u8, app: [*:0]const u8) callconv(.c) ?[*:0]u8,
+    SDL_free: *const fn (mem: ?*anyopaque) callconv(.c) void,
+};
+
 /// The GL entry points, resolved separately from `Api` and on demand.
 ///
 /// Keeping these out of the required table matters: a build of SDL3 without a
@@ -214,4 +226,10 @@ pub fn load() LoadError!Api {
 /// Resolve the GL entry points. Callers treat any error as "no shader support".
 pub fn loadGl() LoadError!GlApi {
     return resolve(GlApi, try open());
+}
+
+/// Resolve the persistence entry points. Callers treat any error as "no
+/// per-user data directory".
+pub fn loadExt() LoadError!ExtApi {
+    return resolve(ExtApi, try open());
 }
