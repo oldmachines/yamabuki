@@ -339,7 +339,11 @@ test "dirpicker: rows are USE THIS FOLDER, .., then entries; activate descends a
     defer arena.deinit();
     const a = arena.allocator();
 
-    const root = ".dirpicker-test-nav";
+    // Leading "./" so a bare relative name still has a POSIX dirname (real
+    // sessions always start from "/" or a drive, which always do) — canGoUp()
+    // is hardcoded true on Windows but POSIX derives it from the path string,
+    // and a bare name with no separator has none.
+    const root = "./.dirpicker-test-nav";
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root ++ "/sub");
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -371,7 +375,9 @@ test "dirpicker: SHOW HIDDEN FOLDERS is always the last row and toggling re-filt
     defer arena.deinit();
     const a = arena.allocator();
 
-    const root = ".dirpicker-test-toggle";
+    // "./" prefix: see the nav test above — canGoUp() needs a real POSIX
+    // dirname, which a bare relative name doesn't have.
+    const root = "./.dirpicker-test-toggle";
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root ++ "/.git");
     try std.Io.Dir.cwd().createDirPath(io, root ++ "/visible");
@@ -414,7 +420,9 @@ test "dirpicker: activating an at_root entry survives descend() freeing that ent
     defer arena.deinit();
     const a = arena.allocator();
 
-    const root = ".dirpicker-test-aliasing";
+    // "./" prefix: see the nav test above — canGoUp() needs a real POSIX
+    // dirname, which a bare relative name doesn't have.
+    const root = "./.dirpicker-test-aliasing";
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root ++ "/child");
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
