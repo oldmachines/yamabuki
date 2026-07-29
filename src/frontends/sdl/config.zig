@@ -31,8 +31,19 @@ pub const Config = struct {
         /// Window scale factor, same meaning and 1..8 range as `--scale`.
         scale: u32 = 3,
         /// Shader preset name, same meaning as `--shader`; null = software blit.
+        /// The struct default stays null — an unattended `--frames N` run
+        /// skips the config file entirely and must never pick up a shader
+        /// (or the GL dependency) CI didn't ask for. Interactive first runs
+        /// get `default_shader` instead; see main.zig's config-load switch.
         shader: ?[]const u8 = null,
     };
+
+    /// Seeded into a brand-new `config.zon` so a fresh install has a shader
+    /// (and working `,`/`.` cycling) out of the box instead of silently
+    /// landing on the software blit. Handheld tier: cheap enough to run on
+    /// weak GPUs too. An existing config's explicit choice (including an
+    /// explicit `null`) always wins over this.
+    pub const default_shader: []const u8 = "crt-easymode";
 
     pub const Audio = struct {
         enabled: bool = true,
@@ -52,10 +63,28 @@ pub const Config = struct {
 
     pub const LibraryCfg = struct {
         /// Directories scanned (recursively) for .sfc/.smc when the app
-        /// launches with no ROM argument. Edited by hand for now, e.g.
-        /// `.rom_dirs = .{ "D:\\Games\\Snes Games" }`.
+        /// launches with no ROM argument. Editable by hand, e.g.
+        /// `.rom_dirs = .{ "D:\\Games\\Snes Games" }`, or from the library
+        /// screen's in-app folder picker (`addRomDir`).
         rom_dirs: []const []const u8 = &.{},
+        /// The in-app folder browser's "USE THIS FOLDER"/`..`/entries list
+        /// hides dot-directories by default (a fresh profile is dozens of
+        /// tool dotdirs deep before the first ROM folder); this shows them.
+        show_hidden_folders: bool = false,
     };
+
+    /// Append `dir` to `library.rom_dirs`, deduped by exact string match —
+    /// the folder picker's alternative to hand-editing the array. A no-op if
+    /// `dir` is already present.
+    pub fn addRomDir(self: *Config, gpa: std.mem.Allocator, dir: []const u8) !void {
+        for (self.library.rom_dirs) |d| {
+            if (std.mem.eql(u8, d, dir)) return;
+        }
+        const grown = try gpa.alloc([]const u8, self.library.rom_dirs.len + 1);
+        @memcpy(grown[0..self.library.rom_dirs.len], self.library.rom_dirs);
+        grown[self.library.rom_dirs.len] = try gpa.dupe(u8, dir);
+        self.library.rom_dirs = grown;
+    }
 
     pub const PerGame = struct {
         game_id: []const u8,
@@ -195,6 +224,22 @@ test "config: unknown fields are ignored, known siblings still land" {
     );
     try std.testing.expectEqual(@as(u32, 2), cfg.video.scale);
     try std.testing.expectEqual(true, cfg.audio.enabled);
+}
+
+test "config: addRomDir appends and dedupes exact matches" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cfg: Config = .{};
+    try cfg.addRomDir(a, "D:\\Games\\Snes Games");
+    try std.testing.expectEqual(@as(usize, 1), cfg.library.rom_dirs.len);
+    try cfg.addRomDir(a, "D:\\Games\\Snes Games");
+    try std.testing.expectEqual(@as(usize, 1), cfg.library.rom_dirs.len);
+    try cfg.addRomDir(a, "/home/user/roms");
+    try std.testing.expectEqual(@as(usize, 2), cfg.library.rom_dirs.len);
+    try std.testing.expectEqualStrings("D:\\Games\\Snes Games", cfg.library.rom_dirs[0]);
+    try std.testing.expectEqualStrings("/home/user/roms", cfg.library.rom_dirs[1]);
 }
 
 test "config: garbage is an error, not a crash" {

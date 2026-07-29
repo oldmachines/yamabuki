@@ -131,11 +131,16 @@ pub fn main(init: std.process.Init) !void {
             config_path = p.config;
             switch (config.load(io, gpa, p.config)) {
                 .loaded => |c| cfg = c,
-                // First run: write the defaults so the file exists to be
-                // discovered and edited.
-                .missing => config.save(io, gpa, cfg, p.config) catch |e| {
-                    try err.print("warning: cannot write {s}: {s}\n", .{ p.config, @errorName(e) });
-                    try err.flush();
+                // First run: write the defaults — seeded with a shader, so
+                // the file exists to be discovered and edited, and the
+                // in-game menu/`,`/`.` shortcuts work immediately rather
+                // than silently sitting on the software blit.
+                .missing => {
+                    cfg.video.shader = config.Config.default_shader;
+                    config.save(io, gpa, cfg, p.config) catch |e| {
+                        try err.print("warning: cannot write {s}: {s}\n", .{ p.config, @errorName(e) });
+                        try err.flush();
+                    };
                 },
                 .invalid => {
                     try err.print("warning: {s} is not valid ZON — using defaults (file left untouched)\n", .{p.config});
@@ -171,7 +176,8 @@ pub fn main(init: std.process.Init) !void {
             sdl,
             args.scale orelse cfg.effectiveScale(err),
             &lib,
-            cfg.library.rom_dirs,
+            &cfg,
+            config_path,
             if (user_paths) |p| p.library else null,
             err,
         ) orelse break;

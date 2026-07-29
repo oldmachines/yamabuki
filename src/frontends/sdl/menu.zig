@@ -361,6 +361,31 @@ pub const Menu = struct {
     }
 };
 
+fn keyToNav(scancode: u32) ?NavEvent {
+    return switch (scancode) {
+        82 => .up,
+        81 => .down,
+        80 => .left,
+        79 => .right,
+        40 => .confirm, // Enter
+        41 => .back, // Esc
+        else => null,
+    };
+}
+
+fn padButtonToNav(button: u8) ?NavEvent {
+    return switch (button) {
+        11 => .up,
+        12 => .down,
+        13 => .left,
+        14 => .right,
+        0 => .confirm, // south
+        1 => .back, // east
+        6 => .close, // start
+        else => null,
+    };
+}
+
 /// The menu's own navigation map — deliberately FIXED, not the config's
 /// bindings: whatever a remap does, arrows/Enter/Esc and dpad/south/east
 /// still steer the menu, so a bad config can always be repaired from
@@ -369,32 +394,98 @@ pub fn navFromEvent(ev: input.Ev) ?NavEvent {
     switch (ev) {
         .key => |k| {
             if (!k.down or k.repeat) return null;
-            return switch (k.scancode) {
-                82 => .up,
-                81 => .down,
-                80 => .left,
-                79 => .right,
-                40 => .confirm, // Enter
-                41 => .back, // Esc
-                else => null,
-            };
+            return keyToNav(k.scancode);
         },
         .pad_button => |pb| {
             if (!pb.down) return null;
-            return switch (pb.button) {
-                11 => .up,
-                12 => .down,
-                13 => .left,
-                14 => .right,
-                0 => .confirm, // south
-                1 => .back, // east
-                6 => .close, // start
-                else => null,
-            };
+            return padButtonToNav(pb.button);
         },
         else => return null,
     }
 }
+
+/// Turns a held Up/Down into repeated `NavEvent`s, so a list is browsed by
+/// holding the key/button instead of tapping it repeatedly — for keyboard
+/// (SDL's own OS repeat is ignored here in favor of this, so behavior
+/// matches the gamepad exactly) and gamepad alike (pads never generate
+/// repeat events on their own). Only Up/Down repeat: Left/Right double as
+/// value-adjust or toggle rows in several pages, where repeating on a hold
+/// would flap a boolean back and forth rather than scroll a list.
+///
+/// Driven by the *raw* input events rather than by `NavEvent` alone, so
+/// release is tracked against the exact key/button that started the hold —
+/// releasing an unrelated key can never cut a hold short.
+pub const Repeater = struct {
+    held: ?Held = null,
+    frames_left: u32 = 0,
+
+    const Held = union(enum) {
+        key: struct { scancode: u32, nav: NavEvent },
+        pad: struct { pad: u32, button: u8, nav: NavEvent },
+    };
+
+    /// ~333ms at 60Hz before the first repeat, then one every ~100ms.
+    const initial_delay_frames: u32 = 20;
+    const repeat_frames: u32 = 6;
+
+    fn repeatable(nav: NavEvent) bool {
+        return switch (nav) {
+            .up, .down => true,
+            else => false,
+        };
+    }
+
+    /// Feed every raw input event, in addition to routing it through
+    /// `navFromEvent` as before — this only tracks hold state, it never
+    /// substitutes for the immediate first press.
+    pub fn feed(self: *Repeater, ev: input.Ev) void {
+        switch (ev) {
+            .key => |k| {
+                if (k.repeat) return; // this struct generates its own repeats
+                const nav = keyToNav(k.scancode) orelse return;
+                if (!repeatable(nav)) return;
+                if (k.down) {
+                    self.held = .{ .key = .{ .scancode = k.scancode, .nav = nav } };
+                    self.frames_left = initial_delay_frames;
+                } else if (self.held) |h| switch (h) {
+                    .key => |hk| if (hk.scancode == k.scancode) {
+                        self.held = null;
+                    },
+                    .pad => {},
+                };
+            },
+            .pad_button => |pb| {
+                const nav = padButtonToNav(pb.button) orelse return;
+                if (!repeatable(nav)) return;
+                if (pb.down) {
+                    self.held = .{ .pad = .{ .pad = pb.pad, .button = pb.button, .nav = nav } };
+                    self.frames_left = initial_delay_frames;
+                } else if (self.held) |h| switch (h) {
+                    .pad => |hp| if (hp.pad == pb.pad and hp.button == pb.button) {
+                        self.held = null;
+                    },
+                    .key => {},
+                };
+            },
+            else => {},
+        }
+    }
+
+    /// Call once per rendered frame. Returns a synthetic `NavEvent` on the
+    /// frame a hold crosses the initial delay, then every `repeat_frames`
+    /// after that — null otherwise.
+    pub fn tick(self: *Repeater) ?NavEvent {
+        const h = self.held orelse return null;
+        if (self.frames_left == 0) return null;
+        self.frames_left -= 1;
+        if (self.frames_left != 0) return null;
+        self.frames_left = repeat_frames;
+        return switch (h) {
+            .key => |k| k.nav,
+            .pad => |p| p.nav,
+        };
+    }
+};
 
 /// Cycle an optional override: forward null -> first -> second -> null;
 /// backward reversed. Works for ?enum{a,b} and ?bool alike.
@@ -640,6 +731,58 @@ test "menu: per-game page cycles overrides and reports dirty" {
     try testing.expectEqual(@as(?bool, true), cfg.perGame("aaaa-test").?.rewind);
     _ = m.handleNav(&cfg, .right, ctx);
     try testing.expectEqual(@as(?bool, false), cfg.perGame("aaaa-test").?.rewind);
+}
+
+test "Repeater: a held Down fires after the initial delay, then on a steady beat" {
+    var r = Repeater{};
+    try testing.expectEqual(@as(?NavEvent, null), r.tick()); // nothing held yet
+
+    r.feed(.{ .key = .{ .scancode = 81, .down = true, .repeat = false } }); // Down
+    for (0..Repeater.initial_delay_frames - 1) |_| try testing.expectEqual(@as(?NavEvent, null), r.tick());
+    try testing.expectEqual(@as(?NavEvent, .down), r.tick());
+    for (0..Repeater.repeat_frames - 1) |_| try testing.expectEqual(@as(?NavEvent, null), r.tick());
+    try testing.expectEqual(@as(?NavEvent, .down), r.tick());
+
+    r.feed(.{ .key = .{ .scancode = 81, .down = false, .repeat = false } });
+    try testing.expectEqual(@as(?NavEvent, null), r.tick());
+}
+
+test "Repeater: OS key-repeat events are ignored, not double-counted" {
+    var r = Repeater{};
+    r.feed(.{ .key = .{ .scancode = 82, .down = true, .repeat = false } }); // Up
+    r.feed(.{ .key = .{ .scancode = 82, .down = true, .repeat = true } }); // OS repeat, ignored
+    r.feed(.{ .key = .{ .scancode = 82, .down = true, .repeat = true } });
+    for (0..Repeater.initial_delay_frames - 1) |_| try testing.expectEqual(@as(?NavEvent, null), r.tick());
+    try testing.expectEqual(@as(?NavEvent, .up), r.tick());
+}
+
+test "Repeater: releasing a different key never cuts a hold short" {
+    var r = Repeater{};
+    r.feed(.{ .key = .{ .scancode = 81, .down = true, .repeat = false } }); // Down held
+    r.feed(.{ .key = .{ .scancode = 79, .down = true, .repeat = false } }); // Right tapped...
+    r.feed(.{ .key = .{ .scancode = 79, .down = false, .repeat = false } }); // ...and released
+    for (0..Repeater.initial_delay_frames - 1) |_| _ = r.tick();
+    try testing.expectEqual(@as(?NavEvent, .down), r.tick()); // Down is still held
+}
+
+test "Repeater: Left/Right and Confirm/Back never repeat" {
+    var r = Repeater{};
+    r.feed(.{ .key = .{ .scancode = 80, .down = true, .repeat = false } }); // Left
+    for (0..200) |_| try testing.expectEqual(@as(?NavEvent, null), r.tick());
+
+    r.feed(.{ .pad_button = .{ .pad = 0, .button = 0, .down = true } }); // south = confirm
+    for (0..200) |_| try testing.expectEqual(@as(?NavEvent, null), r.tick());
+}
+
+test "Repeater: a pad button repeats and is released by the same pad+button only" {
+    var r = Repeater{};
+    r.feed(.{ .pad_button = .{ .pad = 0, .button = 11, .down = true } }); // up
+    r.feed(.{ .pad_button = .{ .pad = 1, .button = 11, .down = false } }); // different pad, same button
+    for (0..Repeater.initial_delay_frames - 1) |_| _ = r.tick();
+    try testing.expectEqual(@as(?NavEvent, .up), r.tick());
+
+    r.feed(.{ .pad_button = .{ .pad = 0, .button = 11, .down = false } });
+    try testing.expectEqual(@as(?NavEvent, null), r.tick());
 }
 
 test "menu: capture times out back to browsing" {
