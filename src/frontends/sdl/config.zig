@@ -31,8 +31,19 @@ pub const Config = struct {
         /// Window scale factor, same meaning and 1..8 range as `--scale`.
         scale: u32 = 3,
         /// Shader preset name, same meaning as `--shader`; null = software blit.
+        /// The struct default stays null — an unattended `--frames N` run
+        /// skips the config file entirely and must never pick up a shader
+        /// (or the GL dependency) CI didn't ask for. Interactive first runs
+        /// get `default_shader` instead; see main.zig's config-load switch.
         shader: ?[]const u8 = null,
     };
+
+    /// Seeded into a brand-new `config.zon` so a fresh install has a shader
+    /// (and working `,`/`.` cycling) out of the box instead of silently
+    /// landing on the software blit. Handheld tier: cheap enough to run on
+    /// weak GPUs too. An existing config's explicit choice (including an
+    /// explicit `null`) always wins over this.
+    pub const default_shader: []const u8 = "crt-easymode";
 
     pub const Audio = struct {
         enabled: bool = true,
