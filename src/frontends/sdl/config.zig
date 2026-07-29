@@ -56,6 +56,10 @@ pub const Config = struct {
         /// `.rom_dirs = .{ "D:\\Games\\Snes Games" }`, or from the library
         /// screen's in-app folder picker (`addRomDir`).
         rom_dirs: []const []const u8 = &.{},
+        /// The in-app folder browser's "USE THIS FOLDER"/`..`/entries list
+        /// hides dot-directories by default (a fresh profile is dozens of
+        /// tool dotdirs deep before the first ROM folder); this shows them.
+        show_hidden_folders: bool = false,
     };
 
     /// Append `dir` to `library.rom_dirs`, deduped by exact string match —

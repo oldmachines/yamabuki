@@ -317,6 +317,10 @@ pub fn run(
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
+    // Hold-to-scroll for the menu's Up/Down; reset whenever the menu isn't
+    // open so a key held from before it opened (or from gameplay) can never
+    // carry a repeat in.
+    var repeater: menu.Repeater = .{};
     // The overlay composes into this and the normal video path presents it —
     // so the CRT shader shades the menu too. Sized for the largest frame the
     // PPU produces (512-wide hi-res, 239-line overscan).
@@ -332,7 +336,7 @@ pub fn run(
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
 
     while (running) {
-        if (mnu) |*m| m.tick();
+        if (mnu) |*m| m.tick() else repeater = .{};
         var ev: sdl3.Event = undefined;
         while (sdl.SDL_PollEvent(&ev)) {
             if (ev.type == sdl3.event_quit) {
@@ -389,6 +393,7 @@ pub fn run(
             }
 
             if (mnu) |*m| {
+                repeater.feed(nev);
                 // Menu path: raw events feed a pending capture; otherwise
                 // the fixed navigation map steers.
                 const mctx: menu.Ctx = .{
@@ -516,6 +521,20 @@ pub fn run(
                 .pad_opened, .pad_closed => unreachable,
             }
         }
+
+        // A held Up/Down keeps scrolling the menu without a fresh keypress
+        // per row; never during a remap capture, where a raw held key is
+        // being bound instead. Up/Down only ever move a cursor, so the
+        // Request this produces is always .none — .up/.down never adjust a
+        // value or toggle anything.
+        if (mnu) |*m| if (!m.capturing()) if (repeater.tick()) |nav| {
+            const mctx: menu.Ctx = .{
+                .gpa = gpa,
+                .game_id = opts.game_id,
+                .shader_name = if (glv) |g| g.names[g.index] else null,
+            };
+            std.debug.assert(m.handleNav(opts.cfg, nav, mctx) == .none);
+        };
 
         // Holding rewind freezes forward time and steps history back one
         // capture per displayed frame (~real-time backwards); at the end
@@ -788,6 +807,8 @@ pub fn runLibrary(
     var cursor: usize = 0;
     var scroll: usize = 0;
     const visible_rows = 17;
+    // Hold-to-scroll for both the game list and the folder browser.
+    var repeater: menu.Repeater = .{};
 
     // Row 0 of the list is always the ADD ROM FOLDER action, so the browser
     // never depends on a hand-edited config.zon. `.picker` owns the folder
@@ -822,6 +843,7 @@ pub fn runLibrary(
                 },
                 else => continue,
             };
+            repeater.feed(nev);
             const n = switch (mode) {
                 .list => lib.entries.items.len + 1,
                 .picker => picker.?.rowCount(),
@@ -839,7 +861,7 @@ pub fn runLibrary(
                 },
                 .confirm => switch (mode) {
                     .list => if (cursor == 0) {
-                        picker = dirpicker.Picker.init(gpa, io);
+                        picker = dirpicker.Picker.init(gpa, io, cfg.library.show_hidden_folders);
                         mode = .picker;
                         cursor = 0;
                         scroll = 0;
@@ -860,6 +882,16 @@ pub fn runLibrary(
                             cursor = 0;
                             scroll = 0;
                         },
+                        .toggled_hidden => |show| {
+                            cfg.library.show_hidden_folders = show;
+                            if (config_path) |p| config.save(io, gpa, cfg.*, p) catch |e| {
+                                err.print("warning: cannot write {s}: {s}\n", .{ p, @errorName(e) }) catch {};
+                                err.flush() catch {};
+                            };
+                            // Cursor stays put (the toggle row you just
+                            // pressed); the post-poll clamp below catches it
+                            // if the re-filtered listing got shorter.
+                        },
                         .none => {
                             cursor = 0;
                             scroll = 0;
@@ -876,6 +908,24 @@ pub fn runLibrary(
                         scroll = 0;
                     },
                 },
+            }
+        }
+
+        // A held Up/Down keeps scrolling without a fresh keypress per row —
+        // .up/.down only ever move `cursor` here, same as a real press.
+        if (repeater.tick()) |nav| {
+            const n = switch (mode) {
+                .list => lib.entries.items.len + 1,
+                .picker => picker.?.rowCount(),
+            };
+            switch (nav) {
+                .up => if (n != 0) {
+                    cursor = if (cursor == 0) n - 1 else cursor - 1;
+                },
+                .down => if (n != 0) {
+                    cursor = if (cursor + 1 >= n) 0 else cursor + 1;
+                },
+                else => {},
             }
         }
 
@@ -995,6 +1045,11 @@ fn drawPickerScreen(
         if (selected) ui.drawText(&surf, 2, y, ">", ui.color.accent);
         const fg = if (selected) ui.color.text else ui.color.text_dim;
         ui.drawText(&surf, 10, y, pk.rowLabel(i), fg);
+        const value = pk.rowValue(i);
+        if (value.len != 0) {
+            const vx = 248 - @as(i32, @intCast(ui.textWidth(value)));
+            ui.drawText(&surf, vx, y, value, fg);
+        }
     }
 
     if (pk.err_msg) |msg| {
