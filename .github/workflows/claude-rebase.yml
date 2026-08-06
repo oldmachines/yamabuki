@@ -40,7 +40,9 @@ jobs:
           github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           # A prior merge to main (usually by the auto-merge bot) is what makes
           # these stale; allow the agent to run on this bot-driven trigger.
-          allowed_bots: "claude"
+          # Scheduled runs are attributed to the system actor `github-actions`,
+          # which also needs to be allowed or the action refuses to start.
+          allowed_bots: "claude,github-actions"
           claude_args: >-
             --max-turns 80
             --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(gh api:*),Bash(git:*),Read,Glob,Grep,Edit,Write"
