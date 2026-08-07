@@ -248,6 +248,10 @@ fn setPage(pages: *WramPages, idx: u16) void {
     pages[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
 }
 
+fn getPage(pages: WramPages, idx: u16) bool {
+    return pages[idx / 64] & (@as(u64, 1) << @intCast(idx % 64)) != 0;
+}
+
 /// Do two routines' WRAM footprints share a page? Moving one of them to the
 /// SA-1 would strand the other's state on the wrong side of the bus.
 pub fn pagesOverlap(a: WramPages, b: WramPages) bool {
@@ -1466,6 +1470,258 @@ pub fn assessConversion(prof: *const Profiler, verdict: Verdict) Conversion {
     return out;
 }
 
+// --- stage S2: the relocation planner -------------------------------------------
+
+/// Where a relocated region lands on the SA-1 side. Both destinations are
+/// visible to BOTH CPUs — I-RAM through the $3000-$37FF window, BW-RAM
+/// through banks $40+ and the $6000 window — which is what makes "shared
+/// with resident code" a re-pointing cost instead of a hard blocker: the
+/// state moves once and both sides are rewritten to the new address.
+pub const PlanDest = enum { iram, bwram };
+
+/// One relocatable region of WRAM state and its assigned destination.
+pub const PlanRegion = struct {
+    /// Linear WRAM offset and byte length. For exact footprints this is a
+    /// gap-merged run of touched addresses (the span is reserved — holes
+    /// inside a struct are still part of it); for page-bound footprints it
+    /// is whole 256-byte pages, an upper bound.
+    start: u32,
+    len: u32,
+    exact: bool,
+    /// Sum of the slow-frame cycles of the hot-set routines touching this
+    /// region — the placement priority.
+    heat: u64,
+    dest: PlanDest,
+    /// Offset within the destination memory. I-RAM offsets are CPU address
+    /// $3000+off (SA-1 side $0000+off); BW-RAM offsets are $40:0000+off.
+    dest_off: u32,
+    /// Direct-page state (WRAM $0000-$00FF): placed in I-RAM at its own
+    /// offset, so the whole dp window relocates by setting D=$3000 on the
+    /// SA-1 and every dp operand stays byte-identical.
+    dp: bool,
+    /// Code OUTSIDE the hot set also touches this region: the resident side
+    /// must be re-pointed too (both memories are dual-visible, so this is
+    /// rewrite work, not a refusal).
+    shared_outside: bool,
+    /// A DMA/HDMA the hot set arms reads through this region, so it must be
+    /// linearly addressable on the A-bus: forced to BW-RAM.
+    dma_fed: bool,
+};
+
+pub const plan_region_cap: usize = 96;
+/// Exact-run grouping: touched addresses closer than this belong to the
+/// same struct/array as far as a plan is concerned.
+pub const plan_gap_merge: u32 = 16;
+
+pub const Plan = struct {
+    regions: [plan_region_cap]PlanRegion = undefined,
+    n: usize = 0,
+    /// True when the conversion verdict gave the planner a hot set to work
+    /// with at all; false mirrors the `conversion:` line's own answer.
+    viable: bool = false,
+    iram_used: u32 = 0,
+    bwram_used: u32 = 0,
+    /// Any dp region exists: the SA-1 boots with D=$3000 and I-RAM's first
+    /// page is reserved for the dp window.
+    has_dp: bool = false,
+    /// More regions than the cap; the plan is a prefix, not the whole map.
+    region_overflow: bool = false,
+};
+
+/// Const lookup of a routine slot by entry (the find-or-create `routineSlot`
+/// is for recording; a planner must not mutate).
+fn findRoutineSlot(prof: *const Profiler, entry: u24) ?u16 {
+    var i: usize = (@as(usize, entry) *% 2654435761) % routine_slots;
+    for (0..routine_slots) |_| {
+        const r = &prof.routines[i];
+        if (r.entry == Routine.empty) return null;
+        if (r.entry == entry) return @intCast(i);
+        i = (i + 1) % routine_slots;
+    }
+    return null;
+}
+
+/// Stage S2: fold the conversion verdict's hot set into a concrete
+/// allocation map — which WRAM state moves where. Placement policy, in
+/// order: DMA-fed regions go to BW-RAM (a transfer's A-bus side needs a
+/// linear address; re-pointing the arm is part of the plan); direct-page
+/// regions go to I-RAM at their own offsets (D=$3000 relocates the whole
+/// window with zero operand rewrites — the SMW SA-1 Pack's own trick);
+/// everything else fills I-RAM hottest-first and spills to BW-RAM. The plan
+/// is the hand-off artifact between the analyser and stage S3's mechanical
+/// rewrite — and a map a human conversion author can execute today.
+pub fn planRelocation(prof: *const Profiler, conv: Conversion) Plan {
+    var plan: Plan = .{};
+    if (!conv.warranted or !conv.concentrated or conv.n == 0) return plan;
+    plan.viable = true;
+
+    var slots: [conversion_set_max]u16 = undefined;
+    var n_slots: usize = 0;
+    for (conv.entries[0..conv.n]) |e| {
+        if (findRoutineSlot(prof, e)) |s| {
+            slots[n_slots] = s;
+            n_slots += 1;
+        }
+    }
+
+    // The raw material: exact addresses from exact members, whole pages from
+    // page-bound members.
+    var addrs: [conversion_set_max * wram_addr_cap]u32 = undefined;
+    var n_addrs: usize = 0;
+    var inexact_pages: WramPages = @splat(0);
+    for (slots[0..n_slots]) |slot| {
+        const r = &prof.routines[slot];
+        if (r.wram_overflow) {
+            for (&inexact_pages, r.wram_pages) |*p, rp| p.* |= rp;
+        } else {
+            for (r.wram_addrs[0..r.n_wram_addrs]) |a| {
+                addrs[n_addrs] = a;
+                n_addrs += 1;
+            }
+        }
+    }
+    std.mem.sort(u32, addrs[0..n_addrs], {}, std.sort.asc(u32));
+
+    // Regionize: page runs first (they are already an upper bound), then
+    // gap-merged exact runs, skipping addresses a page region already holds.
+    var start: ?u32 = null;
+    var page: u32 = 0;
+    while (page <= wram_page_count) : (page += 1) {
+        const set = page < wram_page_count and getPage(inexact_pages, @intCast(page));
+        if (set and start == null) start = page * 256;
+        if (!set and start != null) {
+            addRegion(&plan, start.?, page * 256 - start.?, false);
+            start = null;
+        }
+    }
+    var i: usize = 0;
+    while (i < n_addrs) {
+        const a = addrs[i];
+        if (getPage(inexact_pages, pageIndex(a))) {
+            i += 1;
+            continue; // already inside a page region
+        }
+        var end = a;
+        var j = i + 1;
+        while (j < n_addrs) : (j += 1) {
+            const b = addrs[j];
+            if (getPage(inexact_pages, pageIndex(b))) break;
+            if (b - end > plan_gap_merge) break;
+            end = b;
+        }
+        addRegion(&plan, a, end - a + 1, true);
+        i = j;
+    }
+
+    // Attributes: heat, sharing, dp, DMA feed.
+    var outside: WramPages = @splat(0);
+    for (prof.routines, 0..) |r, ri| {
+        if (r.entry == Routine.empty) continue;
+        const in_set = for (slots[0..n_slots]) |slot| {
+            if (slot == ri) break true;
+        } else false;
+        if (!in_set) {
+            for (&outside, r.wram_pages) |*p, rp| p.* |= rp;
+        }
+    }
+    for (plan.regions[0..plan.n]) |*reg| {
+        reg.dp = reg.start < 0x100;
+        var p = pageIndex(reg.start);
+        const p_end = pageIndex(reg.start + reg.len - 1);
+        while (p <= p_end) : (p += 1) {
+            if (getPage(outside, p)) reg.shared_outside = true;
+        }
+        for (slots[0..n_slots]) |slot| {
+            const r = &prof.routines[slot];
+            var touches = false;
+            var q = pageIndex(reg.start);
+            while (q <= p_end) : (q += 1) {
+                if (getPage(r.wram_pages, q)) touches = true;
+            }
+            if (touches) reg.heat += r.slow_cycles;
+            for (r.dma[0..r.n_dma]) |d| {
+                const src = wramOffset(d.src) orelse continue;
+                const span = @max(d.bytes_max, 1);
+                if (src < reg.start + reg.len and src + span > reg.start)
+                    reg.dma_fed = true;
+            }
+        }
+        if (reg.dp) plan.has_dp = true;
+    }
+
+    // Placement. dp regions pin their own offsets in I-RAM (D=$3000 needs
+    // them byte-identical); DMA-fed regions go to BW-RAM; the rest fills
+    // I-RAM hottest-first behind whatever the dp window reserved.
+    var iram_cursor: u32 = 0;
+    var bwram_cursor: u32 = 0;
+    for (plan.regions[0..plan.n]) |*reg| {
+        if (reg.dp and !reg.dma_fed) {
+            reg.dest = .iram;
+            reg.dest_off = reg.start;
+            iram_cursor = @max(iram_cursor, reg.start + reg.len);
+        } else if (reg.dma_fed) {
+            reg.dest = .bwram;
+            reg.dest_off = bwram_cursor;
+            bwram_cursor += reg.len;
+        }
+    }
+    if (plan.has_dp) iram_cursor = @max(iram_cursor, 0x100);
+    // Hottest-first for what remains, by insertion over the small set.
+    var order: [plan_region_cap]usize = undefined;
+    var n_order: usize = 0;
+    for (plan.regions[0..plan.n], 0..) |reg, ri| {
+        if (reg.dp or reg.dma_fed) continue;
+        var k = n_order;
+        while (k > 0 and plan.regions[order[k - 1]].heat < reg.heat) : (k -= 1) {
+            order[k] = order[k - 1];
+        }
+        order[k] = ri;
+        n_order += 1;
+    }
+    for (order[0..n_order]) |ri| {
+        const reg = &plan.regions[ri];
+        if (iram_cursor + reg.len <= iram_bytes) {
+            reg.dest = .iram;
+            reg.dest_off = iram_cursor;
+            iram_cursor += reg.len;
+        } else {
+            reg.dest = .bwram;
+            reg.dest_off = bwram_cursor;
+            bwram_cursor += reg.len;
+        }
+    }
+    plan.iram_used = iram_cursor;
+    plan.bwram_used = bwram_cursor;
+
+    // Stable output order: I-RAM first, then BW-RAM, each by destination.
+    std.mem.sort(PlanRegion, plan.regions[0..plan.n], {}, struct {
+        fn lt(_: void, a: PlanRegion, b: PlanRegion) bool {
+            if (a.dest != b.dest) return a.dest == .iram;
+            return a.dest_off < b.dest_off;
+        }
+    }.lt);
+    return plan;
+}
+
+fn addRegion(plan: *Plan, start: u32, len: u32, exact: bool) void {
+    if (plan.n == plan_region_cap) {
+        plan.region_overflow = true;
+        return;
+    }
+    plan.regions[plan.n] = .{
+        .start = start,
+        .len = len,
+        .exact = exact,
+        .heat = 0,
+        .dest = .bwram,
+        .dest_off = 0,
+        .dp = false,
+        .shared_outside = false,
+        .dma_fed = false,
+    };
+    plan.n += 1;
+}
+
 /// Dropped frames in an unbroken run longer than this are a *stall*, not
 /// slowdown. Slowdown is a game failing to keep up while it is still playing —
 /// it drops one frame in two or one in three, so its runs are short. An unbroken
@@ -2505,4 +2761,109 @@ test "conversion: a shared WRAM page and a WRAM-sourced DMA surface as blockers"
     try std.testing.expect(c.concentrated);
     try std.testing.expect(c.wram_dma);
     try std.testing.expect(c.shared_pages >= 1);
+}
+
+test "plan: exact hot set fills I-RAM hottest-first with gap-merged runs" {
+    var t: Trace = .{};
+    // A (hottest): a 3-address run at $7E:1000 with small gaps -> one region.
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    for (0..60) |i| t.p.step(0x00_A003 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x7E_1000 + @as(u24, @intCast((i % 3) * 8)), null, .{});
+    t.ret(0x00_A200, 0x1FF);
+    // B (cooler): one address in another page.
+    hotCall(&t, 0x00_9006, 0x00_B000, 20, 0x7E_2200, false);
+    lagFrame(&t);
+
+    const conv = assessConversion(&t.p, .cpu_bound);
+    try std.testing.expect(conv.concentrated);
+    const plan = planRelocation(&t.p, conv);
+    try std.testing.expect(plan.viable);
+    try std.testing.expectEqual(@as(usize, 2), plan.n);
+    // Both fit I-RAM; A's run spans $1000..$1010 (17 bytes, gap-merged).
+    for (plan.regions[0..plan.n]) |r| {
+        try std.testing.expectEqual(PlanDest.iram, r.dest);
+        try std.testing.expect(r.exact);
+        try std.testing.expect(!r.dp and !r.shared_outside and !r.dma_fed);
+    }
+    // Hottest-first: A's region (heat 60 steps) gets the lower offset.
+    try std.testing.expectEqual(@as(u32, 0x7E_1000 & 0x1FFFF), plan.regions[0].start);
+    try std.testing.expectEqual(@as(u32, 17), plan.regions[0].len);
+    try std.testing.expectEqual(@as(u32, 0), plan.regions[0].dest_off);
+    try std.testing.expect(plan.regions[0].heat > plan.regions[1].heat);
+    try std.testing.expectEqual(plan.iram_used, plan.regions[1].dest_off + plan.regions[1].len);
+    try std.testing.expectEqual(@as(u32, 0), plan.bwram_used);
+    try std.testing.expect(!plan.has_dp);
+}
+
+test "plan: dp state pins its own I-RAM offsets; DMA-fed state is forced to BW-RAM" {
+    var t: Trace = .{};
+    // Hot routine touches dp ($7E:0040) and arms a GDMA out of $7E:2000.
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    for (0..40) |i| t.p.step(0x00_A003 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x00_0040, null, .{});
+    t.p.noteDmaArm(.gdma, 1, 0x7E_2000, 0x100, 0x18, false, null);
+    for (0..10) |i| t.p.step(0x00_A103 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x7E_2010, null, .{});
+    t.ret(0x00_A200, 0x1FF);
+    lagFrame(&t);
+
+    const conv = assessConversion(&t.p, .cpu_bound);
+    const plan = planRelocation(&t.p, conv);
+    try std.testing.expect(plan.viable);
+    try std.testing.expect(plan.has_dp);
+    try std.testing.expectEqual(@as(usize, 2), plan.n);
+    // The dp region keeps its own offset in I-RAM.
+    const dp_reg = plan.regions[0];
+    try std.testing.expect(dp_reg.dp);
+    try std.testing.expectEqual(PlanDest.iram, dp_reg.dest);
+    try std.testing.expectEqual(@as(u32, 0x40), dp_reg.start);
+    try std.testing.expectEqual(dp_reg.start, dp_reg.dest_off);
+    // The DMA-fed region goes to BW-RAM even though I-RAM has room.
+    const dma_reg = plan.regions[1];
+    try std.testing.expect(dma_reg.dma_fed);
+    try std.testing.expectEqual(PlanDest.bwram, dma_reg.dest);
+    // The dp window reserves I-RAM's first page.
+    try std.testing.expectEqual(@as(u32, 0x100), plan.iram_used);
+}
+
+test "plan: page-bound footprints make page regions and big state spills to BW-RAM" {
+    var t: Trace = .{};
+    // Overflow the exact set: walk 100 distinct WRAM addresses across pages
+    // $7E:30xx-$7E:33xx while on top -> page-granularity footprint.
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    for (0..100) |i| t.p.step(0x00_A003 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x7E_3000 + @as(u24, @intCast(i)) * 10, null, .{});
+    t.ret(0x00_A400, 0x1FF);
+    lagFrame(&t);
+
+    const conv = assessConversion(&t.p, .cpu_bound);
+    const plan = planRelocation(&t.p, conv);
+    try std.testing.expect(plan.viable);
+    try std.testing.expectEqual(@as(usize, 1), plan.n);
+    const reg = plan.regions[0];
+    try std.testing.expect(!reg.exact);
+    try std.testing.expectEqual(@as(u32, 0x3000), reg.start);
+    // 100 addresses stride 10 end at $3000+990: pages $30..$33, 1 KiB.
+    try std.testing.expectEqual(@as(u32, 4 * 256), reg.len);
+    try std.testing.expectEqual(PlanDest.iram, reg.dest); // 1 KiB still fits
+}
+
+test "plan: sharing with resident code is flagged; no plan without a verdict" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    for (0..40) |i| t.p.step(0x00_A003 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x7E_1000, null, .{});
+    t.ret(0x00_A200, 0x1FF);
+    // Cold resident code touches the same page.
+    hotCall(&t, 0x00_9006, 0x00_B000, 1, 0x7E_1080, false);
+    lagFrame(&t);
+
+    const conv = assessConversion(&t.p, .cpu_bound);
+    const plan = planRelocation(&t.p, conv);
+    try std.testing.expect(plan.viable);
+    var found_shared = false;
+    for (plan.regions[0..plan.n]) |r| {
+        if (r.start == 0x1000) found_shared = r.shared_outside;
+    }
+    try std.testing.expect(found_shared);
+
+    // A not-warranted verdict yields no plan, mirroring the conversion line.
+    const no_plan = planRelocation(&t.p, assessConversion(&t.p, .not_cpu_bound));
+    try std.testing.expect(!no_plan.viable);
+    try std.testing.expectEqual(@as(usize, 0), no_plan.n);
 }

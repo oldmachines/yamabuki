@@ -79,6 +79,9 @@ const Args = struct {
     /// profiled run as a bsnes-plus `-usage.bin` file (DiztinGUIsh imports
     /// it). A `--sa1-report` modifier, like `--hot`.
     usage_map_out: ?[]const u8 = null,
+    /// Stage S2: print the relocation plan — the WRAM -> I-RAM/BW-RAM
+    /// allocation map for the conversion verdict's hot set.
+    plan: bool = false,
     /// `--wide N` (M12): extra columns rendered on each side of the standard
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
@@ -126,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
-            \\                         [--usage-map out.bin]
+            \\                         [--plan] [--usage-map out.bin]
             \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
@@ -150,6 +153,9 @@ pub fn main(init: std.process.Init) !void {
             \\  --usage-map f export the profiled run's execution/access coverage as a bsnes-plus
             \\                -usage.bin (code vs data with M/X widths, plus the RAM access map;
             \\                DiztinGUIsh imports it directly)
+            \\  --plan        print the relocation plan for the hot set: which WRAM state moves to
+            \\                SA-1 I-RAM vs BW-RAM, with the dp window, DMA feeds, and sharing
+            \\                called out per region
             \\
         , .{});
         try out.flush();
@@ -695,6 +701,27 @@ fn runReport(
                 try out.print("\"{x:0>2}:{x:0>4}\"", .{ e >> 16, e & 0xFFFF });
             }
             try out.print("]}}", .{});
+            if (args.plan) {
+                const plan = profile.planRelocation(&con.prof, c);
+                try out.print(",\"plan\":{{\"viable\":{},\"iram_used\":{},\"bwram_used\":{}," ++
+                    "\"has_dp\":{},\"overflow\":{},\"regions\":[", .{
+                    plan.viable, plan.iram_used,       plan.bwram_used,
+                    plan.has_dp, plan.region_overflow,
+                });
+                for (plan.regions[0..plan.n], 0..) |r, ri| {
+                    if (ri != 0) try out.print(",", .{});
+                    try out.print(
+                        "{{\"start\":{},\"len\":{},\"exact\":{},\"heat\":{},\"dest\":\"{s}\"," ++
+                            "\"dest_off\":{},\"dp\":{},\"shared\":{},\"dma_fed\":{}}}",
+                        .{
+                            r.start, r.len,            r.exact,
+                            r.heat,  @tagName(r.dest), r.dest_off,
+                            r.dp,    r.shared_outside, r.dma_fed,
+                        },
+                    );
+                }
+                try out.print("]}}", .{});
+            }
         }
         if (args.routines) {
             const rows = try routineRows(gpa, &con.prof);
@@ -806,7 +833,9 @@ fn runReport(
         , .{sum.frames}),
     }
 
-    try printConversion(out, profile.assessConversion(&con.prof, sum.verdict));
+    const conv = profile.assessConversion(&con.prof, sum.verdict);
+    try printConversion(out, conv);
+    if (args.plan) try printPlan(out, profile.planRelocation(&con.prof, conv));
 
     if (args.hot) {
         // Where every cycle went, loop or not.
@@ -1019,6 +1048,59 @@ test "usage-map file layout: block sizes per chip, CPU bytes verbatim" {
         @as(u64, core.usage_map.cpu_map_len + core.usage_map.smp_map_len + (1 << 23)),
         st.size,
     );
+}
+
+/// Stage S2: the relocation plan — where each region of the hot set's WRAM
+/// state lands on the SA-1 side, and what each move costs.
+fn printPlan(out: *std.Io.Writer, plan: core.profile.Plan) !void {
+    if (!plan.viable) {
+        try out.print("\n  relocation plan: none — the conversion verdict above gave the planner no hot set.\n", .{});
+        return;
+    }
+    var total_heat: u64 = 0;
+    for (plan.regions[0..plan.n]) |r| total_heat += r.heat;
+
+    try out.print("\n  relocation plan (stage S2): {} region(s), I-RAM {}/{} bytes, BW-RAM ", .{
+        plan.n, plan.iram_used, core.profile.iram_bytes,
+    });
+    try printByteCount(out, plan.bwram_used);
+    if (plan.has_dp) try out.print("; SA-1 boots with D=$3000 (dp window in I-RAM)", .{});
+    try out.print("\n", .{});
+    try out.print("     {s:<16} {s:>6}  {s:<16} {s:>5}  {s}\n", .{ "wram", "size", "dest", "heat", "" });
+    for (plan.regions[0..plan.n]) |r| {
+        const bank: u32 = 0x7E + (r.start >> 16);
+        const lo: u32 = r.start & 0xFFFF;
+        var range_buf: [16]u8 = undefined;
+        const range = if (r.len == 1)
+            std.fmt.bufPrint(&range_buf, "${x:0>2}:{x:0>4}", .{ bank, lo }) catch ""
+        else
+            std.fmt.bufPrint(&range_buf, "${x:0>2}:{x:0>4}-{x:0>4}", .{ bank, lo, (r.start + r.len - 1) & 0xFFFF }) catch "";
+        var dest_buf: [16]u8 = undefined;
+        const dest = switch (r.dest) {
+            .iram => std.fmt.bufPrint(&dest_buf, "I-RAM ${x:0>4}", .{0x3000 + r.dest_off}) catch "",
+            .bwram => std.fmt.bufPrint(&dest_buf, "BW-RAM ${x:0>2}:{x:0>4}", .{ 0x40 + (r.dest_off >> 16), r.dest_off & 0xFFFF }) catch "",
+        };
+        try out.print("     {s:<16} {d:>6}  {s:<16} {d:>4.0}%  {s}{s}{s}{s}\n", .{
+            range,
+            r.len,
+            dest,
+            pct(r.heat, total_heat),
+            if (r.dp) "dp " else "",
+            if (r.dma_fed) "feeds-DMA " else "",
+            if (r.shared_outside) "SHARED " else "",
+            if (r.exact) "" else "page-bound",
+        });
+    }
+    if (plan.region_overflow)
+        try out.print("     (more regions than the {} tracked — this plan is a prefix)\n", .{core.profile.plan_region_cap});
+    try out.print(
+        \\    (heat is each region's share of the hot set's slow-frame work. A page-bound
+        \\    row is an upper bound: the whole touched page moves. SHARED rows need the
+        \\    resident side re-pointed too — I-RAM and BW-RAM are visible to both CPUs,
+        \\    so sharing is rewrite work, not a refusal. feeds-DMA rows sit in BW-RAM
+        \\    because a transfer's A-bus side needs a linear address.)
+        \\
+    , .{});
 }
 
 /// The unified `conversion:` paragraph — the report's bottom line, tying the
@@ -1380,6 +1462,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.routines = true;
         } else if (std.mem.eql(u8, a, "--usage-map")) {
             out.usage_map_out = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--plan")) {
+            out.plan = true;
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);

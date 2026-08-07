@@ -303,8 +303,21 @@ manual process (profile, transform, verify against the original), automated:
   usage-map paragraph in the analyser section) code/data discovery from real
   play — dynamic coverage sidesteps static-disassembly undecidability, and
   doubles as the community-standard usage-map artifact;
-  (S2) a relocation plan from the conversion verdict's hot set and its WRAM
-  working sets — an allocation map WRAM → I-RAM/BW-RAM; (S3) the mechanical
+  (S2, **built**) the relocation plan — `--sa1-report --plan` folds the
+  conversion verdict's hot set into a concrete allocation map, WRAM region by
+  WRAM region: direct-page state pins its own offsets in I-RAM so the SA-1
+  relocates the whole dp window by booting with D=$3000 (the SMW SA-1 Pack's
+  own trick, zero operand rewrites); DMA-fed state is forced to BW-RAM (a
+  transfer's A-bus side needs a linear address); everything else fills I-RAM
+  hottest-first by slow-frame share and spills to BW-RAM. Regions are
+  gap-merged exact runs when the footprint stayed exact, whole pages (an
+  upper bound, and marked as one) when it capped; sharing with resident code
+  is flagged per region as re-pointing work rather than refused — I-RAM and
+  BW-RAM are visible to both CPUs, which is precisely what makes shared state
+  relocatable at all. Text and `--json` both; unit-held on synthetic traces
+  (dp pinning, DMA forcing, hottest-first fill, page-bound spill, the
+  no-verdict mirror). Like the verdict thresholds, unvalidated against a real
+  conversion until commercial dumps are in hand; (S3) the mechanical
   rewrite — header to SA-1 mapping, an S-CPU boot shim and message-port MMIO
   proxy, NMI/IRQ forwarding via SNV/SIV, and static WRAM address rewriting in
   the moved code (absolute/long addressing only; self-modifying code,
