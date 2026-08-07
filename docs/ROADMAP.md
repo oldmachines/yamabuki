@@ -346,8 +346,14 @@ manual process (profile, transform, verify against the original), automated:
   original on the S-CPU, which stays correct. Unit-held end to end: a
   converted cart booted in-process, the routine's work observed happening in
   I-RAM by the SA-1, the marshalled result landing back in S-CPU WRAM.
-  Still ahead in S3b: multiple routines per cart, the S-CPU MMIO proxy for
-  non-leaf work, NMI/IRQ forwarding via SNV/SIV; (S4, **built as the gate**) differential
+  S3b now offloads **up to seven routines per cart** — each eligible leaf
+  gets its own message id and call stub, and the dispatcher is emitted as an
+  id switch over shared marshal/unmarshal subroutines. What S3b deliberately
+  does NOT include, re-scoped honestly: the S-CPU MMIO proxy and SNV/SIV
+  interrupt forwarding belong to *whole-game migration* — the model where
+  the entire game runs on the SA-1 and the S-CPU becomes a service loop,
+  which is a different execution architecture than routine offload, not a
+  missing feature of it; that model is future work beyond this ladder; (S4, **built as the gate**) differential
   verification, two-tier: a conversion that changed no timing must be pixel-
   and audio-IDENTICAL; one that genuinely sped the game up cannot be (fewer
   lag frames = fewer repeated pictures), so the fallback demands EQUIVALENCE

@@ -735,11 +735,12 @@ fn runSa1Gen(
             res.stats.rewritten_long, res.stats.rewritten_abs,
             res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
         });
-        if (res.stats.offloaded != 0) {
+        if (res.stats.offload_count != 0) {
             try out.print(
-                "  S3b: routine $00:{x:0>4} executes ON THE SA-1 ({} call site(s) re-pointed\n" ++
-                    "  through the message-port stub, registers marshalled via the I-RAM mailbox)\n",
-                .{ res.stats.offloaded, res.stats.offload_sites },
+                "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
+                    "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
+                    "  mailbox)\n",
+                .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
             );
         } else {
             try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});

@@ -105,8 +105,10 @@ pub const Stats = struct {
     /// S3b: the entry of the routine now executing on the SA-1, when one
     /// passed the leaf-eligibility walk. 0 = none offloaded.
     offloaded: u24 = 0,
-    /// JSR call sites re-pointed at the offload stub.
+    /// JSR call sites re-pointed at the offload stubs.
     offload_sites: u32 = 0,
+    /// How many routines were offloaded (message ids 1..count).
+    offload_count: u8 = 0,
 };
 
 pub const Result = struct {
@@ -378,6 +380,8 @@ const iram_offload_limit: u32 = 0x700;
 /// call sites are re-pointed at the stub; unseen call sites keep calling the
 /// original routine on the S-CPU, which stays correct — the routine's code
 /// is never modified.
+pub const offload_max: usize = 7;
+
 fn tryOffload(
     out: []u8,
     plan: *const profile.Plan,
@@ -388,47 +392,109 @@ fn tryOffload(
     crv: *u16,
 ) void {
     if (plan.iram_used > iram_offload_limit) return;
-    const entry: u16 = for (candidates) |c| {
+    // Every eligible hot routine with at least one executed, rewritable call
+    // site gets a message id (1..offload_max) — an uncalled offload is dead
+    // weight and takes no slot.
+    var entries: [offload_max]u16 = undefined;
+    var n: usize = 0;
+    for (candidates) |c| {
+        if (n == offload_max) break;
         if (c >> 16 != 0 or (c & 0xFFFF) < 0x8000) continue;
-        if (eligibleLeaf(out, usage, plan, res, @truncate(c))) break @truncate(c);
-    } else return;
+        const e: u16 = @truncate(c);
+        const dup = for (entries[0..n]) |x| {
+            if (x == e) break true;
+        } else false;
+        if (dup) continue;
+        if (!eligibleLeaf(out, usage, plan, res, e)) continue;
+        if (countCallSites(out, usage, e) == 0) continue;
+        entries[n] = e;
+        n += 1;
+    }
+    if (n == 0) return;
 
-    // Space for the stub + dispatcher, in front of the shim's reservation so
-    // the two carves cannot overlap (the shim bytes are written later).
-    const need: u32 = stub_template.len + disp_template.len;
-    const carve = patchgen.findFreeSpace(out[0..shim_carve], need) orelse return;
-    const stub_addr: u16 = 0x8000 + @as(u16, @intCast(carve));
-    const disp_addr: u16 = stub_addr + @as(u16, @intCast(stub_template.len));
+    // Dispatcher layout (byte-exact; the emitters below mirror it):
+    //   prologue 23 | loop body 12 | n x 16-byte id blocks | JMP loop 3 |
+    //   signal 19 | unmarshal 21 | marshal 24
+    const nn: u32 = @intCast(n);
+    const disp_len: u32 = 35 + nn * 16 + 3 + 19 + 21 + 24;
+    const need: u32 = nn * @as(u32, stub_template.len) + disp_len;
+    const base = patchgen.findFreeSpace(out[0..shim_carve], need) orelse return;
+    const stub_base: u16 = 0x8000 + @as(u16, @intCast(base));
+    const disp_addr: u16 = stub_base + @as(u16, @intCast(nn * stub_template.len));
+    const loop_addr: u16 = disp_addr + 23;
+    const sig_addr: u16 = disp_addr + @as(u16, @intCast(35 + nn * 16 + 3));
+    const unm_addr: u16 = sig_addr + 19;
+    const mar_addr: u16 = unm_addr + 21;
 
-    var stub = stub_template;
-    var disp = disp_template;
-    // Dispatcher fixups: dp base and the routine entry.
+    // Stubs, one per routine, and their call-site rewrites.
+    for (entries[0..n], 0..) |e, i| {
+        var stub = stub_template;
+        const id: u8 = @intCast(i + 1);
+        stub[stub_id_send_off] = id;
+        stub[stub_id_cmp_off] = id;
+        @memcpy(out[base + i * stub_template.len ..][0..stub_template.len], &stub);
+        const stub_addr = stub_base + @as(u16, @intCast(i * stub_template.len));
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            if (usage[a16] & usage_map.flag_opcode == 0) continue;
+            const file = a16 - 0x8000;
+            if (out[file] != 0x20) continue;
+            if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) != e) continue;
+            std.mem.writeInt(u16, out[file + 1 ..][0..2], stub_addr, .little);
+            res.stats.offload_sites += 1;
+        }
+    }
+
+    // The dispatcher, emitted around the computed addresses.
+    const d = out[base + nn * @as(u32, stub_template.len) ..];
+    var cur: usize = 0;
     const dp_base: u16 = if (res.stats.d_moved) 0x3000 else 0;
-    disp[disp_dp_off] = @truncate(dp_base);
-    disp[disp_dp_off + 1] = @truncate(dp_base >> 8);
-    disp[disp_entry_off] = @truncate(entry);
-    disp[disp_entry_off + 1] = @truncate(entry >> 8);
-    @memcpy(out[carve..][0..stub.len], &stub);
-    @memcpy(out[carve + stub.len ..][0..disp.len], &disp);
+    // Prologue: gates, native mode, stack under the mailbox, D.
+    put(d, &cur, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
+    // loop: wait for a nonzero message, park its id at $3787.
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
+    // One block per id: CMP #id / BNE +12 / JSR unm / JSR entry / JSR mar / JMP sig.
+    for (entries[0..n], 0..) |e, i| {
+        put(d, &cur, &.{ 0xC9, @intCast(i + 1), 0xD0, 0x0C });
+        putJsr(d, &cur, unm_addr);
+        putJsr(d, &cur, e);
+        putJsr(d, &cur, mar_addr);
+        put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
+    }
+    // Unknown id: back to the loop.
+    put(d, &cur, &.{ 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
+    // sig: echo the id as the done message, await the ack, clear, loop.
+    put(d, &cur, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x09, 0x22, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xD0, 0xF9, 0x9C, 0x09, 0x22, 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
+    // unm: caller P staged, registers in, PLP last (sets the entry widths).
+    put(d, &cur, &.{ 0xAD, 0x86, 0x37, 0x48, 0xAD, 0x81, 0x37, 0xEB, 0xAD, 0x80, 0x37, 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37, 0x28, 0x60 });
+    // mar: exit P captured first, registers out.
+    put(d, &cur, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
+    std.debug.assert(cur == disp_len);
 
-    // Re-point every executed bank-$00 `JSR entry` at the stub.
+    res.stats.offloaded = entries[0];
+    res.stats.offload_count = @intCast(n);
+    crv.* = disp_addr;
+}
+
+fn put(d: []u8, cur: *usize, bytes: []const u8) void {
+    @memcpy(d[cur.*..][0..bytes.len], bytes);
+    cur.* += bytes.len;
+}
+
+fn putJsr(d: []u8, cur: *usize, target: u16) void {
+    put(d, cur, &.{ 0x20, @truncate(target), @truncate(target >> 8) });
+}
+
+fn countCallSites(out: []const u8, usage: []const u8, entry: u16) u32 {
+    var count: u32 = 0;
     var a16: u32 = 0x8000;
     while (a16 < 0x10000) : (a16 += 1) {
         if (usage[a16] & usage_map.flag_opcode == 0) continue;
         const file = a16 - 0x8000;
         if (out[file] != 0x20) continue;
-        if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) != entry) continue;
-        // The stub itself JSRs nothing; call sites inside the routine span
-        // cannot exist (the walk refused calls).
-        std.mem.writeInt(u16, out[file + 1 ..][0..2], stub_addr, .little);
-        res.stats.offload_sites += 1;
+        if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) == entry) count += 1;
     }
-    if (res.stats.offload_sites == 0) {
-        // Nothing calls it where we can see: undo nothing, offload nothing.
-        return;
-    }
-    res.stats.offloaded = entry;
-    crv.* = disp_addr;
+    return count;
 }
 
 /// Static leaf-eligibility walk from `entry` over covered code: ends at the
@@ -536,65 +602,15 @@ const stub_template = [_]u8{
     0x60, // 67 RTS
 };
 
-/// The SA-1 side: native mode, stack parked under the mailbox, D set to the
-/// shared base, then an eternal serve loop — unmarshal with the caller's P,
-/// run the routine, marshal back with its exit P, signal done, await the ack.
-const disp_dp_off: usize = 20;
-const disp_entry_off: usize = 55;
-const disp_template = [_]u8{
-    0x78, // 0  SEI
-    // The write gates are SA-1-side registers: open them ourselves.
-    0xA9, 0xFF, // 1  LDA #$FF
-    0x8D, 0x2A, 0x22, // 3  STA $222A (CIWP: SA-1 may write all I-RAM)
-    0xA9, 0x80, // 6  LDA #$80
-    0x8D, 0x27, 0x22, // 8  STA $2227 (CBWE: SA-1 may write BW-RAM)
-    0x18, // 11 CLC
-    0xFB, // 12 XCE (native mode)
-    0xC2, 0x10, // 13 REP #$10
-    0xA2, 0x78, 0x37, // 15 LDX #$3778 (stack below the mailbox)
-    0x9A, // 18 TXS
-    0xF4, 0x00, 0x00, // 19 PEA <dp base> (fixup at +20)
-    0x2B, // 22 PLD
-    0xE2, 0x20, // 23 loop: SEP #$20
-    0xAD, 0x01, 0x23, // 25 LDA $2301 (CFR)
-    0x29, 0x0F, // 28 AND #$0F
-    0xC9, 0x01, // 30 CMP #$01
-    0xD0, 0xF5, // 32 BNE loop
-    0xAD, 0x86, 0x37, // 34 LDA $3786 (caller P)
-    0x48, // 37 PHA
-    0xAD, 0x81, 0x37, // 38 LDA $3781 (B)
-    0xEB, // 41 XBA
-    0xAD, 0x80, 0x37, // 42 LDA $3780 (A low)
-    0xC2, 0x10, // 45 REP #$10
-    0xAE, 0x82, 0x37, // 47 LDX $3782
-    0xAC, 0x84, 0x37, // 50 LDY $3784
-    0x28, // 53 PLP (caller P: the routine's entry widths)
-    0x20, 0x00, 0x00, // 54 JSR <entry> (fixup at +55)
-    0x08, // 57 PHP (exit P)
-    0xC2, 0x10, // 58 REP #$10
-    0x8E, 0x82, 0x37, // 60 STX $3782
-    0x8C, 0x84, 0x37, // 63 STY $3784
-    0xE2, 0x20, // 66 SEP #$20
-    0x8D, 0x80, 0x37, // 68 STA $3780
-    0xEB, // 71 XBA
-    0x8D, 0x81, 0x37, // 72 STA $3781
-    0xEB, // 75 XBA
-    0x68, // 76 PLA (exit P)
-    0x8D, 0x86, 0x37, // 77 STA $3786
-    0xA9, 0x01, // 80 LDA #$01
-    0x8D, 0x09, 0x22, // 82 STA $2209 (done -> SFR)
-    0xAD, 0x01, 0x23, // 85 wa: LDA $2301
-    0x29, 0x0F, // 88 AND #$0F
-    0xD0, 0xF9, // 90 BNE wa (S-CPU acked)
-    0x9C, 0x09, 0x22, // 92 STZ $2209
-    0x80, 0xB6, // 95 BRA loop (23 - 97 = -74 = $B6)
-};
+/// Offsets of the message id inside `stub_template` (the LDA #id that sends
+/// it and the CMP #id that awaits the echo).
+const stub_id_send_off: usize = 24;
+const stub_id_cmp_off: usize = 34;
 
 comptime {
-    std.debug.assert(disp_template[disp_dp_off - 1] == 0xF4); // PEA
-    std.debug.assert(disp_template[disp_entry_off - 1] == 0x20); // JSR
+    std.debug.assert(stub_template[stub_id_send_off - 1] == 0xA9); // LDA #
+    std.debug.assert(stub_template[stub_id_cmp_off - 1] == 0xC9); // CMP #
     std.debug.assert(stub_template.len == 68);
-    std.debug.assert(disp_template.len == 97);
 }
 
 // --- tests ---------------------------------------------------------------------
@@ -901,6 +917,59 @@ test "S3b: an offloaded leaf routine runs on the SA-1 and its results marshal ba
     con0.runFrame();
     try testing.expectEqual(@as(u8, 1), con0.bus.wram.data[0x1F00]);
     try testing.expectEqual(@as(u8, 1), con0.bus.wram.data[0x100]);
+}
+
+test "S3b: two routines offload to distinct message ids and both round-trip" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    // Reset: LDA #$05 / JSR $8020 / JSR $8030 / STA $7E0100 / spin.
+    @memcpy(rom[0x0000..0x000E], &[_]u8{
+        0xA9, 0x05,
+        0x20, 0x20,
+        0x80, 0x20,
+        0x30, 0x80,
+        0x8F, 0x00,
+        0x01, 0x7E,
+        0x80, 0xFE,
+    });
+    // Leaf 1 at $8020: INC the moved byte at $7E:1F00 (via rewritten long).
+    @memcpy(rom[0x0020..0x002A], &[_]u8{ 0xAF, 0x00, 0x1F, 0x7E, 0x1A, 0x8F, 0x00, 0x1F, 0x7E, 0x60 });
+    // Leaf 2 at $8030: ASL the moved byte at $7E:1F08.
+    @memcpy(rom[0x0030..0x003B], &[_]u8{ 0xAF, 0x08, 0x1F, 0x7E, 0x1A, 0x1A, 0x8F, 0x08, 0x1F, 0x7E, 0x60 });
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x00_8000, 0x00_8002, 0x00_8005, 0x00_8008, 0x00_800C }) |a| markOp(usage, a);
+    for ([_]u32{ 0x00_8020, 0x00_8024, 0x00_8025, 0x00_8029 }) |a| markOp(usage, a);
+    for ([_]u32{ 0x00_8030, 0x00_8034, 0x00_8035, 0x00_8036, 0x00_803A }) |a| markOp(usage, a);
+
+    var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
+    var ref: ?Refusal = null;
+    const res = try convert(gpa, rom, &plan, usage, &.{ 0x00_8020, 0x00_8030 }, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 2), res.stats.offload_count);
+    try testing.expectEqual(@as(u32, 2), res.stats.offload_sites);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+    // Both leaves ran on the SA-1: leaf 1 incremented $1F00 (0 -> 1), leaf 2
+    // shifted $1F08 twice after INC (A came in as leaf 1's result 1 -> INC 2
+    // -> ASL 4? No: leaf 2 loads $1F08 (0), INC 1, ASL 2, stores 2). The
+    // marshalled A after leaf 2 (2) lands in unmoved WRAM.
+    try testing.expectEqual(@as(u8, 1), con.bus.sa1.iram[0x40]);
+    try testing.expectEqual(@as(u8, 2), con.bus.sa1.iram[0x48]);
+    try testing.expectEqual(@as(u8, 2), con.bus.wram.data[0x100]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x1F00]);
 }
 
 test "S3b eligibility: calls, unseen code, indexed data, and unmoved WRAM all refuse" {
