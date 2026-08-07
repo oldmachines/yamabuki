@@ -29,6 +29,11 @@ pub const Entry = struct {
     /// patch availability can be checked without re-reading the ROM. 0 in an
     /// entry from an older cache means "unknown" and forces a re-identify.
     crc32: u32 = 0,
+    /// Raw $FFD5 map-mode byte (bit 4 = FastROM) — what tells the library a
+    /// game is SlowROM and therefore worth offering FastROM generation for.
+    /// 0 is not a real map mode, so it doubles as the "older cache,
+    /// re-identify" marker the same way crc32 does.
+    map_mode: u8 = 0,
     /// Session-only, refreshed by the library screen (never trusted from the
     /// cache): a patch for this game is available right now.
     has_patch: bool = false,
@@ -187,9 +192,13 @@ pub const Scanner = struct {
             const c = self.candidates.items[self.index];
             self.index += 1;
             if (lib.find(c.path)) |hit| {
-                // A 0 crc32 is a pre-crc cache entry: re-identify it once so
-                // patch matching works, instead of carrying the gap forever.
-                if (hit.size == c.size and hit.mtime_s == c.mtime_s and hit.crc32 != 0) {
+                // A 0 crc32 or map_mode is a cache entry from before those
+                // fields existed: re-identify it once so patch matching and
+                // the generation offer work, instead of carrying the gap
+                // forever.
+                if (hit.size == c.size and hit.mtime_s == c.mtime_s and
+                    hit.crc32 != 0 and hit.map_mode != 0)
+                {
                     self.fresh.append(self.gpa, hit.*) catch {};
                     return false;
                 }
@@ -220,6 +229,7 @@ pub const Scanner = struct {
             .region = regionName(header.region),
             .chip = chipName(header.chipset),
             .crc32 = core.patch.crc32(image),
+            .map_mode = header.map_mode,
         };
     }
 };

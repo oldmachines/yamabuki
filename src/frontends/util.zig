@@ -165,75 +165,215 @@ pub const GenOutcome = struct {
     fast: core.profile.Summary,
 };
 
-const GenRun = struct {
-    audio: u64,
-    summary: core.profile.Summary,
-    memsel_pcs: [core.profile.memsel_pc_cap]u24,
-    n_memsel_pcs: usize,
-    memsel_overflow: bool,
-    /// Frame at whose end `bus.fastrom` was false, if any.
-    fastrom_lost_at: ?u32,
-};
-
-/// One profiled run of `total` frames over `image`. When `expect` is null the
-/// per-frame framebuffer hashes are recorded into `hashes`; otherwise each
-/// frame is compared against it and the first divergence is returned in
-/// `mismatch`.
-fn genRun(
+/// The generation pipeline as a resumable session, so a UI can run it in
+/// slices on its main loop — the same incremental-not-threaded stance as the
+/// SDL library scanner — while the headless one-shot wrapper below just steps
+/// it to completion. Phases: profile the unpatched ROM (which also observes
+/// the MEMSEL stores the generator must neutralise) → transform → replay and
+/// compare frame-for-frame → encode. A failure at any point carries its
+/// reason; nothing is handed out unless every gate passed.
+pub const GenSession = struct {
     gpa: std.mem.Allocator,
+    /// Borrowed; must outlive the session (it is also the BPS source).
     image: []const u8,
-    hashes: []u64,
-    expect: ?[]const u64,
+    frames: u32,
     skip: u32,
     buttons: u16,
-    mismatch: *?u32,
-) !GenRun {
-    const total: u32 = @intCast(hashes.len);
-    const cart = try core.Cartridge.load(gpa, image);
-    const con = try gpa.create(core.ProfilingConsole);
-    defer gpa.destroy(con);
-    con.init(cart);
-    defer gpa.free(con.cart.rom);
+    total: u32,
 
-    const samples = try gpa.alloc(core.profile.FrameSample, total);
-    defer gpa.free(samples);
-    var n_samples: usize = 0;
+    /// Baseline per-frame framebuffer hashes — what the verify run replays
+    /// against.
+    hashes: []u64,
+    samples: []core.profile.FrameSample,
+    scratch: []f64,
 
-    var audio: u64 = core.console.audio_hash_init;
-    var fastrom_lost_at: ?u32 = null;
-    for (0..total) |i| {
-        if (buttons != 0) con.setButtons(0, buttons);
-        con.runFrame();
-        try drainAudio(con, &audio, {}, null);
-        const h = core.console.hashFrame(con.framebuffer());
-        hashes[i] = h;
-        if (expect) |want| {
-            if (h != want[i] and mismatch.* == null) {
-                mismatch.* = @intCast(i);
-                break;
-            }
-            if (!con.bus.fastrom and fastrom_lost_at == null)
-                fastrom_lost_at = @intCast(i);
-        }
-        if (con.takeProfile()) |s| {
-            if (i >= skip) {
-                samples[n_samples] = s;
-                n_samples += 1;
-            }
+    phase: Phase = .baseline,
+    con: ?*core.ProfilingConsole = null,
+    i: u32 = 0,
+    n_samples: usize = 0,
+    audio: u64 = core.console.audio_hash_init,
+
+    base_audio: u64 = 0,
+    base_summary: core.profile.Summary = undefined,
+
+    /// The transformed image, owned by the session until `finish` hands it
+    /// out in a `GenOutcome` (then null).
+    gen_image: ?[]u8 = null,
+    stub_addr: u16 = 0,
+    trampolines: u8 = 0,
+    nopped: u8 = 0,
+
+    pub const Phase = enum { baseline, verify, finished };
+    pub const Progress = struct { phase: Phase, frame: u32, total: u32 };
+    pub const Status = union(enum) { running: Progress, done: GenOutcome, failed: GenFailure };
+
+    pub fn start(
+        gpa: std.mem.Allocator,
+        image: []const u8,
+        frames: u32,
+        skip: u32,
+        buttons: u16,
+    ) !GenSession {
+        const total = skip + frames;
+        var s: GenSession = .{
+            .gpa = gpa,
+            .image = image,
+            .frames = frames,
+            .skip = skip,
+            .buttons = buttons,
+            .total = total,
+            .hashes = try gpa.alloc(u64, total),
+            .samples = undefined,
+            .scratch = undefined,
+        };
+        errdefer gpa.free(s.hashes);
+        s.samples = try gpa.alloc(core.profile.FrameSample, total);
+        errdefer gpa.free(s.samples);
+        s.scratch = try gpa.alloc(f64, total);
+        errdefer gpa.free(s.scratch);
+        try s.bootConsole(image);
+        return s;
+    }
+
+    /// Safe on every path: cancel mid-run, after a failure, or after `done`
+    /// (the handed-out image/bps are the caller's and are not touched).
+    pub fn deinit(self: *GenSession) void {
+        self.dropConsole();
+        if (self.gen_image) |gi| self.gpa.free(gi);
+        self.gpa.free(self.hashes);
+        self.gpa.free(self.samples);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
+    fn bootConsole(self: *GenSession, image: []const u8) !void {
+        const cart = try core.Cartridge.load(self.gpa, image);
+        const con = self.gpa.create(core.ProfilingConsole) catch |e| {
+            self.gpa.free(cart.rom);
+            return e;
+        };
+        con.init(cart);
+        self.con = con;
+        self.i = 0;
+        self.n_samples = 0;
+        self.audio = core.console.audio_hash_init;
+    }
+
+    fn dropConsole(self: *GenSession) void {
+        if (self.con) |c| {
+            self.gpa.free(c.cart.rom);
+            self.gpa.destroy(c);
+            self.con = null;
         }
     }
 
-    const scratch = try gpa.alloc(f64, n_samples);
-    defer gpa.free(scratch);
-    return .{
-        .audio = audio,
-        .summary = core.profile.summarise(samples[0..n_samples], scratch),
-        .memsel_pcs = con.prof.memsel_pcs,
-        .n_memsel_pcs = con.prof.n_memsel_pcs,
-        .memsel_overflow = con.prof.memsel_overflow,
-        .fastrom_lost_at = fastrom_lost_at,
-    };
-}
+    /// Advance up to `max_frames` emulated frames. Phase transitions
+    /// (transform, encode) happen inside a step and cost no frame budget.
+    /// After `.done` or `.failed` the session must not be stepped again.
+    pub fn step(self: *GenSession, max_frames: u32) !Status {
+        std.debug.assert(self.phase != .finished);
+        var budget = max_frames;
+        while (budget > 0) : (budget -= 1) {
+            switch (self.phase) {
+                .baseline => {
+                    const idx = self.i;
+                    self.hashes[idx] = try self.runOneFrame();
+                    if (self.i == self.total) if (try self.finishBaseline()) |f| {
+                        self.phase = .finished;
+                        return .{ .failed = f };
+                    };
+                },
+                .verify => {
+                    const idx = self.i;
+                    const h = try self.runOneFrame();
+                    if (h != self.hashes[idx]) {
+                        self.phase = .finished;
+                        return .{ .failed = .{ .frame_mismatch = idx } };
+                    }
+                    if (!self.con.?.bus.fastrom) {
+                        self.phase = .finished;
+                        return .{ .failed = .{ .memsel_lost = idx } };
+                    }
+                    if (self.i == self.total) {
+                        const status = try self.finish();
+                        self.phase = .finished;
+                        return status;
+                    }
+                },
+                .finished => unreachable,
+            }
+        }
+        return .{ .running = .{ .phase = self.phase, .frame = self.i, .total = self.total } };
+    }
+
+    fn runOneFrame(self: *GenSession) !u64 {
+        const con = self.con.?;
+        if (self.buttons != 0) con.setButtons(0, self.buttons);
+        con.runFrame();
+        try drainAudio(con, &self.audio, {}, null);
+        if (con.takeProfile()) |smp| {
+            if (self.i >= self.skip) {
+                self.samples[self.n_samples] = smp;
+                self.n_samples += 1;
+            }
+        }
+        self.i += 1;
+        return core.console.hashFrame(con.framebuffer());
+    }
+
+    /// Close the baseline run and transform. Returns a failure to report, or
+    /// null when the session has moved on to the verify run.
+    fn finishBaseline(self: *GenSession) !?GenFailure {
+        const con = self.con.?;
+        self.base_summary = core.profile.summarise(self.samples[0..self.n_samples], self.scratch);
+        self.base_audio = self.audio;
+        if (con.prof.memsel_overflow) {
+            self.dropConsole();
+            return .{ .refused = .{ .reason = .memsel_store_unpatchable } };
+        }
+        const memsel_pcs: [core.profile.memsel_pc_cap]u24 = con.prof.memsel_pcs;
+        const n_memsel: usize = con.prof.n_memsel_pcs;
+        self.dropConsole();
+
+        var refusal: ?core.patchgen.Refusal = null;
+        const res = core.patchgen.generate(self.gpa, self.image, .{
+            .memsel_store_pcs = memsel_pcs[0..n_memsel],
+        }, &refusal) catch |e| switch (e) {
+            error.Refused => return .{ .refused = refusal.? },
+            else => return e,
+        };
+        self.gen_image = res.image;
+        self.stub_addr = res.stub_addr;
+        self.trampolines = res.trampolines;
+        self.nopped = res.memsel_stores_nopped;
+
+        try self.bootConsole(res.image);
+        self.phase = .verify;
+        return null;
+    }
+
+    /// Close the verify run: the audio gate, then the encode and hand-off.
+    fn finish(self: *GenSession) !Status {
+        if (self.audio != self.base_audio) {
+            return .{ .failed = .audio_mismatch };
+        }
+        const fast_summary = core.profile.summarise(self.samples[0..self.n_samples], self.scratch);
+        self.dropConsole();
+        const bps = try core.patch.writeBps(self.gpa, self.image, self.gen_image.?);
+        const image = self.gen_image.?;
+        self.gen_image = null; // ownership moves to the outcome
+        return .{ .done = .{
+            .image = image,
+            .bps = bps,
+            .stub_addr = self.stub_addr,
+            .trampolines = self.trampolines,
+            .memsel_stores_nopped = self.nopped,
+            .frames = self.frames,
+            .base = self.base_summary,
+            .fast = fast_summary,
+        } };
+    }
+};
 
 /// Generate the FastROM transformation of a copier-stripped `image` and
 /// verify it in-emulator before encoding anything: the patched ROM must
@@ -246,6 +386,8 @@ fn genRun(
 ///
 /// On failure, `failure` names what went wrong and nothing is returned; a
 /// patch that cannot be verified is a patch that does not get written.
+/// (This is `GenSession` stepped to completion — the SDL player runs the
+/// same session incrementally with a progress screen.)
 pub fn generateFastromVerified(
     gpa: std.mem.Allocator,
     image: []const u8,
@@ -254,57 +396,18 @@ pub fn generateFastromVerified(
     buttons: u16,
     failure: *?GenFailure,
 ) !GenOutcome {
-    const total = skip + frames;
-    const hashes = try gpa.alloc(u64, total);
-    defer gpa.free(hashes);
-    const fast_hashes = try gpa.alloc(u64, total);
-    defer gpa.free(fast_hashes);
-
-    var no_mismatch: ?u32 = null;
-    const base = try genRun(gpa, image, hashes, null, skip, buttons, &no_mismatch);
-
-    var refusal: ?core.patchgen.Refusal = null;
-    if (base.memsel_overflow) {
-        failure.* = .{ .refused = .{ .reason = .memsel_store_unpatchable } };
-        return error.GenFailed;
+    var s = try GenSession.start(gpa, image, frames, skip, buttons);
+    defer s.deinit();
+    while (true) {
+        switch (try s.step(std.math.maxInt(u32))) {
+            .running => {},
+            .done => |o| return o,
+            .failed => |f| {
+                failure.* = f;
+                return error.GenFailed;
+            },
+        }
     }
-    const res = core.patchgen.generate(gpa, image, .{
-        .memsel_store_pcs = base.memsel_pcs[0..base.n_memsel_pcs],
-    }, &refusal) catch |e| switch (e) {
-        error.Refused => {
-            failure.* = .{ .refused = refusal.? };
-            return error.GenFailed;
-        },
-        else => return e,
-    };
-    errdefer gpa.free(res.image);
-
-    var mismatch: ?u32 = null;
-    const fast = try genRun(gpa, res.image, fast_hashes, hashes, skip, buttons, &mismatch);
-    if (mismatch) |frame| {
-        failure.* = .{ .frame_mismatch = frame };
-        return error.GenFailed;
-    }
-    if (fast.fastrom_lost_at) |frame| {
-        failure.* = .{ .memsel_lost = frame };
-        return error.GenFailed;
-    }
-    if (fast.audio != base.audio) {
-        failure.* = .audio_mismatch;
-        return error.GenFailed;
-    }
-
-    const bps = try core.patch.writeBps(gpa, image, res.image);
-    return .{
-        .image = res.image,
-        .bps = bps,
-        .stub_addr = res.stub_addr,
-        .trampolines = res.trampolines,
-        .memsel_stores_nopped = res.memsel_stores_nopped,
-        .frames = frames,
-        .base = base.summary,
-        .fast = fast.summary,
-    };
 }
 
 /// argv with argv[0] already skipped: the boilerplate every frontend's arg

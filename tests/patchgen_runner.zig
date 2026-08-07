@@ -78,9 +78,34 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    // The SDL player runs the same pipeline as an incremental session on its
+    // main loop; stepping it in ragged chunks must produce the identical
+    // patch, or the two entry points have quietly diverged.
+    {
+        var session = try util.GenSession.start(gpa, image, verify_frames, verify_skip, 0);
+        defer session.deinit();
+        const inc: util.GenOutcome = loop: while (true) {
+            switch (try session.step(7)) {
+                .running => {},
+                .done => |o| break :loop o,
+                .failed => |f| {
+                    try out.print("FAIL: incremental session failed where the one-shot passed ({s})\n", .{@tagName(f)});
+                    try out.flush();
+                    std.process.exit(1);
+                },
+            }
+        };
+        if (!std.mem.eql(u8, inc.bps, res.bps)) {
+            try out.print("FAIL: incremental session produced a different BPS than the one-shot\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+    }
+
     try out.print(
         "patchgen-runner: PASS — {} bytes of BPS, stub at $00:{x:0>4}, {} trampoline(s), " ++
-            "{} MEMSEL store(s) neutralised, {} frames verified, util {d:.0}% -> {d:.0}%\n",
+            "{} MEMSEL store(s) neutralised, {} frames verified, util {d:.0}% -> {d:.0}%, " ++
+            "incremental session byte-identical\n",
         .{
             res.bps.len,                 res.stub_addr,
             res.trampolines,             res.memsel_stores_nopped,

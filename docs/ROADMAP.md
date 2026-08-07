@@ -289,7 +289,14 @@ manual process (profile, transform, verify against the original), automated:
   any hand-authored patch), written to `<rom>.bps`, and reported with its
   measured effect — utilisation before and after. End-to-end in CI:
   `zig build test-patchgen` generates, verifies, and re-applies through the
-  public applier against a fetched test ROM.
+  public applier against a fetched test ROM — and steps the same pipeline as
+  an incremental session, asserting a byte-identical patch. That session is
+  how the **SDL player** runs it: picking a SlowROM game with no patch offers
+  GENERATE FASTROM PATCH (declinable per game, never re-offered after a
+  refusal), generation runs on the main loop under a per-frame budget with a
+  progress bar and cancel — the library scanner's no-thread pattern — and a
+  success drops the BPS into the patches folder, where discovery finds it and
+  the PLAY PATCHED prompt takes over, measured effect shown.
 - **Rung two — SA-1 — staged, not started.** Vilela's conversions are still
   per-game reverse engineering, and the honest path automates the *mechanical
   fraction* of it while refusing the rest by name: (S1) code/data discovery
