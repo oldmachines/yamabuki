@@ -93,6 +93,10 @@ const Args = struct {
     /// Generate a FastROM patch for this ROM, verified in-emulator before
     /// anything is written (see `util.generateFastromVerified`).
     gen_fastrom: bool = false,
+    /// Stage S3: generate an SA-1 conversion patch — the shell (SA-1 cart +
+    /// parked SA-1) plus the plan's clean state relocations — verified
+    /// frame- and audio-identical before anything is written.
+    gen_sa1: bool = false,
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
@@ -131,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\                         [--plan] [--usage-map out.bin]
             \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
+            \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--out p.bps] [--frames N]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
@@ -145,6 +150,10 @@ pub fn main(init: std.process.Init) !void {
             \\                in-emulator (every frame pixel- and audio-identical to the unpatched
             \\                run, MEMSEL held); only a verified patch is written, as BPS
             \\  --out p       where --gen-fastrom-patch writes the patch (default: <rom>.bps)
+            \\  --gen-sa1-patch  stage S3: convert to an SA-1 cart (shell + the relocation plan's
+            \\                clean state moves), verified pixel- and audio-identical; the game
+            \\                still runs on the S-CPU — execution migration is stage S3b
+            \\                (default output: <rom>-sa1.bps)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -194,6 +203,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image));
+        return;
+    }
+    if (args.gen_sa1) {
+        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image));
         return;
     }
 
@@ -589,6 +602,116 @@ fn runGenerate(
         total,
     });
     try out.flush();
+}
+
+/// `--gen-sa1-patch` (stage S3): profile, plan, convert (shell + clean state
+/// relocations), verify frame- and audio-identical, and only then write the
+/// BPS. `image` is copier-stripped.
+fn runSa1Gen(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+) !void {
+    const frames = args.frames orelse gen_frames_default;
+    const total = args.skip + frames;
+    try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    try out.flush();
+
+    // Baseline: per-frame hashes, audio, the profile, and the coverage map
+    // the rewriter walks.
+    const hashes = try gpa.alloc(u64, total);
+    const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    @memset(ub, 0);
+    const umap: core.usage_map.UsageMap = .{ .bytes = ub };
+    var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+    try samples.ensureTotalCapacity(total);
+    var base_audio = core.console.audio_hash_init;
+    {
+        const cart = try core.Cartridge.load(gpa, image);
+        const con = try gpa.create(core.ProfilingConsole);
+        con.init(cart);
+        con.usage = &umap;
+        for (0..total) |i| {
+            con.runFrame();
+            try util.drainAudio(con, &base_audio, {}, null);
+            hashes[i] = core.console.hashFrame(con.framebuffer());
+            if (con.takeProfile()) |s| {
+                if (i >= args.skip) samples.appendAssumeCapacity(s);
+            }
+        }
+        const scratch = try gpa.alloc(f64, samples.items.len);
+        const sum = profile.summarise(samples.items, scratch);
+        const conv = profile.assessConversion(&con.prof, sum.verdict);
+        const plan = profile.planRelocation(&con.prof, conv);
+
+        var refusal: ?core.sa1gen.Refusal = null;
+        const res = core.sa1gen.convert(gpa, image, &plan, ub, &refusal) catch |e| switch (e) {
+            error.Refused => {
+                try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
+                try out.flush();
+                std.process.exit(1);
+            },
+            else => return e,
+        };
+
+        // Verify: the converted cart must render and sound identical while
+        // the game still runs on the S-CPU and the SA-1 sits parked.
+        var fast_audio = core.console.audio_hash_init;
+        {
+            const cart2 = try core.Cartridge.load(gpa, res.image);
+            const con2 = try gpa.create(core.ProfilingConsole);
+            con2.init(cart2);
+            for (0..total) |i| {
+                con2.runFrame();
+                try util.drainAudio(con2, &fast_audio, {}, null);
+                if (core.console.hashFrame(con2.framebuffer()) != hashes[i]) {
+                    try out.print(
+                        \\verification FAILED at frame {}: the converted cart renders differently.
+                        \\  Either uncovered code touches moved state, or the shell itself is wrong
+                        \\  for this game. No patch written.
+                        \\
+                    , .{i});
+                    try out.flush();
+                    std.process.exit(1);
+                }
+            }
+        }
+        if (fast_audio != base_audio) {
+            try out.print("verification FAILED: audio diverged. No patch written.\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+
+        const bps = try core.patch.writeBps(gpa, image, res.image);
+        const stem = args.rom[0 .. std.mem.lastIndexOfScalar(u8, args.rom, '.') orelse args.rom.len];
+        const path = args.gen_out orelse try std.fmt.allocPrint(gpa, "{s}-sa1.bps", .{stem});
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bps }) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            try out.flush();
+            std.process.exit(1);
+        };
+
+        try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
+        try out.print(
+            \\SA-1 conversion, stage S3 (shell + state relocation):
+            \\  shim at $00:{x:0>4}, SA-1 booted and parked at $00:{x:0>4}
+            \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
+            \\  verified: {} frames pixel- and audio-identical (game still runs on the S-CPU;
+            \\  moved state now lives in SA-1 I-RAM/BW-RAM, which both CPUs can reach)
+            \\  caveat: code the profile never executed is invisible to the rewriter; a longer
+            \\  or more varied capture widens coverage. Execution migration is stage S3b.
+            \\
+        , .{
+            res.stats.shim_addr,      res.stats.park_addr,
+            res.stats.regions_moved,  res.stats.regions_blocked,
+            res.stats.rewritten_long, res.stats.rewritten_abs,
+            res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
+            total,
+        });
+        try out.flush();
+    }
 }
 
 fn runReport(
@@ -1473,6 +1596,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.buttons = try std.fmt.parseInt(u16, digits, 16);
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
+        } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
+            out.gen_sa1 = true;
         } else if (std.mem.eql(u8, a, "--out")) {
             out.gen_out = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
@@ -1484,10 +1609,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         if (out.accuracy == .accurate) return error.WideNeedsFast;
         if (out.wide > core.ppu.wide_margin_max) return error.WideTooBig;
     }
-    if (out.gen_fastrom and (out.patch != null or out.auto_patch or
+    if ((out.gen_fastrom or out.gen_sa1) and (out.patch != null or out.auto_patch or
         out.save_patched != null or out.auto_fastrom or
         out.accuracy == .accurate or out.wide != 0 or out.sa1_report))
         return error.GenConflicts;
+    if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }

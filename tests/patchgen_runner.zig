@@ -102,10 +102,49 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Stage S3 shell: the same ROM converted to an SA-1 cart (empty plan, so
+    // shell only — the SA-1 boots and parks) must render and sound identical.
+    {
+        var refusal: ?core.sa1gen.Refusal = null;
+        const empty: core.profile.Plan = .{};
+        const sa1 = try core.sa1gen.convert(gpa, image, &empty, null, &refusal);
+        const cart2 = try core.Cartridge.load(gpa, sa1.image);
+        if (cart2.chip != .sa1) {
+            try out.print("FAIL: converted cart did not identify as SA-1\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+        const orig_cart = try core.Cartridge.load(gpa, image);
+        const con_a = try gpa.create(core.FastConsole);
+        con_a.init(orig_cart);
+        const con_b = try gpa.create(core.FastConsole);
+        con_b.init(cart2);
+        var audio_a = core.console.audio_hash_init;
+        var audio_b = core.console.audio_hash_init;
+        for (0..verify_frames) |i| {
+            con_a.runFrame();
+            con_b.runFrame();
+            try util.drainAudio(con_a, &audio_a, {}, null);
+            try util.drainAudio(con_b, &audio_b, {}, null);
+            const ha = core.console.hashFrame(con_a.framebuffer());
+            const hb = core.console.hashFrame(con_b.framebuffer());
+            if (ha != hb) {
+                try out.print("FAIL: SA-1 shell diverged at frame {}\n", .{i});
+                try out.flush();
+                std.process.exit(1);
+            }
+        }
+        if (audio_a != audio_b) {
+            try out.print("FAIL: SA-1 shell audio diverged\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+    }
+
     try out.print(
         "patchgen-runner: PASS — {} bytes of BPS, stub at $00:{x:0>4}, {} trampoline(s), " ++
             "{} MEMSEL store(s) neutralised, {} frames verified, util {d:.0}% -> {d:.0}%, " ++
-            "incremental session byte-identical\n",
+            "incremental session byte-identical; SA-1 shell boots parked and identical\n",
         .{
             res.bps.len,                 res.stub_addr,
             res.trampolines,             res.memsel_stores_nopped,

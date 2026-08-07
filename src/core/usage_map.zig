@@ -115,9 +115,23 @@ pub fn dataWidth(op: u8, m8: bool, x8: bool) u8 {
     };
 }
 
+/// The operand shape stage S3's rewriter cares about: does this instruction
+/// name a static data address, and in what form? Control transfers, stack
+/// forms, immediates, and block moves are `.none` — their operands are never
+/// a rewritable data address. Indirect-through-dp forms are `.dp`: their
+/// operand IS a direct-page address (the pointer's home); where the pointer
+/// points is runtime data, which is exactly why indirection is a coverage
+/// caveat and not a rewrite.
+pub const Mode = enum { none, dp, dp_idx, abs, abs_x, abs_y, long, long_x };
+
+/// The addressing mode of `op`, for the static rewriter.
+pub fn mode(op: u8) Mode {
+    return meta[op].mode;
+}
+
 const LenClass = enum { l1, l2, l3, l4, imm_m, imm_x };
 const WidthClass = enum { none, one, m, x, two, three };
-const Meta = struct { len: LenClass, width: WidthClass };
+const Meta = struct { len: LenClass, width: WidthClass, mode: Mode };
 
 const meta: [256]Meta = blk: {
     var t: [256]Meta = undefined;
@@ -236,7 +250,60 @@ fn classify(op: u8) Meta {
             else => .none,
         };
     };
-    return .{ .len = len, .width = width };
+    // Operand shape, from the same column structure. `odd` selects the
+    // indexed variant rows ($1x/$3x/.../$Fx).
+    const odd = (op & 0x10) != 0;
+    const m: Mode = switch (col) {
+        0x0, 0x8, 0xA, 0xB => .none, // control / implied / stack
+        0x1 => .dp, // (dp,X) / (dp),Y — the operand is a dp address
+        0x2 => if (odd) .dp else .none, // ALU (dp) / control+imm specials
+        0x3 => .none, // stack-relative
+        0x4 => switch (op) {
+            0x44, 0x54, 0xF4 => .none, // MVP, MVN, PEA
+            0xD4 => .dp, // PEI (dp)
+            else => if (odd) .dp_idx else .dp,
+        },
+        0x5, 0x6 => if (odd) .dp_idx else .dp, // dp,X and dp,Y rows included
+        0x7 => .dp, // [dp] / [dp],Y
+        0x9 => if (odd) .abs_y else .none, // abs,Y / immediate
+        0xC => switch (op) {
+            0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0xFC => .none, // jumps
+            0x3C, 0xBC => .abs_x, // BIT/LDY abs,X
+            else => .abs,
+        },
+        0xD => if (odd) .abs_x else .abs,
+        0xE => if (op == 0xBE) .abs_y else if (odd) .abs_x else .abs,
+        0xF => if (odd) .long_x else .long,
+        else => unreachable,
+    };
+    return .{ .len = len, .width = width, .mode = m };
+}
+
+test "operand modes: the rewriter's view of the matrix" {
+    try testing.expectEqual(Mode.long, mode(0xAF)); // LDA long
+    try testing.expectEqual(Mode.long, mode(0x8F)); // STA long
+    try testing.expectEqual(Mode.long_x, mode(0xBF)); // LDA long,X
+    try testing.expectEqual(Mode.abs, mode(0xAD)); // LDA abs
+    try testing.expectEqual(Mode.abs, mode(0x8D)); // STA abs
+    try testing.expectEqual(Mode.abs, mode(0xEE)); // INC abs
+    try testing.expectEqual(Mode.abs, mode(0x9C)); // STZ abs
+    try testing.expectEqual(Mode.abs_x, mode(0x9D)); // STA abs,X
+    try testing.expectEqual(Mode.abs_x, mode(0x3C)); // BIT abs,X
+    try testing.expectEqual(Mode.abs_y, mode(0xB9)); // LDA abs,Y
+    try testing.expectEqual(Mode.abs_y, mode(0xBE)); // LDX abs,Y
+    try testing.expectEqual(Mode.dp, mode(0xA5)); // LDA dp
+    try testing.expectEqual(Mode.dp, mode(0x64)); // STZ dp
+    try testing.expectEqual(Mode.dp, mode(0xB2)); // LDA (dp)
+    try testing.expectEqual(Mode.dp, mode(0xA7)); // LDA [dp]
+    try testing.expectEqual(Mode.dp, mode(0xD4)); // PEI
+    try testing.expectEqual(Mode.dp_idx, mode(0xB5)); // LDA dp,X
+    try testing.expectEqual(Mode.dp_idx, mode(0xB6)); // LDX dp,Y
+    try testing.expectEqual(Mode.none, mode(0x4C)); // JMP abs: code, not data
+    try testing.expectEqual(Mode.none, mode(0x22)); // JSL
+    try testing.expectEqual(Mode.none, mode(0xA9)); // LDA #
+    try testing.expectEqual(Mode.none, mode(0x48)); // PHA
+    try testing.expectEqual(Mode.none, mode(0x03)); // ORA sr,S
+    try testing.expectEqual(Mode.none, mode(0x54)); // MVN
 }
 
 // --- tests ---------------------------------------------------------------------

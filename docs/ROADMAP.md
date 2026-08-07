@@ -317,12 +317,27 @@ manual process (profile, transform, verify against the original), automated:
   relocatable at all. Text and `--json` both; unit-held on synthetic traces
   (dp pinning, DMA forcing, hottest-first fill, page-bound spill, the
   no-verdict mirror). Like the verdict thresholds, unvalidated against a real
-  conversion until commercial dumps are in hand; (S3) the mechanical
-  rewrite — header to SA-1 mapping, an S-CPU boot shim and message-port MMIO
-  proxy, NMI/IRQ forwarding via SNV/SIV, and static WRAM address rewriting in
-  the moved code (absolute/long addressing only; self-modifying code,
-  untraced indirect jumps, and indexed accesses that cross the relocated
-  region are refusals, fed by the analyser's blocker lists); (S4) the same
+  conversion until commercial dumps are in hand; (S3, **first half built**)
+  the mechanical rewrite. What is built and CI-gated (`--gen-sa1-patch`):
+  the **shell** — a plain LoROM cart converted to a real SA-1 cart (chipset
+  $35, map mode $23, BW-RAM declared; the Super MMC's power-on bank map
+  already reproduces LoROM addressing) with an S-CPU reset shim that opens
+  the SNES-side write gates, boots the SA-1 through the real CRV/$2200
+  protocol into a park stub, and continues the game on the S-CPU — and the
+  **state relocation**: every executed instruction whose operand statically
+  names a byte of a plan region is rewritten to the region's new home
+  (long/long-mirror operands exactly; absolute operands under $2000 to the
+  I-RAM window; a pinned dp window moves wholesale by booting the S-CPU with
+  D=$3000). Both I-RAM and BW-RAM are visible to both CPUs, so state moves
+  BEFORE execution does and the differential gate proves the rewrite
+  preserved behavior frame-for-frame. Refusals, per the ladder's contract:
+  indexed accesses into a region block it (an index can carry past a moved
+  edge), an absolute site whose region went to BW-RAM blocks it, a dp-window
+  hazard pins D at 0 — a blocked region simply does not move, which is
+  always correct and always reported. Not yet built (S3b): migrating
+  execution itself — the S-CPU service loop / message-port MMIO proxy,
+  NMI/IRQ forwarding via SNV/SIV, and moving the hot routines onto the
+  SA-1; (S4) the same
   differential verification as FastROM plus a measured slowdown reduction,
   with Vilela's own published conversions (Contra III, Gradius III) as ground
   truth to compare against. Each stage lands separately, each refusal prints

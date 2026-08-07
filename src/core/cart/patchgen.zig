@@ -224,7 +224,7 @@ fn refuse(refusal: *?Refusal, r: Refusal) Error {
 /// identical $00 or $FF bytes, kept at least 8 bytes clear of the run's start
 /// so an off-by-one in the neighbouring data's own length costs nothing.
 /// Returns the offset within `window`, or null.
-fn findFreeSpace(window: []const u8, need: u32) ?u32 {
+pub fn findFreeSpace(window: []const u8, need: u32) ?u32 {
     const margin = 8;
     var best_off: u32 = 0;
     var best_len: u32 = 0;
@@ -275,7 +275,7 @@ fn pcToFileOffset(header: header_mod.Header, image_len: usize, pc: u24) ?u32 {
 /// mirroring repeats it (384 KiB = 256 + 2x128, and so on); if the size is
 /// too irregular even for that, the plain sum stands — the pair is still
 /// self-consistent, which is all the console ever checks.
-fn recomputeChecksum(image: []u8, header_offset: u32) void {
+pub fn recomputeChecksum(image: []u8, header_offset: u32) void {
     const cs = header_offset + 0x1C;
     var sum: u32 = 0x1FE; // FF + FF + 00 + 00
     const p = std.math.floorPowerOfTwo(usize, image.len);
