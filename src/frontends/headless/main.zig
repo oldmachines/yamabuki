@@ -647,7 +647,7 @@ fn runSa1Gen(
         const plan = profile.planRelocation(&con.prof, conv);
 
         var refusal: ?core.sa1gen.Refusal = null;
-        const res = core.sa1gen.convert(gpa, image, &plan, ub, &refusal) catch |e| switch (e) {
+        const res = core.sa1gen.convert(gpa, image, &plan, ub, conv.entries[0..conv.n], &refusal) catch |e| switch (e) {
             error.Refused => {
                 try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
                 try out.flush();

@@ -334,10 +334,20 @@ manual process (profile, transform, verify against the original), automated:
   indexed accesses into a region block it (an index can carry past a moved
   edge), an absolute site whose region went to BW-RAM blocks it, a dp-window
   hazard pins D at 0 — a blocked region simply does not move, which is
-  always correct and always reported. Not yet built (S3b): migrating
-  execution itself — the S-CPU service loop / message-port MMIO proxy,
-  NMI/IRQ forwarding via SNV/SIV, and moving the hot routines onto the
-  SA-1; (S4) the same
+  always correct and always reported. S3b's first slice is
+  built too: **an eligible hot leaf routine now executes on the SA-1** — the
+  eligibility walk (covered code, single RTS, every data access SA-1-visible
+  after relocation, no calls/jumps/indexed sites) picks it, executed JSR
+  call sites are re-pointed at an S-CPU stub that marshals A/B/X/Y/P through
+  an I-RAM mailbox and speaks the real CFR/SFR message nibbles to an SA-1
+  dispatcher (native mode, stack parked under the mailbox, its own
+  CIWP/CBWE gates opened), which runs the routine's original, rewritten code
+  and marshals the exit state back; unseen call sites keep calling the
+  original on the S-CPU, which stays correct. Unit-held end to end: a
+  converted cart booted in-process, the routine's work observed happening in
+  I-RAM by the SA-1, the marshalled result landing back in S-CPU WRAM.
+  Still ahead in S3b: multiple routines per cart, the S-CPU MMIO proxy for
+  non-leaf work, NMI/IRQ forwarding via SNV/SIV; (S4) the same
   differential verification as FastROM plus a measured slowdown reduction,
   with Vilela's own published conversions (Contra III, Gradius III) as ground
   truth to compare against. Each stage lands separately, each refusal prints

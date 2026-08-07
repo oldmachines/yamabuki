@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     {
         var refusal: ?core.sa1gen.Refusal = null;
         const empty: core.profile.Plan = .{};
-        const sa1 = try core.sa1gen.convert(gpa, image, &empty, null, &refusal);
+        const sa1 = try core.sa1gen.convert(gpa, image, &empty, null, &.{}, &refusal);
         const cart2 = try core.Cartridge.load(gpa, sa1.image);
         if (cart2.chip != .sa1) {
             try out.print("FAIL: converted cart did not identify as SA-1\n", .{});
