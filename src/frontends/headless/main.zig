@@ -74,10 +74,20 @@ const Args = struct {
     /// 0x1000 = Start). A title screen that waits for input renders the same
     /// frame forever otherwise, so this is what gets a game past it.
     buttons: u16 = 0,
+    /// Generate a FastROM patch for this ROM, verified in-emulator before
+    /// anything is written (see `util.generateFastromVerified`).
+    gen_fastrom: bool = false,
+    /// Where to write the generated patch. Default: `<rom>.bps` next to the
+    /// ROM — the softpatch convention every frontend picks up by name.
+    gen_out: ?[]const u8 = null,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
 const report_frames_default: u32 = 3600;
+
+/// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
+/// same standard patches/fastrom-compat.zon entries are verified to.
+const gen_frames_default: u32 = 1800;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -92,12 +102,16 @@ pub fn main(init: std.process.Init) !void {
             try out.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
         } else if (e == error.WideTooBig) {
             try out.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
+        } else if (e == error.GenConflicts) {
+            try out.print("error: --gen-fastrom-patch runs its own baseline and verify passes; it cannot be combined\n" ++
+                "       with --patch/--auto-patch/--save-patched/--auto-fastrom/--accurate/--wide/--sa1-report\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
+            \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
@@ -108,6 +122,10 @@ pub fn main(init: std.process.Init) !void {
             \\  --buttons M   pad-1 buttons held all run, as a hex mask (0x1000 = Start)
             \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
             \\                (fast core only; for widescreen game patches such as wide-snes)
+            \\  --gen-fastrom-patch  derive a FastROM conversion for this SlowROM game and verify it
+            \\                in-emulator (every frame pixel- and audio-identical to the unpatched
+            \\                run, MEMSEL held); only a verified patch is written, as BPS
+            \\  --out p       where --gen-fastrom-patch writes the patch (default: <rom>.bps)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -146,6 +164,11 @@ pub fn main(init: std.process.Init) !void {
         };
         try out.print("wrote {s} ({d} bytes)\n", .{ save_path, image.len });
         try out.flush();
+        return;
+    }
+
+    if (args.gen_fastrom) {
+        try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image));
         return;
     }
 
@@ -431,6 +454,118 @@ test "auto-patch decides all four flows" {
 /// on its own — the attract/demo loop for most carts, a title screen for the
 /// rest. That is a real limitation and the report says so, because a title
 /// screen idling at 8% utilisation is not evidence of anything.
+/// The default output path for a generated patch: `<rom>.bps` next to the
+/// ROM file — the softpatch naming every frontend discovers by basename.
+fn defaultBpsPath(gpa: std.mem.Allocator, rom_path: []const u8) ![]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, rom_path, '.') orelse rom_path.len;
+    const slash = std.mem.lastIndexOfScalar(u8, rom_path, '/') orelse 0;
+    const stem = if (dot > slash) rom_path[0..dot] else rom_path;
+    return std.fmt.allocPrint(gpa, "{s}.bps", .{stem});
+}
+
+/// `--gen-fastrom-patch`: derive the FastROM conversion, verify it
+/// in-emulator, and only then write the BPS. `image` is copier-stripped.
+fn runGenerate(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+) !void {
+    const frames = args.frames orelse gen_frames_default;
+    const total = args.skip + frames;
+
+    try out.print("baseline + verify runs, {} frames each ({d:.0}s)...\n", .{ total, @as(f64, @floatFromInt(total)) / 60.0 });
+    try out.flush();
+
+    var failure: ?util.GenFailure = null;
+    const res = util.generateFastromVerified(gpa, image, frames, args.skip, args.buttons, &failure) catch |e| switch (e) {
+        error.GenFailed => {
+            switch (failure.?) {
+                .refused => |r| {
+                    try out.print("refused: {s}\n", .{r.reason.describe()});
+                    switch (r.reason) {
+                        .memsel_store_unpatchable => if (r.detail != 0) try out.print(
+                            "  the store at ${x:0>2}:{x:0>4} is not a plain STZ/STA $420D\n",
+                            .{ r.detail >> 16, r.detail & 0xFFFF },
+                        ),
+                        .no_free_space => try out.print(
+                            "  needed {} bytes of $00/$FF padding in bank $00\n",
+                            .{r.detail},
+                        ),
+                        else => {},
+                    }
+                },
+                .frame_mismatch => |f| try out.print(
+                    \\verification FAILED at frame {}: the patched run renders differently.
+                    \\  FastROM timing changed something visible — this game has code timed
+                    \\  against SlowROM latency and is not mechanically convertible.
+                    \\
+                , .{f}),
+                .memsel_lost => |f| try out.print(
+                    \\verification FAILED at frame {}: the game disabled MEMSEL from a code
+                    \\  path the baseline run never exercised.
+                    \\
+                , .{f}),
+                .audio_mismatch => try out.print(
+                    \\verification FAILED: the audio streams diverge. FastROM timing moved an
+                    \\  APU handshake — this game is not mechanically convertible.
+                    \\
+                , .{}),
+            }
+            try out.print("no patch written.\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        },
+        else => return e,
+    };
+
+    const path = args.gen_out orelse try defaultBpsPath(gpa, args.rom);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = res.bps }) catch {
+        try out.print("error: cannot write '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+
+    const header = try core.header.detect(image);
+    const title = std.mem.trim(u8, &header.title, " \x00");
+    const src_sha = core.registry.sha256Hex(image);
+    const patch_sha = core.registry.sha256Hex(res.bps);
+    const base_name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+
+    try out.print("wrote {s} ({} bytes)\n\n", .{ path, res.bps.len });
+    try out.print("{s}\n", .{title});
+    try out.print("  stub at $00:{x:0>4}, {} vector trampoline(s), {} MEMSEL store(s) neutralised\n", .{
+        res.stub_addr, res.trampolines, res.memsel_stores_nopped,
+    });
+    try out.print("  verified: {} frames pixel- and audio-identical to the unpatched ROM\n", .{total});
+    try out.print("  measured: mean CPU utilisation {d:.0}% -> {d:.0}%, slowdown {} -> {} frames\n", .{
+        res.base.mean_util * 100, res.fast.mean_util * 100,
+        res.base.slow_frames,     res.fast.slow_frames,
+    });
+    try out.print(
+        \\  caveat: verified from power-on for {} frames with buttons ${x:0>4} held; code
+        \\  paths beyond that window (menus, later levels) ran at FastROM timing untested.
+        \\
+        \\ready to paste into patches/registry.zon for --auto-patch:
+        \\    .{{
+        \\        .source_sha256 = "{s}",
+        \\        .title = "{s}",
+        \\        .patch_name = "{s}",
+        \\        .patch_sha256 = "{s}",
+        \\        .url = "generated locally: yamabuki-headless --gen-fastrom-patch",
+        \\        .license_note = "machine-generated FastROM conversion, verified {} frames from power-on",
+        \\    }},
+        \\
+    , .{
+        total,     args.buttons,
+        &src_sha,  title,
+        base_name, &patch_sha,
+        total,
+    });
+    try out.flush();
+}
+
 fn runReport(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -949,6 +1084,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             const digits = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
             out.buttons = try std.fmt.parseInt(u16, digits, 16);
+        } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
+            out.gen_fastrom = true;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            out.gen_out = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
@@ -958,5 +1097,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         if (out.accuracy == .accurate) return error.WideNeedsFast;
         if (out.wide > core.ppu.wide_margin_max) return error.WideTooBig;
     }
+    if (out.gen_fastrom and (out.patch != null or out.auto_patch or
+        out.save_patched != null or out.auto_fastrom or
+        out.accuracy == .accurate or out.wide != 0 or out.sa1_report))
+        return error.GenConflicts;
     return out;
 }

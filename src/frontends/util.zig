@@ -132,6 +132,181 @@ pub fn drainAudioDiscard(con: anytype) void {
     while (con.readAudio(&drain) != 0) {}
 }
 
+// --- FastROM patch generation, verified in-emulator ---------------------------
+
+/// Why a generation attempt produced no patch.
+pub const GenFailure = union(enum) {
+    /// The transform refused; see `core.patchgen.Reason.describe`.
+    refused: core.patchgen.Refusal,
+    /// First frame whose framebuffer hash diverged from the unpatched run —
+    /// the faster bus changed something the player would see.
+    frame_mismatch: u32,
+    /// The 32 kHz audio streams diverged over the run.
+    audio_mismatch,
+    /// Frame at whose end MEMSEL read back disabled in the patched run: the
+    /// game cleared it from a code path the baseline never exercised.
+    memsel_lost: u32,
+};
+
+/// A generated, verified patch and its measured effect.
+pub const GenOutcome = struct {
+    /// The transformed image and the encoded BPS, both caller-owned.
+    image: []u8,
+    bps: []u8,
+    stub_addr: u16,
+    trampolines: u8,
+    memsel_stores_nopped: u8,
+    /// Profiled frames (after the skipped boot) in each run.
+    frames: u32,
+    /// The profiler's frame-budget summary, unpatched and patched. FastROM
+    /// cuts ~2 master cycles from every ROM access, which shows up here as
+    /// idle headroom — the proof the patch does something.
+    base: core.profile.Summary,
+    fast: core.profile.Summary,
+};
+
+const GenRun = struct {
+    audio: u64,
+    summary: core.profile.Summary,
+    memsel_pcs: [core.profile.memsel_pc_cap]u24,
+    n_memsel_pcs: usize,
+    memsel_overflow: bool,
+    /// Frame at whose end `bus.fastrom` was false, if any.
+    fastrom_lost_at: ?u32,
+};
+
+/// One profiled run of `total` frames over `image`. When `expect` is null the
+/// per-frame framebuffer hashes are recorded into `hashes`; otherwise each
+/// frame is compared against it and the first divergence is returned in
+/// `mismatch`.
+fn genRun(
+    gpa: std.mem.Allocator,
+    image: []const u8,
+    hashes: []u64,
+    expect: ?[]const u64,
+    skip: u32,
+    buttons: u16,
+    mismatch: *?u32,
+) !GenRun {
+    const total: u32 = @intCast(hashes.len);
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.ProfilingConsole);
+    defer gpa.destroy(con);
+    con.init(cart);
+    defer gpa.free(con.cart.rom);
+
+    const samples = try gpa.alloc(core.profile.FrameSample, total);
+    defer gpa.free(samples);
+    var n_samples: usize = 0;
+
+    var audio: u64 = core.console.audio_hash_init;
+    var fastrom_lost_at: ?u32 = null;
+    for (0..total) |i| {
+        if (buttons != 0) con.setButtons(0, buttons);
+        con.runFrame();
+        try drainAudio(con, &audio, {}, null);
+        const h = core.console.hashFrame(con.framebuffer());
+        hashes[i] = h;
+        if (expect) |want| {
+            if (h != want[i] and mismatch.* == null) {
+                mismatch.* = @intCast(i);
+                break;
+            }
+            if (!con.bus.fastrom and fastrom_lost_at == null)
+                fastrom_lost_at = @intCast(i);
+        }
+        if (con.takeProfile()) |s| {
+            if (i >= skip) {
+                samples[n_samples] = s;
+                n_samples += 1;
+            }
+        }
+    }
+
+    const scratch = try gpa.alloc(f64, n_samples);
+    defer gpa.free(scratch);
+    return .{
+        .audio = audio,
+        .summary = core.profile.summarise(samples[0..n_samples], scratch),
+        .memsel_pcs = con.prof.memsel_pcs,
+        .n_memsel_pcs = con.prof.n_memsel_pcs,
+        .memsel_overflow = con.prof.memsel_overflow,
+        .fastrom_lost_at = fastrom_lost_at,
+    };
+}
+
+/// Generate the FastROM transformation of a copier-stripped `image` and
+/// verify it in-emulator before encoding anything: the patched ROM must
+/// render every one of `skip + frames` frames pixel-identical to the
+/// unpatched ROM (boot included) and produce an identical audio stream — the
+/// faster bus may change nothing the player sees or hears — and MEMSEL must
+/// read enabled at every frame boundary of the patched run. MEMSEL stores the
+/// baseline run observes are handed to the generator for neutralisation, so
+/// the stock `STZ $420D` init idiom does not silently undo the patch.
+///
+/// On failure, `failure` names what went wrong and nothing is returned; a
+/// patch that cannot be verified is a patch that does not get written.
+pub fn generateFastromVerified(
+    gpa: std.mem.Allocator,
+    image: []const u8,
+    frames: u32,
+    skip: u32,
+    buttons: u16,
+    failure: *?GenFailure,
+) !GenOutcome {
+    const total = skip + frames;
+    const hashes = try gpa.alloc(u64, total);
+    defer gpa.free(hashes);
+    const fast_hashes = try gpa.alloc(u64, total);
+    defer gpa.free(fast_hashes);
+
+    var no_mismatch: ?u32 = null;
+    const base = try genRun(gpa, image, hashes, null, skip, buttons, &no_mismatch);
+
+    var refusal: ?core.patchgen.Refusal = null;
+    if (base.memsel_overflow) {
+        failure.* = .{ .refused = .{ .reason = .memsel_store_unpatchable } };
+        return error.GenFailed;
+    }
+    const res = core.patchgen.generate(gpa, image, .{
+        .memsel_store_pcs = base.memsel_pcs[0..base.n_memsel_pcs],
+    }, &refusal) catch |e| switch (e) {
+        error.Refused => {
+            failure.* = .{ .refused = refusal.? };
+            return error.GenFailed;
+        },
+        else => return e,
+    };
+    errdefer gpa.free(res.image);
+
+    var mismatch: ?u32 = null;
+    const fast = try genRun(gpa, res.image, fast_hashes, hashes, skip, buttons, &mismatch);
+    if (mismatch) |frame| {
+        failure.* = .{ .frame_mismatch = frame };
+        return error.GenFailed;
+    }
+    if (fast.fastrom_lost_at) |frame| {
+        failure.* = .{ .memsel_lost = frame };
+        return error.GenFailed;
+    }
+    if (fast.audio != base.audio) {
+        failure.* = .audio_mismatch;
+        return error.GenFailed;
+    }
+
+    const bps = try core.patch.writeBps(gpa, image, res.image);
+    return .{
+        .image = res.image,
+        .bps = bps,
+        .stub_addr = res.stub_addr,
+        .trampolines = res.trampolines,
+        .memsel_stores_nopped = res.memsel_stores_nopped,
+        .frames = frames,
+        .base = base.summary,
+        .fast = fast.summary,
+    };
+}
+
 /// argv with argv[0] already skipped: the boilerplate every frontend's arg
 /// parser starts with. The allocator form (not `iterate()`) is used because
 /// Windows decodes the command line from UTF-16 and needs one; `gpa` is

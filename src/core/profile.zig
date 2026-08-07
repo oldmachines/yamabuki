@@ -273,6 +273,11 @@ pub fn pageCount(pages: WramPages) u32 {
 pub const wram_addr_cap: usize = 64;
 pub const mmio_reg_cap: usize = 32;
 
+/// Distinct PCs storing to MEMSEL ($420D) the profiler tracks for the FastROM
+/// patch generator. Real games have one or two (the init macro); the cap is
+/// generous, and blowing it marks the game unpatchable rather than guessing.
+pub const memsel_pc_cap: usize = 8;
+
 /// A routine's WRAM footprint, as the report shows it: an exact byte count
 /// when the set never capped, otherwise the honest range between what was
 /// actually counted (a hard lower bound — the cap or more were touched) and
@@ -577,6 +582,16 @@ pub const Profiler = struct {
     total_work: u64,
     total_idle: u64,
 
+    /// PCs of instructions that stored to MEMSEL ($420D), deduplicated. The
+    /// FastROM patch generator needs them: its reset stub sets the bit once,
+    /// and any store the game makes afterwards (the stock `STZ $420D` init
+    /// idiom) would undo it — so the generator NOPs the stores it can prove
+    /// harmless and refuses the rest. Overflow means the game pokes MEMSEL
+    /// from more sites than any sane init code has: unpatchable.
+    memsel_pcs: [memsel_pc_cap]u24,
+    n_memsel_pcs: u8,
+    memsel_overflow: bool,
+
     pub const StackFrame = struct {
         slot: u16,
         sp_pre: u16,
@@ -647,6 +662,9 @@ pub const Profiler = struct {
         .waiting_slow = 0,
         .total_work = 0,
         .total_idle = 0,
+        .memsel_pcs = @splat(0),
+        .n_memsel_pcs = 0,
+        .memsel_overflow = false,
     };
 
     /// Account for one retired instruction.
@@ -668,6 +686,13 @@ pub const Profiler = struct {
     ) void {
         self.pages[pc >> 8] += cycles;
         self.observed += cycles;
+
+        // MEMSEL stores, for the FastROM generator. Checked against the raw
+        // write address so it works whichever bank mirror the store used.
+        if (write) |addr| {
+            if ((addr & 0xFFFF) == 0x420D and ((addr >> 16) & 0x7F) <= 0x3F)
+                self.noteMemselStore(pc);
+        }
 
         if (waiting) {
             // WAI: halted until an interrupt. Waiting, by construction — and a
@@ -730,6 +755,24 @@ pub const Profiler = struct {
         }
 
         self.applyEvent(ev);
+    }
+
+    /// Record (deduplicated) the PC of a store to MEMSEL.
+    fn noteMemselStore(self: *Profiler, pc: u24) void {
+        for (self.memsel_pcs[0..self.n_memsel_pcs]) |p| {
+            if (p == pc) return;
+        }
+        if (self.n_memsel_pcs == memsel_pc_cap) {
+            self.memsel_overflow = true;
+            return;
+        }
+        self.memsel_pcs[self.n_memsel_pcs] = pc;
+        self.n_memsel_pcs += 1;
+    }
+
+    /// The PCs observed storing to MEMSEL, for the FastROM patch generator.
+    pub fn memselStorePcs(self: *const Profiler) []const u24 {
+        return self.memsel_pcs[0..self.n_memsel_pcs];
     }
 
     /// Sort one data access into the routine on top of the stack's footprint.
@@ -2013,4 +2056,19 @@ test "the WRAM low-page mirror in system banks counts as WRAM" {
     const a = t.routine(0x00_A000);
     // Both addresses resolve to the same linear WRAM offset: one entry.
     try std.testing.expectEqual(@as(u16, 1), a.n_wram_addrs);
+}
+
+test "MEMSEL stores are recorded by PC, deduplicated, across bank mirrors" {
+    var t: Trace = .{};
+    t.run(0x00_8100, null, 0x00_420D); // STZ $420D in the init sweep
+    t.run(0x00_8100, null, 0x00_420D); // same site again: deduplicated
+    t.run(0x80_9200, null, 0x80_420D); // a second site, via the fast mirror
+    t.run(0x00_8200, null, 0x00_4200); // a different register: not recorded
+    t.run(0x00_8300, null, 0x7E_420D); // WRAM, not MMIO: not recorded
+
+    const pcs = t.p.memselStorePcs();
+    try std.testing.expectEqual(@as(usize, 2), pcs.len);
+    try std.testing.expectEqual(@as(u24, 0x00_8100), pcs[0]);
+    try std.testing.expectEqual(@as(u24, 0x80_9200), pcs[1]);
+    try std.testing.expect(!t.p.memsel_overflow);
 }

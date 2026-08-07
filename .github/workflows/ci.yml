@@ -94,6 +94,9 @@ jobs:
             git clone --depth 1 https://github.com/PeterLemon/SNES.git test-data/snes-roms
           fi
       - run: zig build test-roms -Doptimize=${{ matrix.optimize }}
+      # FastROM patch generator end-to-end: generate, verify in-emulator,
+      # re-apply the emitted BPS through the public applier.
+      - run: zig build test-patchgen -Doptimize=${{ matrix.optimize }}
       # The accurate core must reproduce every golden hash: a line nothing
       # races mid-scanline renders bit-identically to the fast core.
       - if: matrix.optimize == 'ReleaseFast'

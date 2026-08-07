@@ -222,6 +222,26 @@ pub fn build(b: *std.Build) void {
     const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
     roms_step.dependOn(&run_roms.step);
 
+    // FastROM patch generator end-to-end: generate, verify in-emulator, and
+    // re-apply the emitted BPS through the public applier. Same test data as
+    // test-roms.
+    const patchgen_runner = b.addExecutable(.{
+        .name = "patchgen-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/patchgen_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
+            },
+        }),
+    });
+    const run_patchgen = b.addRunArtifact(patchgen_runner);
+    run_patchgen.setCwd(b.path("."));
+    const patchgen_step = b.step("test-patchgen", "Generate + verify + re-apply a FastROM patch end-to-end (needs test-data/)");
+    patchgen_step.dependOn(&run_patchgen.step);
+
     // Commercial-boot golden gate (M13): opt-in, local ROMs only — commercial
     // ROMs cannot be fetched or vendored. With no directory every pinned game
     // prints SKIP and the step exits 0, so CI needs no special casing.
