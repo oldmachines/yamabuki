@@ -82,8 +82,8 @@ pub fn main(init: std.process.Init) !void {
         "patchgen-runner: PASS — {} bytes of BPS, stub at $00:{x:0>4}, {} trampoline(s), " ++
             "{} MEMSEL store(s) neutralised, {} frames verified, util {d:.0}% -> {d:.0}%\n",
         .{
-            res.bps.len,              res.stub_addr,
-            res.trampolines,          res.memsel_stores_nopped,
+            res.bps.len,                 res.stub_addr,
+            res.trampolines,             res.memsel_stores_nopped,
             verify_skip + verify_frames, res.base.mean_util * 100,
             res.fast.mean_util * 100,
         },

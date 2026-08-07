@@ -5,6 +5,7 @@
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
 //!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc] [--wide N]
 //!   yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
+//!   yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
 //! output to inspect, and the printed hashes are what `zig build test-roms`
@@ -22,13 +23,21 @@
 //! against the registry. A missing patch prints where to fetch it and runs
 //! unpatched; the emulator never downloads anything.
 //!
-//! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
-//! game with the frame-budget profiler compiled in and answers the question that
-//! comes before every other one — *is this game CPU-bound at all?* `--routines`
-//! adds steps two and three: which routines cost the frame, and each hot
-//! routine's WRAM working set, MMIO blockers, and page-sharing with the rest —
-//! the numbers that decide whether it is worth moving to the SA-1. See
-//! `core/profile.zig` for what is being measured and why.
+//! `--sa1-report` is the SA-1 candidacy analyser (M12): it runs the game with
+//! the frame-budget profiler compiled in and answers the question that comes
+//! before every other one — *is this game CPU-bound at all?* — then ties
+//! everything into a graded `conversion:` verdict. `--routines` adds the
+//! detail tables: which routines cost the frame, each hot routine's WRAM
+//! working set, MMIO blockers, DMA/HDMA arms, and page-sharing with the rest.
+//! See `core/profile.zig` for what is being measured and why.
+//!
+//! `--gen-fastrom-patch` makes the emulator *write* a patch: it derives the
+//! FastROM transformation mechanically (see `core/cart/patchgen.zig`), runs
+//! the game unpatched and patched, and only when every frame's framebuffer
+//! and the whole audio stream are identical — and MEMSEL stayed enabled —
+//! encodes the result as a BPS (default: `<rom>.bps` beside the ROM, the
+//! softpatch convention the SDL player discovers by name). A patch that
+//! cannot be verified is never written; every refusal names its reason.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -1003,7 +1012,7 @@ fn printDmaUse(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
     switch (d.kind) {
         .gdma => {
             try out.print("gdma ch{d} ${x:0>2}:{x:0>4} {s} $21{x:0>2} (", .{
-                d.channel,          d.src >> 16, d.src & 0xFFFF,
+                d.channel,                       d.src >> 16, d.src & 0xFFFF,
                 if (d.a_is_dest) "<-" else "->", d.b_reg,
             });
             try printByteCount(out, d.bytes_max);
@@ -1026,9 +1035,9 @@ fn printDmaUseJson(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
         "{{\"kind\":\"{s}\",\"ch\":{d},\"src\":\"{x:0>2}:{x:0>4}\",\"b_reg\":\"$21{x:0>2}\"," ++
             "\"bytes\":{d},\"a_is_dest\":{},\"arms\":{d},\"src_wram\":{},\"indirect_wram\":{}}}",
         .{
-            @tagName(d.kind), d.channel,   d.src >> 16,
-            d.src & 0xFFFF,   d.b_reg,     d.bytes_max,
-            d.a_is_dest,      d.arms,      d.src_wram,
+            @tagName(d.kind), d.channel, d.src >> 16,
+            d.src & 0xFFFF,   d.b_reg,   d.bytes_max,
+            d.a_is_dest,      d.arms,    d.src_wram,
             d.indirect_wram,
         },
     );

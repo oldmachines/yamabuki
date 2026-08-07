@@ -222,7 +222,7 @@ serialize/unserialize.
 | M9 | Enhancement chips: Super FX → DSP-1 (HLE) → SA-1 (reuses the 65816 core) → Cx4 (HLE) → S-DD1 | krom CHIP suite golden-gated; Star Fox, Mario Kart, Kirby 3, MMX2, Star Ocean boot/play | Done — **Super FX (GSU) done**: full instruction set with the hardware's one-byte prefetch pipeline (delay slots and R15 semantics emerge from it), 512-byte code cache (16-byte line fills, SNES cache injection), ROM buffer, PLOT/RPIX pixel cache with column-major char addressing (2/4/8bpp × 128/160/192/OBJ heights, dither, transparency), catch-up scheduling off the master clock, STOP IRQ into the CPU line, save-stated. Gated by 58 golden ROMs: 31 GSUTest opcode screens (hardware-verified PASS/FAIL checks) + 27 plot demos matching krom's captures pixel-for-pixel modulo the global one-line display offset (see PPU notes). Ordered first because it is the only chip with test-ROM coverage. **DSP-1 (HLE) done**: the µPD7725 math coprocessor at the command level — the full documented command set (multiply, inverse with Newton refinement, interpolated sin/cos, 2D/3D rotate, attitude matrices with objective/subjective/scalar transforms, gyrate, radius/range/distance, and the mode 7 projection family: parameter → self-refilling raster stream → project/target), the DR/SR port state machine, and both board decodes (LoROM $30-$3F:$8000+ for carts up to 1 MiB, $60-$6F low half above that; HiROM $00-$1F:$6000-$7FFF). Data-ROM tables are regenerated at comptime from closed forms (reciprocal seeds round(2^29/d), sine trunc(32768·sin), power-of-two shift tables incl. the chip's $3C one-word bug); only the 49-word sqrt segment and a few polynomial constants are carried as documented literals. No DSP-1 test ROMs exist, so the gate is unit tests: exact vectors cross-checked against the reference HLE for every command family plus port-protocol edge cases (raster skip-writes, $80 idle bytes, ROM dump). Commands execute instantly (SR always ready) — documented HLE simplification. DSP-2/3/4 carry different µPD7725 programs and stay out of scope. **SA-1 done**: a second 65816 at 10.74 MHz reusing the same generic CPU core (the Sa1 struct is its bus), with 2 KiB IRAM, BW-RAM in linear and 2/4-bit bitmap projections, the Super MMC's four switchable 1 MiB ROM regions (page table rebuilt on bank writes), interrupt vectors served from registers by intercepting vector-window reads (the same trick swaps the SNES NMI/IRQ vectors to SNV/SIV — that page stays off the fast path), message ports and IRQs both directions, H/V and linear timers, normal DMA, both character-conversion DMA types, the multiply/divide/cumulative arithmetic unit, and the variable-length bit reader. Catch-up scheduled off the master clock (exactly half-rate) per scanline and before any shared access. No SA-1 test ROMs exist, so the gate is unit tests: the SA-1 boots from CRV and executes real 65816 code from MMC-mapped ROM in-process, IRQ/NMI delivery both ways, MMC remaps, DMA + CC1/CC2 conversions, arithmetic and bit-reader vectors, timers, protection bits, and a serialize roundtrip. Fast-core simplifications: no bus-conflict arbitration stalls, timer IRQs land on instruction boundaries, SA-1-side data reads of $00:FFEA-FFFF return the vector registers. **Cx4 (HLE) done**: the Hitachi HG51B169 on the Mega Man X2/X3 boards, at the command level. A plain memory-mapped device — an 8 KiB RAM window at $6000-$7FFF of banks $00-$3F/$80-$BF; games stage operands into the register file at $7F40-$7FA4 and poke a command byte to $7F4F, which runs the whole operation synchronously (no interrupt line, no busy flag the games poll, so nothing schedules — the command completes inside the port write and the $7F5E status reads 0). The full routine set: the wireframe transform + line rasterizer, OAM builder, affine scale/rotate, line transformer, bitplane wave, sprite disintegrate, and the scalar commands (24-bit multiply, 48-bit square, Pythagoras, atan2, polar↔rectangular with the radius clamp and y-bias, sum, trapezoid spans, coordinate transform, propulsion, set-vector-length). Sine/cosine are comptime round(32767·sin/cos(2πi/512)) — the chip's own table carries ±1 Q15 rounding noise with no single closed form, but that low bit can never move an integer screen coordinate, so the clean formula stands; only the 48-byte $5C self-test response is carried verbatim. No Cx4 test ROMs exist, so the gate is unit tests: every scalar command with vectors minted from the reference algorithm, the OAM builder, memory load, the status/window ports through the real bus, and a serialize roundtrip. HLE simplifications: commands complete instantly, double-precision trig drives the wireframe rotations (a rotated vertex can differ from the chip's fixed-point microcode by a sub-pixel amount before rounding), and degenerate projections fold the way an x86 double→int conversion would. The data ROM (needed only for the LLE approach, which requires the copyrighted Cx4 program) is unused. **S-DD1 done**: the decompressor on the Star Ocean / Street Fighter Alpha 2 boards, and the memory-map controller it shares a package with. The MMC is what a cart needs first: banks $C0-$FF are a 4 MiB window of four 1 MiB slices selected by $4804-$4807, and Star Ocean's reset code ends in `JML $C0:8001`, so plain LoROM addressing put it into open bus and it never rendered a frame. The decompressor is the ABS lossless entropy coder — a probability estimator over 32 neighbour-keyed contexts driving Golomb run-length codes, one bit at a time, with output logic reassembling bits into SNES bitplane bytes for the 2/4/8bpp tile layouts and mode 7. A DMA channel armed through $4800/$4801 takes its A-side bytes from the decoder instead of ROM (one-shot per transfer), which is how these games get graphics into VRAM. Written from the published algorithm description, not another emulator's source: the Golomb run lengths are generated at comptime from the closed form the documented decode tables imply (run = ~bitreverse_k(field)), and only the 33-state probability evolution table is carried verbatim as an irreducible hardware constant. No S-DD1 test ROMs exist, so the gate is unit tests (bank windowing through the real page table, the arm-once DMA path, both coder branches, a serialize roundtrip) plus the anchor that actually matters: Star Ocean boots, and every byte of graphics on its title screen and menu came out of the decoder, pinned as a commercial-boot golden. Fast-core simplification: a decompressing DMA expands synchronously as the transfer runs, so the chip has no observable busy period. Fast-core simplifications for Super FX: synchronous ROM/RAM buffers (SFR "R" flag always reads 0), no RON/RAN arbitration stalls or SNES-side ROM lock during GO |
 | M10 | ARM performance tuning, tile-decode cache, musl static packaging, bench gate hardened | ≥60 FPS sustained on a Cortex-A53-class device | In progress — tile-row decode cache for both BG (memoized by char address) and sprites (once per tile column); each plane word read once per row instead of per pixel; bit-identical, ~+18–39% headless FPS on 8bpp BG-heavy ROMs and ~+13% on the sprite-heavy Rings ROM. Bench gate hardened: a comptime-gated VRAM-word counter (`vram_reads`, compiled out of shipping builds) feeds `zig build bench-check`, a deterministic per-ROM baseline that fails CI on any steps/cycles/traffic drift — locking the decode cache in. Static-musl handheld packaging (`tools/package_handheld.sh`) with a CI assertion that every musl artifact has no dynamic libc / NEEDED shared object. The ≥60 FPS target is measured on-device |
 | M11 | CRT shaders: GL ES pipeline in the SDL frontend, libretro presets transpiled ahead of time | Presets render on-device; the bake gate holds the promised set | In progress — the SDL frontend had no GPU path at all (an `SDL_Renderer` blit of the RGB565 frame). Now: a GL ES context with the entry points resolved through `SDL_GL_GetProcAddress` (the same hand-ported-ABI, no-link-time-dependency stance as `sdl3.zig`), a multi-pass FBO chain with pass aliases, double-buffered feedback targets, an input-frame history ring, and LUT textures, plus a fallback ladder — **GL ES 3 → GL 3.3 → GL ES 2 → the existing software blit** — where every rung prints why it fell through, so a missing shader never costs the user the emulator. **The binary contains no shader compiler.** The presets are libretro *slang* (Vulkan GLSL); `tools/transpile_shaders.py` drives glslang and SPIRV-Cross on the *build host* and emits plain GLSL plus a manifest of reflected uniform offsets, and the phosphor-mask PNGs are decoded to raw RGBA there too — so the runtime holds no SPIR-V, no C++, and no image decoder, and the pure-Zig core, the dependency-free `zig build`, and the static-musl package all survive. The tools are themselves built by `zig c++`, so the bake needs no toolchain the repo does not already pin. Two uniform paths, because SPIRV-Cross emits different forms per profile: a real std140 block on ES3/desktop, plain per-member uniforms on ES2 (which has no uniform blocks); `--flatten-ubo` is unusable because it demands one basic type per block and the slang UBO mixes `mat4 MVP` with `uint FrameCount`. A preset is written for a profile only if it transpiled **and** every uniform mapped to a semantic the runtime supplies, so a shader that cannot work is *absent* rather than broken: 31 of 36 (preset, profile) pairs bake — crt-royale on all three, crt-guest-advanced on ES3 + desktop — and the 5 skips are printed with their reason (crt-geom/crt-hyllian use multidimensional array constructors, absent below ESSL 310; crt-guest-advanced needs `textureSize`, absent in ESSL 100). CI asserts the promised set still bakes. Presets are tagged `handheld` or `desktop` and the tag prints at startup — a claim about a Cortex-A53, not a rating. **Gap: not yet run on a GPU.** The pipeline is compile-verified on all targets and the fallible logic (pass geometry, manifest parsing, uniform encoding, feedback flipping, letterboxing) is unit-tested, but no lit pixel has been observed; expect first-run bugs |
-| M12 | ROM patch layer: soft-patching, a hash-keyed patch registry, auto-FastROM, and the SA-1 candidacy analyser | Patched ROMs boot and match the patch author's reference; `--save-patched` round-trips; auto-FastROM gated by a compat list | In progress — **step one of the analyser is done**: `--sa1-report` runs a game and answers the question that comes before every other one, *is it CPU-bound at all*. It cannot be measured directly (the SNES CPU burns the same cycles every frame whatever happens), so it is measured by its complement — the time the CPU spends **waiting** — and a loop counts as waiting if it *changes nothing*: writes nothing, and watches a fixed handful of addresses rather than walking memory (which is what tells a vblank spin from a checksum). Getting there took four corrections, every one of them a bug a *game* found rather than reasoning: a loop is found by **return**, not by proximity (Contra III's wait is a `JSL` inside a `BRA` loop spread over 6 KiB, and a program-counter *span* test called it 100% busy on every frame including its title screen); **stack traffic is not a side effect** (that same `JSL` pushes three bytes a pass, which a naive "writes nothing" test counts as a write); **a wait is allowed to write** (Tetris & Dr. Mario stirs an RNG seed while it spins — the classic way a game seeds randomness from how long you took to press Start — and read 100% busy until writes were permitted; what a wait may never do is poke a hardware register, which is what keeps a DMA-kicking loop out); and the unit of judgement is one **pass**, not one window (else a memory clear that merely precedes a wait condemns it, and Super Mario World's idle time disappears). Reports slowdown separately from **stalls** — an unbroken run of dropped frames is a level load, not a game failing to keep up, and conflating them recommends conversions nobody needs. Utilisation is honestly an *upper* bound (a wait it fails to spot reads as work) and dropped frames a *lower* one (a game polling the pad in its NMI handler can never register a lag frame); the two errors point opposite ways and bracket the truth, and the tool prints both caveats every run. Compiled in as a third comptime instantiation (`ProfilingConsole`), so the shipped core carries no branch for it; emulation under it is bit-identical (5.12M SST cases, 100 goldens, bench baselines all unchanged). Next: cycles per routine, then the WRAM working set of each hot routine — the number that actually decides a conversion |
+| M12 | ROM patch layer: soft-patching, a hash-keyed patch registry, auto-FastROM, and the SA-1 candidacy analyser | Patched ROMs boot and match the patch author's reference; `--save-patched` round-trips; auto-FastROM gated by a compat list | In progress — **step one of the analyser is done**: `--sa1-report` runs a game and answers the question that comes before every other one, *is it CPU-bound at all*. It cannot be measured directly (the SNES CPU burns the same cycles every frame whatever happens), so it is measured by its complement — the time the CPU spends **waiting** — and a loop counts as waiting if it *changes nothing*: writes nothing, and watches a fixed handful of addresses rather than walking memory (which is what tells a vblank spin from a checksum). Getting there took four corrections, every one of them a bug a *game* found rather than reasoning: a loop is found by **return**, not by proximity (Contra III's wait is a `JSL` inside a `BRA` loop spread over 6 KiB, and a program-counter *span* test called it 100% busy on every frame including its title screen); **stack traffic is not a side effect** (that same `JSL` pushes three bytes a pass, which a naive "writes nothing" test counts as a write); **a wait is allowed to write** (Tetris & Dr. Mario stirs an RNG seed while it spins — the classic way a game seeds randomness from how long you took to press Start — and read 100% busy until writes were permitted; what a wait may never do is poke a hardware register, which is what keeps a DMA-kicking loop out); and the unit of judgement is one **pass**, not one window (else a memory clear that merely precedes a wait condemns it, and Super Mario World's idle time disappears). Reports slowdown separately from **stalls** — an unbroken run of dropped frames is a level load, not a game failing to keep up, and conflating them recommends conversions nobody needs. Utilisation is honestly an *upper* bound (a wait it fails to spot reads as work) and dropped frames a *lower* one (a game polling the pad in its NMI handler can never register a lag frame); the two errors point opposite ways and bracket the truth, and the tool prints both caveats every run. Compiled in as a third comptime instantiation (`ProfilingConsole`), so the shipped core carries no branch for it; emulation under it is bit-identical (5.12M SST cases, 100 goldens, bench baselines all unchanged). Steps two and three landed as #57/#76: per-routine cycle attribution (`--routines` — call stack resynced on S, the attribution invariant unit-held), each hot routine's WRAM working set (exact set → page-bound fallback), MMIO blocker lists, and page sharing. Since then: the missing blocker — **DMA/HDMA arms per routine** (GDMA arm-time state snapshotted before the \$420B write destroys it, WRAM-sourced transfers tagged as the blocker they are) — and the **unified `conversion:` verdict** that ties it all together (smallest routine set covering 75% of slow-frame work, its combined WRAM footprint judged against I-RAM/BW-RAM on the honest upper bound, blockers each named). And the stance change: **the emulator now writes patches, not just applies them** — `--gen-fastrom-patch` derives a FastROM conversion mechanically (header speed bit, MEMSEL reset stub in discovered free space, interrupt trampolines into the fast mirror, the stock `STZ \$420D` init idiom NOPed when provably safe), verifies it in-emulator (every frame pixel- and audio-identical to the unpatched run, MEMSEL held), and only then emits BPS — refusal-first, gated end-to-end in CI (`zig build test-patchgen`). The SDL player discovers patches (same-basename softpatch, a patches folder matched by BPS source CRC32, the registry) and asks PLAY PATCHED / PLAY ORIGINAL, remembered per game. See *Generating patches* below for the SA-1 generation arc |
 | M13 | Commercial-boot golden gate: opt-in, local ROMs only, sha256-keyed | `zig build test-commercial -Dcommercial-roms=<dir>`; 13 pinned games | **Done** — see build.zig and tests/commercial_goldens.zon; every stuck-cart fix in the M9-M13 arc landed with a pinned boot |
 | M14 | End-user UI: the SDL app becomes a standalone player — overlay menu over the paused game, gamepads + remapping (2 players, hotplug), .srm battery saves, 8 save-state slots, PNG screenshots, hold-to-rewind, scanned ROM library, per-game overrides | Plays gamepad-only end to end; config/data in OS per-user dirs; zero new dependencies (menu is a custom-drawn 5x7 UI composited into the RGB565 frame, so CRT shaders shade it too); every slice kept all gates green | In progress — landed as a stacked PR series (#91-#97); deferred: .zip ROMs via std.zip, boxart, in-menu ROM-dir picker (needs a text widget), core dirty-page serialize for handheld-class rewind (needs core sign-off) |
 
@@ -266,12 +266,47 @@ actually do.
   wider framebuffer is squarely an emulator's job. The game-side patch stays
   per-game.
 
-**What is not.** Automatically *generating* an SA-1 conversion for an arbitrary
-ROM. Vilela's conversions are per-game reverse engineering — identifying which
-routines can move, relocating the game's RAM into SA-1-visible regions, and
-rewriting logic to run in parallel across two CPUs that share a bus. That is
-authorship, not a transformation, and no emulator derives it from a binary. Any
-roadmap entry promising otherwise would be fiction.
+**Generating patches: the ladder.** Automatically generating conversions *is*
+in scope — as a ladder climbed one verified rung at a time, not a promise. The
+outcome of every rung is a standalone BPS the user applies to their own ROM;
+the repo never ships a modified ROM, and a patch that fails verification is a
+patch that does not get written. What makes this credible is that the emulator
+is both the analysis oracle and the verification harness — Vilela's documented
+manual process (profile, transform, verify against the original), automated:
+
+- **Rung one — FastROM — built.** `--gen-fastrom-patch` derives the
+  transformation mechanically: the header speed bit; a reset stub in
+  *discovered* free space (refused when there is none) that sets MEMSEL and
+  enters the original reset in the $80 fast mirror; `JML` trampolines for
+  every ROM-targeting interrupt vector, because an interrupt forces PBR=$00
+  back into the slow mirror; and the stock `STZ $420D` init idiom — whose PCs
+  the baseline profiling run *observes* — NOPed out, but only when the bytes
+  are provably a plain `STZ`/`STA $420D` (an indexed register sweep is a
+  refusal naming the PC, not a guess). Then the gate: the patched ROM must
+  render every frame pixel-identical and every audio sample identical to the
+  unpatched run, with MEMSEL still enabled at every frame boundary. Only then
+  is the BPS encoded (with all three CRCs, so it refuses the wrong dump like
+  any hand-authored patch), written to `<rom>.bps`, and reported with its
+  measured effect — utilisation before and after. End-to-end in CI:
+  `zig build test-patchgen` generates, verifies, and re-applies through the
+  public applier against a fetched test ROM.
+- **Rung two — SA-1 — staged, not started.** Vilela's conversions are still
+  per-game reverse engineering, and the honest path automates the *mechanical
+  fraction* of it while refusing the rest by name: (S1) code/data discovery
+  from real play — dynamic coverage sidesteps static-disassembly
+  undecidability, and doubles as the community-standard usage-map artifact;
+  (S2) a relocation plan from the conversion verdict's hot set and its WRAM
+  working sets — an allocation map WRAM → I-RAM/BW-RAM; (S3) the mechanical
+  rewrite — header to SA-1 mapping, an S-CPU boot shim and message-port MMIO
+  proxy, NMI/IRQ forwarding via SNV/SIV, and static WRAM address rewriting in
+  the moved code (absolute/long addressing only; self-modifying code,
+  untraced indirect jumps, and indexed accesses that cross the relocated
+  region are refusals, fed by the analyser's blocker lists); (S4) the same
+  differential verification as FastROM plus a measured slowdown reduction,
+  with Vilela's own published conversions (Contra III, Gradius III) as ground
+  truth to compare against. Each stage lands separately, each refusal prints
+  its reason, and a game the generator cannot convert honestly is a game it
+  hands to a human with the map already drawn.
 
 ### The candidacy analyser — `--sa1-report`
 
@@ -295,22 +330,33 @@ So the report is not a trace dump. It is an answer:
   --sa1-report` runs the game and answers it. See *The frame-budget profiler*
   below: this turned out to be much less obvious than it looks, and it is the
   question that kills most candidates outright.
-- **Which routines cost the frame.** Cycles attributed per call site, so the code
-  worth moving announces itself rather than being guessed at.
-- **The working set of each hot routine, and where it lives.** For every address a
-  hot routine reads or writes: WRAM, BW-RAM-able cartridge space, zero page, or
-  MMIO. This is the number that decides the project — the volume of WRAM state a
-  routine touches is precisely the volume that has to be relocated for the SA-1
-  to run it.
-- **The blockers.** WRAM the hot code shares with code that must stay on the
-  S-CPU; DMA and HDMA sources that would have to move with it; MMIO the SA-1
-  cannot reach. These are the reasons a promising-looking game turns out to be a
-  nightmare, and they should surface in an afternoon rather than three weeks in.
-- **A verdict, with its reasoning shown.** "78% of overrun frames are spent in
-  three routines whose combined WRAM working set is 1.4 KiB — that fits I-RAM"
-  is a conversion worth attempting. "Hot code touches 22 KiB of WRAM shared with
-  the sprite engine" is a warning that saves someone a month. The tool's job is to
-  make the second answer as cheap to obtain as the first.
+- **Which routines cost the frame** — **done** (#57). `--routines`: cycles
+  attributed per call site (self and inclusive, with the slow-frame share),
+  so the code worth moving announces itself rather than being guessed at.
+- **The working set of each hot routine, and where it lives** — **done**
+  (#76). For every address a hot routine reads or writes: WRAM (exact set,
+  falling back to a page-granularity bound when it overflows), BW-RAM-able
+  cartridge space, or MMIO. This is the number that decides the project — the
+  volume of WRAM state a routine touches is precisely the volume that has to
+  be relocated for the SA-1 to run it.
+- **The blockers** — **done.** WRAM pages the hot code shares with code that
+  must stay on the S-CPU (`SHARED`); DMA and HDMA arms per routine, with
+  WRAM-sourced transfers tagged (GDMA's arm-time source and length are
+  snapshotted before the $420B write destroys them; the $420C writer owns the
+  HDMA table it armed — coarse but honest); MMIO the SA-1 cannot reach,
+  listed by register. These are the reasons a promising-looking game turns
+  out to be a nightmare, and they surface in an afternoon rather than three
+  weeks in.
+- **A verdict, with its reasoning shown** — **done.** The `conversion:`
+  paragraph in every report: the smallest set of routines covering 75% of
+  slow-frame work (capped at 8 — more than that is a restructuring, not a
+  relocation), its combined WRAM working set judged against I-RAM and BW-RAM
+  on the honest upper bound, and every blocker on its own BUT line. Depth-0
+  slow work counts in the denominator on purpose, so a game whose slow work
+  lives in its main loop reads *diffuse* instead of flattered. What remains
+  unvalidated, said plainly: the 75%/8 thresholds have not yet been run
+  against known ground truth (Contra III, Gradius III, SMW) — that needs
+  local commercial dumps.
 
 The same instrumentation, dumped rather than summarised, gives the artefacts the
 community already works with — execution coverage (which addresses ran, and as
@@ -319,7 +365,11 @@ the existing tooling eats, so the output joins that ecosystem rather than
 starting a second one. Vilela's "SA-1 Collection" reconstructed disassemblies
 from bsnes-plus trace logs and usage maps mailed in from playthroughs; Yamabuki
 should be able to produce those as a by-product of someone simply *playing the
-game*.
+game*. Concretely: bsnes-plus's `-usage.bin` format (one flag byte per bus
+address — Read/Write/Exec/Opcode plus the M/X widths at opcode fetch — CPU
+block then SMP then chip blocks), which DiztinGUIsh imports directly. This is
+stage S1 of the SA-1 generation arc (see *Generating patches* above) and is
+not yet built.
 
 The analyser does not write the patch. It tells you whether the patch is worth
 writing, and hands the author the map.
@@ -424,10 +474,13 @@ so the shipped emulator carries no branch for it — the same trick as `accuracy
 Emulation under it is bit-identical: 5,120,000 SingleStepTests cases, 100 golden
 ROMs, and the deterministic bench baselines are all unchanged.
 
-The order matters: soft-patching first (it makes every existing patch usable),
-then the analyser (it makes new ones possible), then auto-FastROM and widescreen
-(they are narrower wins). Nothing here ships a ROM, and nothing here ships
-someone else's patch — only the ability to apply one you have.
+The order mattered: soft-patching first (it made every existing patch usable),
+then the analyser (it makes new ones possible), then auto-FastROM and
+widescreen (narrower wins), and now generation — the analyser's front end
+feeding a generator whose every output is verified against the original before
+it is written. Nothing here ships a ROM, and nothing here ships someone else's
+patch — only the ability to apply one you have, and now to *make* one from a
+dump you own.
 
 ## Performance engineering
 
