@@ -9,6 +9,7 @@ pub const serialize = @import("serialize.zig");
 pub const header = @import("cart/header.zig");
 pub const cartridge = @import("cart/cartridge.zig");
 pub const patch = @import("cart/patch.zig");
+pub const patchgen = @import("cart/patchgen.zig");
 pub const registry = @import("cart/registry.zig");
 pub const fastrom_compat = @import("cart/fastrom_compat.zig");
 pub const bus = @import("memory/bus.zig");
