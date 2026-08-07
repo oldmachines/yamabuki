@@ -192,6 +192,90 @@ fn applyBps(
     return .{ .image = target, .verified = true };
 }
 
+// --- BPS encoding --------------------------------------------------------------
+
+/// Append a value in BPS varint form (the inverse of `bpsVarint`).
+fn putVarint(list: *std.array_list.Managed(u8), value: u64) !void {
+    var data = value;
+    while (true) {
+        const x: u8 = @truncate(data & 0x7F);
+        data >>= 7;
+        if (data == 0) {
+            try list.append(0x80 | x);
+            return;
+        }
+        try list.append(x);
+        data -= 1;
+    }
+}
+
+/// Length of the run of bytes from `at` where target still matches source.
+fn eqRun(source: []const u8, target: []const u8, at: usize) usize {
+    var n: usize = 0;
+    while (at + n < target.len and at + n < source.len and
+        source[at + n] == target[at + n]) n += 1;
+    return n;
+}
+
+/// An unchanged run shorter than this is cheaper carried inline as TargetRead
+/// data than as its own SourceRead action (switching actions costs ~2 bytes
+/// of varint either side).
+const source_run_min = 4;
+
+/// Encode `target` against `source` as a BPS patch, with all three CRC32s.
+///
+/// Emits SourceRead for unchanged spans and TargetRead for everything else —
+/// no delta search. That is the optimal encoding for what the patch generator
+/// produces (a handful of in-place edits to a ROM image) and valid BPS for
+/// any input pair; a general delta encoder would only shrink patches this
+/// tool never writes. The result round-trips through `apply`, which verifies
+/// every checksum — the generator's gate does exactly that before shipping
+/// a file.
+pub fn writeBps(
+    gpa: std.mem.Allocator,
+    source: []const u8,
+    target: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    var p: std.array_list.Managed(u8) = .init(gpa);
+    errdefer p.deinit();
+    try p.appendSlice("BPS1");
+    try putVarint(&p, source.len);
+    try putVarint(&p, target.len);
+    try putVarint(&p, 0); // no metadata
+
+    var i: usize = 0;
+    while (i < target.len) {
+        const eq = eqRun(source, target, i);
+        if (eq > 0 and (eq >= source_run_min or i + eq == target.len)) {
+            // SourceRead reads the source at the output offset — no operand.
+            try putVarint(&p, ((@as(u64, eq) - 1) << 2) |
+                @intFromEnum(BpsAction.source_read));
+            i += eq;
+            continue;
+        }
+        // Changed span: swallow differing bytes and any unchanged islands too
+        // small to be worth an action switch, until a real run (or the end).
+        var j = i;
+        while (j < target.len) {
+            const e = eqRun(source, target, j);
+            if (e > 0 and (e >= source_run_min or j + e == target.len)) break;
+            j += e + 1;
+        }
+        try putVarint(&p, ((@as(u64, j - i) - 1) << 2) |
+            @intFromEnum(BpsAction.target_read));
+        try p.appendSlice(target[i..j]);
+        i = j;
+    }
+
+    var crcs: [12]u8 = undefined;
+    std.mem.writeInt(u32, crcs[0..4], crc32(source), .little);
+    std.mem.writeInt(u32, crcs[4..8], crc32(target), .little);
+    try p.appendSlice(crcs[0..8]);
+    std.mem.writeInt(u32, crcs[8..12], crc32(p.items), .little);
+    try p.appendSlice(crcs[8..12]);
+    return p.toOwnedSlice();
+}
+
 // --- IPS -----------------------------------------------------------------------
 
 fn applyIps(gpa: std.mem.Allocator, source: []const u8, patch: []const u8) Error!Applied {
@@ -269,21 +353,6 @@ const testing = std.testing;
 test "crc32 matches the reference vector" {
     // The IEEE check value everyone validates against.
     try testing.expectEqual(@as(u32, 0xCBF4_3926), crc32("123456789"));
-}
-
-/// Encode a value in BPS varint form, for building synthetic patches.
-fn putVarint(list: *std.array_list.Managed(u8), value: u64) !void {
-    var data = value;
-    while (true) {
-        const x: u8 = @truncate(data & 0x7F);
-        data >>= 7;
-        if (data == 0) {
-            try list.append(0x80 | x);
-            return;
-        }
-        try list.append(x);
-        data -= 1;
-    }
 }
 
 /// Build a whole BPS patch from actions, with correct CRCs.
@@ -413,6 +482,73 @@ test "ips: records, RLE, extension past the source, and truncation" {
     const got2 = try apply(gpa, source, p.items, &mm);
     defer gpa.free(got2.image);
     try testing.expectEqual(@as(usize, 13), got2.image.len);
+}
+
+test "writeBps round-trips through apply, fully verified" {
+    const gpa = testing.allocator;
+    // A ROM-like source with edits the generator would make: a changed byte
+    // deep inside, a multi-byte stub, and a changed span containing unchanged
+    // islands below the merge threshold (exercises the TargetRead swallow).
+    var source: [1024]u8 = undefined;
+    for (&source, 0..) |*b, k| b.* = @truncate(k *% 31);
+    var target = source;
+    target[0x1D5] |= 0x10; // the header speed bit
+    @memcpy(target[0x200..0x208], "\x78\xA9\x01\x8D\x0D\x42\x5C\x00"); // a stub
+    target[0x300] = 0xAA; // changed
+    // target[0x301..0x303] left equal: a 2-byte island inside the edit
+    target[0x303] = 0xBB; // changed again
+
+    const patch = try writeBps(gpa, &source, &target);
+    defer gpa.free(patch);
+
+    var mm: CrcMismatch = .{};
+    const got = try apply(gpa, &source, patch, &mm);
+    defer gpa.free(got.image);
+    try testing.expectEqualSlices(u8, &target, got.image);
+    try testing.expect(got.verified);
+}
+
+test "writeBps: identical images encode as one SourceRead" {
+    const gpa = testing.allocator;
+    const image = "AN UNCHANGED ROM IMAGE OF SOME LENGTH";
+    const patch = try writeBps(gpa, image, image);
+    defer gpa.free(patch);
+    // Magic(4) + three size varints + one action varint + footer(12): tiny.
+    try testing.expect(patch.len <= 4 + 3 + 2 + 12);
+
+    var mm: CrcMismatch = .{};
+    const got = try apply(gpa, image, patch, &mm);
+    defer gpa.free(got.image);
+    try testing.expectEqualStrings(image, got.image);
+}
+
+test "writeBps: a patch refuses to land on the wrong ROM" {
+    const gpa = testing.allocator;
+    const source = "THE RIGHT SOURCE";
+    const target = "THE RIGHT TARGET";
+    const patch = try writeBps(gpa, source, target);
+    defer gpa.free(patch);
+
+    var mm: CrcMismatch = .{};
+    try testing.expectError(Error.WrongSource, apply(gpa, "A DIFFERENT ROM!", patch, &mm));
+    try testing.expectEqual(crc32(source), mm.expected);
+}
+
+test "writeBps: target longer and shorter than the source both round-trip" {
+    const gpa = testing.allocator;
+    const source = "SHORT SOURCE";
+    const longer = "SHORT SOURCE PLUS AN EXPANSION TAIL";
+    const shorter = "SHORT";
+
+    for ([_][]const u8{ longer, shorter }) |target| {
+        const patch = try writeBps(gpa, source, target);
+        defer gpa.free(patch);
+        var mm: CrcMismatch = .{};
+        const got = try apply(gpa, source, patch, &mm);
+        defer gpa.free(got.image);
+        try testing.expectEqualStrings(target, got.image);
+        try testing.expect(got.verified);
+    }
 }
 
 test "unknown magic is refused" {
