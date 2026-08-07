@@ -1300,6 +1300,172 @@ pub const Summary = struct {
     }
 };
 
+// --- the unified conversion verdict -------------------------------------------
+
+/// The SA-1's on-cartridge memory, which is what a relocated working set has
+/// to fit: 2 KiB of I-RAM (fast, always mapped) or up to 256 KiB of BW-RAM.
+pub const iram_bytes: u32 = 2 * 1024;
+pub const bwram_bytes: u32 = 256 * 1024;
+
+/// The fraction of slow-frame work the hot set must cover for a conversion to
+/// read as a *relocation*. 75% is the point where moving the set changes the
+/// shape of the frame budget rather than shaving it.
+pub const conversion_cover: f64 = 0.75;
+/// More routines than this is a restructuring, not a relocation — the scale
+/// of what SA-1 Root and the SMW SA-1 Pack actually moved per game.
+pub const conversion_set_max: usize = 8;
+
+/// The analyser's bottom line: everything the report has measured, folded
+/// into the one question the ROADMAP promises an answer to — *would this game
+/// convert well, and what would it cost?* Computed, not narrated, so it is
+/// unit-testable; the frontend only formats it.
+pub const Conversion = struct {
+    /// The step-one verdict said the game is actually short of CPU.
+    warranted: bool = false,
+    /// A set of at most `conversion_set_max` routines reaches
+    /// `conversion_cover` of the slow-frame work.
+    concentrated: bool = false,
+    n: usize = 0,
+    entries: [conversion_set_max]u24 = @splat(0),
+    /// Fraction of slow work the set covers, and the denominator itself.
+    covered: f64 = 0,
+    slow_work: u64 = 0,
+    /// Fraction of slow work running at depth 0 — under no call frame, so
+    /// with no unit a conversion could move. Deliberately inside the
+    /// denominator: a game whose slow work lives in its main loop should
+    /// read diffuse, not flattered.
+    main_share: f64 = 0,
+    /// The set's combined WRAM working set (union, deduplicated when every
+    /// member's exact set held).
+    wram: WramFootprint = .{ .min_bytes = 0, .max_bytes = 0, .exact = true },
+    pages: u32 = 0,
+    /// Judged against the honest upper bound (`wram.max_bytes`), so an
+    /// inexact set can never flatter the fit.
+    fits_iram: bool = false,
+    fits_bwram: bool = false,
+    /// WRAM pages the set shares with code outside it — moving the set
+    /// strands state both sides touch.
+    shared_pages: u32 = 0,
+    /// Distinct MMIO registers the set reaches; the SA-1 cannot, so each
+    /// needs an S-CPU stub.
+    mmio_regs: u32 = 0,
+    mmio_overflow: bool = false,
+    /// A DMA/HDMA the set arms is WRAM-sourced: relocate the state and the
+    /// transfer must be re-sourced or proxied.
+    wram_dma: bool = false,
+};
+
+/// Fold the profiler's slow-frame attribution into a `Conversion`.
+///
+/// The denominator is work cycles in dropped frames: waiting excluded (idle
+/// is not work a conversion moves), depth-0 work and interrupt handlers
+/// included (they pinned the frame too) — but only plain `.code` routines are
+/// eligible for the movable set: an NMI/IRQ handler stays on the S-CPU in any
+/// conversion (it answers the S-CPU's interrupts), and the main loop has no
+/// boundary to move.
+pub fn assessConversion(prof: *const Profiler, verdict: Verdict) Conversion {
+    var out: Conversion = .{};
+    out.warranted = verdict == .cpu_bound or verdict == .drops_frames;
+
+    var slow_work: u64 = prof.main_slow;
+    for (prof.routines) |r| {
+        if (r.entry == Routine.empty) continue;
+        slow_work += r.slow_cycles;
+    }
+    out.slow_work = slow_work;
+    if (slow_work == 0) return out;
+    out.main_share = @as(f64, @floatFromInt(prof.main_slow)) / @as(f64, @floatFromInt(slow_work));
+
+    // Rank eligible routines by slow cycles — allocation-free, fixed buffers.
+    var idx: [routine_slots]u16 = undefined;
+    var n_idx: usize = 0;
+    for (prof.routines, 0..) |r, i| {
+        if (r.entry == Routine.empty or r.kind != .code or r.slow_cycles == 0) continue;
+        idx[n_idx] = @intCast(i);
+        n_idx += 1;
+    }
+    std.mem.sort(u16, idx[0..n_idx], prof, struct {
+        fn gt(p: *const Profiler, a: u16, b: u16) bool {
+            return p.routines[a].slow_cycles > p.routines[b].slow_cycles;
+        }
+    }.gt);
+
+    // The smallest prefix reaching the coverage target, capped.
+    var set: [conversion_set_max]u16 = undefined;
+    var cum: u64 = 0;
+    const target = conversion_cover * @as(f64, @floatFromInt(slow_work));
+    for (idx[0..n_idx]) |slot| {
+        if (out.n == conversion_set_max) break;
+        set[out.n] = slot;
+        out.entries[out.n] = @intCast(prof.routines[slot].entry);
+        out.n += 1;
+        cum += prof.routines[slot].slow_cycles;
+        if (@as(f64, @floatFromInt(cum)) >= target) break;
+    }
+    out.covered = @as(f64, @floatFromInt(cum)) / @as(f64, @floatFromInt(slow_work));
+    out.concentrated = out.n > 0 and @as(f64, @floatFromInt(cum)) >= target;
+
+    // Union working set and blockers over the chosen set.
+    var pages: WramPages = @splat(0);
+    var exact = true;
+    var addrs: [conversion_set_max * wram_addr_cap]u32 = undefined;
+    var n_addrs: usize = 0;
+    var mmio: [conversion_set_max * mmio_reg_cap]u16 = undefined;
+    var n_mmio: usize = 0;
+    for (set[0..out.n]) |slot| {
+        const r = &prof.routines[slot];
+        for (&pages, r.wram_pages) |*p, rp| p.* |= rp;
+        if (r.wram_overflow) exact = false;
+        for (r.wram_addrs[0..r.n_wram_addrs]) |a| {
+            const dup = for (addrs[0..n_addrs]) |seen| {
+                if (seen == a) break true;
+            } else false;
+            if (!dup) {
+                addrs[n_addrs] = a;
+                n_addrs += 1;
+            }
+        }
+        if (r.mmio_overflow) out.mmio_overflow = true;
+        for (r.mmio_regs[0..r.n_mmio_regs]) |reg| {
+            const dup = for (mmio[0..n_mmio]) |seen| {
+                if (seen == reg) break true;
+            } else false;
+            if (!dup) {
+                mmio[n_mmio] = reg;
+                n_mmio += 1;
+            }
+        }
+        for (r.dma[0..r.n_dma]) |d| {
+            if (d.src_wram or d.indirect_wram) out.wram_dma = true;
+        }
+    }
+    out.pages = pageCount(pages);
+    out.wram = if (exact)
+        .{ .min_bytes = @intCast(n_addrs), .max_bytes = @intCast(n_addrs), .exact = true }
+    else
+        .{ .min_bytes = @intCast(n_addrs), .max_bytes = out.pages * 256, .exact = false };
+    out.fits_iram = out.wram.max_bytes <= iram_bytes and out.pages != 0;
+    out.fits_bwram = out.wram.max_bytes <= bwram_bytes;
+    out.mmio_regs = @intCast(n_mmio);
+
+    // Pages shared with anything outside the set (handlers and cold code
+    // both count — whoever it is, moving the set strands them).
+    var outside: WramPages = @splat(0);
+    for (prof.routines, 0..) |r, i| {
+        if (r.entry == Routine.empty) continue;
+        const in_set = for (set[0..out.n]) |slot| {
+            if (slot == i) break true;
+        } else false;
+        if (in_set) continue;
+        for (&outside, r.wram_pages) |*p, rp| p.* |= rp;
+    }
+    var shared: u32 = 0;
+    for (pages, outside) |a, b| shared += @popCount(a & b);
+    out.shared_pages = shared;
+
+    return out;
+}
+
 /// Dropped frames in an unbroken run longer than this are a *stall*, not
 /// slowdown. Slowdown is a game failing to keep up while it is still playing —
 /// it drops one frame in two or one in three, so its runs are short. An unbroken
@@ -2247,4 +2413,96 @@ test "an HDMA table in WRAM and an indirect bank in WRAM are both blockers" {
     try std.testing.expect(!r.dma[0].indirect_wram);
     try std.testing.expect(!r.dma[1].src_wram);
     try std.testing.expect(r.dma[1].indirect_wram);
+}
+
+/// Close a frame as DROPPED (no input poll) — how slow_cycles accrue.
+fn lagFrame(t: *Trace) void {
+    t.p.endFrame(0, false);
+    _ = t.p.take();
+}
+
+/// One call that does `work` steps of straight-line work touching `wram_at`
+/// (a different address per step when `walk_wram`), then returns.
+fn hotCall(t: *Trace, site: u24, entry: u24, work: u32, wram_at: u24, walk_wram: bool) void {
+    t.call(site, entry, 0x1FF);
+    for (0..work) |i| {
+        const a: ?u24 = if (walk_wram) wram_at + @as(u24, @intCast(i)) else wram_at;
+        t.p.step(entry + 3 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, a, null, .{});
+    }
+    t.ret(entry + 3 + @as(u24, @intCast(work)) * 3, 0x1FF);
+}
+
+test "conversion: concentrated hot set that fits I-RAM, clean, worth attempting" {
+    var t: Trace = .{};
+    // Three routines dominate a dropped frame; a fourth is cold. Each hot
+    // routine touches a handful of WRAM bytes in its own page.
+    hotCall(&t, 0x00_9000, 0x00_A000, 40, 0x7E_1000, false);
+    hotCall(&t, 0x00_9006, 0x00_B000, 40, 0x7E_1100, false);
+    hotCall(&t, 0x00_900C, 0x00_C000, 40, 0x7E_1200, false);
+    hotCall(&t, 0x00_9012, 0x00_D000, 2, 0x7E_5000, false);
+    lagFrame(&t);
+
+    const c = assessConversion(&t.p, .cpu_bound);
+    try std.testing.expect(c.warranted);
+    try std.testing.expect(c.concentrated);
+    try std.testing.expect(c.n <= 4 and c.n >= 3);
+    try std.testing.expect(c.covered >= conversion_cover);
+    try std.testing.expect(c.wram.exact);
+    try std.testing.expect(c.fits_iram);
+    try std.testing.expect(!c.wram_dma);
+    try std.testing.expectEqual(@as(u32, 0), c.shared_pages);
+}
+
+test "conversion: not warranted when the step-one verdict says not CPU-bound" {
+    var t: Trace = .{};
+    hotCall(&t, 0x00_9000, 0x00_A000, 40, 0x7E_1000, false);
+    lagFrame(&t);
+    const c = assessConversion(&t.p, .not_cpu_bound);
+    try std.testing.expect(!c.warranted);
+}
+
+test "conversion: diffuse when no small set covers the slow work" {
+    var t: Trace = .{};
+    // Twelve equal routines: the capped top 8 cover 2/3 < 75%.
+    for (0..12) |i| {
+        const entry: u24 = 0x00_A000 + @as(u24, @intCast(i)) * 0x100;
+        hotCall(&t, 0x00_9000 + @as(u24, @intCast(i)) * 6, entry, 20, 0x7E_1000 + @as(u24, @intCast(i)), false);
+    }
+    lagFrame(&t);
+    const c = assessConversion(&t.p, .cpu_bound);
+    try std.testing.expect(c.warranted);
+    try std.testing.expect(!c.concentrated);
+    try std.testing.expectEqual(conversion_set_max, c.n);
+    try std.testing.expect(c.covered < conversion_cover);
+}
+
+test "conversion: depth-0 slow work reads as diffuse, not flattered" {
+    var t: Trace = .{};
+    // One small routine, then a long straight-line main-loop grind: most of
+    // the dropped frame's work has no call frame to move.
+    hotCall(&t, 0x00_9000, 0x00_A000, 10, 0x7E_1000, false);
+    for (0..90) |i| t.p.step(0x00_9100 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, null, null, .{});
+    lagFrame(&t);
+
+    const c = assessConversion(&t.p, .cpu_bound);
+    try std.testing.expect(c.warranted);
+    try std.testing.expect(!c.concentrated);
+    try std.testing.expect(c.main_share > 0.5);
+}
+
+test "conversion: a shared WRAM page and a WRAM-sourced DMA surface as blockers" {
+    var t: Trace = .{};
+    // The hot routine works in page $7E:10xx and arms a WRAM-sourced GDMA.
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    for (0..40) |i| t.p.step(0x00_A003 + @as(u24, @intCast(i)) * 3, Trace.cyc, false, 0x7E_1000, null, .{});
+    t.p.noteDmaArm(.gdma, 1, 0x7E_2000, 0x400, 0x18, false, null);
+    t.ret(0x00_A200, 0x1FF);
+    // A cold routine touches the same page — outside the set, shares state.
+    hotCall(&t, 0x00_9006, 0x00_B000, 1, 0x7E_1080, false);
+    lagFrame(&t);
+
+    const c = assessConversion(&t.p, .cpu_bound);
+    try std.testing.expect(c.concentrated);
+    try std.testing.expect(c.wram_dma);
+    try std.testing.expect(c.shared_pages >= 1);
 }

@@ -312,7 +312,7 @@ const Booted = struct {
 /// Read and apply one patch file to `image`, with the same refusals and
 /// warnings whichever way the patch was chosen (a `--patch` flag or launch
 /// discovery).
-fn applySoftPatch(io: std.Io, gpa: std.mem.Allocator, image: []const u8, patch_path: []const u8, err: *std.Io.Writer) ![]const u8 {
+fn applySoftPatch(io: std.Io, gpa: std.mem.Allocator, image: []const u8, patch_path: []const u8, err: *std.Io.Writer) ![]u8 {
     const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read patch '{s}'\n", .{patch_path});
         try err.flush();

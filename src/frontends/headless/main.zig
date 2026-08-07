@@ -621,6 +621,27 @@ fn runReport(
                 @tagName(sum.verdict),
             },
         );
+        {
+            const c = profile.assessConversion(&con.prof, sum.verdict);
+            try out.print(
+                ",\"conversion\":{{\"warranted\":{},\"concentrated\":{},\"covered\":{d:.4}," ++
+                    "\"slow_work\":{},\"main_share\":{d:.4},\"wram_min\":{},\"wram_max\":{}," ++
+                    "\"wram_exact\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}," ++
+                    "\"shared_pages\":{},\"mmio\":{},\"wram_dma\":{},\"entries\":[",
+                .{
+                    c.warranted,      c.concentrated, c.covered,
+                    c.slow_work,      c.main_share,   c.wram.min_bytes,
+                    c.wram.max_bytes, c.wram.exact,   c.pages,
+                    c.fits_iram,      c.fits_bwram,   c.shared_pages,
+                    c.mmio_regs,      c.wram_dma,
+                },
+            );
+            for (c.entries[0..c.n], 0..) |e, i| {
+                if (i != 0) try out.print(",", .{});
+                try out.print("\"{x:0>2}:{x:0>4}\"", .{ e >> 16, e & 0xFFFF });
+            }
+            try out.print("]}}", .{});
+        }
         if (args.routines) {
             const rows = try routineRows(gpa, &con.prof);
             const total = attributedTotal(rows);
@@ -730,6 +751,8 @@ fn runReport(
             \\
         , .{sum.frames}),
     }
+
+    try printConversion(out, profile.assessConversion(&con.prof, sum.verdict));
 
     if (args.hot) {
         // Where every cycle went, loop or not.
@@ -883,6 +906,95 @@ fn runReport(
 }
 
 const routine_rows_shown: usize = 16;
+
+/// The unified `conversion:` paragraph — the report's bottom line, tying the
+/// slow-frame concentration to the WRAM fit and the blockers. Graded: not
+/// warranted / worth attempting (with any blockers each on their own line) /
+/// warranted but diffuse.
+fn printConversion(out: *std.Io.Writer, c: core.profile.Conversion) !void {
+    if (!c.warranted) {
+        try out.print("\n  conversion: not warranted — the game is not short of CPU (see the verdict above).\n", .{});
+        return;
+    }
+    if (c.slow_work == 0 or c.n == 0) {
+        try out.print(
+            \\
+            \\  conversion: warranted, but no slow-frame work was attributed to any routine
+            \\  (all of it ran while waiting, or the capture was too short). Nothing to rank.
+            \\
+        , .{});
+        return;
+    }
+    if (!c.concentrated) {
+        try out.print(
+            \\
+            \\  conversion: warranted but diffuse — the top {} routine(s) cover only {d:.0}% of
+            \\  the work in dropped frames
+        , .{ c.n, c.covered * 100 });
+        if (c.main_share >= 0.10) try out.print(
+            \\, and {d:.0}% of it runs at the top level, under no
+            \\  call frame
+        , .{c.main_share * 100});
+        try out.print(
+            \\. There is no small set to move; this is a restructuring, not a
+            \\  relocation.
+            \\
+        , .{});
+        return;
+    }
+
+    try out.print("\n  conversion: {d:.0}% of the work in dropped frames lands in {} routine(s) (", .{
+        c.covered * 100, c.n,
+    });
+    for (c.entries[0..c.n], 0..) |e, i| {
+        if (i != 0) try out.print(", ", .{});
+        try out.print("${x:0>2}:{x:0>4}", .{ e >> 16, e & 0xFFFF });
+    }
+    try out.print(")\n  whose combined WRAM working set is ", .{});
+    if (c.pages == 0) {
+        try out.print("empty (no WRAM access recorded)", .{});
+    } else {
+        try printWramFootprint(out, c.wram);
+        try out.print(" across {} page(s)", .{c.pages});
+    }
+    if (c.fits_iram) {
+        try out.print(" — fits I-RAM (2 KiB).\n", .{});
+    } else if (c.fits_bwram) {
+        try out.print(" — too big for I-RAM (2 KiB) but fits\n  cartridge BW-RAM (256 KiB).\n", .{});
+    } else {
+        try out.print(" — exceeds even BW-RAM (256 KiB); a straight\n  port cannot hold it.\n", .{});
+    }
+
+    var blockers = false;
+    if (c.shared_pages != 0) {
+        blockers = true;
+        try out.print(
+            "  BUT: {} WRAM page(s) of that set are shared with code that stays behind —\n" ++
+                "  moving the set strands state both sides touch.\n",
+            .{c.shared_pages},
+        );
+    }
+    if (c.wram_dma) {
+        blockers = true;
+        try out.print(
+            "  BUT: a DMA/HDMA the set arms is WRAM-sourced — relocate the state and the\n" ++
+                "  transfer must be re-sourced or proxied.\n",
+            .{},
+        );
+    }
+    if (c.mmio_regs != 0) {
+        try out.print("  It reaches {}{s} MMIO register(s) the SA-1 cannot touch — each access needs\n  an S-CPU stub.\n", .{
+            c.mmio_regs, if (c.mmio_overflow) "+" else "",
+        });
+    }
+    if (!c.fits_bwram) {
+        try out.print("  Not worth attempting as a relocation at this size.\n", .{});
+    } else if (blockers) {
+        try out.print("  Worth attempting only with the blockers above priced in.\n", .{});
+    } else {
+        try out.print("  No page of it is shared with resident code and no DMA sources it. Worth\n  attempting.\n", .{});
+    }
+}
 
 /// One DMA use as the routine table's detail line shows it, e.g.
 /// `gdma ch1 $7E:2000 -> $2118 (4.0 KiB, 214 arms) WRAM` — the arrow shows
@@ -1074,8 +1186,8 @@ const WramVerdict = struct {
     fits_bwram: bool,
 };
 
-const iram_bytes: u32 = 2 * 1024;
-const bwram_bytes: u32 = 256 * 1024;
+const iram_bytes = core.profile.iram_bytes;
+const bwram_bytes = core.profile.bwram_bytes;
 
 fn wramVerdict(rows: []const RoutineRow) WramVerdict {
     var union_pages: core.profile.WramPages = @splat(0);
