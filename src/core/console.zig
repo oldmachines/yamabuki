@@ -21,6 +21,7 @@ const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
 const CpuFlags = @import("cpu/wdc65816.zig").Flags;
+const Dma = @import("memory/dma.zig").Dma;
 const profile = @import("profile.zig");
 
 /// Save-state container magic ("YMBK") and format version. The version bumps
@@ -288,6 +289,26 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     .sp_after = self.cpu.regs.s,
                 },
             );
+            // DMA/HDMA arming, blamed on the routine the store ran under.
+            // GDMA state is consumed (and the mask cleared) so a later $420B
+            // write of zero cannot re-count the previous trigger; HDMA regs
+            // survive arming, so its snapshot reads live.
+            if (dataAddr(self.bus.last_data_write)) |w| {
+                const a16: u16 = @truncate(w);
+                if (((w >> 16) & 0x7F) <= 0x3F) {
+                    var arms_buf: [8]Dma.ArmInfo = undefined;
+                    if (a16 == 0x420B and self.bus.dma.last_gdma_mask != 0) {
+                        for (self.bus.dma.gdmaArms(&arms_buf)) |a| {
+                            self.prof.noteDmaArm(.gdma, a.channel, a.src, a.bytes, a.b_reg, a.a_is_dest, null);
+                        }
+                        self.bus.dma.last_gdma_mask = 0;
+                    } else if (a16 == 0x420C and self.bus.dma.hdmaen != 0) {
+                        for (self.bus.dma.hdmaArms(&arms_buf)) |a| {
+                            self.prof.noteDmaArm(.hdma, a.channel, a.src, 0, a.b_reg, false, a.indirect_bank);
+                        }
+                    }
+                }
+            }
         }
 
         fn dataAddr(v: u32) ?u24 {

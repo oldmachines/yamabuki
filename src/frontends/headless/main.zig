@@ -626,11 +626,16 @@ fn runReport(
             const total = attributedTotal(rows);
             const verdict = wramVerdict(topCodeRows(rows));
             try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"wram_verdict\":" ++
-                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"routines\":[", .{
+                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"main_dma\":[", .{
                 con.prof.stack_resets, con.prof.routines_dropped,
                 verdict.union_bytes,   verdict.union_pages,
                 verdict.fits_iram,     verdict.fits_bwram,
             });
+            for (con.prof.main_dma[0..con.prof.n_main_dma], 0..) |d, di| {
+                if (di != 0) try out.print(",", .{});
+                try printDmaUseJson(out, d);
+            }
+            try out.print("],\"routines\":[", .{});
             for (rows, 0..) |r, i| {
                 if (i != 0) try out.print(",", .{});
                 switch (r.what) {
@@ -647,6 +652,11 @@ fn runReport(
                         for (r.mmio_regs, 0..) |reg, mi| {
                             if (mi != 0) try out.print(",", .{});
                             try out.print("\"${x:0>4}\"", .{reg});
+                        }
+                        try out.print("],\"dma\":[", .{});
+                        for (r.dma, 0..) |d, di| {
+                            if (di != 0) try out.print(",", .{});
+                            try printDmaUseJson(out, d);
                         }
                         try out.print("]", .{});
                     },
@@ -778,9 +788,16 @@ fn runReport(
                 .waiting => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(waiting)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
                 }),
-                .main => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
-                    "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
-                }),
+                .main => {
+                    try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
+                        "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
+                    });
+                    for (con.prof.main_dma[0..con.prof.n_main_dma]) |d| {
+                        try out.print("                dma  ", .{});
+                        try printDmaUse(out, d);
+                        try out.print("\n", .{});
+                    }
+                },
                 .code => {
                     try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
                         r.entry >> 16,       r.entry & 0xFFFF,
@@ -807,6 +824,16 @@ fn runReport(
                         }
                     }
                     try out.print("\n", .{});
+                    // The DMA it arms: a WRAM-sourced transfer is a blocker —
+                    // relocate the state and the transfer ships garbage
+                    // unless it is re-sourced or proxied.
+                    for (r.dma) |d| {
+                        try out.print("                dma  ", .{});
+                        try printDmaUse(out, d);
+                        try out.print("\n", .{});
+                    }
+                    if (r.dma_overflow)
+                        try out.print("                dma  (more channel uses than the {} tracked)\n", .{profile.dma_use_cap});
                 },
             }
         }
@@ -857,6 +884,44 @@ fn runReport(
 
 const routine_rows_shown: usize = 16;
 
+/// One DMA use as the routine table's detail line shows it, e.g.
+/// `gdma ch1 $7E:2000 -> $2118 (4.0 KiB, 214 arms) WRAM` — the arrow shows
+/// which side the A-bus address is; the WRAM tag is the blocker call-out.
+fn printDmaUse(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
+    switch (d.kind) {
+        .gdma => {
+            try out.print("gdma ch{d} ${x:0>2}:{x:0>4} {s} $21{x:0>2} (", .{
+                d.channel,          d.src >> 16, d.src & 0xFFFF,
+                if (d.a_is_dest) "<-" else "->", d.b_reg,
+            });
+            try printByteCount(out, d.bytes_max);
+            try out.print(", {d} arm(s))", .{d.arms});
+            if (d.src_wram) try out.print("  WRAM", .{});
+        },
+        .hdma => {
+            try out.print("hdma ch{d} table ${x:0>2}:{x:0>4} -> $21{x:0>2} ({d} arm(s))", .{
+                d.channel, d.src >> 16, d.src & 0xFFFF, d.b_reg, d.arms,
+            });
+            if (d.src_wram) try out.print("  WRAM TABLE", .{});
+            if (d.indirect_wram) try out.print("  WRAM INDIRECT", .{});
+        },
+    }
+}
+
+/// The same use as a JSON object (no trailing separator).
+fn printDmaUseJson(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
+    try out.print(
+        "{{\"kind\":\"{s}\",\"ch\":{d},\"src\":\"{x:0>2}:{x:0>4}\",\"b_reg\":\"$21{x:0>2}\"," ++
+            "\"bytes\":{d},\"a_is_dest\":{},\"arms\":{d},\"src_wram\":{},\"indirect_wram\":{}}}",
+        .{
+            @tagName(d.kind), d.channel,   d.src >> 16,
+            d.src & 0xFFFF,   d.b_reg,     d.bytes_max,
+            d.a_is_dest,      d.arms,      d.src_wram,
+            d.indirect_wram,
+        },
+    );
+}
+
 /// One row of the `--routines` table: a named routine, or one of the two
 /// synthetic rows the attribution invariant needs — "(waiting)" (idle cycles,
 /// wherever the wait lived) and "(main)" (code under no call frame).
@@ -875,6 +940,9 @@ const RoutineRow = struct {
     /// (i.e. `con.prof`) outlives the report, which it does.
     mmio_regs: []const u16 = &.{},
     touches_sram: bool = false,
+    /// DMA/HDMA channels this routine armed (same lifetime note).
+    dma: []const core.profile.DmaUse = &.{},
+    dma_overflow: bool = false,
 };
 
 /// Collect and rank every routine with self time, synthetics included.
@@ -898,6 +966,8 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
             .wram_pages = r.wram_pages,
             .mmio_regs = prof.routines[i].mmio_regs[0..r.n_mmio_regs],
             .touches_sram = r.touches_sram,
+            .dma = prof.routines[i].dma[0..r.n_dma],
+            .dma_overflow = r.dma_overflow,
         });
     }
     std.mem.sort(RoutineRow, rows.items, {}, struct {
@@ -915,10 +985,12 @@ test "routine rows carry the WRAM footprint and shared flag into the report" {
     p.step(0x00_9000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
     p.step(0x00_A000, cyc, false, 0x7E_1000, null, .{});
     p.step(0x00_A003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
-    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212.
+    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212,
+    // and arms a WRAM-sourced GDMA while on top.
     p.step(0x00_9006, cyc, false, null, null, .{ .kind = .call, .target = 0x00_B000, .sp_before = 0x1FF, .sp_after = 0x1FD });
     p.step(0x00_B000, cyc, false, 0x7E_1005, null, .{});
     p.step(0x00_B003, cyc, false, 0x00_4212, null, .{});
+    p.noteDmaArm(.gdma, 1, 0x7E_2000, 0x400, 0x18, false, null);
     p.step(0x00_B006, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -942,6 +1014,9 @@ test "routine rows carry the WRAM footprint and shared flag into the report" {
     try std.testing.expectEqual(@as(usize, 1), b.mmio_regs.len);
     try std.testing.expectEqual(@as(u16, 0x4212), b.mmio_regs[0]);
     try std.testing.expect(!b.touches_sram);
+    try std.testing.expectEqual(@as(usize, 1), b.dma.len);
+    try std.testing.expect(b.dma[0].src_wram);
+    try std.testing.expectEqual(@as(usize, 0), a.dma.len);
 
     // Same 256-byte page ($7E1000 and $7E1005): each names the other.
     try std.testing.expect(wramShared(rows, a_idx.?));

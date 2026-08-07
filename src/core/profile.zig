@@ -278,6 +278,75 @@ pub const mmio_reg_cap: usize = 32;
 /// generous, and blowing it marks the game unpatchable rather than guessing.
 pub const memsel_pc_cap: usize = 8;
 
+/// Distinct (kind, channel) DMA arms tracked per routine. Eight channels x
+/// two kinds bounds the honest maximum at 16, but a routine arming more than
+/// 8 distinct channel uses is already the whole story; overflow flags it.
+pub const dma_use_cap: usize = 8;
+
+pub const DmaKind = enum(u1) { gdma, hdma };
+
+/// One channel a routine arms, folded across every re-arm. A game double-
+/// buffering the same channel from alternating addresses stays one entry —
+/// `src` keeps the first-seen address, `src_wram` is sticky across re-arms —
+/// so the cap survives real usage patterns.
+pub const DmaUse = struct {
+    kind: DmaKind,
+    channel: u3,
+    /// First-seen A-bus source (GDMA) or table address (HDMA).
+    src: u24,
+    /// Any arm of this use named a WRAM source/table — THE blocker: state a
+    /// conversion relocates out of WRAM has to be re-sourced for the DMA
+    /// that reads it, or the transfer ships garbage.
+    src_wram: bool,
+    /// HDMA indirect mode fetching its data from WRAM (same blocker).
+    indirect_wram: bool,
+    /// Largest single GDMA transfer seen (0 for HDMA — per-line).
+    bytes_max: u32,
+    /// B-bus register low byte (the $21xx side), first seen.
+    b_reg: u8,
+    /// GDMA direction bit (B->A: the A-bus side is the destination).
+    a_is_dest: bool,
+    /// Times this use was armed.
+    arms: u32,
+
+    pub const zero: DmaUse = .{
+        .kind = .gdma,
+        .channel = 0,
+        .src = 0,
+        .src_wram = false,
+        .indirect_wram = false,
+        .bytes_max = 0,
+        .b_reg = 0,
+        .a_is_dest = false,
+        .arms = 0,
+    };
+};
+
+/// Fold one arming into a capped DmaUse list (shared by the per-routine
+/// lists and the profiler's depth-0 `main_dma`).
+fn foldDmaUse(
+    list: *[dma_use_cap]DmaUse,
+    n: *u8,
+    overflow: *bool,
+    use: DmaUse,
+) void {
+    for (list[0..n.*]) |*u| {
+        if (u.kind == use.kind and u.channel == use.channel) {
+            u.arms +%= 1;
+            u.src_wram = u.src_wram or use.src_wram;
+            u.indirect_wram = u.indirect_wram or use.indirect_wram;
+            u.bytes_max = @max(u.bytes_max, use.bytes_max);
+            return;
+        }
+    }
+    if (n.* == dma_use_cap) {
+        overflow.* = true;
+        return;
+    }
+    list[n.*] = use;
+    n.* += 1;
+}
+
 /// A routine's WRAM footprint, as the report shows it: an exact byte count
 /// when the set never capped, otherwise the honest range between what was
 /// actually counted (a hard lower bound — the cap or more were touched) and
@@ -412,6 +481,12 @@ pub const Routine = struct {
     /// It touched cartridge SRAM/BW-RAM space — already SA-1-visible, so a
     /// conversion pays nothing to keep this access where it is.
     touches_sram: bool,
+    /// DMA/HDMA channels this routine armed while on top of the stack (the
+    /// $420B/$420C store is not a control transfer, so top-of-stack IS the
+    /// arming routine). WRAM-sourced entries are blockers; see `DmaUse`.
+    dma: [dma_use_cap]DmaUse,
+    n_dma: u8,
+    dma_overflow: bool,
 
     pub const empty: u32 = 0xFFFF_FFFF;
 
@@ -582,6 +657,14 @@ pub const Profiler = struct {
     total_work: u64,
     total_idle: u64,
 
+    /// DMA/HDMA arms made by depth-0 code — kept apart from the routine
+    /// table for the same reason `main_self` is: the main loop cannot be
+    /// moved as a unit, and its arms should not vanish just because no call
+    /// frame owned them.
+    main_dma: [dma_use_cap]DmaUse,
+    n_main_dma: u8,
+    main_dma_overflow: bool,
+
     /// PCs of instructions that stored to MEMSEL ($420D), deduplicated. The
     /// FastROM patch generator needs them: its reset stub sets the bit once,
     /// and any store the game makes afterwards (the stock `STZ $420D` init
@@ -646,6 +729,9 @@ pub const Profiler = struct {
             .n_mmio_regs = 0,
             .mmio_overflow = false,
             .touches_sram = false,
+            .dma = @splat(.zero),
+            .n_dma = 0,
+            .dma_overflow = false,
         }),
         .routines_dropped = 0,
         .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0 }),
@@ -662,6 +748,9 @@ pub const Profiler = struct {
         .waiting_slow = 0,
         .total_work = 0,
         .total_idle = 0,
+        .main_dma = @splat(.zero),
+        .n_main_dma = 0,
+        .main_dma_overflow = false,
         .memsel_pcs = @splat(0),
         .n_memsel_pcs = 0,
         .memsel_overflow = false,
@@ -755,6 +844,40 @@ pub const Profiler = struct {
         }
 
         self.applyEvent(ev);
+    }
+
+    /// Route a DMA/HDMA arming to whoever is on top of the call stack. The
+    /// console calls this after seeing a $420B/$420C store — that store is
+    /// not a control transfer, so the stack the instruction ran under is the
+    /// arming routine's. Depth-0 arms land in `main_dma`.
+    pub fn noteDmaArm(
+        self: *Profiler,
+        kind: DmaKind,
+        channel: u3,
+        src: u24,
+        bytes: u32,
+        b_reg: u8,
+        a_is_dest: bool,
+        indirect_bank: ?u8,
+    ) void {
+        const use: DmaUse = .{
+            .kind = kind,
+            .channel = channel,
+            .src = src,
+            .src_wram = wramOffset(src) != null,
+            .indirect_wram = if (indirect_bank) |b| b == 0x7E or b == 0x7F else false,
+            .bytes_max = bytes,
+            .b_reg = b_reg,
+            .a_is_dest = a_is_dest,
+            .arms = 1,
+        };
+        const slot = self.topSlot();
+        if (slot == slot_main) {
+            foldDmaUse(&self.main_dma, &self.n_main_dma, &self.main_dma_overflow, use);
+        } else {
+            const r = &self.routines[slot];
+            foldDmaUse(&r.dma, &r.n_dma, &r.dma_overflow, use);
+        }
     }
 
     /// Record (deduplicated) the PC of a store to MEMSEL.
@@ -2071,4 +2194,57 @@ test "MEMSEL stores are recorded by PC, deduplicated, across bank mirrors" {
     try std.testing.expectEqual(@as(u24, 0x00_8100), pcs[0]);
     try std.testing.expectEqual(@as(u24, 0x80_9200), pcs[1]);
     try std.testing.expect(!t.p.memsel_overflow);
+}
+
+test "DMA arms land on the routine on top of the stack; depth 0 goes to main_dma" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    // The upload routine: STA $420B while on top — a WRAM-sourced GDMA.
+    t.p.noteDmaArm(.gdma, 1, 0x7E_2000, 0x1000, 0x18, false, null);
+    t.ret(0x00_A003, 0x1FF);
+    // Depth 0: the main loop arms HDMA from a ROM table.
+    t.p.noteDmaArm(.hdma, 3, 0x00_8D00, 0, 0x0D, false, null);
+
+    const r = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u8, 1), r.n_dma);
+    try std.testing.expectEqual(DmaKind.gdma, r.dma[0].kind);
+    try std.testing.expect(r.dma[0].src_wram);
+    try std.testing.expectEqual(@as(u32, 0x1000), r.dma[0].bytes_max);
+
+    try std.testing.expectEqual(@as(u8, 1), t.p.n_main_dma);
+    try std.testing.expectEqual(DmaKind.hdma, t.p.main_dma[0].kind);
+    try std.testing.expect(!t.p.main_dma[0].src_wram);
+}
+
+test "re-arming the same channel folds; src_wram is sticky; the cap flags overflow" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    // Double-buffering: same channel, alternating sources, one of them WRAM.
+    t.p.noteDmaArm(.gdma, 1, 0x00_C000, 0x800, 0x18, false, null);
+    t.p.noteDmaArm(.gdma, 1, 0x7E_3000, 0x400, 0x18, false, null);
+    const r = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u8, 1), r.n_dma);
+    try std.testing.expectEqual(@as(u32, 2), r.dma[0].arms);
+    try std.testing.expect(r.dma[0].src_wram); // sticky across re-arms
+    try std.testing.expectEqual(@as(u32, 0x800), r.dma[0].bytes_max);
+    try std.testing.expectEqual(@as(u24, 0x00_C000), r.dma[0].src); // first seen
+
+    // Nine distinct (kind, channel) uses: the ninth overflows the cap.
+    for (0..8) |ch| t.p.noteDmaArm(.hdma, @intCast(ch), 0x00_8000, 0, 0, false, null);
+    const r2 = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u8, dma_use_cap), r2.n_dma);
+    try std.testing.expect(r2.dma_overflow);
+}
+
+test "an HDMA table in WRAM and an indirect bank in WRAM are both blockers" {
+    var t: Trace = .{};
+    t.call(0x00_9000, 0x00_A000, 0x1FF);
+    t.p.noteDmaArm(.hdma, 2, 0x7E_1A00, 0, 0x0D, false, null);
+    t.p.noteDmaArm(.hdma, 4, 0x00_8D00, 0, 0x26, false, 0x7E);
+    const r = t.routine(0x00_A000);
+    try std.testing.expectEqual(@as(u8, 2), r.n_dma);
+    try std.testing.expect(r.dma[0].src_wram);
+    try std.testing.expect(!r.dma[0].indirect_wram);
+    try std.testing.expect(!r.dma[1].src_wram);
+    try std.testing.expect(r.dma[1].indirect_wram);
 }

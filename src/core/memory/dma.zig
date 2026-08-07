@@ -52,7 +52,84 @@ pub const Dma = struct {
     channels: [8]Channel,
     hdmaen: u8, // $420C
 
-    pub const init: Dma = .{ .channels = [_]Channel{.{}} ** 8, .hdmaen = 0 };
+    // Arm-time diagnostics for the SA-1 candidacy analyser (`--sa1-report`),
+    // not machine state: GDMA destroys its own arm-time configuration as it
+    // runs (`a_addr` advances, `count` counts down to zero inside the $420B
+    // write), so what was ASKED FOR has to be captured before the transfer.
+    // A handful of stores per (rare) $420B trigger, in the same acceptance
+    // class as `bus.last_data_read`. Excluded from save states.
+    /// Channel mask of the most recent $420B trigger (never cleared by the
+    /// engine; the profiling console consumes and clears it).
+    last_gdma_mask: u8,
+    last_gdma_src: [8]u24,
+    last_gdma_len: [8]u32,
+
+    pub const serialize_skip = .{ "last_gdma_mask", "last_gdma_src", "last_gdma_len" };
+
+    pub const init: Dma = .{
+        .channels = [_]Channel{.{}} ** 8,
+        .hdmaen = 0,
+        .last_gdma_mask = 0,
+        .last_gdma_src = @splat(0),
+        .last_gdma_len = @splat(0),
+    };
+
+    /// One channel's arming, as the analyser reports it.
+    pub const ArmInfo = struct {
+        channel: u3,
+        /// GDMA: the A-bus start address (source, or destination when
+        /// `a_is_dest`) at trigger time. HDMA: the table address.
+        src: u24,
+        /// GDMA transfer size in bytes; 0 for HDMA (per-line, open-ended).
+        bytes: u32,
+        /// B-bus register low byte (the $21xx side).
+        b_reg: u8,
+        /// GDMA direction bit: B->A (the A-bus side is written).
+        a_is_dest: bool,
+        /// HDMA indirect mode: the bank indirect data is fetched from.
+        indirect_bank: ?u8,
+    };
+
+    /// The channels the most recent $420B trigger ran, reassembled from the
+    /// snapshot plus the live registers the transfer does not move
+    /// (control, b_addr).
+    pub fn gdmaArms(self: *const Dma, buf: *[8]ArmInfo) []ArmInfo {
+        var n: usize = 0;
+        for (0..8) |i| {
+            if (self.last_gdma_mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const ch = &self.channels[i];
+            buf[n] = .{
+                .channel = @intCast(i),
+                .src = self.last_gdma_src[i],
+                .bytes = self.last_gdma_len[i],
+                .b_reg = ch.b_addr,
+                .a_is_dest = ch.control & 0x80 != 0,
+                .indirect_bank = null,
+            };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    /// The channels enabled at a $420C write. HDMA arming mutates nothing,
+    /// so everything reads live; `src` is the table the channel will walk.
+    pub fn hdmaArms(self: *const Dma, buf: *[8]ArmInfo) []ArmInfo {
+        var n: usize = 0;
+        for (0..8) |i| {
+            if (self.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const ch = &self.channels[i];
+            buf[n] = .{
+                .channel = @intCast(i),
+                .src = (@as(u24, ch.a_bank) << 16) | ch.a_addr,
+                .bytes = 0,
+                .b_reg = ch.b_addr,
+                .a_is_dest = false,
+                .indirect_bank = if (ch.control & 0x40 != 0) ch.indirect_bank else null,
+            };
+            n += 1;
+        }
+        return buf[0..n];
+    }
 
     // --- register file ($43xy) --------------------------------------------
 
@@ -98,6 +175,15 @@ pub const Dma = struct {
     /// `bus` is the owning Bus (aliased with `self` — Zig permits it).
     pub fn startGpDma(self: *Dma, bus: anytype, mask: u8) void {
         if (mask == 0) return;
+        // Snapshot what was asked for before the channel loop destroys it
+        // (see the field comments above).
+        self.last_gdma_mask = mask;
+        for (0..8) |i| {
+            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const ch = &self.channels[i];
+            self.last_gdma_src[i] = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
+            self.last_gdma_len[i] = if (ch.count == 0) 0x10000 else ch.count;
+        }
         const start = bus.clock;
         var cost: u64 = dma_setup_cycles;
         for (0..8) |i| {
@@ -278,4 +364,92 @@ test "transfer unit patterns cover the documented modes" {
     try std.testing.expectEqual(@as(usize, 1), unit_offsets[0].len);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, unit_offsets[1]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, unit_offsets[4]);
+}
+
+/// A minimal bus for exercising startGpDma without a console: 64 KiB of
+/// WRAM-ish memory behind read8/write8, plus the fields the engine touches.
+const ArmTestBus = struct {
+    mem: [0x10000]u8 = @splat(0),
+    clock: u64 = 0,
+    mdr: u8 = 0,
+    // The chip enum needs an .sdd1 member (and the sdd1 stub its methods)
+    // for transferGpChannel's decompress path to type-check; it never runs
+    // here because the chip is .none.
+    cart: struct { chip: enum { none, sdd1 } } = .{ .chip = .none },
+    sdd1: struct {
+        pub fn channelArmed(_: @This(), _: usize) bool {
+            return false;
+        }
+        pub fn beginTransfer(_: @This(), _: usize, _: u24) void {}
+        pub fn nextByte(_: @This()) u8 {
+            return 0;
+        }
+    } = .{},
+
+    fn read8(self: *ArmTestBus, addr: u24) u8 {
+        return self.mem[@as(u16, @truncate(addr))];
+    }
+    fn write8(self: *ArmTestBus, addr: u24, value: u8) void {
+        self.mem[@as(u16, @truncate(addr))] = value;
+    }
+};
+
+test "gdma arming is snapshotted before the transfer destroys it" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+
+    // ch1: 0x40 bytes from $7E:2000 to $2118 (mode 1, increment).
+    dma.writeReg(0x4310, 0x01);
+    dma.writeReg(0x4311, 0x18);
+    dma.writeReg(0x4312, 0x00);
+    dma.writeReg(0x4313, 0x20);
+    dma.writeReg(0x4314, 0x7E);
+    dma.writeReg(0x4315, 0x40);
+    dma.writeReg(0x4316, 0x00);
+    dma.startGpDma(&bus, 0x02);
+
+    // The transfer consumed the live registers...
+    try std.testing.expectEqual(@as(u16, 0), dma.channels[1].count);
+    try std.testing.expectEqual(@as(u16, 0x2040), dma.channels[1].a_addr);
+    // ...but the snapshot holds what was asked for.
+    var buf: [8]Dma.ArmInfo = undefined;
+    const arms = dma.gdmaArms(&buf);
+    try std.testing.expectEqual(@as(usize, 1), arms.len);
+    try std.testing.expectEqual(@as(u3, 1), arms[0].channel);
+    try std.testing.expectEqual(@as(u24, 0x7E_2000), arms[0].src);
+    try std.testing.expectEqual(@as(u32, 0x40), arms[0].bytes);
+    try std.testing.expectEqual(@as(u8, 0x18), arms[0].b_reg);
+    try std.testing.expect(!arms[0].a_is_dest);
+    try std.testing.expect(arms[0].indirect_bank == null);
+
+    // count == 0 means the full 64 KiB, and the direction bit carries.
+    dma.writeReg(0x4300, 0x81);
+    dma.writeReg(0x4305, 0x00);
+    dma.writeReg(0x4306, 0x00);
+    dma.startGpDma(&bus, 0x01);
+    const arms2 = dma.gdmaArms(&buf);
+    try std.testing.expectEqual(@as(usize, 1), arms2.len);
+    try std.testing.expectEqual(@as(u32, 0x10000), arms2[0].bytes);
+    try std.testing.expect(arms2[0].a_is_dest);
+}
+
+test "hdma arming reads live registers, indirect bank only in indirect mode" {
+    var dma: Dma = .init;
+    // ch3: direct mode, table at $00:8D00.
+    dma.writeReg(0x4330, 0x02);
+    dma.writeReg(0x4331, 0x0D);
+    dma.writeReg(0x4332, 0x00);
+    dma.writeReg(0x4333, 0x8D);
+    dma.writeReg(0x4334, 0x00);
+    // ch4: indirect mode from bank $7E.
+    dma.writeReg(0x4340, 0x42);
+    dma.writeReg(0x4347, 0x7E);
+    dma.hdmaen = 0x18;
+
+    var buf: [8]Dma.ArmInfo = undefined;
+    const arms = dma.hdmaArms(&buf);
+    try std.testing.expectEqual(@as(usize, 2), arms.len);
+    try std.testing.expectEqual(@as(u24, 0x00_8D00), arms[0].src);
+    try std.testing.expect(arms[0].indirect_bank == null);
+    try std.testing.expectEqual(@as(?u8, 0x7E), arms[1].indirect_bank);
 }
