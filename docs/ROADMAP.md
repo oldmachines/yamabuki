@@ -297,11 +297,12 @@ manual process (profile, transform, verify against the original), automated:
   progress bar and cancel — the library scanner's no-thread pattern — and a
   success drops the BPS into the patches folder, where discovery finds it and
   the PLAY PATCHED prompt takes over, measured effect shown.
-- **Rung two — SA-1 — staged, not started.** Vilela's conversions are still
+- **Rung two — SA-1 — staged; S1 built.** Vilela's conversions are still
   per-game reverse engineering, and the honest path automates the *mechanical
-  fraction* of it while refusing the rest by name: (S1) code/data discovery
-  from real play — dynamic coverage sidesteps static-disassembly
-  undecidability, and doubles as the community-standard usage-map artifact;
+  fraction* of it while refusing the rest by name: (S1, **built** — see the
+  usage-map paragraph in the analyser section) code/data discovery from real
+  play — dynamic coverage sidesteps static-disassembly undecidability, and
+  doubles as the community-standard usage-map artifact;
   (S2) a relocation plan from the conversion verdict's hot set and its WRAM
   working sets — an allocation map WRAM → I-RAM/BW-RAM; (S3) the mechanical
   rewrite — header to SA-1 mapping, an S-CPU boot shim and message-port MMIO
@@ -372,11 +373,18 @@ the existing tooling eats, so the output joins that ecosystem rather than
 starting a second one. Vilela's "SA-1 Collection" reconstructed disassemblies
 from bsnes-plus trace logs and usage maps mailed in from playthroughs; Yamabuki
 should be able to produce those as a by-product of someone simply *playing the
-game*. Concretely: bsnes-plus's `-usage.bin` format (one flag byte per bus
-address — Read/Write/Exec/Opcode plus the M/X widths at opcode fetch — CPU
-block then SMP then chip blocks), which DiztinGUIsh imports directly. This is
-stage S1 of the SA-1 generation arc (see *Generating patches* above) and is
-not yet built.
+game*. **Built** (stage S1 of the generation arc): `--sa1-report --usage-map
+out.bin` exports the profiled run's coverage in bsnes-plus's `-usage.bin`
+format — one flag byte per bus address (Read $80 / Write $40 / Exec $20 /
+Opcode $10, with the M/X widths latest-wins at opcode fetch and writes
+demoting self-modified bytes back to data), CPU block then a zero SMP block
+then a zero chip block per cart, so DiztinGUIsh imports it directly. The
+instruction-length/data-width tables it marks operands and 16-bit accesses
+with are the only hand-derived opcode metadata in the tree, spot-tested
+against the datasheet. Divergences from bsnes-plus, stated in the module doc:
+S-CPU accesses only (no SMP/coprocessor cores, no DMA-moved bytes), one data
+access per instruction back-marked from its last byte (pointer indirections
+unmarked), vector fetches unmarked.
 
 The analyser does not write the patch. It tells you whether the patch is worth
 writing, and hands the author the map.

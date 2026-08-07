@@ -33,6 +33,7 @@ pub const sa1 = @import("chips/sa1.zig");
 pub const cx4 = @import("chips/cx4.zig");
 pub const console = @import("console.zig");
 pub const profile = @import("profile.zig");
+pub const usage_map = @import("usage_map.zig");
 
 pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;

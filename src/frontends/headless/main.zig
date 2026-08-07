@@ -75,6 +75,10 @@ const Args = struct {
     /// Steps two and three of the analyser: the per-routine cycle attribution
     /// table, and each hot routine's WRAM working set and blockers.
     routines: bool = false,
+    /// Stage S1 of the SA-1 arc: export execution/access coverage from the
+    /// profiled run as a bsnes-plus `-usage.bin` file (DiztinGUIsh imports
+    /// it). A `--sa1-report` modifier, like `--hot`.
+    usage_map_out: ?[]const u8 = null,
     /// `--wide N` (M12): extra columns rendered on each side of the standard
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
@@ -114,12 +118,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (e == error.GenConflicts) {
             try out.print("error: --gen-fastrom-patch runs its own baseline and verify passes; it cannot be combined\n" ++
                 "       with --patch/--auto-patch/--save-patched/--auto-fastrom/--accurate/--wide/--sa1-report\n", .{});
+        } else if (e == error.UsageNeedsReport) {
+            try out.print("error: --usage-map is a --sa1-report modifier (coverage comes from the profiled run)\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
+            \\                         [--usage-map out.bin]
             \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
@@ -140,6 +147,9 @@ pub fn main(init: std.process.Init) !void {
             \\  --hot         also list the loops the frame is spent in, and how each was classified
             \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
             \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
+            \\  --usage-map f export the profiled run's execution/access coverage as a bsnes-plus
+            \\                -usage.bin (code vs data with M/X widths, plus the RAM access map;
+            \\                DiztinGUIsh imports it directly)
             \\
         , .{});
         try out.flush();
@@ -582,12 +592,21 @@ fn runReport(
     args: Args,
     cart: core.Cartridge,
 ) !void {
-    _ = io;
     const want = args.frames orelse report_frames_default;
 
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
+
+    // Coverage wants the boot code too, so the map is attached before the
+    // skipped frames run, not after.
+    var umap: core.usage_map.UsageMap = undefined;
+    if (args.usage_map_out != null) {
+        const bytes = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        @memset(bytes, 0);
+        umap = .{ .bytes = bytes };
+        con.usage = &umap;
+    }
 
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(want);
@@ -598,6 +617,32 @@ fn runReport(
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
         if (i >= args.skip) samples.appendAssumeCapacity(s);
+    }
+
+    if (args.usage_map_out) |path| {
+        writeUsageMap(io, path, umap.bytes, con.cart.chip) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const extra: usize = switch (con.cart.chip) {
+            .sa1 => 1 << 24,
+            .superfx => 1 << 23,
+            else => 0,
+        };
+        try out.print(
+            "wrote {s} ({d:.1} MiB — S-CPU block recorded, SMP{s} zero-filled; " ++
+                "bsnes-plus -usage.bin layout, DiztinGUIsh-importable)\n",
+            .{
+                path,
+                @as(f64, @floatFromInt(core.usage_map.cpu_map_len + core.usage_map.smp_map_len + extra)) / (1024 * 1024),
+                switch (con.cart.chip) {
+                    .sa1 => " and SA-1 blocks",
+                    .superfx => " and Super FX blocks",
+                    else => " block",
+                },
+            },
+        );
     }
 
     const scratch = try gpa.alloc(f64, samples.items.len);
@@ -915,6 +960,66 @@ fn runReport(
 }
 
 const routine_rows_shown: usize = 16;
+
+/// Write a usage map in bsnes-plus's `-usage.bin` layout: the CPU block
+/// verbatim, then a zero-filled SMP block, then a zero-filled coprocessor
+/// block when the cart carries one (SA-1: 16 MiB, Super FX: 8 MiB) — so the
+/// byte layout matches what bsnes-plus writes for the same cart and existing
+/// importers need no special-casing.
+fn writeUsageMap(io: std.Io, path: []const u8, cpu: []const u8, chip: core.cartridge.ChipKind) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    const wr = &fw.interface;
+
+    try wr.writeAll(cpu);
+    const zeros: [4096]u8 = @splat(0);
+    var left: usize = core.usage_map.smp_map_len + @as(usize, switch (chip) {
+        .sa1 => 1 << 24,
+        .superfx => 1 << 23,
+        else => 0,
+    });
+    while (left != 0) {
+        const n = @min(left, zeros.len);
+        try wr.writeAll(zeros[0..n]);
+        left -= n;
+    }
+    try wr.flush();
+}
+
+test "usage-map file layout: block sizes per chip, CPU bytes verbatim" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = ".usage-map-test-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const cpu = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    defer gpa.free(cpu);
+    @memset(cpu, 0);
+    cpu[0x00_8000] = core.usage_map.flag_opcode | core.usage_map.flag_exec;
+    cpu[0xFF_FFFF] = core.usage_map.flag_read;
+
+    // A plain cart: CPU + SMP blocks only.
+    try writeUsageMap(io, root ++ "/plain-usage.bin", cpu, .none);
+    const plain = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/plain-usage.bin", gpa, .limited(64 << 20));
+    defer gpa.free(plain);
+    try std.testing.expectEqual(core.usage_map.cpu_map_len + core.usage_map.smp_map_len, plain.len);
+    try std.testing.expectEqual(cpu[0x00_8000], plain[0x00_8000]);
+    try std.testing.expectEqual(cpu[0xFF_FFFF], plain[0xFF_FFFF]);
+    try std.testing.expectEqual(@as(u8, 0), plain[core.usage_map.cpu_map_len]); // SMP zeros
+
+    // A Super FX cart appends its (zero) 8 MiB block.
+    try writeUsageMap(io, root ++ "/sfx-usage.bin", cpu, .superfx);
+    const st = try std.Io.Dir.cwd().statFile(io, root ++ "/sfx-usage.bin", .{});
+    try std.testing.expectEqual(
+        @as(u64, core.usage_map.cpu_map_len + core.usage_map.smp_map_len + (1 << 23)),
+        st.size,
+    );
+}
 
 /// The unified `conversion:` paragraph — the report's bottom line, tying the
 /// slow-frame concentration to the WRAM fit and the blockers. Graded: not
@@ -1273,6 +1378,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--usage-map")) {
+            out.usage_map_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
@@ -1297,5 +1404,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         out.save_patched != null or out.auto_fastrom or
         out.accuracy == .accurate or out.wide != 0 or out.sa1_report))
         return error.GenConflicts;
+    if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }
