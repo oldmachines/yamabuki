@@ -747,7 +747,7 @@ fn runSa1Gen(
                 \\  NMI forwarded S-CPU -> SA-1 through CCNT/CNV
                 \\
             , .{
-                res.stats.shim_addr,    res.stats.park_addr,
+                res.stats.shim_addr,     res.stats.park_addr,
                 res.stats.offload_sites, res.stats.rewritten_long,
             });
         } else {
