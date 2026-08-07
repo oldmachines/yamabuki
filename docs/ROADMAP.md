@@ -347,10 +347,19 @@ manual process (profile, transform, verify against the original), automated:
   converted cart booted in-process, the routine's work observed happening in
   I-RAM by the SA-1, the marshalled result landing back in S-CPU WRAM.
   Still ahead in S3b: multiple routines per cart, the S-CPU MMIO proxy for
-  non-leaf work, NMI/IRQ forwarding via SNV/SIV; (S4) the same
-  differential verification as FastROM plus a measured slowdown reduction,
-  with Vilela's own published conversions (Contra III, Gradius III) as ground
-  truth to compare against. Each stage lands separately, each refusal prints
+  non-leaf work, NMI/IRQ forwarding via SNV/SIV; (S4, **built as the gate**) differential
+  verification, two-tier: a conversion that changed no timing must be pixel-
+  and audio-IDENTICAL; one that genuinely sped the game up cannot be (fewer
+  lag frames = fewer repeated pictures), so the fallback demands EQUIVALENCE
+  MODULO TIMING — the same distinct pictures in the same order under
+  consecutive-dedup comparison, plus a measured, non-negative lag
+  improvement; anything else refuses, including a "conversion" that made
+  things slower. Limits stated with it: audio equivalence is not checkable
+  across a timing shift (reported UNVERIFIED in that tier), and a game that
+  animates through lag from an NMI-side frame counter legitimately reads
+  divergent — the gate refuses rather than guesses. What S4 still lacks is
+  ground truth: comparing generated conversions against Vilela's published
+  patches (Contra III, Gradius III) needs commercial dumps. Each stage lands separately, each refusal prints
   its reason, and a game the generator cannot convert honestly is a game it
   hands to a human with the map already drawn.
 

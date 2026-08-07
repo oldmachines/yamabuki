@@ -656,9 +656,16 @@ fn runSa1Gen(
             else => return e,
         };
 
-        // Verify: the converted cart must render and sound identical while
-        // the game still runs on the S-CPU and the SA-1 sits parked.
+        // Verify with the stage-S4 two-tier gate. A conversion that changed
+        // no timing must be pixel- AND audio-identical; one that genuinely
+        // sped the game up cannot be (fewer lag frames = fewer repeats), so
+        // the fallback demands the same distinct pictures in the same order
+        // (consecutive-dedup equality) plus a measured, non-negative lag
+        // improvement. Anything else is a refusal.
         var fast_audio = core.console.audio_hash_init;
+        const conv_hashes = try gpa.alloc(u64, total);
+        var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+        try conv_samples.ensureTotalCapacity(total);
         {
             const cart2 = try core.Cartridge.load(gpa, res.image);
             const con2 = try gpa.create(core.ProfilingConsole);
@@ -666,22 +673,45 @@ fn runSa1Gen(
             for (0..total) |i| {
                 con2.runFrame();
                 try util.drainAudio(con2, &fast_audio, {}, null);
-                if (core.console.hashFrame(con2.framebuffer()) != hashes[i]) {
-                    try out.print(
-                        \\verification FAILED at frame {}: the converted cart renders differently.
-                        \\  Either uncovered code touches moved state, or the shell itself is wrong
-                        \\  for this game. No patch written.
-                        \\
-                    , .{i});
-                    try out.flush();
-                    std.process.exit(1);
+                conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
+                if (con2.takeProfile()) |s| {
+                    if (i >= args.skip) conv_samples.appendAssumeCapacity(s);
                 }
             }
         }
-        if (fast_audio != base_audio) {
-            try out.print("verification FAILED: audio diverged. No patch written.\n", .{});
-            try out.flush();
-            std.process.exit(1);
+        const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
+        const conv_sum = profile.summarise(conv_samples.items, conv_scratch);
+
+        const equiv = util.framesEquivalent(hashes, conv_hashes);
+        const strictly_identical = equiv == .identical and fast_audio == base_audio;
+        switch (equiv) {
+            .identical => if (fast_audio != base_audio) {
+                try out.print("verification FAILED: frames identical but audio diverged. No patch written.\n", .{});
+                try out.flush();
+                std.process.exit(1);
+            },
+            .equivalent => {
+                if (conv_sum.lag_frames > sum.lag_frames) {
+                    try out.print(
+                        \\verification FAILED: the converted run shows the same pictures but drops
+                        \\  MORE frames ({} -> {}) — a regression, not a conversion. No patch written.
+                        \\
+                    , .{ sum.lag_frames, conv_sum.lag_frames });
+                    try out.flush();
+                    std.process.exit(1);
+                }
+            },
+            .divergent => {
+                try out.print(
+                    \\verification FAILED: the converted run renders pictures the original never
+                    \\  showed (or misses ones it did). Either uncovered code touches moved state,
+                    \\  or the game animates through lag (an NMI-side frame counter), which this
+                    \\  gate cannot tell apart from breakage. No patch written.
+                    \\
+                , .{});
+                try out.flush();
+                std.process.exit(1);
+            },
         }
 
         const bps = try core.patch.writeBps(gpa, image, res.image);
@@ -695,21 +725,47 @@ fn runSa1Gen(
 
         try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
         try out.print(
-            \\SA-1 conversion, stage S3 (shell + state relocation):
-            \\  shim at $00:{x:0>4}, SA-1 booted and parked at $00:{x:0>4}
+            \\SA-1 conversion (stages S3 + S4):
+            \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
             \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
-            \\  verified: {} frames pixel- and audio-identical (game still runs on the S-CPU;
-            \\  moved state now lives in SA-1 I-RAM/BW-RAM, which both CPUs can reach)
-            \\  caveat: code the profile never executed is invisible to the rewriter; a longer
-            \\  or more varied capture widens coverage. Execution migration is stage S3b.
             \\
         , .{
             res.stats.shim_addr,      res.stats.park_addr,
             res.stats.regions_moved,  res.stats.regions_blocked,
             res.stats.rewritten_long, res.stats.rewritten_abs,
             res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
-            total,
         });
+        if (res.stats.offloaded != 0) {
+            try out.print(
+                "  S3b: routine $00:{x:0>4} executes ON THE SA-1 ({} call site(s) re-pointed\n" ++
+                    "  through the message-port stub, registers marshalled via the I-RAM mailbox)\n",
+                .{ res.stats.offloaded, res.stats.offload_sites },
+            );
+        } else {
+            try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
+        }
+        if (strictly_identical) {
+            try out.print(
+                "  verified: IDENTICAL — {} frames pixel- and audio-identical (no timing shift)\n",
+                .{total},
+            );
+        } else {
+            try out.print(
+                \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same
+                \\  order, redistributed across {} frames (a speedup's exact signature); audio
+                \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
+                \\
+            , .{total});
+        }
+        try out.print(
+            "  measured: dropped frames {} -> {}, mean utilisation {d:.0}% -> {d:.0}%\n",
+            .{ sum.lag_frames, conv_sum.lag_frames, sum.mean_util * 100, conv_sum.mean_util * 100 },
+        );
+        try out.print(
+            \\  caveat: code the profile never executed is invisible to the rewriter; a longer
+            \\  or more varied capture widens coverage.
+            \\
+        , .{});
         try out.flush();
     }
 }

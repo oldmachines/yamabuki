@@ -410,6 +410,80 @@ pub fn generateFastromVerified(
     }
 }
 
+// --- stage S4: the timing-tolerant differential gate ---------------------------
+
+/// How two runs' per-frame framebuffer hash sequences relate.
+pub const Equivalence = enum {
+    /// Every frame identical: nothing observable moved. The only acceptable
+    /// verdict for a transformation that promises no timing change (FastROM
+    /// verification, the SA-1 shell, pure state relocation on a headroom
+    /// capture).
+    identical,
+    /// The runs show the SAME distinct pictures in the same order, but with
+    /// different numbers of consecutive repeats — exactly the signature of a
+    /// speedup: a lag frame re-shows the previous picture, and a faster run
+    /// repeats it fewer times. This is the strongest mechanical equivalence
+    /// a working offload can satisfy, and it is falsifiable: any new,
+    /// missing, or reordered picture is a divergence.
+    equivalent,
+    /// The converted run rendered something the original never showed (or
+    /// vice versa): the transformation changed behavior, not just timing.
+    divergent,
+};
+
+/// Classify two hash sequences. The dedup view collapses consecutive equal
+/// hashes; equality of the collapsed sequences is the "same pictures, fewer
+/// repeats" test. Honest limits, for the caller to print: a game that
+/// animates from an NMI-side frame counter does not re-show identical
+/// pictures during lag, so its speedup can legitimately read `divergent` —
+/// the gate refuses rather than guesses; and audio equivalence is not
+/// checkable across a timing shift at all.
+pub fn framesEquivalent(base: []const u64, conv: []const u64) Equivalence {
+    if (std.mem.eql(u64, base, conv)) return .identical;
+    var bi: usize = 0;
+    var ci: usize = 0;
+    while (bi < base.len and ci < conv.len) {
+        if (base[bi] != conv[ci]) return .divergent;
+        const h = base[bi];
+        while (bi < base.len and base[bi] == h) bi += 1;
+        while (ci < conv.len and conv[ci] == h) ci += 1;
+    }
+    // A tail of repeats on one side only is still the same picture stream;
+    // any NEW picture in a tail is not.
+    while (bi < base.len) : (bi += 1) {
+        if (bi > 0 and base[bi] != base[bi - 1]) return .divergent;
+    }
+    while (ci < conv.len) : (ci += 1) {
+        if (ci > 0 and conv[ci] != conv[ci - 1]) return .divergent;
+    }
+    return .equivalent;
+}
+
+test "framesEquivalent: identity, speedup-shaped repeats, and real divergence" {
+    const a = [_]u64{ 1, 1, 2, 2, 2, 3 };
+    try std.testing.expectEqual(Equivalence.identical, framesEquivalent(&a, &a));
+    // The sped-up run shows the same pictures with fewer lag repeats.
+    const fast = [_]u64{ 1, 2, 2, 3, 3, 3 };
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&a, &fast));
+    // Symmetric: a slower run is still the same picture stream (the caller
+    // judges whether slower is acceptable — the gate only judges sameness).
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&fast, &a));
+    // A picture the original never showed: divergent.
+    const wrong = [_]u64{ 1, 2, 9, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &wrong));
+    // A missing picture: divergent.
+    const skipped = [_]u64{ 1, 3, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &skipped));
+    // Reordered pictures: divergent.
+    const reordered = [_]u64{ 2, 1, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &reordered));
+    // Tails: extra repeats of the last picture are fine, new pictures not.
+    const tail_repeat = [_]u64{ 1, 2, 2, 3, 3, 3, 3, 3 };
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&a, &tail_repeat));
+    const tail_new = [_]u64{ 1, 1, 2, 2, 2, 3, 4 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &tail_new));
+}
+
 /// argv with argv[0] already skipped: the boilerplate every frontend's arg
 /// parser starts with. The allocator form (not `iterate()`) is used because
 /// Windows decodes the command line from UTF-16 and needs one; `gpa` is
