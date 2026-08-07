@@ -97,6 +97,10 @@ const Args = struct {
     /// parked SA-1) plus the plan's clean state relocations — verified
     /// frame- and audio-identical before anything is written.
     gen_sa1: bool = false,
+    /// With --gen-sa1-patch: whole-game migration (SA-1 Root) — the entire
+    /// game executes on the SA-1 and the S-CPU becomes an MMIO service
+    /// loop — instead of the routine-offload ladder.
+    whole_game: bool = false,
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
@@ -135,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
             \\                         [--plan] [--usage-map out.bin]
             \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
-            \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--out p.bps] [--frames N]
+            \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--whole-game] [--out p.bps] [--frames N]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
@@ -154,6 +158,10 @@ pub fn main(init: std.process.Init) !void {
             \\                clean state moves), verified pixel- and audio-identical; the game
             \\                still runs on the S-CPU — execution migration is stage S3b
             \\                (default output: <rom>-sa1.bps)
+            \\  --whole-game  with --gen-sa1-patch: whole-game migration (SA-1 Root) — the game
+            \\                executes entirely on the SA-1, the S-CPU becomes an MMIO service
+            \\                loop; needs the WRAM working set inside I-RAM's identity window
+            \\                and refuses by name when it cannot prove the move
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -643,11 +651,16 @@ fn runSa1Gen(
         }
         const scratch = try gpa.alloc(f64, samples.items.len);
         const sum = profile.summarise(samples.items, scratch);
-        const conv = profile.assessConversion(&con.prof, sum.verdict);
-        const plan = profile.planRelocation(&con.prof, conv);
 
         var refusal: ?core.sa1gen.Refusal = null;
-        const res = core.sa1gen.convert(gpa, image, &plan, ub, conv.entries[0..conv.n], &refusal) catch |e| switch (e) {
+        const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
+            core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
+        else blk: {
+            const conv = profile.assessConversion(&con.prof, sum.verdict);
+            const plan = profile.planRelocation(&con.prof, conv);
+            break :blk core.sa1gen.convert(gpa, image, &plan, ub, conv.entries[0..conv.n], &refusal);
+        };
+        const res = converted catch |e| switch (e) {
             error.Refused => {
                 try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
                 try out.flush();
@@ -724,26 +737,41 @@ fn runSa1Gen(
         };
 
         try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
-        try out.print(
-            \\SA-1 conversion (stages S3 + S4):
-            \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
-            \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
-            \\
-        , .{
-            res.stats.shim_addr,      res.stats.park_addr,
-            res.stats.regions_moved,  res.stats.regions_blocked,
-            res.stats.rewritten_long, res.stats.rewritten_abs,
-            res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
-        });
-        if (res.stats.offload_count != 0) {
+        if (args.whole_game) {
             try out.print(
-                "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
-                    "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
-                    "  mailbox)\n",
-                .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
-            );
+                \\whole-game migration (SA-1 Root):
+                \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
+                \\  the game executes ENTIRELY on the SA-1 — its WRAM working set lives in
+                \\  identity-mapped I-RAM; {d} MMIO site(s) proxied through the I-RAM mailbox
+                \\  (NMI masked per transaction), {d} long site(s) re-banked into the window;
+                \\  NMI forwarded S-CPU -> SA-1 through CCNT/CNV
+                \\
+            , .{
+                res.stats.shim_addr,    res.stats.park_addr,
+                res.stats.offload_sites, res.stats.rewritten_long,
+            });
         } else {
-            try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
+            try out.print(
+                \\SA-1 conversion (stages S3 + S4):
+                \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
+                \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
+                \\
+            , .{
+                res.stats.shim_addr,      res.stats.park_addr,
+                res.stats.regions_moved,  res.stats.regions_blocked,
+                res.stats.rewritten_long, res.stats.rewritten_abs,
+                res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
+            });
+            if (res.stats.offload_count != 0) {
+                try out.print(
+                    "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
+                        "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
+                        "  mailbox)\n",
+                    .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
+                );
+            } else {
+                try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
+            }
         }
         if (strictly_identical) {
             try out.print(
@@ -1655,6 +1683,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
             out.gen_sa1 = true;
+        } else if (std.mem.eql(u8, a, "--whole-game")) {
+            out.whole_game = true;
         } else if (std.mem.eql(u8, a, "--out")) {
             out.gen_out = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
@@ -1671,6 +1701,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         out.accuracy == .accurate or out.wide != 0 or out.sa1_report))
         return error.GenConflicts;
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
+    if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }

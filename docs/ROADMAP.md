@@ -348,12 +348,34 @@ manual process (profile, transform, verify against the original), automated:
   I-RAM by the SA-1, the marshalled result landing back in S-CPU WRAM.
   S3b now offloads **up to seven routines per cart** — each eligible leaf
   gets its own message id and call stub, and the dispatcher is emitted as an
-  id switch over shared marshal/unmarshal subroutines. What S3b deliberately
-  does NOT include, re-scoped honestly: the S-CPU MMIO proxy and SNV/SIV
-  interrupt forwarding belong to *whole-game migration* — the model where
-  the entire game runs on the SA-1 and the S-CPU becomes a service loop,
-  which is a different execution architecture than routine offload, not a
-  missing feature of it; that model is future work beyond this ladder; (S4, **built as the gate**) differential
+  id switch over shared marshal/unmarshal subroutines. **Whole-game
+  migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
+  a different execution model from routine offload — is built as a narrow
+  vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes
+  an MMIO service loop. It leans on one mapping fact — the SA-1's I-RAM
+  occupies $0000-$07FF of its bus, exactly where the S-CPU sees WRAM's low
+  mirror — so a game whose *measured* WRAM working set (effective addresses:
+  dp, stack, and indirect included) fits under $07F0 needs zero WRAM
+  rewriting. Every executed MMIO site becomes a same-length JSR to an
+  emitted helper that files the access through an I-RAM mailbox the S-CPU
+  performs on the real bus; NMI crosses the wall S-CPU→SA-1 through a CCNT
+  message and an emitted CNV shim that acks CIC before the game's own
+  handler, and every helper masks that NMI (CIE) for the span of its
+  transaction — a message meanwhile latches and delivers on the unmask, so
+  the game's NMI handler (whose own MMIO files through the same mailbox)
+  can never corrupt a request in flight. Refusals, per the ladder's
+  contract: WRAM touched beyond the window or inside the reserved mailbox
+  tail, IRQ use, ambiguous native/emulation NMI handlers, MMIO in any shape
+  but plain LDA/STA/STZ absolute in bank $00 code (8- and 16-bit both),
+  block moves, BRK/COP, STP — each by name. Known honest gaps that fall to
+  the S4 gate instead of static proof: DMA sourced from low WRAM and
+  WRAM-port traffic reach the S-CPU's real WRAM, not I-RAM — a game relying
+  on either diverges in verification and no patch is written. Unit-held end
+  to end: a synthetic game profiled on the original console, migrated, and
+  booted — its working state observed in I-RAM written by the SA-1, its
+  port writes landing in real WRAM through the mailbox, a read round-trip
+  crossing both directions, and the NMI handler counting frames from
+  interrupt context through the masked protocol; (S4, **built as the gate**) differential
   verification, two-tier: a conversion that changed no timing must be pixel-
   and audio-IDENTICAL; one that genuinely sped the game up cannot be (fewer
   lag frames = fewer repeated pictures), so the fallback demands EQUIVALENCE
