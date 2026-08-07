@@ -375,7 +375,14 @@ manual process (profile, transform, verify against the original), automated:
   booted — its working state observed in I-RAM written by the SA-1, its
   port writes landing in real WRAM through the mailbox, a read round-trip
   crossing both directions, and the NMI handler counting frames from
-  interrupt context through the masked protocol; (S4, **built as the gate**) differential
+  interrupt context through the masked protocol. And proven satisfiable by
+  a real program, not just by refusals: `zig build wg-demo` writes a
+  playable demo game (NMI-driven backdrop animation — a distinct picture
+  every frame, every PPU write vblank-aligned) that goes through
+  `--gen-sa1-patch --whole-game` end to end: 300 frames strict-tier pixel-
+  and audio-identical, BPS written, re-applied through `--patch`, and
+  booted; the CI patchgen runner drives the same image through the whole
+  pipeline on every run; (S4, **built as the gate**) differential
   verification, two-tier: a conversion that changed no timing must be pixel-
   and audio-IDENTICAL; one that genuinely sped the game up cannot be (fewer
   lag frames = fewer repeated pictures), so the fallback demands EQUIVALENCE
