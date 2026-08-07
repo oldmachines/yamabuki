@@ -24,6 +24,7 @@ const png = @import("png.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
 const dirpicker = @import("dirpicker.zig");
+const patchfind = @import("patchfind.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -751,6 +752,7 @@ pub fn runLibrary(
     cfg: *config.Config,
     config_path: ?[]const u8,
     cache_path: ?[]const u8,
+    patches_dir: ?[]const u8,
     err: *std.Io.Writer,
 ) !?[]const u8 {
     if (!sdl.SDL_Init(sdl3.init_video | sdl3.init_audio)) {
@@ -810,13 +812,24 @@ pub fn runLibrary(
     // Hold-to-scroll for both the game list and the folder browser.
     var repeater: menu.Repeater = .{};
 
+    // Patch availability: the folder index is built once, and every entry's
+    // PATCH tag is refreshed from it now (cached entries) and again when a
+    // scan completes (fresh ones).
+    var patch_index = patchfind.FolderIndex.build(io, gpa, patches_dir);
+    refreshPatchTags(io, gpa, lib, &patch_index);
+
     // Row 0 of the list is always the ADD ROM FOLDER action, so the browser
-    // never depends on a hand-edited config.zon. `.picker` owns the folder
-    // browser while it's open; `.list` is the game list.
-    const Mode = enum { list, picker };
+    // never depends on a hand-edited config.zon. `.prompt` is the two-row
+    // patched-or-original question for a game with a patch available;
+    // `.picker` owns the folder browser while it's open; `.list` is the
+    // game list.
+    const Mode = enum { list, picker, prompt };
     var mode: Mode = .list;
     var picker: ?dirpicker.Picker = null;
     defer if (picker) |*pk| pk.deinit();
+    // The entry the prompt is about, and where the list cursor goes back to.
+    var prompt_entry: usize = 0;
+    var saved_cursor: usize = 0;
 
     while (true) {
         var ev: sdl3.Event = undefined;
@@ -847,6 +860,7 @@ pub fn runLibrary(
             const n = switch (mode) {
                 .list => lib.entries.items.len + 1,
                 .picker => picker.?.rowCount(),
+                .prompt => 2,
             };
             switch (menu.navFromEvent(nev) orelse continue) {
                 .up => if (n != 0) {
@@ -866,7 +880,36 @@ pub fn runLibrary(
                         cursor = 0;
                         scroll = 0;
                     } else if (cursor - 1 < lib.entries.items.len) {
-                        picked = cursor - 1;
+                        const e = &lib.entries.items[cursor - 1];
+                        if (e.has_patch) {
+                            // Ask patched-or-original, preselecting the
+                            // remembered choice (default: original — the
+                            // saves the player already has stay in front).
+                            mode = .prompt;
+                            prompt_entry = cursor - 1;
+                            saved_cursor = cursor;
+                            cursor = blk: {
+                                if (cfg.perGame(e.game_id)) |p| if (p.patch) |c| {
+                                    break :blk if (c == .patched) 0 else 1;
+                                };
+                                break :blk 1;
+                            };
+                        } else {
+                            picked = cursor - 1;
+                        }
+                    },
+                    .prompt => {
+                        const e = &lib.entries.items[prompt_entry];
+                        if (cfg.perGameMut(gpa, e.game_id)) |pg| {
+                            pg.patch = if (cursor == 0) .patched else .original;
+                            if (config_path) |p| config.save(io, gpa, cfg.*, p) catch |se| {
+                                err.print("warning: cannot write {s}: {s}\n", .{ p, @errorName(se) }) catch {};
+                                err.flush() catch {};
+                            };
+                        } else |_| {}
+                        picked = prompt_entry;
+                        cursor = saved_cursor;
+                        mode = .list;
                     },
                     .picker => switch (picker.?.activate(io, cursor)) {
                         .use_folder => |path| {
@@ -907,6 +950,10 @@ pub fn runLibrary(
                         cursor = 0;
                         scroll = 0;
                     },
+                    .prompt => {
+                        cursor = saved_cursor;
+                        mode = .list;
+                    },
                 },
             }
         }
@@ -917,6 +964,7 @@ pub fn runLibrary(
             const n = switch (mode) {
                 .list => lib.entries.items.len + 1,
                 .picker => picker.?.rowCount(),
+                .prompt => 2,
             };
             switch (nav) {
                 .up => if (n != 0) {
@@ -936,6 +984,7 @@ pub fn runLibrary(
         const deadline = sdl.SDL_GetTicksNS() + 6 * std.time.ns_per_ms;
         while (!scanner.done and sdl.SDL_GetTicksNS() < deadline) {
             if (scanner.stepOne(io, lib)) {
+                refreshPatchTags(io, gpa, lib, &patch_index);
                 if (cache_path) |p| lib.saveCache(io, gpa, p) catch {};
             }
         }
@@ -943,6 +992,7 @@ pub fn runLibrary(
         const total = switch (mode) {
             .list => lib.entries.items.len + 1,
             .picker => picker.?.rowCount(),
+            .prompt => 2,
         };
         if (cursor >= total and total != 0) cursor = total - 1;
         if (cursor < scroll) scroll = cursor;
@@ -951,6 +1001,7 @@ pub fn runLibrary(
         switch (mode) {
             .list => drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, cfg.library.rom_dirs.len == 0, if (scanner.done) null else scanner.remaining()),
             .picker => drawPickerScreen(&canvas, &picker.?, cursor, scroll, visible_rows),
+            .prompt => drawPatchPromptScreen(&canvas, lib.entries.items[prompt_entry].title, cursor),
         }
 
         _ = sdl.SDL_UpdateTexture(texture, null, &canvas, 256 * 2);
@@ -1003,9 +1054,12 @@ fn drawLibraryScreen(
         const e = lib.entries.items[i - 1];
         const max_title = 32;
         ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, max_title)], fg);
-        var tag: [16]u8 = undefined;
+        var tag: [24]u8 = undefined;
+        const patch_txt = if (e.has_patch) "PATCH " else "";
         const tag_txt = if (e.chip.len != 0)
-            std.fmt.bufPrint(&tag, "{s} {s}", .{ e.chip, e.region }) catch e.region
+            std.fmt.bufPrint(&tag, "{s}{s} {s}", .{ patch_txt, e.chip, e.region }) catch e.region
+        else if (e.has_patch)
+            std.fmt.bufPrint(&tag, "{s}{s}", .{ patch_txt, e.region }) catch e.region
         else
             e.region;
         ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(tag_txt))), y, tag_txt, ui.color.text_dim);
@@ -1018,6 +1072,44 @@ fn drawLibraryScreen(
     } else {
         ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B QUIT", ui.color.text_dim);
     }
+}
+
+/// Refresh every entry's PATCH tag from the current filesystem state: a
+/// same-basename softpatch or a patch-folder match by cached CRC32. Cheap —
+/// one stat-or-small-read per entry plus the prebuilt folder index.
+fn refreshPatchTags(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    lib: *library.Library,
+    idx: *const patchfind.FolderIndex,
+) void {
+    for (lib.entries.items) |*e| {
+        e.has_patch = e.crc32 != 0 and
+            patchfind.quickAvailable(io, gpa, e.path, e.crc32, idx);
+    }
+}
+
+/// The patched-or-original question for a game with a patch available — the
+/// same pure-pixel shape as the other screens, so it rides the same tests.
+/// Row 0 = PLAY PATCHED, row 1 = PLAY ORIGINAL.
+fn drawPatchPromptScreen(canvas: *[256 * 224]u16, title: []const u8, cursor: usize) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "PATCH FOUND", ui.color.accent);
+
+    ui.drawTextCentered(&surf, 70, title[0..@min(title.len, 32)], ui.color.text);
+    ui.drawTextCentered(&surf, 88, "A PATCH IS AVAILABLE FOR THIS GAME", ui.color.text_dim);
+
+    const rows = [_][]const u8{ "PLAY PATCHED", "PLAY ORIGINAL" };
+    for (rows, 0..) |label, i| {
+        const y: i32 = @intCast(116 + i * ui.line_h);
+        const selected = i == cursor;
+        if (selected) ui.drawText(&surf, 92, y, ">", ui.color.accent);
+        ui.drawText(&surf, 102, y, label, if (selected) ui.color.text else ui.color.text_dim);
+    }
+
+    ui.drawTextCentered(&surf, 170, "PATCHED AND ORIGINAL KEEP SEPARATE SAVES", ui.color.text_dim);
+    ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B BACK  CHOICE IS REMEMBERED", ui.color.text_dim);
 }
 
 /// The folder browser's whole frame — same pure-pixel shape as
@@ -1070,7 +1162,8 @@ test "library screen: every state draws without out-of-bounds writes" {
     drawLibraryScreen(canvas, &lib, 0, 0, 17, true, null);
     drawLibraryScreen(canvas, &lib, 0, 0, 17, false, null);
     drawLibraryScreen(canvas, &lib, 0, 0, 17, false, 42);
-    // A list longer than the window, cursor at the end, scrolled.
+    // A list longer than the window, cursor at the end, scrolled; every tag
+    // combination including the PATCH prefix.
     for (0..40) |i| {
         var name: [16]u8 = undefined;
         try lib.entries.append(a, .{
@@ -1078,9 +1171,18 @@ test "library screen: every state draws without out-of-bounds writes" {
             .title = try a.dupe(u8, std.fmt.bufPrint(&name, "GAME {d}", .{i}) catch "G"),
             .region = "NTSC",
             .chip = if (i % 3 == 0) "SA-1" else "",
+            .has_patch = i % 2 == 0,
         });
     }
     drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null);
+}
+
+test "patch prompt screen draws both cursor rows without out-of-bounds writes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const canvas = try arena.allocator().create([256 * 224]u16);
+    drawPatchPromptScreen(canvas, "SOME VERY LONG GAME TITLE THAT IS TRUNCATED", 0);
+    drawPatchPromptScreen(canvas, "GAME", 1);
 }
 
 test "picker screen: drive list, a real listing, and an error message all draw cleanly" {

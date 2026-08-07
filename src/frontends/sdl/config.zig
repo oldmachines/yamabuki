@@ -95,6 +95,12 @@ pub const Config = struct {
         /// core, and a conflicting accuracy override is refused at boot.
         wide: ?u32 = null,
         rewind: ?bool = null,
+        /// When a patch is discovered for this game (patchfind.zig): play it
+        /// patched or original. Keyed by the ORIGINAL image's game_id — a
+        /// patched game gets its own id (and saves) once booted, so the
+        /// choice has to hang off the entity the user picked in the library.
+        /// Null = never chosen; the library asks at launch.
+        patch: ?enum { patched, original } = null,
     };
 
     pub fn perGame(self: *const Config, game_id: []const u8) ?*const PerGame {

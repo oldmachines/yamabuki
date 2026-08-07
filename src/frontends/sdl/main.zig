@@ -40,6 +40,7 @@ const config = @import("config.zig");
 const input = @import("input.zig");
 const paths = @import("paths.zig");
 const saves = @import("saves.zig");
+const patchfind = @import("patchfind.zig");
 const library = @import("library.zig");
 
 const Args = struct {
@@ -157,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
     const bindings = input.resolve(&cfg.input, err);
     if (args.rom) |rom_path| {
         // Classic direct launch: boot failures are fatal, CLOSE GAME quits.
-        const b = bootConsole(io, gpa, rom_path, args, &cfg, err) catch std.process.exit(1);
+        const b = bootConsole(io, gpa, rom_path, args, &cfg, if (user_paths) |p| p.patches else null, err) catch std.process.exit(1);
         _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
         return;
     }
@@ -179,9 +180,10 @@ pub fn main(init: std.process.Init) !void {
             &cfg,
             config_path,
             if (user_paths) |p| p.library else null,
+            if (user_paths) |p| p.patches else null,
             err,
         ) orelse break;
-        const b = bootConsole(io, gpa, picked, args, &cfg, err) catch continue;
+        const b = bootConsole(io, gpa, picked, args, &cfg, if (user_paths) |p| p.patches else null, err) catch continue;
         const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
         lib.touch(picked, result.frames / 60);
         if (user_paths) |p| lib.saveCache(io, gpa, p.library) catch {};
@@ -307,35 +309,66 @@ const Booted = struct {
 /// load, per-game merge, region/wide setup, save-file identity. Every
 /// failure prints its reason and returns an error — the direct-launch path
 /// exits on it, the library path goes back to the list.
-fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, err: *std.Io.Writer) !Booted {
+/// Read and apply one patch file to `image`, with the same refusals and
+/// warnings whichever way the patch was chosen (a `--patch` flag or launch
+/// discovery).
+fn applySoftPatch(io: std.Io, gpa: std.mem.Allocator, image: []const u8, patch_path: []const u8, err: *std.Io.Writer) ![]const u8 {
+    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try err.print("error: cannot read patch '{s}'\n", .{patch_path});
+        try err.flush();
+        return error.BootFailed;
+    };
+    var mm: core.patch.CrcMismatch = .{};
+    const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
+        switch (e) {
+            error.WrongSource => try err.print(
+                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
+                .{ patch_path, mm.expected, mm.actual },
+            ),
+            else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
+        }
+        try err.flush();
+        return error.BootFailed;
+    };
+    if (!res.verified) {
+        try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
+        try err.flush();
+    }
+    return res.image;
+}
+
+fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, patches_dir: ?[]const u8, err: *std.Io.Writer) !Booted {
     var image = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read ROM '{s}'\n", .{rom_path});
         try err.flush();
         return error.BootFailed;
     };
     if (args.patch) |patch_path| {
-        const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
-            try err.print("error: cannot read patch '{s}'\n", .{patch_path});
-            try err.flush();
-            return error.BootFailed;
-        };
-        var mm: core.patch.CrcMismatch = .{};
-        const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
-            switch (e) {
-                error.WrongSource => try err.print(
-                    "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
-                    .{ patch_path, mm.expected, mm.actual },
-                ),
-                else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
+        image = try applySoftPatch(io, gpa, image, patch_path, err);
+    } else if (args.frames == 0) {
+        // Launch discovery: a same-basename softpatch, a patch-folder match,
+        // or a registry entry. Whether it is used is the per-game choice the
+        // library's prompt records — keyed by the ORIGINAL image's game_id,
+        // since the patched game gets its own id (and saves) once booted.
+        const stripped = core.header.stripCopierHeader(image);
+        if (core.header.detect(stripped)) |h| {
+            const sha = core.registry.sha256Hex(stripped);
+            const orig_id = try saves.gameId(gpa, &sha, &h.title);
+            if (patchfind.findForRom(io, gpa, rom_path, stripped, patches_dir)) |found| {
+                const pref = if (cfg.perGame(orig_id)) |p| p.patch else null;
+                if (pref) |choice| switch (choice) {
+                    .patched => {
+                        image = try applySoftPatch(io, gpa, image, found.path, err);
+                        try err.print("patch applied: {s}\n", .{found.path});
+                        try err.flush();
+                    },
+                    .original => {},
+                } else {
+                    try err.print("note: a patch is available for this game ({s}) — pick it in the library to choose PLAY PATCHED\n", .{found.path});
+                    try err.flush();
+                }
             }
-            try err.flush();
-            return error.BootFailed;
-        };
-        if (!res.verified) {
-            try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
-            try err.flush();
-        }
-        image = res.image;
+        } else |_| {} // not a SNES ROM: the loader below prints the real error
     }
     if (args.auto_fastrom) {
         const hex = core.registry.sha256Hex(core.header.stripCopierHeader(image));

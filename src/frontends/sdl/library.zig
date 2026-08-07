@@ -25,6 +25,13 @@ pub const Entry = struct {
     chip: []const u8 = "",
     last_played: u64 = 0,
     playtime_s: u64 = 0,
+    /// CRC32 of the copier-stripped image — what BPS patch footers name, so
+    /// patch availability can be checked without re-reading the ROM. 0 in an
+    /// entry from an older cache means "unknown" and forces a re-identify.
+    crc32: u32 = 0,
+    /// Session-only, refreshed by the library screen (never trusted from the
+    /// cache): a patch for this game is available right now.
+    has_patch: bool = false,
 };
 
 const CacheFile = struct {
@@ -180,7 +187,9 @@ pub const Scanner = struct {
             const c = self.candidates.items[self.index];
             self.index += 1;
             if (lib.find(c.path)) |hit| {
-                if (hit.size == c.size and hit.mtime_s == c.mtime_s) {
+                // A 0 crc32 is a pre-crc cache entry: re-identify it once so
+                // patch matching works, instead of carrying the gap forever.
+                if (hit.size == c.size and hit.mtime_s == c.mtime_s and hit.crc32 != 0) {
                     self.fresh.append(self.gpa, hit.*) catch {};
                     return false;
                 }
@@ -210,6 +219,7 @@ pub const Scanner = struct {
             .title = displayTitle(gpa, &header.title, c.path) catch return null,
             .region = regionName(header.region),
             .chip = chipName(header.chipset),
+            .crc32 = core.patch.crc32(image),
         };
     }
 };
