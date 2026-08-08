@@ -380,12 +380,35 @@ manual process (profile, transform, verify against the original), automated:
   and reused, so each retry costs one converted run — converging on the
   maximal verified subset with every dropped routine and its failure
   named in the final report. Measured on the real cart: the decompressor
-  offload diverges at frame 19 (its multi-buffer output pages outrun the
-  profiled marshal evidence — WRAM $1A00 reads zeros where the original
-  decompressed data), the loop drops it by name, and the remaining
-  conversion verifies. That forensic line is the next rung's
-  specification: marshal evidence must cover a pointer routine's whole
-  output surface, not one capture's attribution of it. **Whole-game
+  offload diverges at frame 19 (WRAM $1A00 reads zeros where the original
+  holds decompressed data), the loop drops it by name, and the remaining
+  conversion verifies.
+
+  Two evidence widenings followed from that forensic line, both built:
+  the marshal set is now the **union over sibling entry points** — an
+  alternate entry into an offloaded body (a resumable state machine's
+  "start" and "continue" entries) is separately attributed by the
+  profiler but shares one working set, and the union is taken over EVERY
+  profiled routine, not just the hot candidates, since a sibling can be
+  far too cold to be one — and a **marshal-cost budget** refuses any
+  pointer offload whose per-call state copy would cost more than half the
+  routine's own measured compute, so the offloader is economically honest
+  and not merely correct.
+
+  Neither flipped the cart, and the instrumented re-run sharpened the
+  diagnosis into the next rung's real specification: the mailbox carries
+  the routine's marshalled EXIT registers after the run, so the SA-1
+  genuinely executes the body and marshals back — but the decompressed
+  output is absent from the shadow as well as from WRAM. So this was
+  never a lost write or a missing page: the offloaded body takes a
+  DIFFERENT PATH and never produces the output at all, which points at
+  the state the state machine resumes from rather than at the marshal.
+  Diagnosing further needs an SA-1-side execution trace (which branch the
+  dispatcher's copy takes, and on what state) — instrumentation the
+  profiler has for the S-CPU and not yet for the SA-1. That is the next
+  piece of machinery, and the auto-bisector means building it costs
+  nothing in safety: every wrong guess is caught, named, and dropped
+  without a bad patch ever being written. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
   a different execution model from routine offload — is built as a narrow
   vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes

@@ -129,6 +129,10 @@ pub const Stats = struct {
     /// culprits by name when verification fails.
     offload_entries: [offload_max]u24 = @splat(0),
     offload_ptr_mask: u8 = 0,
+    /// Bytes the pointer offloads marshal per call (both directions), and
+    /// sibling entry points whose working sets were folded in.
+    marshal_bytes: u32 = 0,
+    marshal_siblings: u32 = 0,
 };
 
 pub const Result = struct {
@@ -150,6 +154,11 @@ pub const Result = struct {
 pub const Candidate = struct {
     entry: u24,
     pages: profile.WramPages = @splat(0),
+    /// Measured self cycles and calls, for the marshal-cost budget: an
+    /// offload that spends more moving state than the routine spends
+    /// computing is a regression however correct it is.
+    self_cycles: u64 = 0,
+    calls: u64 = 0,
 };
 
 /// Convert a plain LoROM image into an SA-1 cart per `plan`. `usage` is the
@@ -164,6 +173,12 @@ pub fn convert(
     /// Hot routines (the conversion verdict's set) considered for
     /// execution offload; empty skips S3b entirely.
     candidates: []const Candidate,
+    /// Every OTHER profiled routine, for sibling lookup: an alternate
+    /// entry point into an offloaded routine's body shares its working
+    /// set, and the marshal must cover the union even though the sibling
+    /// itself is far too cold to be a candidate. Empty is safe (the union
+    /// simply finds nothing) — it is evidence, not correctness.
+    neighbours: []const Candidate,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -201,7 +216,7 @@ pub fn convert(
 
     // --- S3b: execution offload, before the shim (it decides CRV) ---------
     var crv: u16 = 0x8000 + @as(u16, @intCast(carve)) + @as(u16, @intCast(shim_len_max));
-    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, carve, &res, &crv);
+    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, neighbours, carve, &res, &crv);
     // The pointer-offload shadow lives at BW-RAM linear $10000+ (bank
     // $41): the cart must carry the full 128 KiB.
     if (res.stats.pointer_offloads > 0 and out[header.offset + 0x18] < 0x07)
@@ -436,6 +451,20 @@ const ptr_db_cap = 4;
 const ptr_run_cap = 8;
 const ptr_pages_cap = 32;
 
+/// Master cycles the S-CPU's MVN spends per byte, each way. The marshal
+/// copies the working set in and out, so a page costs 2 * 256 * this.
+const mvn_cycles_per_byte: u64 = 7;
+
+/// The marshal must cost less than this fraction of what the routine
+/// actually spends computing, per call — otherwise the "offload" is a
+/// regression dressed as a conversion. Half is deliberately conservative:
+/// the SA-1 runs the work at ~2.7x the S-CPU's clock with no bus
+/// contention, so a marshal at half the routine's own cost still leaves a
+/// real win, and anything dearer is refused rather than shipped and
+/// measured later.
+const marshal_budget_num: u64 = 1;
+const marshal_budget_den: u64 = 2;
+
 /// What the pointer-eligibility walk proves about a routine.
 const PtrSpec = struct {
     /// dp offsets of the BANK bytes of long-indirect pointers ([dp] /
@@ -489,6 +518,9 @@ const Chosen = struct {
     kind: OffloadKind,
     spec: PtrSpec = .{},
     runs: Runs = .{},
+    /// Sibling entry points inside this routine's span whose page sets
+    /// were folded into the marshal set.
+    siblings: u32 = 0,
     /// Where the SA-1's rewritten copy of a pointer routine landed (the
     /// dispatcher JSLs it; the original body is never modified).
     copy_addr: u16 = 0,
@@ -500,6 +532,7 @@ fn tryOffload(
     plan: *const profile.Plan,
     usage: []const u8,
     candidates: []const Candidate,
+    neighbours: []const Candidate,
     shim_carve: u32,
     res: *Result,
     crv: *u16,
@@ -531,9 +564,36 @@ fn tryOffload(
         // dispatcher swaps D to $6000 per call and back to 0).
         if (!shadow_ok or res.stats.d_moved) continue;
         const spec = eligiblePointer(out, usage, e) orelse continue;
-        const runs = pageRuns(c.pages) orelse continue;
+        // The marshal set is the union over every candidate whose entry
+        // lies INSIDE this routine's span: alternate entry points into one
+        // body (a resumable state machine's "start" and "continue") are
+        // separately attributed by the profiler, but they are one routine
+        // sharing one working set. Marshalling only the entry we offload
+        // ships a partial view of that state — the exact failure the
+        // auto-bisector caught on a real cart.
+        var marshal_pages = c.pages;
+        var siblings: u32 = 0;
+        for ([_][]const Candidate{ candidates, neighbours }) |list| {
+            for (list) |o| {
+                if (o.entry == c.entry) continue;
+                if (o.entry < c.entry or o.entry - c.entry >= spec.span) continue;
+                for (&marshal_pages, o.pages) |*p, op| p.* |= op;
+                siblings += 1;
+            }
+        }
+        const runs = pageRuns(marshal_pages) orelse continue;
+        // Economics: the marshal must be cheaper than the compute it
+        // enables. Candidates with no measured calls skip the test (the
+        // synthetic unit tests, which carry no profile).
+        if (c.calls != 0) {
+            var bytes: u64 = 0;
+            for (0..runs.n) |r| bytes += @as(u64, runs.len[r]) * 256;
+            const marshal_cost = bytes * 2 * mvn_cycles_per_byte;
+            const per_call = c.self_cycles / c.calls;
+            if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) continue;
+        }
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
-        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs };
+        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings };
         n += 1;
     }
     if (n == 0) return;
@@ -626,6 +686,8 @@ fn tryOffload(
                 const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
                 res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
                 res.stats.pointer_offloads += 1;
+                res.stats.marshal_siblings += c.siblings;
+                for (0..c.runs.n) |r| res.stats.marshal_bytes += @as(u32, c.runs.len[r]) * 256 * 2;
             },
         }
     }
@@ -1546,7 +1608,7 @@ test "shell: header, shim, park, and vector all land; refusals name reasons" {
 
     var ref: ?Refusal = null;
     const empty: profile.Plan = .{};
-    const res = try convert(gpa, rom, &empty, null, &.{}, &ref);
+    const res = try convert(gpa, rom, &empty, null, &.{}, &.{}, &ref);
     defer gpa.free(res.image);
 
     const h = try header_mod.detect(res.image);
@@ -1563,7 +1625,7 @@ test "shell: header, shim, park, and vector all land; refusals name reasons" {
 
     // Refusals: SRAM carts and non-LoROM.
     rom[0x7FC0 + 0x18] = 3;
-    try testing.expectError(error.Refused, convert(gpa, rom, &empty, null, &.{}, &ref));
+    try testing.expectError(error.Refused, convert(gpa, rom, &empty, null, &.{}, &.{}, &ref));
     try testing.expectEqual(Reason.has_sram, ref.?.reason);
 }
 
@@ -1614,7 +1676,7 @@ test "rewriter: long and low-abs sites move; indexed sites block their region" {
     // Clean move to I-RAM offset $80.
     var plan = onePlan(0x1F00, 0x40, .iram, 0x80, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.clean, res.fate[0]);
     try testing.expectEqual(@as(u32, 1), res.stats.rewritten_long);
@@ -1630,7 +1692,7 @@ test "rewriter: long and low-abs sites move; indexed sites block their region" {
     // is rewritten, and the shell still converts.
     @memcpy(rom[0x010A..0x010D], &[_]u8{ 0xBD, 0x10, 0x1F }); // LDA $1F10,X
     markOp(usage, 0x00_810A);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res2.image);
     try testing.expectEqual(RegionFate.blocked_indexed, res2.fate[0]);
     try testing.expectEqual(@as(u32, 0), res2.stats.rewritten_long);
@@ -1654,7 +1716,7 @@ test "rewriter: the dp window moves as a unit with D=$3000, or not at all" {
 
     var plan = onePlan(0x40, 0x10, .iram, 0x40, true);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.d_moved);
     try testing.expectEqual(@as(u32, 1), res.stats.dp_sites);
@@ -1667,7 +1729,7 @@ test "rewriter: the dp window moves as a unit with D=$3000, or not at all" {
     // A dp,X site into the window blocks the whole window: D stays 0.
     @memcpy(rom[0x0106..0x0108], &[_]u8{ 0xB5, 0x40 }); // LDA $40,X
     markOp(usage, 0x00_8106);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res2.image);
     try testing.expect(!res2.stats.d_moved);
     try testing.expectEqual(RegionFate.blocked_indexed, res2.fate[0]);
@@ -1690,7 +1752,7 @@ test "rewriter: an abs site whose region went to BW-RAM blocks it" {
 
     var plan = onePlan(0x1F00, 0x40, .bwram, 0x200, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.blocked_abs_to_bwram, res.fate[0]);
     try testing.expectEqual(@as(u32, 0), res.stats.rewritten_long);
@@ -1698,7 +1760,7 @@ test "rewriter: an abs site whose region went to BW-RAM blocks it" {
     // Long-only access to a BW-RAM region rewrites to $40:xxxx.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA }); // drop the abs site
     markOp(usage, 0x00_8100);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res2.image);
     try testing.expectEqual(RegionFate.clean, res2.fate[0]);
     try testing.expectEqualSlices(u8, &.{ 0xAF, 0x21, 0x02, 0x40 }, res2.image[0x0103..0x0107]);
@@ -1736,7 +1798,7 @@ test "semantic: a converted cart boots, parks the SA-1, and relocated state land
     // The conversion relocates $7E:1F00 to I-RAM offset $40.
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.clean, res.fate[0]);
 
@@ -1788,7 +1850,7 @@ test "S3b: an offloaded leaf routine runs on the SA-1 and its results marshal ba
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8020 }}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8020 }}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u24, 0x8020), res.stats.offloaded);
     try testing.expectEqual(@as(u32, 1), res.stats.offload_sites);
@@ -1852,7 +1914,7 @@ test "S3b: two routines offload to distinct message ids and both round-trip" {
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{ .{ .entry = 0x00_8020 }, .{ .entry = 0x00_8030 } }, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{ .{ .entry = 0x00_8020 }, .{ .entry = 0x00_8030 } }, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 2), res.stats.offload_count);
     try testing.expectEqual(@as(u32, 2), res.stats.offload_sites);
@@ -1933,7 +1995,7 @@ test "S3b pointer offload: a JSL/RTL pointer routine runs on the SA-1 against th
     pages[0] |= 1 << 0;
     pages[0] |= 1 << 0x1F;
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
     try testing.expectEqual(@as(u8, 1), res.stats.offload_count);

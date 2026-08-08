@@ -819,14 +819,37 @@ fn runSa1Gen(
     var plan: profile.Plan = undefined;
     var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
     var n_cands: usize = 0;
+    var neighbours: []const core.sa1gen.Candidate = &.{};
     if (!args.whole_game) {
         conv = profile.assessConversion(&con.prof, sum.verdict);
         plan = profile.planRelocation(&con.prof, conv);
         for (conv.entries[0..conv.n], 0..) |e, i| {
             cands[i] = .{ .entry = e };
-            if (con.prof.routineInfo(e)) |r| cands[i].pages = r.wram_pages;
+            if (con.prof.routineInfo(e)) |r| {
+                cands[i].pages = r.wram_pages;
+                cands[i].self_cycles = r.self_cycles;
+                cands[i].calls = r.calls;
+            }
         }
         n_cands = conv.n;
+        // Sibling evidence: every other profiled routine, so an alternate
+        // entry point into an offloaded body folds its working set into
+        // the marshal even though it is far too cold to be a candidate.
+        var nb: std.array_list.Managed(core.sa1gen.Candidate) = .init(gpa);
+        for (&con.prof.routines) |*r| {
+            if (r.entry == profile.Routine.empty) continue;
+            const in_set = for (conv.entries[0..conv.n]) |e| {
+                if (e == r.entry) break true;
+            } else false;
+            if (in_set) continue;
+            try nb.append(.{
+                .entry = @intCast(r.entry & 0xFF_FFFF),
+                .pages = r.wram_pages,
+                .self_cycles = r.self_cycles,
+                .calls = r.calls,
+            });
+        }
+        neighbours = nb.items;
     }
 
     // The auto-bisect loop: convert, verify, and on a failure that an
@@ -858,7 +881,7 @@ fn runSa1Gen(
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
             core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
         else
-            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], &refusal);
+            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, &refusal);
         const res = converted catch |e| switch (e) {
             error.Refused => {
                 try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
@@ -1124,8 +1147,10 @@ fn reportSa1(
                 try out.print(
                     "  of those, {} pointer routine(s) (JSL/RTL, runtime-pointer data) run against\n" ++
                         "  an identity-offset BW-RAM shadow of their profiled working set, marshalled\n" ++
-                        "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n",
-                    .{res.stats.pointer_offloads},
+                        "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n" ++
+                        "  marshal: {} bytes/call both ways, {} sibling entry point(s) folded into the\n" ++
+                        "  working set, within the cost budget (marshal < half the measured compute)\n",
+                    .{ res.stats.pointer_offloads, res.stats.marshal_bytes, res.stats.marshal_siblings },
                 );
             }
         } else {
