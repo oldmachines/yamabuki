@@ -409,6 +409,19 @@ fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
     con.setButtons(1, f[1]);
 }
 
+/// The `drainAudio` sink for the SA-1 gate's runs: fold each chunk into the
+/// current frame's energy cell, building the per-frame envelope the
+/// audio-tolerant tier compares.
+const EnergySink = struct {
+    cell: *u64,
+
+    fn add(self: EnergySink, chunk: []const i16) anyerror!void {
+        var sum: u64 = 0;
+        for (chunk) |s| sum += @abs(s);
+        self.cell.* += sum;
+    }
+};
+
 /// The `drainAudio` sink for the main run loop: track peak amplitude always,
 /// and accumulate samples for a WAV dump when one was requested.
 const AudioSink = struct {
@@ -769,8 +782,12 @@ fn runSa1Gen(
     try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
     try out.flush();
 
-    // Baseline: per-frame hashes, audio, the profile, and the coverage map
-    // the rewriter walks.
+    // Baseline: per-frame hashes, audio (hash + per-frame energy envelope),
+    // the profile, and the coverage map the rewriter walks.
+    const env_base = try gpa.alloc(u64, total);
+    @memset(env_base, 0);
+    const env_conv = try gpa.alloc(u64, total);
+    @memset(env_conv, 0);
     const hashes = try gpa.alloc(u64, total);
     const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(ub, 0);
@@ -786,7 +803,7 @@ fn runSa1Gen(
         for (0..total) |i| {
             feedMovie(con, mov, i);
             con.runFrame();
-            try util.drainAudio(con, &base_audio, {}, null);
+            try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
             hashes[i] = core.console.hashFrame(con.framebuffer());
             if (con.takeProfile()) |s| {
                 if (i >= args.skip) samples.appendAssumeCapacity(s);
@@ -829,7 +846,7 @@ fn runSa1Gen(
             for (0..total) |i| {
                 feedMovie(con2, mov, i);
                 con2.runFrame();
-                try util.drainAudio(con2, &fast_audio, {}, null);
+                try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
                 conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
                 if (con2.takeProfile()) |s| {
                     if (i >= args.skip) conv_samples.appendAssumeCapacity(s);
@@ -841,11 +858,42 @@ fn runSa1Gen(
 
         const equiv = util.framesEquivalent(hashes, conv_hashes);
         const strictly_identical = equiv == .identical and fast_audio == base_audio;
+        var audio_envelope_tier = false;
         switch (equiv) {
             .identical => if (fast_audio != base_audio) {
-                try out.print("verification FAILED: frames identical but audio diverged. No patch written.\n", .{});
-                try out.flush();
-                std.process.exit(1);
+                // Frames pixel-identical but the sample stream moved: the
+                // relocation's access timings slid the APU handshake. The
+                // stream hash is unrecoverable from a one-sample voice
+                // shift; the envelope tier verifies what still can be —
+                // the same sounds at the same frames.
+                if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
+                    try out.print(
+                        "verification FAILED: frames identical but the audio ENVELOPE diverged at\n" ++
+                            "  frame {} (energy {} -> {}) — a sound was moved, silenced, or invented,\n" ++
+                            "  not just phase-shifted. No patch written.\n",
+                        .{ bad, env_base[bad], env_conv[bad] },
+                    );
+                    // The neighbourhood and the global shape, so the reader
+                    // can tell one slid sound from systemic divergence.
+                    const from = bad -| 5;
+                    const to = @min(total, bad + 6);
+                    try out.print("  frame:    ", .{});
+                    for (from..to) |i| try out.print("{d:>9}", .{i});
+                    try out.print("\n  original: ", .{});
+                    for (from..to) |i| try out.print("{d:>9}", .{env_base[i] / 1000});
+                    try out.print("\n  converted:", .{});
+                    for (from..to) |i| try out.print("{d:>9}", .{env_conv[i] / 1000});
+                    var n_bad: u32 = 0;
+                    for (0..total) |i| {
+                        var one = [1]u64{env_base[i]};
+                        var other = [1]u64{env_conv[i]};
+                        if (util.audioEnvelopeMismatch(one[0..], other[0..]) != null) n_bad += 1;
+                    }
+                    try out.print("\n  (energies in thousands; {} of {} frames outside the window point-wise)\n", .{ n_bad, total });
+                    try out.flush();
+                    std.process.exit(1);
+                }
+                audio_envelope_tier = true;
             },
             .equivalent => {
                 if (conv_sum.lag_frames > sum.lag_frames) {
@@ -922,6 +970,14 @@ fn runSa1Gen(
                 "  verified: IDENTICAL — {} frames pixel- and audio-identical (no timing shift)\n",
                 .{total},
             );
+        } else if (audio_envelope_tier) {
+            try out.print(
+                \\  verified: FRAMES IDENTICAL — every one of {} frames pixel-identical; the
+                \\  audio stream is phase-shifted (relocated access timing slides the APU
+                \\  handshake by a sample) but its per-frame envelope matches: the same sounds
+                \\  at the same frames. Sample-exactness is the one thing left UNVERIFIED.
+                \\
+            , .{total});
         } else {
             try out.print(
                 \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same

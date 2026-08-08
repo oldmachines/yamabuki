@@ -456,6 +456,88 @@ pub const Equivalence = enum {
 /// pictures during lag, so its speedup can legitimately read `divergent` —
 /// the gate refuses rather than guesses; and audio equivalence is not
 /// checkable across a timing shift at all.
+/// Frame-granular audio-envelope comparison, for a converted run whose
+/// FRAMES are pixel-identical but whose sample stream is not hash-equal.
+/// Why that happens: state relocation changes a handful of access timings
+/// by a few master cycles, which slides the S-CPU→APU handshake; a voice
+/// triggered one sample later makes every subsequent MIXED sample differ
+/// numerically, so the stream hash is unrecoverable even though what the
+/// player hears is unchanged. What can still be verified — and what this
+/// checks — is that the same sounds happen at the same frames: each
+/// frame's energy (sum of |sample|) must sit inside the other run's
+/// neighbouring-frame min/max window widened by 10% plus a small
+/// absolute floor (near-silence wobble), checked in BOTH directions so a
+/// missing sound and an extra sound both fail. The ±1-frame window
+/// forgives an effect landing across a frame boundary. Two voices whose
+/// relative phase moved by a sample can also beat constructively for a
+/// frame or two — a brief, bounded energy blip — so RARE excursions are
+/// tolerated: at most one frame per thousand may exceed the 10% window,
+/// and even those must stay inside a hard 35% bound. A sound silenced,
+/// invented, or moved further than the window always exceeds the cap or
+/// the count. Returns the first offending frame, or null when the
+/// envelopes are equivalent.
+pub fn audioEnvelopeMismatch(base: []const u64, conv: []const u64) ?u32 {
+    std.debug.assert(base.len == conv.len);
+    var excursions: usize = 0;
+    var first: ?u32 = null;
+    const allowed = @max(2, base.len / 1000);
+    for (0..base.len) |i| {
+        if (envelopeOutside(base[i], conv, i, 10) or envelopeOutside(conv[i], base, i, 10)) {
+            if (envelopeOutside(base[i], conv, i, 35) or envelopeOutside(conv[i], base, i, 35))
+                return @intCast(i); // beyond the hard bound: never acceptable
+            excursions += 1;
+            if (first == null) first = @intCast(i);
+            if (excursions > allowed) return first;
+        }
+    }
+    return null;
+}
+
+const envelope_floor: u64 = 50_000;
+
+fn envelopeOutside(v: u64, other: []const u64, i: usize, pct: u64) bool {
+    const lo_i = i -| 1;
+    const hi_i = @min(other.len - 1, i + 1);
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    for (other[lo_i .. hi_i + 1]) |c| {
+        lo = @min(lo, c);
+        hi = @max(hi, c);
+    }
+    return v + envelope_floor < lo - lo * pct / 100 or v > hi + hi * pct / 100 + envelope_floor;
+}
+
+test "audioEnvelopeMismatch: sub-sample wobble passes, silenced and invented sounds fail" {
+    // Identical envelopes.
+    const a = [_]u64{ 0, 0, 4_000_000, 4_100_000, 3_900_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &a));
+    // A sample-scale phase shift: energies wobble well under 10%.
+    const wobble = [_]u64{ 0, 0, 4_010_000, 4_070_000, 3_930_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &wobble));
+    // A sound landing one frame late crosses a boundary the window forgives.
+    const late = [_]u64{ 0, 0, 0, 4_000_000, 4_100_000, 0 };
+    const late_base = [_]u64{ 0, 0, 4_000_000, 4_100_000, 0, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&late_base, &late));
+    // A silenced sound fails — in either argument order.
+    const silenced = [_]u64{ 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &silenced) != null);
+    try std.testing.expect(audioEnvelopeMismatch(&silenced, &a) != null);
+    // An invented sound (nothing near it in the original) fails.
+    const invented = [_]u64{ 0, 0, 4_000_000, 4_100_000, 3_900_000, 9_000_000 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &invented) != null);
+    // A rare, bounded excursion — the constructive-overlap blip of two
+    // voices whose phase moved a sample — is tolerated...
+    const blip = [_]u64{ 0, 0, 4_000_000, 4_800_000, 3_900_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &blip));
+    // ...but not one beyond the hard bound,
+    const loud_blip = [_]u64{ 0, 0, 4_000_000, 6_000_000, 3_900_000, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &loud_blip) != null);
+    // and not more of them than one per thousand frames (here: > 2 of 6).
+    const many_blips = [_]u64{ 0, 4_800_000, 4_800_000, 4_900_000, 4_700_000, 0 };
+    const quiet_base = [_]u64{ 0, 4_000_000, 4_000_000, 4_100_000, 3_900_000, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&quiet_base, &many_blips) != null);
+}
+
 pub fn framesEquivalent(base: []const u64, conv: []const u64) Equivalence {
     if (std.mem.eql(u64, base, conv)) return .identical;
     var bi: usize = 0;

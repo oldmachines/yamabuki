@@ -389,7 +389,16 @@ manual process (profile, transform, verify against the original), automated:
   MODULO TIMING — the same distinct pictures in the same order under
   consecutive-dedup comparison, plus a measured, non-negative lag
   improvement; anything else refuses, including a "conversion" that made
-  things slower. Limits stated with it: audio equivalence is not checkable
+  things slower. A third tier sits between them, earned on a real cart:
+  state relocation changes a few access timings without changing any frame,
+  which slides the APU handshake by a sample — one voice shifts and every
+  later MIXED sample differs numerically, so the stream hash is
+  unrecoverable while the player hears nothing. When frames are strictly
+  identical but audio hashes differ, the gate compares per-frame energy
+  envelopes (±1-frame window, 10% band, rare excursions capped at 35% and
+  one per thousand frames, both directions so silenced and invented sounds
+  both fail) and passes as FRAMES IDENTICAL with sample-exactness the one
+  thing left unverified. Limits stated with it: audio equivalence is not checkable
   across a timing shift (reported UNVERIFIED in that tier), and a game that
   animates through lag from an NMI-side frame counter legitimately reads
   divergent — the gate refuses rather than guesses. What S4 still lacks is
