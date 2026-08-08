@@ -818,7 +818,15 @@ fn runSa1Gen(
         else blk: {
             const conv = profile.assessConversion(&con.prof, sum.verdict);
             const plan = profile.planRelocation(&con.prof, conv);
-            break :blk core.sa1gen.convert(gpa, image, &plan, ub, conv.entries[0..conv.n], &refusal);
+            // Each candidate carries its profiled WRAM page bitmap — the
+            // dynamic evidence the pointer-offload path marshals as a
+            // BW-RAM shadow.
+            var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+            for (conv.entries[0..conv.n], 0..) |e, i| {
+                cands[i] = .{ .entry = e };
+                if (con.prof.routineInfo(e)) |r| cands[i].pages = r.wram_pages;
+            }
+            break :blk core.sa1gen.convert(gpa, image, &plan, ub, cands[0..conv.n], &refusal);
         };
         const res = converted catch |e| switch (e) {
             error.Refused => {
@@ -961,6 +969,14 @@ fn runSa1Gen(
                         "  mailbox)\n",
                     .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
                 );
+                if (res.stats.pointer_offloads != 0) {
+                    try out.print(
+                        "  of those, {} pointer routine(s) (JSL/RTL, runtime-pointer data) run against\n" ++
+                            "  an identity-offset BW-RAM shadow of their profiled working set, marshalled\n" ++
+                            "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n",
+                        .{res.stats.pointer_offloads},
+                    );
+                }
             } else {
                 try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
             }

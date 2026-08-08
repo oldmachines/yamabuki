@@ -348,7 +348,35 @@ manual process (profile, transform, verify against the original), automated:
   I-RAM by the SA-1, the marshalled result landing back in S-CPU WRAM.
   S3b now offloads **up to seven routines per cart** — each eligible leaf
   gets its own message id and call stub, and the dispatcher is emitted as an
-  id switch over shared marshal/unmarshal subroutines. **Whole-game
+  id switch over shared marshal/unmarshal subroutines. And beyond leaves,
+  S3b has a **pointer-offload path** for the routine shape that dominates
+  real slowdown (measured on a real cart: Gradius III's streaming graphics
+  decompressor): JSL/RTL routines whose data flows through dp cells and
+  RUNTIME pointers, which no static rewriter can re-point. They run as
+  COMPUTE offloads: the S-CPU stub marshals the routine's profiled WRAM
+  working set into an identity-offset BW-RAM shadow (bank $41, MVN block
+  copies), translates the enumerated long-pointer bank slots ($7E -> $41),
+  and triggers; the SA-1 executes a COPY of the body — the LDA #$7E/PHA/PLB
+  data-bank idiom rewritten to the shadow bank, intra-span JMPs re-based,
+  the ORIGINAL untouched so unseen S-CPU callers still run unmodified
+  code — with D=$6000 over the SA-1's BW-RAM window so dp operands stay
+  byte-identical; then everything marshals back. The stub is entirely
+  long-addressed, so it is correct under any caller data bank and can live
+  in any ROM bank (JSL sites take a 24-bit rewrite). The eligibility walk
+  proves what it can (return shape, span containment, no MMIO/abs/
+  stack-relative, the DB idiom, the bank slots) and runs on DYNAMIC
+  evidence for the rest — pointer values and dp,X reaches are gated by S4,
+  not static proof. Unit-held end to end: a synthetic pointer routine
+  offloads, and the SA-1's execution is proven by the shadow residue and
+  the mailbox's marshalled exit registers. On the real cart it engages —
+  the decompressor passes the walk (414-byte span, 2 bank slots, 3 JSL
+  sites re-pointed) and runs on the SA-1 — and S4 then refuses the result,
+  honestly: a decompression call spans frames, and the NMI-driven DMA that
+  consumes the output buffers sees in-flight state on the original but
+  pre-call state under compute-offload. The refusal names the next
+  human-scale step (the consumer must move too, or the call must split at
+  frame boundaries), which is precisely the shape of work Vilela's real
+  conversion did by hand. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
   a different execution model from routine offload — is built as a narrow
   vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes

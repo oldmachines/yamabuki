@@ -248,7 +248,7 @@ fn setPage(pages: *WramPages, idx: u16) void {
     pages[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
 }
 
-fn getPage(pages: WramPages, idx: u16) bool {
+pub fn getPage(pages: WramPages, idx: u16) bool {
     return pages[idx / 64] & (@as(u64, 1) << @intCast(idx % 64)) != 0;
 }
 
@@ -1013,6 +1013,20 @@ pub const Profiler = struct {
         // Inclusive time is charged once per outermost instance, so recursion
         // does not double-count the same wall cycles.
         if (r.on_stack == 0) r.incl_cycles += self.observed - f.observed_at;
+    }
+
+    /// Const lookup of a routine's record by entry — the S3b pointer-offload
+    /// asks for a candidate's profiled WRAM page bitmap (its dynamic
+    /// evidence). Null when the entry was never profiled.
+    pub fn routineInfo(self: *const Profiler, entry: u24) ?*const Routine {
+        var i: usize = (@as(usize, entry) *% 2654435761) % routine_slots;
+        for (0..routine_slots) |_| {
+            const r = &self.routines[i];
+            if (r.entry == Routine.empty) return null;
+            if (r.entry == entry) return r;
+            i = (i + 1) % routine_slots;
+        }
+        return null;
     }
 
     /// Find or insert the routine keyed by `entry` (open addressing, drop and

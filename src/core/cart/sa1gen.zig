@@ -121,6 +121,9 @@ pub const Stats = struct {
     offload_sites: u32 = 0,
     /// How many routines were offloaded (message ids 1..count).
     offload_count: u8 = 0,
+    /// How many of those went through the pointer-offload path (JSL/RTL
+    /// routines running against the BW-RAM shadow).
+    pointer_offloads: u8 = 0,
 };
 
 pub const Result = struct {
@@ -128,6 +131,20 @@ pub const Result = struct {
     stats: Stats,
     /// Per plan region (same order), what happened to it.
     fate: [profile.plan_region_cap]RegionFate,
+    /// Per plan region, how many sites the rewriter actually re-pointed.
+    /// A "clean" region with zero sites moved vacuously — nothing refers
+    /// to its new home, so its I-RAM/BW-RAM bytes are dead storage the
+    /// offload machinery may safely overlay.
+    region_sites: [profile.plan_region_cap]u32 = @splat(0),
+};
+
+/// A hot routine considered for execution offload: the entry, plus its
+/// profiled WRAM page bitmap — the dynamic evidence the pointer-offload
+/// path marshals as a BW-RAM shadow. An empty bitmap limits the routine to
+/// the static leaf walk.
+pub const Candidate = struct {
+    entry: u24,
+    pages: profile.WramPages = @splat(0),
 };
 
 /// Convert a plain LoROM image into an SA-1 cart per `plan`. `usage` is the
@@ -139,9 +156,9 @@ pub fn convert(
     image: []const u8,
     plan: *const profile.Plan,
     usage: ?[]const u8,
-    /// Hot-routine entries (the conversion verdict's set) considered for
+    /// Hot routines (the conversion verdict's set) considered for
     /// execution offload; empty skips S3b entirely.
-    candidates: []const u24,
+    candidates: []const Candidate,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -180,6 +197,10 @@ pub fn convert(
     // --- S3b: execution offload, before the shim (it decides CRV) ---------
     var crv: u16 = 0x8000 + @as(u16, @intCast(carve)) + @as(u16, @intCast(shim_len_max));
     if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, carve, &res, &crv);
+    // The pointer-offload shadow lives at BW-RAM linear $10000+ (bank
+    // $41): the cart must carry the full 128 KiB.
+    if (res.stats.pointer_offloads > 0 and out[header.offset + 0x18] < 0x07)
+        out[header.offset + 0x18] = 0x07;
 
     // --- the S-CPU boot shim and the SA-1 park stub -----------------------
     const shim_addr: u16 = 0x8000 + @as(u16, @intCast(carve));
@@ -326,6 +347,7 @@ fn rewrite(
                     // Rewrite pass, clean regions only. Indexed sites never
                     // get here — pass 0 blocked their regions.
                     const within = wram_off - r.start;
+                    res.region_sites[region] += 1;
                     switch (md) {
                         .dp => res.stats.dp_sites += 1, // covered by D=$3000
                         .abs => {
@@ -394,84 +416,248 @@ const iram_offload_limit: u32 = 0x700;
 /// is never modified.
 pub const offload_max: usize = 7;
 
+/// The pointer-offload's BW-RAM shadow: WRAM $7E:xxxx mirrors at bank $41
+/// (linear $10000+xxxx) — identity offsets, so pointer VALUES survive and
+/// only bank bytes translate. Bank $41 keeps the whole shadow inside the
+/// cart's 128 KiB BW-RAM ceiling (`cartridge.max_sram`); routines whose
+/// profiled pages touch $7F have no shadow home and stay on the S-CPU.
+/// The SA-1 runs pointer routines with D=$6000 and its BW-RAM window
+/// (CBM block 8) mapped over the shadow's first 8 KiB, so dp operands
+/// stay byte-identical too.
+const shadow_linear: u32 = 0x1_0000;
+const shadow_bank: u8 = 0x41;
+const ptr_slot_cap = 6;
+const ptr_db_cap = 4;
+const ptr_run_cap = 8;
+const ptr_pages_cap = 32;
+
+/// What the pointer-eligibility walk proves about a routine.
+const PtrSpec = struct {
+    /// dp offsets of the BANK bytes of long-indirect pointers ([dp] /
+    /// [dp],y name a 24-bit pointer at dp..dp+2) — translated $7E/$7F ->
+    /// $42/$43 in the shadow before the SA-1 runs, and back after.
+    slots: [ptr_slot_cap]u8 = undefined,
+    n_slots: usize = 0,
+    /// File offsets of the $7E immediate in a LDA #$7E / PHA / PLB idiom —
+    /// rewritten to the shadow bank IN THE SA-1'S COPY of the routine so
+    /// (dp),y stores land in the shadow. The original body is never
+    /// modified: unseen S-CPU callers keep calling unchanged code.
+    db_sites: [ptr_db_cap]u32 = undefined,
+    n_db: usize = 0,
+    /// Bytes from entry to the closing RTL: the span copied for the SA-1.
+    span: u32 = 0,
+};
+
+/// The routine's profiled WRAM pages coalesced into marshal runs (split at
+/// the $7E/$7F boundary so each run has one MVN bank pair).
+const Runs = struct {
+    start: [ptr_run_cap]u16 = undefined, // first page index
+    len: [ptr_run_cap]u16 = undefined, // pages
+    n: usize = 0,
+};
+
+fn pageRuns(pages: profile.WramPages) ?Runs {
+    var runs: Runs = .{};
+    var total: u32 = 0;
+    var p: u16 = 0;
+    while (p < 512) : (p += 1) {
+        if (!profile.getPage(pages, p)) continue;
+        if (p >= 256) return null; // $7F has no shadow home
+        total += 1;
+        if (runs.n > 0 and runs.start[runs.n - 1] + runs.len[runs.n - 1] == p) {
+            runs.len[runs.n - 1] += 1;
+        } else {
+            if (runs.n == ptr_run_cap) return null;
+            runs.start[runs.n] = p;
+            runs.len[runs.n] = 1;
+            runs.n += 1;
+        }
+    }
+    if (total == 0 or total > ptr_pages_cap) return null;
+    return runs;
+}
+
+const OffloadKind = enum { leaf, ptr };
+
+const Chosen = struct {
+    entry: u16,
+    kind: OffloadKind,
+    spec: PtrSpec = .{},
+    runs: Runs = .{},
+    /// Where the SA-1's rewritten copy of a pointer routine landed (the
+    /// dispatcher JSLs it; the original body is never modified).
+    copy_addr: u16 = 0,
+    copy_bank: u8 = 0,
+};
+
 fn tryOffload(
     out: []u8,
     plan: *const profile.Plan,
     usage: []const u8,
-    candidates: []const u24,
+    candidates: []const Candidate,
     shim_carve: u32,
     res: *Result,
     crv: *u16,
 ) void {
-    if (plan.iram_used > iram_offload_limit) return;
-    // Every eligible hot routine with at least one executed, rewritable call
-    // site gets a message id (1..offload_max) — an uncalled offload is dead
-    // weight and takes no slot.
-    var entries: [offload_max]u16 = undefined;
+    // The offload machinery parks the SA-1 stack and mailbox in I-RAM
+    // $700-$7FF, which must not carry LIVE relocated state. A region that
+    // "moved" with zero rewritten sites is dead storage — nothing refers
+    // to its new home — and may be overlaid.
+    if (iramLive(plan, res) > iram_offload_limit) return;
+    const shadow_ok = bwramLive(plan, res) <= shadow_linear;
+    var chosen: [offload_max]Chosen = undefined;
     var n: usize = 0;
     for (candidates) |c| {
         if (n == offload_max) break;
-        if (c >> 16 != 0 or (c & 0xFFFF) < 0x8000) continue;
-        const e: u16 = @truncate(c);
-        const dup = for (entries[0..n]) |x| {
-            if (x == e) break true;
+        if (c.entry >> 16 != 0 or (c.entry & 0xFFFF) < 0x8000) continue;
+        const e: u16 = @truncate(c.entry);
+        const dup = for (chosen[0..n]) |x| {
+            if (x.entry == e) break true;
         } else false;
         if (dup) continue;
-        if (!eligibleLeaf(out, usage, plan, res, e)) continue;
-        if (countCallSites(out, usage, e) == 0) continue;
-        entries[n] = e;
+        if (eligibleLeaf(out, usage, plan, res, e)) {
+            if (countCallSites(out, usage, e, 0x20) == 0) continue;
+            chosen[n] = .{ .entry = e, .kind = .leaf };
+            n += 1;
+            continue;
+        }
+        // Pointer path: dynamic evidence (the profiled page set) + the
+        // static walk; requires the shadow banks free and D unmoved (the
+        // dispatcher swaps D to $6000 per call and back to 0).
+        if (!shadow_ok or res.stats.d_moved) continue;
+        const spec = eligiblePointer(out, usage, e) orelse continue;
+        const runs = pageRuns(c.pages) orelse continue;
+        if (countCallSites(out, usage, e, 0x22) == 0) continue;
+        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs };
         n += 1;
     }
     if (n == 0) return;
 
     // Dispatcher layout (byte-exact; the emitters below mirror it):
-    //   prologue 23 | loop body 12 | n x 16-byte id blocks | JMP loop 3 |
-    //   signal 19 | unmarshal 21 | marshal 24
-    const nn: u32 = @intCast(n);
-    const disp_len: u32 = 35 + nn * 16 + 3 + 19 + 21 + 24;
-    const need: u32 = nn * @as(u32, stub_template.len) + disp_len;
-    const base = patchgen.findFreeSpace(out[0..shim_carve], need) orelse return;
-    const stub_base: u16 = 0x8000 + @as(u16, @intCast(base));
-    const disp_addr: u16 = stub_base + @as(u16, @intCast(nn * stub_template.len));
-    const loop_addr: u16 = disp_addr + 23;
-    const sig_addr: u16 = disp_addr + @as(u16, @intCast(35 + nn * 16 + 3));
+    //   prologue 28 | loop body 12 | id blocks (leaf 16 / ptr 25) |
+    //   JMP loop 3 | signal 19 | unmarshal 21 | marshal 24
+    // Pointer stubs are fully long-addressed and JSL-reached, so they may
+    // live in ANY bank — carved from padding past the shim region, which
+    // keeps every carve disjoint by construction. No room for them keeps
+    // the leaves and retries the sizing.
+    const ptr_area_start: u32 = shim_carve + shim_len_max + park_len;
+    var blocks_len: u32 = 0;
+    var leaf_stubs: u32 = 0;
+    var base: u32 = 0;
+    var ptr_base: u32 = 0;
+    while (true) {
+        blocks_len = 0;
+        leaf_stubs = 0;
+        var ptr_stub_len: u32 = 0;
+        for (chosen[0..n]) |c| switch (c.kind) {
+            .leaf => {
+                blocks_len += 16;
+                leaf_stubs += 1;
+            },
+            .ptr => {
+                blocks_len += 25;
+                ptr_stub_len += ptrStubLen(c.spec, c.runs) + c.spec.span;
+            },
+        };
+        const dl: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
+        base = patchgen.findFreeSpace(out[0..shim_carve], leaf_stubs * @as(u32, stub_template.len) + dl) orelse return;
+        if (ptr_stub_len == 0) break;
+        if (patchgen.findFreeSpace(out[ptr_area_start..], ptr_stub_len)) |off| {
+            ptr_base = ptr_area_start + off;
+            // Stubs and body copies execute in place: the allocation must
+            // not straddle a 32 KiB bank boundary (PC wraps inside a bank).
+            if ((ptr_base % 0x8000) + ptr_stub_len <= 0x8000) break;
+        }
+        dropPtr(&chosen, &n);
+        if (n == 0) return;
+    }
+    const disp_len: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
+
+    const disp_addr: u16 = 0x8000 + @as(u16, @intCast(base)) +
+        @as(u16, @intCast(leaf_stubs * stub_template.len));
+    const loop_addr: u16 = disp_addr + 28;
+    const sig_addr: u16 = disp_addr + @as(u16, @intCast(28 + 12 + blocks_len + 3));
     const unm_addr: u16 = sig_addr + 19;
     const mar_addr: u16 = unm_addr + 21;
+    const dp_base: u16 = if (res.stats.d_moved) 0x3000 else 0;
 
-    // Stubs, one per routine, and their call-site rewrites.
-    for (entries[0..n], 0..) |e, i| {
-        var stub = stub_template;
+    // Stubs (and, for pointer routines, the SA-1's rewritten body copy)
+    // plus their call-site rewrites.
+    var leaf_i: u32 = 0;
+    var ptr_cur: u32 = ptr_base;
+    for (chosen[0..n], 0..) |*c, i| {
         const id: u8 = @intCast(i + 1);
-        stub[stub_id_send_off] = id;
-        stub[stub_id_cmp_off] = id;
-        @memcpy(out[base + i * stub_template.len ..][0..stub_template.len], &stub);
-        const stub_addr = stub_base + @as(u16, @intCast(i * stub_template.len));
-        var a16: u32 = 0x8000;
-        while (a16 < 0x10000) : (a16 += 1) {
-            if (usage[a16] & usage_map.flag_opcode == 0) continue;
-            const file = a16 - 0x8000;
-            if (out[file] != 0x20) continue;
-            if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) != e) continue;
-            std.mem.writeInt(u16, out[file + 1 ..][0..2], stub_addr, .little);
-            res.stats.offload_sites += 1;
+        switch (c.kind) {
+            .leaf => {
+                var stub = stub_template;
+                stub[stub_id_send_off] = id;
+                stub[stub_id_cmp_off] = id;
+                @memcpy(out[base + leaf_i * stub_template.len ..][0..stub_template.len], &stub);
+                const stub_addr: u16 = 0x8000 + @as(u16, @intCast(base + leaf_i * stub_template.len));
+                leaf_i += 1;
+                res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x20, stub_addr, 0);
+            },
+            .ptr => {
+                const stub_file = ptr_cur;
+                const emitted = emitPtrStub(out[stub_file..], id, c.spec, c.runs);
+                std.debug.assert(emitted == ptrStubLen(c.spec, c.runs));
+                ptr_cur += emitted;
+                // The SA-1's copy of the body, immediately after the stub:
+                // the DB idiom's bank immediates become the shadow bank,
+                // and intra-span JMP targets are re-based. The ORIGINAL
+                // body stays untouched for unseen S-CPU callers.
+                const copy_file = ptr_cur;
+                const entry_file: u32 = c.entry - 0x8000;
+                @memcpy(out[copy_file..][0..c.spec.span], out[entry_file..][0..c.spec.span]);
+                for (c.spec.db_sites[0..c.spec.n_db]) |site| {
+                    std.debug.assert(out[copy_file + (site - entry_file)] == 0x7E);
+                    out[copy_file + (site - entry_file)] = shadow_bank;
+                }
+                c.copy_bank = @intCast(copy_file / 0x8000);
+                c.copy_addr = @intCast(0x8000 + (copy_file % 0x8000));
+                fixupJmps(out, usage, c.entry, c.spec.span, copy_file, c.copy_addr);
+                ptr_cur += c.spec.span;
+                const stub_bank: u8 = @intCast(stub_file / 0x8000);
+                const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
+                res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
+                res.stats.pointer_offloads += 1;
+            },
         }
     }
 
     // The dispatcher, emitted around the computed addresses.
-    const d = out[base + nn * @as(u32, stub_template.len) ..];
+    const d = out[base + leaf_stubs * @as(u32, stub_template.len) ..];
     var cur: usize = 0;
-    const dp_base: u16 = if (res.stats.d_moved) 0x3000 else 0;
-    // Prologue: gates, native mode, stack under the mailbox, D.
-    put(d, &cur, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
+    // Prologue: gates, the shadow window (CBM block 16 = linear $20000,
+    // the $7E shadow's first 8 KiB, for pointer routines' dp), native
+    // mode, stack under the mailbox, D.
+    put(d, &cur, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0xA9, 0x08, 0x8D, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
     // loop: wait for a nonzero message, park its id at $3787.
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
-    // One block per id: CMP #id / BNE +12 / JSR unm / JSR entry / JSR mar / JMP sig.
-    for (entries[0..n], 0..) |e, i| {
-        put(d, &cur, &.{ 0xC9, @intCast(i + 1), 0xD0, 0x0C });
-        putJsr(d, &cur, unm_addr);
-        putJsr(d, &cur, e);
-        putJsr(d, &cur, mar_addr);
-        put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
+    for (chosen[0..n], 0..) |c, i| {
+        const id: u8 = @intCast(i + 1);
+        switch (c.kind) {
+            // CMP #id / BNE +12 / JSR unm / JSR entry / JSR mar / JMP sig.
+            .leaf => {
+                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x0C });
+                putJsr(d, &cur, unm_addr);
+                putJsr(d, &cur, c.entry);
+                putJsr(d, &cur, mar_addr);
+                put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
+            },
+            // Pointer block: same shape with D swapped to $6000 around a
+            // JSL of the SA-1's body copy (which returns RTL), then back
+            // to the base D.
+            .ptr => {
+                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x15 });
+                putJsr(d, &cur, unm_addr);
+                put(d, &cur, &.{ 0xF4, 0x00, 0x60, 0x2B }); // PEA $6000 / PLD
+                put(d, &cur, &.{ 0x22, @truncate(c.copy_addr), @truncate(c.copy_addr >> 8), c.copy_bank });
+                put(d, &cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
+                putJsr(d, &cur, mar_addr);
+                put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
+            },
+        }
     }
     // Unknown id: back to the loop.
     put(d, &cur, &.{ 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
@@ -483,9 +669,66 @@ fn tryOffload(
     put(d, &cur, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
     std.debug.assert(cur == disp_len);
 
-    res.stats.offloaded = entries[0];
+    res.stats.offloaded = chosen[0].entry;
     res.stats.offload_count = @intCast(n);
     crv.* = disp_addr;
+}
+
+/// Highest I-RAM byte carrying LIVE relocated state (a clean region with at
+/// least one rewritten site, or the moved dp window).
+fn iramLive(plan: *const profile.Plan, res: *const Result) u32 {
+    var live: u32 = 0;
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean or r.dest != .iram) continue;
+        if (res.region_sites[ri] == 0 and !(r.dp and res.stats.d_moved)) continue;
+        live = @max(live, r.dest_off + r.len);
+    }
+    return live;
+}
+
+/// Highest BW-RAM byte carrying live relocated state, for the shadow guard.
+fn bwramLive(plan: *const profile.Plan, res: *const Result) u32 {
+    var live: u32 = 0;
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean or r.dest != .bwram) continue;
+        if (res.region_sites[ri] == 0) continue;
+        live = @max(live, r.dest_off + r.len);
+    }
+    return live;
+}
+
+/// Re-base intra-span JMP abs targets in a pointer routine's copy. All
+/// other flow in the span is relative (branches, BRL) and relocates for
+/// free; the eligibility walk refused everything else.
+fn fixupJmps(out: []u8, usage: []const u8, entry: u16, span: u32, copy_file: u32, copy_addr: u16) void {
+    var pc: u32 = entry;
+    while (pc - entry < span) {
+        if (usage[pc] & usage_map.flag_opcode == 0) {
+            pc += 1;
+            continue;
+        }
+        const file = pc - 0x8000;
+        const op = out[file];
+        const m8 = usage[pc] & usage_map.flag_m != 0;
+        const x8 = usage[pc] & usage_map.flag_x != 0;
+        if (op == 0x4C) {
+            const t = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            const rebased: u16 = copy_addr + (t - entry);
+            std.mem.writeInt(u16, out[copy_file + (pc - entry) + 1 ..][0..2], rebased, .little);
+        }
+        pc += usage_map.instrLen(op, m8, x8);
+    }
+}
+
+fn dropPtr(chosen: *[offload_max]Chosen, n: *usize) void {
+    var w: usize = 0;
+    for (chosen[0..n.*]) |c| {
+        if (c.kind == .leaf) {
+            chosen[w] = c;
+            w += 1;
+        }
+    }
+    n.* = w;
 }
 
 fn put(d: []u8, cur: *usize, bytes: []const u8) void {
@@ -497,16 +740,219 @@ fn putJsr(d: []u8, cur: *usize, target: u16) void {
     put(d, cur, &.{ 0x20, @truncate(target), @truncate(target >> 8) });
 }
 
-fn countCallSites(out: []const u8, usage: []const u8, entry: u16) u32 {
+/// Count executed call sites of `entry` (bank $00): `op` is 0x20 (JSR,
+/// scanned in bank $00 — a JSR's target shares the caller's bank) or 0x22
+/// (JSL with an explicit bank-$00 target, scanned across every bank,
+/// executed flags merged over the $80+ fast mirrors).
+fn countCallSites(out: []const u8, usage: []const u8, entry: u16, op: u8) u32 {
+    return callSites(out, null, usage, entry, op, 0, 0);
+}
+
+/// Re-point every executed call site of `entry` at the stub. JSR sites take
+/// a 16-bit target (stub in bank $00); JSL sites take the full 24-bit stub
+/// address. Returns the number rewritten.
+fn rewriteCallSites(out: []u8, usage: []const u8, entry: u16, op: u8, stub_addr: u16, stub_bank: u8) u32 {
+    return callSites(out, out, usage, entry, op, stub_addr, stub_bank);
+}
+
+fn callSites(ro: []const u8, rw: ?[]u8, usage: []const u8, entry: u16, op: u8, stub_addr: u16, stub_bank: u8) u32 {
     var count: u32 = 0;
-    var a16: u32 = 0x8000;
-    while (a16 < 0x10000) : (a16 += 1) {
-        if (usage[a16] & usage_map.flag_opcode == 0) continue;
-        const file = a16 - 0x8000;
-        if (out[file] != 0x20) continue;
-        if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) == entry) count += 1;
+    const bank_top: u32 = if (op == 0x20) 1 else 0x40;
+    var bank: u32 = 0;
+    while (bank < bank_top) : (bank += 1) {
+        const bank_file = bank * 0x8000;
+        if (bank_file >= ro.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu_addr = (bank << 16) | a16;
+            if ((usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
+            const file = bank_file + (a16 - 0x8000);
+            if (ro[file] != op) continue;
+            if (std.mem.readInt(u16, ro[file + 1 ..][0..2], .little) != entry) continue;
+            if (op == 0x22 and ro[file + 3] != 0x00) continue;
+            if (rw) |w| {
+                std.mem.writeInt(u16, w[file + 1 ..][0..2], stub_addr, .little);
+                if (op == 0x22) w[file + 3] = stub_bank;
+            }
+            count += 1;
+        }
     }
     return count;
+}
+
+/// Static pointer-eligibility walk: a JSL/RTL routine whose data flows
+/// through dp cells and runtime pointers, offloadable as COMPUTE against
+/// the BW-RAM shadow of its profiled working set. The walk proves what it
+/// can (return shape, span containment, no MMIO/abs/stack-relative sites,
+/// the DB idiom, the long-pointer bank slots); the pointer VALUES are
+/// dynamic evidence — anything they reach outside the marshalled shadow
+/// diverges in S4 verification and no patch ships. Refusal here is a skip,
+/// not an error: the routine simply stays on the S-CPU.
+fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
+    const span_max: u32 = 1024;
+    var spec: PtrSpec = .{};
+    var has_idp = false;
+    var pc: u32 = entry;
+    var limit: u32 = entry;
+    while (pc - entry < span_max) {
+        if (pc > 0xFFFF) return null;
+        if (usage[pc] & usage_map.flag_opcode == 0) {
+            // A gap (data or never-taken padding) is fine while pending
+            // flow still reaches past it; a gap at the frontier is not.
+            if (pc >= limit) return null;
+            pc += 1;
+            continue;
+        }
+        const file = pc - 0x8000;
+        const op = out[file];
+        const m8 = usage[pc] & usage_map.flag_m != 0;
+        const x8 = usage[pc] & usage_map.flag_x != 0;
+        const len = usage_map.instrLen(op, m8, x8);
+        switch (op) {
+            0x6B => { // RTL: done once every pending path has closed
+                if (pc >= limit) {
+                    if (has_idp and spec.n_db == 0) return null;
+                    spec.span = pc + 1 - entry;
+                    return spec;
+                }
+            },
+            // Wrong return shape, calls, far jumps, block moves,
+            // interrupt-adjacent, D/S relocation: not this routine.
+            0x60, 0x40, 0x20, 0x22, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return null,
+            0x00, 0x02, 0xCB, 0xDB, 0x44, 0x54 => return null,
+            0x2B, 0x5B, 0x1B, 0x9A, 0xFB, 0x58 => return null,
+            0x4C => { // JMP abs: intra-span only
+                const dst: u32 = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                if (dst < entry or dst - entry >= span_max) return null;
+                limit = @max(limit, dst);
+            },
+            0x82 => { // BRL
+                const disp: i16 = @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little));
+                const dst = pc + 3 +% @as(u32, @bitCast(@as(i32, disp)));
+                if (dst < entry or dst - entry >= span_max) return null;
+                limit = @max(limit, dst);
+            },
+            0x10, 0x30, 0x50, 0x70, 0x80, 0x90, 0xB0, 0xD0, 0xF0 => {
+                const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
+                if (dst < entry or dst - entry >= span_max) return null;
+                limit = @max(limit, dst);
+            },
+            0xA9 => if (m8 and out[file + 1] == 0x7E) {
+                // LDA #$7E / PHA / PLB is the shadow's rewrite point; a
+                // bare #$7E has an unknowable purpose — refuse.
+                if (file + 3 >= out.len or out[file + 2] != 0x48 or out[file + 3] != 0xAB) return null;
+                if (spec.n_db == ptr_db_cap) return null;
+                spec.db_sites[spec.n_db] = file + 1;
+                spec.n_db += 1;
+            },
+            else => {},
+        }
+        // Long-indirect pointers ([dp] / [dp],y, the $x7 column): the bank
+        // byte at dp+2 is a translation slot ($7E/$7F -> shadow).
+        if (op & 0x0F == 0x07) {
+            const slot: u16 = @as(u16, out[file + 1]) + 2;
+            if (slot > 0xFF) return null; // bank byte past the dp window
+            const dup = for (spec.slots[0..spec.n_slots]) |s| {
+                if (s == slot) break true;
+            } else false;
+            if (!dup) {
+                if (spec.n_slots == ptr_slot_cap) return null;
+                spec.slots[spec.n_slots] = @intCast(slot);
+                spec.n_slots += 1;
+            }
+        }
+        // 16-bit-indirect pointers ((dp) / (dp),y) resolve with DB: only
+        // sound once the DB idiom pins it to the shadow. (dp,x) hides the
+        // pointer cell behind a runtime index; stack-relative reads the
+        // S-CPU stack the SA-1 does not have.
+        if (op & 0x1F == 0x11 or op & 0x1F == 0x12) has_idp = true;
+        if (op & 0x1F == 0x01 or op & 0x0F == 0x03) return null;
+        switch (usage_map.mode(op)) {
+            .none, .dp => {},
+            // dp,X/dp,Y: a runtime index that can leave the shadow's dp
+            // window (8 KiB under D=$6000). Statically unprovable — but
+            // the pointer path runs on dynamic evidence: an index that
+            // actually left the marshalled shadow reads ROM instead of
+            // state, diverges in S4 verification, and no patch ships.
+            .dp_idx => {},
+            .abs, .abs_x, .abs_y => return null, // DB-relative: unprovable under a rewritten DB
+            .long, .long_x => {
+                const b = out[file + 3];
+                // ROM and BW-RAM read identically on the SA-1; long WRAM
+                // or MMIO cannot follow execution across.
+                const ok = (b >= 0x40 and b <= 0x4F) or b >= 0xC0 or (b & 0x7F) <= 0x3F;
+                if (!ok) return null;
+            },
+        }
+        pc += len;
+    }
+    return null;
+}
+
+/// Byte-exact length of a pointer stub (the emitter asserts against it).
+fn ptrStubLen(spec: PtrSpec, runs: Runs) u32 {
+    return 100 + 24 * @as(u32, @intCast(runs.n)) + 28 * @as(u32, @intCast(spec.n_slots));
+}
+
+/// The S-CPU side of a pointer offload, emitted per routine. Everything is
+/// long-addressed (mailbox, message ports, shadow) so the stub is correct
+/// under ANY caller data bank and may itself live in any ROM bank — which
+/// is also why JSL sites can reach it with a 24-bit rewrite. Sequence:
+/// marshal registers -> copy the working set into the shadow (MVN) ->
+/// translate the long-pointer bank slots ($7E/$7F -> $42/$43) -> send the
+/// message id and spin the double handshake -> translate back -> copy the
+/// shadow back -> restore DB -> unmarshal with the routine's exit state ->
+/// RTL.
+fn emitPtrStub(d: []u8, id: u8, spec: PtrSpec, runs: Runs) u32 {
+    var cur: usize = 0;
+    // Register marshal in (33). PHB first so the caller P (pushed second)
+    // is on top for the PLA below.
+    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 }); // PHB / PHP / SEP #$20
+    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB }); // A low, B
+    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 }); // X, Y via A
+    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 }); // caller P
+    // Shadow copy-in (2 + 12/run). MVN encoding: opcode, DEST bank, SRC bank.
+    put(d, &cur, &.{ 0xC2, 0x30 });
+    for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], false);
+    // Slot translate-in (2 + 14/slot): $7E bank bytes -> the shadow bank.
+    // (A plain LoROM game has no $40+ pointers to collide with the exact
+    // compare; $7F pointers stay untranslated and fail S4 if followed.)
+    put(d, &cur, &.{ 0xE2, 0x20 });
+    for (spec.slots[0..spec.n_slots]) |s| {
+        put(d, &cur, &.{ 0xAF, s, 0x00, shadow_bank, 0xC9, 0x7E, 0xD0, 0x06, 0xA9, shadow_bank, 0x8F, s, 0x00, shadow_bank });
+    }
+    // Send + double handshake (30), all long-addressed.
+    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 }); // message id -> CFR
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 }); // await echo
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // ack
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 }); // await clear
+    // Slot translate-back (14/slot).
+    for (spec.slots[0..spec.n_slots]) |s| {
+        put(d, &cur, &.{ 0xAF, s, 0x00, shadow_bank, 0xC9, shadow_bank, 0xD0, 0x06, 0xA9, 0x7E, 0x8F, s, 0x00, shadow_bank });
+    }
+    // Shadow copy-out (2 + 12/run).
+    put(d, &cur, &.{ 0xC2, 0x30 });
+    for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], true);
+    // Restore caller DB, then unmarshal — long-addressed, so DB-proof (30).
+    put(d, &cur, &.{0xAB}); // PLB
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 }); // X, Y
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 }); // exit P staged
+    put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 }); // B, A low
+    put(d, &cur, &.{ 0x28, 0x6B }); // PLP (exit flags/widths) / RTL
+    return @intCast(cur);
+}
+
+/// One MVN marshal run: pages [start, start+len) of $7E WRAM to/from the
+/// identity-offset shadow at bank $41. `back` copies shadow -> WRAM.
+fn putMvnRun(d: []u8, cur: *usize, start_page: u16, n_pages: u16, back: bool) void {
+    const off: u16 = (start_page & 0xFF) << 8;
+    const count: u16 = n_pages * 256 - 1;
+    const dst: u8 = if (back) 0x7E else shadow_bank;
+    const src: u8 = if (back) shadow_bank else 0x7E;
+    put(d, cur, &.{ 0xA2, @truncate(off), @truncate(off >> 8) }); // LDX #off (source)
+    put(d, cur, &.{ 0xA0, @truncate(off), @truncate(off >> 8) }); // LDY #off (dest, identity)
+    put(d, cur, &.{ 0xA9, @truncate(count), @truncate(count >> 8) }); // LDA #count-1
+    put(d, cur, &.{ 0x54, dst, src }); // MVN
 }
 
 /// Static leaf-eligibility walk from `entry` over covered code: ends at the
@@ -1333,7 +1779,7 @@ test "S3b: an offloaded leaf routine runs on the SA-1 and its results marshal ba
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{0x00_8020}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8020 }}, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u24, 0x8020), res.stats.offloaded);
     try testing.expectEqual(@as(u32, 1), res.stats.offload_sites);
@@ -1397,7 +1843,7 @@ test "S3b: two routines offload to distinct message ids and both round-trip" {
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{ 0x00_8020, 0x00_8030 }, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{ .{ .entry = 0x00_8020 }, .{ .entry = 0x00_8030 } }, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 2), res.stats.offload_count);
     try testing.expectEqual(@as(u32, 2), res.stats.offload_sites);
@@ -1418,6 +1864,95 @@ test "S3b: two routines offload to distinct message ids and both round-trip" {
     try testing.expectEqual(@as(u8, 2), con.bus.sa1.iram[0x48]);
     try testing.expectEqual(@as(u8, 2), con.bus.wram.data[0x100]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x1F00]);
+}
+
+test "S3b pointer offload: a JSL/RTL pointer routine runs on the SA-1 against the shadow" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0xE000..0x10000], 0xFF); // bank $01 tail: pointer-stub carve space
+
+    // Caller at $8000: [$00] -> ROM data at $00:9000, ($03) -> $1F00 (the
+    // DB idiom in the routine picks the bank), JSL the routine, publish a
+    // copied byte to unmoved WRAM, spin.
+    @memcpy(rom[0x0000..0x0024], &[_]u8{
+        0x18, 0xFB, // CLC / XCE
+        0xE2, 0x30, // SEP #$30
+        0x64, 0x00, // STZ $00
+        0xA9, 0x90, 0x85, 0x01, // src = $00:9000
+        0x64, 0x02, // src bank $00
+        0x64, 0x03, // dst = $1F00
+        0xA9, 0x1F,
+        0x85, 0x04,
+        0xA9, 0x7E, 0x85, 0x05, // dst bank byte (realistic clutter; (dp),y ignores it)
+        0x22, 0x40, 0x80, 0x00, // JSL $00:8040
+        0xAF, 0x02, 0x1F, 0x7E, // LDA $7E:1F02
+        0x8F, 0x00, 0x01, 0x7E, // STA $7E:0100 (marker)
+        0x80, 0xFE, // BRA *
+    });
+    // The routine at $8040 — the Gradius-decompressor shape in miniature:
+    // JSL/RTL, the LDA #$7E/PHA/PLB idiom, a long-indirect read through a
+    // dp pointer ([$00],y — bank slot at $02), and a DB-relative indirect
+    // write (($03),y). Copies 4 bytes of ROM into WRAM via pointers.
+    @memcpy(rom[0x0040..0x0052], &[_]u8{
+        0x8B, // PHB
+        0xA9, 0x7E, 0x48, 0xAB, // LDA #$7E / PHA / PLB (-> shadow bank)
+        0xA0, 0x00, // LDY #$00
+        0xB7, 0x00, // loop: LDA [$00],y
+        0x91, 0x03, // STA ($03),y
+        0xC8, // INY
+        0xC0, 0x04, // CPY #$04
+        0xD0, 0xF7, // BNE loop
+        0xAB, // PLB
+        0x6B, // RTL
+    });
+    @memcpy(rom[0x1000..0x1004], &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }); // $00:9000
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8008, 0x800A, 0x800C, 0x800E, 0x8010, 0x8012, 0x8014, 0x8016, 0x801A, 0x801E, 0x8022 }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8043, 0x8044, 0x8045, 0x8047, 0x8049, 0x804B, 0x804C, 0x804E, 0x8050, 0x8051 }) |a| markOp(usage, a);
+
+    // A viable plan with a vacuous region (nothing references it), and the
+    // routine's profiled pages: page 0 (dp cells and pointers) + page $1F
+    // (the destination buffer).
+    var plan = onePlan(0x0F00, 0x10, .iram, 0x80, false);
+    var pages: profile.WramPages = @splat(0);
+    pages[0] |= 1 << 0;
+    pages[0] |= 1 << 0x1F;
+    var ref: ?Refusal = null;
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
+    try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
+    try testing.expectEqual(@as(u32, 1), res.stats.offload_sites);
+    // The shadow needs the full 128 KiB of BW-RAM declared.
+    try testing.expectEqual(@as(u8, 0x07), res.image[0x7FC0 + 0x18]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+    // The pointer walk copied ROM through the shadow and the marshal
+    // brought it home: the caller sees its data in WRAM as always.
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.wram.data[0x1F00..0x1F04]);
+    try testing.expectEqual(@as(u8, 0xBE), con.bus.wram.data[0x0100]);
+    // And the SA-1 really did the work, visible two ways: the shadow
+    // (BW-RAM linear $11F00, bank $41's identity image of $7E:1F00)
+    // carries the same bytes — no S-CPU game code path writes there —
+    // and the mailbox holds the routine's marshalled exit state (A = the
+    // last copied byte, Y = the loop's exit count), which only the SA-1
+    // dispatcher writes after running the routine.
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.sa1.bwram[0x11F00..0x11F04]);
+    try testing.expectEqual(@as(u8, 0xEF), con.bus.sa1.iram[0x780]);
+    try testing.expectEqual(@as(u8, 0x04), con.bus.sa1.iram[0x784]);
 }
 
 test "S3b eligibility: calls, unseen code, indexed data, and unmoved WRAM all refuse" {
