@@ -124,6 +124,11 @@ pub const Stats = struct {
     /// How many of those went through the pointer-offload path (JSL/RTL
     /// routines running against the BW-RAM shadow).
     pointer_offloads: u8 = 0,
+    /// The offloaded entries in message-id order, and which of them are
+    /// pointer offloads (bit i = entry i) — the auto-bisect loop drops
+    /// culprits by name when verification fails.
+    offload_entries: [offload_max]u24 = @splat(0),
+    offload_ptr_mask: u8 = 0,
 };
 
 pub const Result = struct {
@@ -671,6 +676,10 @@ fn tryOffload(
 
     res.stats.offloaded = chosen[0].entry;
     res.stats.offload_count = @intCast(n);
+    for (chosen[0..n], 0..) |c, i| {
+        res.stats.offload_entries[i] = c.entry;
+        if (c.kind == .ptr) res.stats.offload_ptr_mask |= @as(u8, 1) << @intCast(i);
+    }
     crv.* = disp_addr;
 }
 

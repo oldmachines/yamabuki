@@ -782,52 +782,83 @@ fn runSa1Gen(
     try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
     try out.flush();
 
-    // Baseline: per-frame hashes, audio (hash + per-frame energy envelope),
-    // the profile, and the coverage map the rewriter walks.
+    // Baseline ONCE: per-frame hashes, audio (hash + per-frame energy
+    // envelope), the profile, and the coverage map the rewriter walks.
+    // Every verification attempt below replays against this.
     const env_base = try gpa.alloc(u64, total);
     @memset(env_base, 0);
     const env_conv = try gpa.alloc(u64, total);
-    @memset(env_conv, 0);
     const hashes = try gpa.alloc(u64, total);
+    const conv_hashes = try gpa.alloc(u64, total);
     const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(ub, 0);
     const umap: core.usage_map.UsageMap = .{ .bytes = ub };
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
     var base_audio = core.console.audio_hash_init;
-    {
-        const cart = try core.Cartridge.load(gpa, image);
-        const con = try gpa.create(core.ProfilingConsole);
-        con.init(cart);
-        con.usage = &umap;
-        for (0..total) |i| {
-            feedMovie(con, mov, i);
-            con.runFrame();
-            try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
-            hashes[i] = core.console.hashFrame(con.framebuffer());
-            if (con.takeProfile()) |s| {
-                if (i >= args.skip) samples.appendAssumeCapacity(s);
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.ProfilingConsole);
+    con.init(cart);
+    con.usage = &umap;
+    for (0..total) |i| {
+        feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
+        con.runFrame();
+        try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
+        hashes[i] = core.console.hashFrame(con.framebuffer());
+        if (con.takeProfile()) |smp| {
+            if (i >= args.skip) samples.appendAssumeCapacity(smp);
+        }
+    }
+    const scratch = try gpa.alloc(f64, samples.items.len);
+    const sum = profile.summarise(samples.items, scratch);
+
+    // The verdict, plan, and candidate set are fixed by the baseline; only
+    // the candidate FILTER changes across bisect attempts.
+    var conv: profile.Conversion = undefined;
+    var plan: profile.Plan = undefined;
+    var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+    var n_cands: usize = 0;
+    if (!args.whole_game) {
+        conv = profile.assessConversion(&con.prof, sum.verdict);
+        plan = profile.planRelocation(&con.prof, conv);
+        for (conv.entries[0..conv.n], 0..) |e, i| {
+            cands[i] = .{ .entry = e };
+            if (con.prof.routineInfo(e)) |r| cands[i].pages = r.wram_pages;
+        }
+        n_cands = conv.n;
+    }
+
+    // The auto-bisect loop: convert, verify, and on a failure that an
+    // offloaded routine could explain, diagnose (first divergent frame +
+    // a WRAM diff attributed against the offloads' working sets), drop
+    // the culprit, and retry. The loop terminates: every retry removes
+    // one offloaded routine, and a failure with none left is terminal.
+    var dropped: [profile.conversion_set_max]u24 = undefined;
+    var dropped_why: [profile.conversion_set_max][]const u8 = undefined;
+    var n_dropped: usize = 0;
+    var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+    try conv_samples.ensureTotalCapacity(total);
+
+    while (true) {
+        // Candidates minus the dropped culprits.
+        var act: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+        var n_act: usize = 0;
+        for (cands[0..n_cands]) |c| {
+            const is_dropped = for (dropped[0..n_dropped]) |d| {
+                if (d == c.entry) break true;
+            } else false;
+            if (!is_dropped) {
+                act[n_act] = c;
+                n_act += 1;
             }
         }
-        const scratch = try gpa.alloc(f64, samples.items.len);
-        const sum = profile.summarise(samples.items, scratch);
 
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
             core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
-        else blk: {
-            const conv = profile.assessConversion(&con.prof, sum.verdict);
-            const plan = profile.planRelocation(&con.prof, conv);
-            // Each candidate carries its profiled WRAM page bitmap — the
-            // dynamic evidence the pointer-offload path marshals as a
-            // BW-RAM shadow.
-            var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
-            for (conv.entries[0..conv.n], 0..) |e, i| {
-                cands[i] = .{ .entry = e };
-                if (con.prof.routineInfo(e)) |r| cands[i].pages = r.wram_pages;
-            }
-            break :blk core.sa1gen.convert(gpa, image, &plan, ub, cands[0..conv.n], &refusal);
-        };
+        else
+            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], &refusal);
         const res = converted catch |e| switch (e) {
             error.Refused => {
                 try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
@@ -837,182 +868,302 @@ fn runSa1Gen(
             else => return e,
         };
 
-        // Verify with the stage-S4 two-tier gate. A conversion that changed
-        // no timing must be pixel- AND audio-identical; one that genuinely
-        // sped the game up cannot be (fewer lag frames = fewer repeats), so
-        // the fallback demands the same distinct pictures in the same order
-        // (consecutive-dedup equality) plus a measured, non-negative lag
-        // improvement. Anything else is a refusal.
+        // The verify run for this attempt.
+        @memset(env_conv, 0);
         var fast_audio = core.console.audio_hash_init;
-        const conv_hashes = try gpa.alloc(u64, total);
-        var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
-        try conv_samples.ensureTotalCapacity(total);
+        conv_samples.clearRetainingCapacity();
         {
             const cart2 = try core.Cartridge.load(gpa, res.image);
             const con2 = try gpa.create(core.ProfilingConsole);
             con2.init(cart2);
             for (0..total) |i| {
                 feedMovie(con2, mov, i);
+                if (mov == null and args.buttons != 0) con2.setButtons(0, args.buttons);
                 con2.runFrame();
                 try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
                 conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
-                if (con2.takeProfile()) |s| {
-                    if (i >= args.skip) conv_samples.appendAssumeCapacity(s);
+                if (con2.takeProfile()) |smp| {
+                    if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
                 }
             }
+            con2.cart.deinit(gpa);
+            gpa.destroy(con2);
         }
         const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
         const conv_sum = profile.summarise(conv_samples.items, conv_scratch);
 
+        // Stage-S4 gate, three tiers: strict identity; frames identical
+        // with envelope-equivalent audio; equivalent modulo timing with a
+        // non-negative lag improvement.
         const equiv = util.framesEquivalent(hashes, conv_hashes);
-        const strictly_identical = equiv == .identical and fast_audio == base_audio;
-        var audio_envelope_tier = false;
-        switch (equiv) {
-            .identical => if (fast_audio != base_audio) {
-                // Frames pixel-identical but the sample stream moved: the
-                // relocation's access timings slid the APU handshake. The
-                // stream hash is unrecoverable from a one-sample voice
-                // shift; the envelope tier verifies what still can be —
-                // the same sounds at the same frames.
+        var fail_why: []const u8 = "";
+        var fail_frame: u32 = 0;
+        const passed: ?SaTier = switch (equiv) {
+            .identical => blk: {
+                if (fast_audio == base_audio) break :blk .strict;
                 if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
-                    try out.print(
-                        "verification FAILED: frames identical but the audio ENVELOPE diverged at\n" ++
-                            "  frame {} (energy {} -> {}) — a sound was moved, silenced, or invented,\n" ++
-                            "  not just phase-shifted. No patch written.\n",
-                        .{ bad, env_base[bad], env_conv[bad] },
-                    );
-                    // The neighbourhood and the global shape, so the reader
-                    // can tell one slid sound from systemic divergence.
-                    const from = bad -| 5;
-                    const to = @min(total, bad + 6);
-                    try out.print("  frame:    ", .{});
-                    for (from..to) |i| try out.print("{d:>9}", .{i});
-                    try out.print("\n  original: ", .{});
-                    for (from..to) |i| try out.print("{d:>9}", .{env_base[i] / 1000});
-                    try out.print("\n  converted:", .{});
-                    for (from..to) |i| try out.print("{d:>9}", .{env_conv[i] / 1000});
-                    var n_bad: u32 = 0;
-                    for (0..total) |i| {
-                        var one = [1]u64{env_base[i]};
-                        var other = [1]u64{env_conv[i]};
-                        if (util.audioEnvelopeMismatch(one[0..], other[0..]) != null) n_bad += 1;
-                    }
-                    try out.print("\n  (energies in thousands; {} of {} frames outside the window point-wise)\n", .{ n_bad, total });
-                    try out.flush();
-                    std.process.exit(1);
+                    fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
+                    fail_frame = bad;
+                    break :blk null;
                 }
-                audio_envelope_tier = true;
+                break :blk .envelope;
             },
-            .equivalent => {
+            .equivalent => blk: {
                 if (conv_sum.lag_frames > sum.lag_frames) {
-                    try out.print(
-                        \\verification FAILED: the converted run shows the same pictures but drops
-                        \\  MORE frames ({} -> {}) — a regression, not a conversion. No patch written.
-                        \\
-                    , .{ sum.lag_frames, conv_sum.lag_frames });
-                    try out.flush();
-                    std.process.exit(1);
+                    fail_why = "same pictures but MORE dropped frames — a regression";
+                    break :blk null;
                 }
+                break :blk .equivalent;
             },
-            .divergent => {
-                try out.print(
-                    \\verification FAILED: the converted run renders pictures the original never
-                    \\  showed (or misses ones it did). Either uncovered code touches moved state,
-                    \\  or the game animates through lag (an NMI-side frame counter), which this
-                    \\  gate cannot tell apart from breakage. No patch written.
-                    \\
-                , .{});
-                try out.flush();
-                std.process.exit(1);
+            .divergent => blk: {
+                fail_why = "renders pictures the original never showed";
+                fail_frame = firstDiff(hashes, conv_hashes);
+                break :blk null;
             },
-        }
-
-        const bps = try core.patch.writeBps(gpa, image, res.image);
-        const stem = args.rom[0 .. std.mem.lastIndexOfScalar(u8, args.rom, '.') orelse args.rom.len];
-        const path = args.gen_out orelse try std.fmt.allocPrint(gpa, "{s}-sa1.bps", .{stem});
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bps }) catch {
-            try out.print("error: cannot write '{s}'\n", .{path});
-            try out.flush();
-            std.process.exit(1);
         };
 
-        try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
-        if (args.whole_game) {
-            try out.print(
-                \\whole-game migration (SA-1 Root):
-                \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
-                \\  the game executes ENTIRELY on the SA-1 — its WRAM working set lives in
-                \\  identity-mapped I-RAM; {d} MMIO site(s) proxied through the I-RAM mailbox
-                \\  (NMI masked per transaction), {d} long site(s) re-banked into the window;
-                \\  NMI forwarded S-CPU -> SA-1 through CCNT/CNV
-                \\
-            , .{
-                res.stats.shim_addr,     res.stats.park_addr,
-                res.stats.offload_sites, res.stats.rewritten_long,
-            });
-        } else {
-            try out.print(
-                \\SA-1 conversion (stages S3 + S4):
-                \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
-                \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
-                \\
-            , .{
-                res.stats.shim_addr,      res.stats.park_addr,
-                res.stats.regions_moved,  res.stats.regions_blocked,
-                res.stats.rewritten_long, res.stats.rewritten_abs,
-                res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
-            });
-            if (res.stats.offload_count != 0) {
-                try out.print(
-                    "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
-                        "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
-                        "  mailbox)\n",
-                    .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
-                );
-                if (res.stats.pointer_offloads != 0) {
-                    try out.print(
-                        "  of those, {} pointer routine(s) (JSL/RTL, runtime-pointer data) run against\n" ++
-                            "  an identity-offset BW-RAM shadow of their profiled working set, marshalled\n" ++
-                            "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n",
-                        .{res.stats.pointer_offloads},
-                    );
-                }
-            } else {
-                try out.print("  S3b: no hot routine passed the leaf-offload walk; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
-            }
+        if (passed) |tier| {
+            // Success: write the patch and the report.
+            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped]);
+            return;
         }
-        if (strictly_identical) {
-            try out.print(
-                "  verified: IDENTICAL — {} frames pixel- and audio-identical (no timing shift)\n",
-                .{total},
-            );
-        } else if (audio_envelope_tier) {
-            try out.print(
-                \\  verified: FRAMES IDENTICAL — every one of {} frames pixel-identical; the
-                \\  audio stream is phase-shifted (relocated access timing slides the APU
-                \\  handshake by a sample) but its per-frame envelope matches: the same sounds
-                \\  at the same frames. Sample-exactness is the one thing left UNVERIFIED.
+
+        // Failure. Terminal when no offloaded routine could explain it.
+        if (args.whole_game or res.stats.offload_count == 0) {
+            try out.print("verification FAILED: {s}", .{fail_why});
+            if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
+            try out.print(".\n  No patch written.\n", .{});
+            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv, fail_frame, total);
+            if (equiv == .divergent) try out.print(
+                \\  Either uncovered code touches moved state, or the game animates through
+                \\  lag (an NMI-side frame counter), which this gate cannot tell apart from
+                \\  breakage.
                 \\
-            , .{total});
-        } else {
-            try out.print(
-                \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same
-                \\  order, redistributed across {} frames (a speedup's exact signature); audio
-                \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
-                \\
-            , .{total});
+            , .{});
+            try out.flush();
+            std.process.exit(1);
         }
-        try out.print(
-            "  measured: dropped frames {} -> {}, mean utilisation {d:.0}% -> {d:.0}%\n",
-            .{ sum.lag_frames, conv_sum.lag_frames, sum.mean_util * 100, conv_sum.mean_util * 100 },
-        );
-        try out.print(
-            \\  caveat: code the profile never executed is invisible to the rewriter; a longer
-            \\  or more varied capture widens coverage.
-            \\
-        , .{});
+
+        // Diagnose and drop a culprit, then go around again.
+        const culprit = try diagnoseCulprit(gpa, out, args, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why);
+        dropped[n_dropped] = culprit;
+        dropped_why[n_dropped] = fail_why;
+        n_dropped += 1;
+        try out.print("  auto-bisect: dropping offload $00:{x:0>4} and retrying ({} attempt(s) so far)\n", .{ culprit, n_dropped });
         try out.flush();
     }
+}
+
+/// Which S4 tier a successful SA-1 conversion verified under.
+const SaTier = enum { strict, envelope, equivalent };
+
+/// First index where the two per-frame hash streams differ (streams are
+/// equal length by construction). Only meaningful for the divergent case,
+/// where it anchors the forensics.
+fn firstDiff(a: []const u64, b: []const u64) u32 {
+    for (a, b, 0..) |x, y, i| {
+        if (x != y) return @intCast(i);
+    }
+    return 0;
+}
+
+/// On a failed attempt with offloads active: replay BOTH images to the
+/// first bad frame, diff WRAM, attribute the differing bytes against the
+/// offloaded routines' profiled working sets, and pick the routine to
+/// drop — the attributed one when the evidence names it, the last
+/// offloaded one otherwise.
+fn diagnoseCulprit(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    base_image: []const u8,
+    res: core.sa1gen.Result,
+    cands: []const core.sa1gen.Candidate,
+    mov: ?util.movie.Movie,
+    equiv: util.Equivalence,
+    fail_frame: u32,
+    fail_why: []const u8,
+) !u24 {
+    const n_off = res.stats.offload_count;
+    const entries = res.stats.offload_entries[0..n_off];
+    try out.print("verification failed with {} offload(s) active: {s}\n", .{ n_off, fail_why });
+
+    var culprit: u24 = entries[n_off - 1];
+    if (equiv == .divergent) {
+        // Replay both sides to the divergence and diff WRAM.
+        const wram_a = try replayWram(gpa, base_image, fail_frame + 1, args, mov);
+        const wram_b = try replayWram(gpa, res.image, fail_frame + 1, args, mov);
+        var n_shown: u32 = 0;
+        var attributed: ?u24 = null;
+        for (wram_a, wram_b, 0..) |x, y, off| {
+            if (x == y) continue;
+            const page: u16 = @intCast(off >> 8);
+            var owner: ?u24 = null;
+            var shared = false;
+            for (entries) |e| {
+                for (cands) |c| {
+                    if (c.entry == e and page < 512 and profile.getPage(c.pages, page)) {
+                        if (owner != null) shared = true;
+                        owner = e;
+                    }
+                }
+            }
+            if (n_shown < 4) {
+                try out.print("  diverged by frame {}: WRAM $7E:{x:0>4} = {x:0>2} -> {x:0>2}{s}", .{
+                    fail_frame, off, x, y,
+                    if (owner != null) " — inside the working set of $00:" else " — outside every offloaded set",
+                });
+                if (owner) |o| try out.print("{x:0>4}{s}", .{ o, if (shared) " (shared)" else "" });
+                try out.print("\n", .{});
+            }
+            if (attributed == null and owner != null and !shared) attributed = owner;
+            n_shown += 1;
+        }
+        if (n_shown > 4) try out.print("  ({} differing WRAM byte(s) total)\n", .{n_shown});
+        if (n_shown == 0) try out.print("  WRAM identical at the divergent frame — the difference is in PPU state\n  (timing-visible mid-flight rendering, not corrupted memory)\n", .{});
+        if (attributed) |a| culprit = a;
+    }
+    return culprit;
+}
+
+/// Replay an image for `n` frames and return its WRAM (caller-owned copy).
+fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, args: Args, mov: ?util.movie.Movie) ![]u8 {
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..n) |i| {
+        feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
+        con.runFrame();
+    }
+    return gpa.dupe(u8, &con.bus.wram.data);
+}
+
+/// The envelope-failure neighbourhood diagnostic (terminal failures only).
+fn printEnvelopeDiag(out: *std.Io.Writer, env_base: []const u64, env_conv: []const u64, bad: u32, total: u32) !void {
+    const from = bad -| 5;
+    const to = @min(total, bad + 6);
+    try out.print("  frame:    ", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{i});
+    try out.print("\n  original: ", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{env_base[i] / 1000});
+    try out.print("\n  converted:", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{env_conv[i] / 1000});
+    var n_bad: u32 = 0;
+    for (0..total) |i| {
+        var one = [1]u64{env_base[i]};
+        var other = [1]u64{env_conv[i]};
+        if (util.audioEnvelopeMismatch(one[0..], other[0..]) != null) n_bad += 1;
+    }
+    try out.print("\n  (energies in thousands; {} of {} frames outside the window point-wise)\n", .{ n_bad, total });
+}
+
+/// The success report for an SA-1 conversion attempt, including what the
+/// auto-bisect dropped along the way.
+fn reportSa1(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+    res: core.sa1gen.Result,
+    tier: SaTier,
+    total: u32,
+    sum: profile.Summary,
+    conv_sum: profile.Summary,
+    dropped: []const u24,
+    dropped_why: []const []const u8,
+) !void {
+    const bps = try core.patch.writeBps(gpa, image, res.image);
+    const stem = args.rom[0 .. std.mem.lastIndexOfScalar(u8, args.rom, '.') orelse args.rom.len];
+    const path = args.gen_out orelse try std.fmt.allocPrint(gpa, "{s}-sa1.bps", .{stem});
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bps }) catch {
+        try out.print("error: cannot write '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+
+    try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
+    if (args.whole_game) {
+        try out.print(
+            \\whole-game migration (SA-1 Root):
+            \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
+            \\  the game executes ENTIRELY on the SA-1 — its WRAM working set lives in
+            \\  identity-mapped I-RAM; {d} MMIO site(s) proxied through the I-RAM mailbox
+            \\  (NMI masked per transaction), {d} long site(s) re-banked into the window;
+            \\  NMI forwarded S-CPU -> SA-1 through CCNT/CNV
+            \\
+        , .{
+            res.stats.shim_addr,     res.stats.park_addr,
+            res.stats.offload_sites, res.stats.rewritten_long,
+        });
+    } else {
+        try out.print(
+            \\SA-1 conversion (stages S3 + S4):
+            \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
+            \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
+            \\
+        , .{
+            res.stats.shim_addr,      res.stats.park_addr,
+            res.stats.regions_moved,  res.stats.regions_blocked,
+            res.stats.rewritten_long, res.stats.rewritten_abs,
+            res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
+        });
+        if (res.stats.offload_count != 0) {
+            try out.print(
+                "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
+                    "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
+                    "  mailbox)\n",
+                .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
+            );
+            if (res.stats.pointer_offloads != 0) {
+                try out.print(
+                    "  of those, {} pointer routine(s) (JSL/RTL, runtime-pointer data) run against\n" ++
+                        "  an identity-offset BW-RAM shadow of their profiled working set, marshalled\n" ++
+                        "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n",
+                    .{res.stats.pointer_offloads},
+                );
+            }
+        } else {
+            try out.print("  S3b: no hot routine passed the offload walks; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
+        }
+        for (dropped, dropped_why) |d, why| {
+            try out.print("  auto-bisect: offload $00:{x:0>4} DROPPED — with it, verification {s}\n", .{ d, why });
+        }
+    }
+    switch (tier) {
+        .strict => try out.print(
+            "  verified: IDENTICAL — {} frames pixel- and audio-identical (no timing shift)\n",
+            .{total},
+        ),
+        .envelope => try out.print(
+            \\  verified: FRAMES IDENTICAL — every one of {} frames pixel-identical; the
+            \\  audio stream is phase-shifted (relocated access timing slides the APU
+            \\  handshake by a sample) but its per-frame envelope matches: the same sounds
+            \\  at the same frames. Sample-exactness is the one thing left UNVERIFIED.
+            \\
+        , .{total}),
+        .equivalent => try out.print(
+            \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same
+            \\  order, redistributed across {} frames (a speedup's exact signature); audio
+            \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
+            \\
+        , .{total}),
+    }
+    try out.print(
+        "  measured: dropped frames {} -> {}, mean utilisation {d:.0}% -> {d:.0}%\n",
+        .{ sum.lag_frames, conv_sum.lag_frames, sum.mean_util * 100, conv_sum.mean_util * 100 },
+    );
+    try out.print(
+        \\  caveat: code the profile never executed is invisible to the rewriter; a longer
+        \\  or more varied capture widens coverage.
+        \\
+    , .{});
+    try out.flush();
 }
 
 fn runReport(

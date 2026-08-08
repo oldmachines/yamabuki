@@ -370,13 +370,22 @@ manual process (profile, transform, verify against the original), automated:
   offloads, and the SA-1's execution is proven by the shadow residue and
   the mailbox's marshalled exit registers. On the real cart it engages —
   the decompressor passes the walk (414-byte span, 2 bank slots, 3 JSL
-  sites re-pointed) and runs on the SA-1 — and S4 then refuses the result,
-  honestly: a decompression call spans frames, and the NMI-driven DMA that
-  consumes the output buffers sees in-flight state on the original but
-  pre-call state under compute-offload. The refusal names the next
-  human-scale step (the consumer must move too, or the call must split at
-  frame boundaries), which is precisely the shape of work Vilela's real
-  conversion did by hand. **Whole-game
+  sites re-pointed) and runs on the SA-1 — and when S4 catches a
+  divergence, the generator no longer just refuses: **the iteration loop
+  itself is automated**. On a failed attempt with offloads active it
+  replays both images to the first divergent frame, diffs WRAM,
+  attributes each differing byte against the offloaded routines'
+  profiled working sets (printed by name and address), drops the
+  attributed culprit, and re-verifies — the baseline is profiled once
+  and reused, so each retry costs one converted run — converging on the
+  maximal verified subset with every dropped routine and its failure
+  named in the final report. Measured on the real cart: the decompressor
+  offload diverges at frame 19 (its multi-buffer output pages outrun the
+  profiled marshal evidence — WRAM $1A00 reads zeros where the original
+  decompressed data), the loop drops it by name, and the remaining
+  conversion verifies. That forensic line is the next rung's
+  specification: marshal evidence must cover a pointer routine's whole
+  output surface, not one capture's attribution of it. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
   a different execution model from routine offload — is built as a narrow
   vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes
