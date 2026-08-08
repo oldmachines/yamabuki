@@ -31,9 +31,10 @@
 
 const std = @import("std");
 const wdc65816 = @import("../cpu/wdc65816.zig");
+const sa1_trace = @import("../sa1_trace.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat", "trace" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -45,6 +46,10 @@ pub const Sa1 = struct {
     bwram_mask: u32,
 
     cpu: CpuT,
+    /// SA-1-side execution instrumentation, attached by a profiling
+    /// frontend (see sa1_trace.zig); null in every shipped path, where it
+    /// costs one predictable test per SA-1 instruction and nothing else.
+    trace: ?*sa1_trace.Trace,
     iram: [0x800]u8,
     mdr: u8,
 
@@ -223,6 +228,10 @@ pub const Sa1 = struct {
                 break;
             }
             self.pollInterrupts();
+            if (self.trace) |t| {
+                const r = &self.cpu.regs;
+                t.note(@as(u24, r.pbr) << 16 | r.pc, r.c, r.x, r.y, r.d, r.dbr, r.p);
+            }
             const before = self.budget;
             self.cpu.step();
             self.advanceTimer(@intCast(before - self.budget));

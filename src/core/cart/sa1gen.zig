@@ -133,6 +133,13 @@ pub const Stats = struct {
     /// sibling entry points whose working sets were folded in.
     marshal_bytes: u32 = 0,
     marshal_siblings: u32 = 0,
+    /// Where each offload's SA-1-side body copy landed (full 24-bit
+    /// address), in message-id order; 0 for leaf offloads, which run the
+    /// original body in place. Lets a diagnosis point the SA-1 execution
+    /// trace (sa1_trace.zig) straight at the code that ran.
+    offload_copy: [offload_max]u24 = @splat(0),
+    /// Each copy's length in bytes, same order.
+    offload_copy_len: [offload_max]u32 = @splat(0),
 };
 
 pub const Result = struct {
@@ -680,6 +687,8 @@ fn tryOffload(
                 }
                 c.copy_bank = @intCast(copy_file / 0x8000);
                 c.copy_addr = @intCast(0x8000 + (copy_file % 0x8000));
+                res.stats.offload_copy[i] = @as(u24, c.copy_bank) << 16 | c.copy_addr;
+                res.stats.offload_copy_len[i] = c.spec.span;
                 fixupJmps(out, usage, c.entry, c.spec.span, copy_file, c.copy_addr);
                 ptr_cur += c.spec.span;
                 const stub_bank: u8 = @intCast(stub_file / 0x8000);
@@ -2024,6 +2033,125 @@ test "S3b pointer offload: a JSL/RTL pointer routine runs on the SA-1 against th
     try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.sa1.bwram[0x11F00..0x11F04]);
     try testing.expectEqual(@as(u8, 0xEF), con.bus.sa1.iram[0x780]);
     try testing.expectEqual(@as(u8, 0x04), con.bus.sa1.iram[0x784]);
+}
+
+test "sa1 trace: the SA-1's path through an offloaded body is observable" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    // Same cart as the pointer-offload test, re-converted here so the
+    // trace watches a body whose expected path is known exactly.
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0xE000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x0024], &[_]u8{
+        0x18, 0xFB,
+        0xE2, 0x30,
+        0x64, 0x00,
+        0xA9, 0x90,
+        0x85, 0x01,
+        0x64, 0x02,
+        0x64, 0x03,
+        0xA9, 0x1F,
+        0x85, 0x04,
+        0xA9, 0x7E,
+        0x85, 0x05,
+        0x22, 0x40,
+        0x80, 0x00,
+        0xAF, 0x02,
+        0x1F, 0x7E,
+        0x8F, 0x00,
+        0x01, 0x7E,
+        0x80, 0xFE,
+    });
+    // $8040: PHB / LDA #$7E / PHA / PLB / LDY #0 / loop: LDA [$00],y /
+    // STA ($03),y / INY / CPY #4 / BNE loop / PLB / RTL. The BNE at
+    // $804e is taken 3 times and falls through once.
+    @memcpy(rom[0x0040..0x0052], &[_]u8{
+        0x8B,
+        0xA9,
+        0x7E,
+        0x48,
+        0xAB,
+        0xA0,
+        0x00,
+        0xB7,
+        0x00,
+        0x91,
+        0x03,
+        0xC8,
+        0xC0,
+        0x04,
+        0xD0,
+        0xF7,
+        0xAB,
+        0x6B,
+    });
+    @memcpy(rom[0x1000..0x1004], &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8008, 0x800A, 0x800C, 0x800E, 0x8010, 0x8012, 0x8014, 0x8016, 0x801A, 0x801E, 0x8022 }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8043, 0x8044, 0x8045, 0x8047, 0x8049, 0x804B, 0x804C, 0x804E, 0x8050, 0x8051 }) |a| markOp(usage, a);
+
+    var plan = onePlan(0x0F00, 0x10, .iram, 0x80, false);
+    var pages: profile.WramPages = @splat(0);
+    pages[0] |= 1 << 0;
+    pages[0] |= 1 << 0x1F;
+    var ref: ?Refusal = null;
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    // Watch the tail of bank $01, where the pointer stub and the body
+    // copy are carved (findFreeSpace takes the end of the longest run).
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x01_F800);
+    con.bus.sa1.trace = trace;
+    con.runFrame();
+
+    // The SA-1 executed, and the trace saw it — not merely "something
+    // ran": the marshalled result proves the same run the offload made.
+    try testing.expect(trace.total > 0);
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.wram.data[0x1F00..0x1F04]);
+
+    // The body copy's own path, read straight out of the coverage: every
+    // instruction of the copied routine ran, and the loop's branch ran
+    // exactly as many times as the loop iterated.
+    var body: ?u24 = null;
+    var addr: u24 = 0x01_F800;
+    while (addr < 0x01_F800 + sa1_trace.window_cap) : (addr += 1) {
+        // The copy starts with the original's PHB opcode ($8B) and is the
+        // only $8B in the carve that the SA-1 actually executed.
+        const file: u32 = (@as(u32, addr >> 16) * 0x8000) + ((addr & 0xFFFF) - 0x8000);
+        if (trace.ran(addr) and res.image[file] == 0x8B) {
+            body = addr;
+            break;
+        }
+    }
+    const b = body orelse return error.BodyNeverRan;
+    // PHB once per call, and the loop's BNE once per iteration (4).
+    try testing.expectEqual(@as(u32, 1), trace.countAt(b));
+    try testing.expectEqual(@as(u32, 4), trace.countAt(b + 14)); // BNE
+    // The RTL closed the call.
+    try testing.expect(trace.ran(b + 17));
+
+    // And the register ring carries the state the branch decided on: the
+    // last in-window record is a real instruction with plausible state.
+    var buf: [sa1_trace.ring_cap]sa1_trace.Rec = undefined;
+    const recent = trace.recent(&buf);
+    try testing.expect(recent.len > 0);
+    try testing.expect(recent[recent.len - 1].pc >= 0x01_F800);
 }
 
 test "S3b eligibility: calls, unseen code, indexed data, and unmoved WRAM all refuse" {

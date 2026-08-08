@@ -403,12 +403,33 @@ manual process (profile, transform, verify against the original), automated:
   never a lost write or a missing page: the offloaded body takes a
   DIFFERENT PATH and never produces the output at all, which points at
   the state the state machine resumes from rather than at the marshal.
-  Diagnosing further needs an SA-1-side execution trace (which branch the
-  dispatcher's copy takes, and on what state) — instrumentation the
-  profiler has for the S-CPU and not yet for the SA-1. That is the next
-  piece of machinery, and the auto-bisector means building it costs
-  nothing in safety: every wrong guess is caught, named, and dropped
-  without a bad patch ever being written. **Whole-game
+  That called for an SA-1-side execution trace — instrumentation the
+  profiler had for the S-CPU and not for the SA-1 — which is now
+  **built** (`sa1_trace.zig`): a per-byte execution coverage window over
+  the SA-1's address space plus a register-carrying ring of the most
+  recent in-window instructions, attached the same way the coverage map
+  is (an optional pointer a profiling frontend sets, so a shipped build
+  carries one predictable null test per SA-1 instruction). The
+  auto-bisector now points it straight at a diverging offload's body
+  copy and prints what it finds, so "which path did the SA-1 take, on
+  what state" is a direct read.
+
+  It answered the question on the first run. Of the offloaded
+  decompressor's 214 instructions the SA-1 covers **52**, entering the
+  body 7 times and executing 14,672 instructions inside those 52 —
+  and the first instruction it never reaches is the original's
+  `$00:9bda`, the state machine's RESUME entry. The register ring shows
+  the exit path taken every time: `LDY $06 / CPY $08 / BCS` straight to
+  the routine's `STZ $10 / PLB / RTL`. In other words the offloaded copy
+  reads its own progress cursor as already past the end of the input and
+  returns immediately, doing no work — a divergence in the small dp
+  state the machine resumes from, not in the buffers the marshal was
+  built around. The `D=$6000` window and the shadow data bank (`DB=$41`)
+  are visibly correct in the trace, so the remaining suspect is narrow
+  and named: which of those dp cells the marshal actually delivers, and
+  when relative to the sibling entry's own S-CPU calls. That is the next
+  rung, and the auto-bisector keeps it safe to leave open — every wrong
+  guess is caught, named, and dropped without a bad patch being written. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
   a different execution model from routine offload — is built as a narrow
   vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes

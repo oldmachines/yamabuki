@@ -968,7 +968,7 @@ fn runSa1Gen(
         }
 
         // Diagnose and drop a culprit, then go around again.
-        const culprit = try diagnoseCulprit(gpa, out, args, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why);
+        const culprit = try diagnoseCulprit(gpa, out, args, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
         dropped[n_dropped] = culprit;
         dropped_why[n_dropped] = fail_why;
         n_dropped += 1;
@@ -1006,6 +1006,7 @@ fn diagnoseCulprit(
     equiv: util.Equivalence,
     fail_frame: u32,
     fail_why: []const u8,
+    usage: []const u8,
 ) !u24 {
     const n_off = res.stats.offload_count;
     const entries = res.stats.offload_entries[0..n_off];
@@ -1046,7 +1047,88 @@ fn diagnoseCulprit(
         if (n_shown == 0) try out.print("  WRAM identical at the divergent frame — the difference is in PPU state\n  (timing-visible mid-flight rendering, not corrupted memory)\n", .{});
         if (attributed) |a| culprit = a;
     }
+
+    // SA-1-side forensics for a pointer offload: replay the converted
+    // image to the divergent frame with an execution trace over the
+    // offloaded body's COPY, so the path the SA-1 actually took through
+    // it is a direct read rather than an inference.
+    for (entries, 0..) |e, i| {
+        const copy = res.stats.offload_copy[i];
+        if (copy == 0) continue; // leaf offload: no copy to watch
+        const span = res.stats.offload_copy_len[i];
+        const trace = try replayTrace(gpa, res.image, fail_frame + 1, args, mov, copy);
+        defer gpa.destroy(trace);
+        try out.print(
+            "  sa1 trace of $00:{x:0>4}'s body copy at ${x:0>2}:{x:0>4} ({} bytes): {} instruction(s)\n" ++
+                "  executed across {} distinct byte(s)",
+            .{ e, copy >> 16, @as(u16, @truncate(copy)), span, trace.total, trace.distinct },
+        );
+        if (trace.total == 0) {
+            try out.print(" — THE SA-1 NEVER ENTERED IT\n", .{});
+            continue;
+        }
+        try out.print(", entered {} time(s)\n", .{trace.countAt(copy)});
+        // How much of the body the SA-1 actually walked. Only OPCODE
+        // starts count — operand bytes are never instruction addresses,
+        // and the copy mirrors the original byte for byte, so the S1
+        // coverage map supplies which offsets are opcodes.
+        var n_ops: u32 = 0;
+        var n_ran: u32 = 0;
+        var first_skipped: ?u24 = null;
+        for (0..span) |k| {
+            if (usage[e + k] & core.usage_map.flag_opcode == 0) continue;
+            n_ops += 1;
+            if (trace.ran(copy + @as(u24, @intCast(k)))) {
+                n_ran += 1;
+            } else if (first_skipped == null) {
+                first_skipped = @intCast(e + k);
+            }
+        }
+        try out.print("  covered {}/{} of the body's instructions", .{ n_ran, n_ops });
+        if (first_skipped) |f| try out.print(
+            "; first one never reached is the original's $00:{x:0>4}\n",
+            .{f},
+        ) else try out.print(" (the whole body ran)\n", .{});
+        // The last few instructions, with the state that decided them.
+        var buf: [core.sa1_trace.ring_cap]core.sa1_trace.Rec = undefined;
+        const recent = trace.recent(&buf);
+        const show = @min(recent.len, 6);
+        try out.print("  last {} instruction(s) inside it:\n", .{show});
+        for (recent[recent.len - show ..]) |r| try out.print(
+            "    ${x:0>2}:{x:0>4}  A={x:0>4} X={x:0>4} Y={x:0>4} D={x:0>4} DB={x:0>2} P={x:0>2}\n",
+            .{ r.pc >> 16, @as(u16, @truncate(r.pc)), r.c, r.x, r.y, r.d, r.dbr, r.p },
+        );
+    }
     return culprit;
+}
+
+/// Replay `image` for `n` frames with an SA-1 execution trace windowed at
+/// `lo`. Caller owns the returned trace.
+fn replayTrace(
+    gpa: std.mem.Allocator,
+    image: []const u8,
+    n: u32,
+    args: Args,
+    mov: ?util.movie.Movie,
+    lo: u24,
+) !*core.sa1_trace.Trace {
+    const trace = try gpa.create(core.sa1_trace.Trace);
+    errdefer gpa.destroy(trace);
+    trace.* = core.sa1_trace.Trace.init(lo);
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.bus.sa1.trace = trace;
+    for (0..n) |i| {
+        feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
+        con.runFrame();
+    }
+    return trace;
 }
 
 /// Replay an image for `n` frames and return its WRAM (caller-owned copy).
