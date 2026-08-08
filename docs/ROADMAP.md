@@ -563,8 +563,23 @@ never register a dropped frame: slowdown is a **lower bound**. The two errors po
 in opposite directions and bracket the truth rather than compounding, which is the
 main reason for keeping both signals. The upper bound on utilisation is the
 direction that *flatters* a conversion, which is why the tool prints the caveat
-every run. And nothing presses any buttons: what gets profiled is the attract loop,
-which for most carts is real gameplay and for some is a title screen idling at 12%.
+every run. And by default nothing presses any buttons: what gets profiled is the
+attract loop, which for most carts is real gameplay and for some is a title screen
+idling at 12%. **Input movies close that gap.** The SDL player records a
+playthrough as the per-frame pad masks (F10 toggles it; recording starts with a
+repower because power-on is the only state a replay can reconstruct, and anything
+that breaks the input-stream model — reset, load state, rewind — discards the
+recording rather than writing a movie that cannot replay). The `.ymv` carries the
+CRC32 of the image as played, the core and region it ran on, and the framebuffer
+and audio hashes after its last frame, so a replay is *verified*, not hoped:
+`--movie` in either frontend replays from power-on and reports sync or DESYNC
+against those hashes, refusing up front any movie whose image, core, or region
+cannot reproduce. The same flag feeds `--sa1-report` and both `--gen-*` modes,
+where the movie drives the profiled runs — S1 coverage, the conversion verdict,
+and S4 verification all measured over real gameplay instead of whatever the
+attract loop happened to exercise. The determinism this rests on is not new: the
+whole differential ladder already runs on it, and CI would catch a violation
+instantly.
 
 The profiler is a third comptime instantiation of the core (`ProfilingConsole`),
 so the shipped emulator carries no branch for it — the same trick as `accuracy`.

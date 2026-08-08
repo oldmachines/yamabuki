@@ -90,6 +90,11 @@ const Args = struct {
     /// 0x1000 = Start). A title screen that waits for input renders the same
     /// frame forever otherwise, so this is what gets a game past it.
     buttons: u16 = 0,
+    /// A recorded playthrough (.ymv) driving both pads from power-on. In a
+    /// normal run it replays and verifies the movie's end hashes; in the
+    /// generator/report modes it drives the profiled runs, so coverage and
+    /// verification come from real gameplay instead of the attract mode.
+    movie: ?[]const u8 = null,
     /// Generate a FastROM patch for this ROM, verified in-emulator before
     /// anything is written (see `util.generateFastromVerified`).
     gen_fastrom: bool = false,
@@ -131,6 +136,8 @@ pub fn main(init: std.process.Init) !void {
                 "       with --patch/--auto-patch/--save-patched/--auto-fastrom/--accurate/--wide/--sa1-report\n", .{});
         } else if (e == error.UsageNeedsReport) {
             try out.print("error: --usage-map is a --sa1-report modifier (coverage comes from the profiled run)\n", .{});
+        } else if (e == error.MovieConflicts) {
+            try out.print("error: --movie and --buttons are both input sources; pick one\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
@@ -148,6 +155,10 @@ pub fn main(init: std.process.Init) !void {
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
             \\  --buttons M   pad-1 buttons held all run, as a hex mask (0x1000 = Start)
+            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\                from power-on, verifying its end hashes; with --sa1-report or a
+            \\                --gen-* mode the movie drives the profiled runs instead, so
+            \\                coverage and verification come from real gameplay
             \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
             \\                (fast core only; for widescreen game patches such as wide-snes)
             \\  --gen-fastrom-patch  derive a FastROM conversion for this SlowROM game and verify it
@@ -209,12 +220,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The movie identifies itself against the image AS PLAYED (post
+    // soft-patching): loaded here, after the patch stage, and checked
+    // against the same stripped image the run will use.
+    var mov: ?util.movie.Movie = null;
+    if (args.movie) |mpath| mov = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+
     if (args.gen_fastrom) {
-        try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image));
+        try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
     }
     if (args.gen_sa1) {
-        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image));
+        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
     }
 
@@ -227,7 +244,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (args.sa1_report) {
-        try runReport(io, gpa, out, args, cart);
+        try runReport(io, gpa, out, args, cart, mov);
         return;
     }
 
@@ -238,6 +255,10 @@ pub fn main(init: std.process.Init) !void {
         .ntsc => con.setRegion(.ntsc),
         .pal => con.setRegion(.pal),
     }
+    // The movie dictates the region it was recorded under — a replay on the
+    // wrong timing cannot reproduce (an explicit conflicting --region was
+    // already refused in loadMovie).
+    if (mov) |m| con.setRegion(if (m.region == 1) .pal else .ntsc);
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
 
@@ -246,14 +267,37 @@ pub fn main(init: std.process.Init) !void {
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
-    const frames = args.frames orelse 1;
-    for (0..frames) |_| {
-        if (args.buttons != 0) con.setButtons(0, args.buttons);
+    const frames = args.frames orelse if (mov) |m| @as(u32, @intCast(m.frames.len)) else 1;
+    for (0..frames) |i| {
+        if (mov) |m| {
+            const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
+            con.setButtons(0, f[0]);
+            con.setButtons(1, f[1]);
+        } else if (args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
             .wav = if (args.wav != null) &audio_all else null,
         }, AudioSink.collect);
+        // The frame the movie ends on is the one its hashes describe.
+        if (mov) |m| if (i + 1 == m.frames.len) {
+            if (m.end_frame_hash == 0) {
+                try out.print("movie: {} frames replayed (no end hashes recorded — sync unverified)\n", .{m.frames.len});
+            } else {
+                const fh = core.console.hashFrame(con.framebuffer());
+                const audio_ok = m.end_audio_hash == 0 or audio_hash == m.end_audio_hash;
+                if (fh == m.end_frame_hash and audio_ok) {
+                    try out.print("movie: sync verified — {} frames replayed, end hashes match\n", .{m.frames.len});
+                } else {
+                    try out.print(
+                        "movie: DESYNC at end of replay — frame hash {x:0>16} (movie {x:0>16}), audio {s}\n",
+                        .{ fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged" },
+                    );
+                    try out.flush();
+                    std.process.exit(1);
+                }
+            }
+        };
     }
 
     const fb = con.framebuffer();
@@ -274,6 +318,95 @@ pub fn main(init: std.process.Init) !void {
         try out.print("wrote {s} ({} stereo frames)\n", .{ path, audio_all.items.len / 2 });
         try out.flush();
     }
+}
+
+/// Load a .ymv and refuse every mismatch that would make the replay a lie:
+/// wrong image (CRC of the stripped, post-patch image), wrong core accuracy,
+/// or a conflicting explicit --region. Exits with a message rather than
+/// returning an error — a bad movie is a usage problem, not a crash.
+fn loadMovie(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    path: []const u8,
+    image: []const u8,
+) util.movie.Movie {
+    const fail = struct {
+        fn f(o: *std.Io.Writer) noreturn {
+            o.flush() catch {};
+            std.process.exit(1);
+        }
+    }.f;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
+        out.print("error: cannot read movie '{s}'\n", .{path}) catch {};
+        fail(out);
+    };
+    const m = util.movie.parse(gpa, bytes) catch |e| {
+        out.print("error: '{s}' is not a valid movie: {s}\n", .{ path, @errorName(e) }) catch {};
+        fail(out);
+    };
+    const crc = util.movie.imageCrc(image);
+    if (m.rom_crc != crc) {
+        out.print(
+            "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
+            .{ path, m.rom_crc, crc },
+        ) catch {};
+        fail(out);
+    }
+    const acc: u8 = if (args.accuracy == .accurate) 1 else 0;
+    if (m.accuracy != acc) {
+        out.print("error: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+            path,
+            if (m.accuracy == 1) "accurate" else "fast",
+            if (acc == 1) "accurate" else "fast",
+        }) catch {};
+        fail(out);
+    }
+    const explicit_conflict = switch (args.region) {
+        .auto => false,
+        .ntsc => m.region != 0,
+        .pal => m.region != 1,
+    };
+    if (explicit_conflict) {
+        out.print("error: movie '{s}' was recorded in {s}; --region conflicts\n", .{
+            path, if (m.region == 1) "PAL" else "NTSC",
+        }) catch {};
+        fail(out);
+    }
+    // The generator/report consoles run on the cart's auto-detected region
+    // and take no override, so a movie recorded under one cannot reproduce
+    // there. The normal run path applies the movie's region instead.
+    if (args.gen_fastrom or args.gen_sa1 or args.sa1_report) {
+        const auto_pal = core.header.detect(image) catch null;
+        if (auto_pal) |h| {
+            const auto_region: u8 = if (core.timing.regionFromHeaderByte(h.region) == .pal) 1 else 0;
+            if (m.region != auto_region) {
+                out.print(
+                    "error: movie '{s}' was recorded under a region override ({s}); the profiled runs use the cart's own region\n",
+                    .{ path, if (m.region == 1) "PAL" else "NTSC" },
+                ) catch {};
+                fail(out);
+            }
+        }
+    }
+    out.print("movie: {s} — {} frames, {s}, end hashes {s}\n", .{
+        path,
+        m.frames.len,
+        if (m.region == 1) "PAL" else "NTSC",
+        if (m.end_frame_hash != 0) "recorded" else "absent",
+    }) catch {};
+    return m;
+}
+
+/// Feed frame `i` of a movie into a console — both ports, released past the
+/// movie's end. A no-op without a movie.
+fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
+    const m = mov orelse return;
+    const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
+    con.setButtons(0, f[0]);
+    con.setButtons(1, f[1]);
 }
 
 /// The `drainAudio` sink for the main run loop: track peak amplitude always,
@@ -517,15 +650,20 @@ fn runGenerate(
     out: *std.Io.Writer,
     args: Args,
     image: []const u8,
+    mov: ?util.movie.Movie,
 ) !void {
-    const frames = args.frames orelse gen_frames_default;
+    // A movie sets the capture length: cover the whole recorded playthrough.
+    const frames = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        gen_frames_default;
     const total = args.skip + frames;
 
     try out.print("baseline + verify runs, {} frames each ({d:.0}s)...\n", .{ total, @as(f64, @floatFromInt(total)) / 60.0 });
     try out.flush();
 
     var failure: ?util.GenFailure = null;
-    const res = util.generateFastromVerified(gpa, image, frames, args.skip, args.buttons, &failure) catch |e| switch (e) {
+    const res = util.generateFastromVerified(gpa, image, frames, args.skip, args.buttons, if (mov) |m| m.frames else null, &failure) catch |e| switch (e) {
         error.GenFailed => {
             switch (failure.?) {
                 .refused => |r| {
@@ -621,8 +759,12 @@ fn runSa1Gen(
     out: *std.Io.Writer,
     args: Args,
     image: []const u8,
+    mov: ?util.movie.Movie,
 ) !void {
-    const frames = args.frames orelse gen_frames_default;
+    const frames = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        gen_frames_default;
     const total = args.skip + frames;
     try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
     try out.flush();
@@ -642,6 +784,7 @@ fn runSa1Gen(
         con.init(cart);
         con.usage = &umap;
         for (0..total) |i| {
+            feedMovie(con, mov, i);
             con.runFrame();
             try util.drainAudio(con, &base_audio, {}, null);
             hashes[i] = core.console.hashFrame(con.framebuffer());
@@ -684,6 +827,7 @@ fn runSa1Gen(
             const con2 = try gpa.create(core.ProfilingConsole);
             con2.init(cart2);
             for (0..total) |i| {
+                feedMovie(con2, mov, i);
                 con2.runFrame();
                 try util.drainAudio(con2, &fast_audio, {}, null);
                 conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
@@ -805,8 +949,12 @@ fn runReport(
     out: *std.Io.Writer,
     args: Args,
     cart: core.Cartridge,
+    mov: ?util.movie.Movie,
 ) !void {
-    const want = args.frames orelse report_frames_default;
+    const want = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        report_frames_default;
 
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
@@ -827,6 +975,7 @@ fn runReport(
 
     var drain: [4096]i16 = undefined;
     for (0..args.skip + want) |i| {
+        feedMovie(con, mov, i);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
@@ -1679,6 +1828,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             const digits = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
             out.buttons = try std.fmt.parseInt(u16, digits, 16);
+        } else if (std.mem.eql(u8, a, "--movie")) {
+            out.movie = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
@@ -1702,6 +1853,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         return error.GenConflicts;
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
+    if (out.movie != null and out.buttons != 0) return error.MovieConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }

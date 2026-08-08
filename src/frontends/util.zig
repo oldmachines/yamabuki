@@ -8,6 +8,13 @@
 const std = @import("std");
 const core = @import("snes_core");
 
+/// Input movies (TAS-style record/replay); see movie.zig.
+pub const movie = @import("movie.zig");
+
+test {
+    _ = movie;
+}
+
 /// Expand one RGB565 pixel to RGB888 by bit-replicating the 5/6-bit channels
 /// into 8 bits, so white (0x1F/0x3F/0x1F) lands on 0xFF/0xFF/0xFF instead of
 /// the 0xF8/0xFC/0xF8 a naive left-shift gives. This is the one expansion
@@ -179,6 +186,11 @@ pub const GenSession = struct {
     frames: u32,
     skip: u32,
     buttons: u16,
+    /// Optional recorded playthrough driving both pads, one entry per frame
+    /// (borrowed; must outlive the session). Set after `start`. Overrides
+    /// `buttons`; past its end both pads read released — deterministic in
+    /// both runs either way, which is all the pipeline requires.
+    movie_frames: ?[]const [2]u16 = null,
     total: u32,
 
     /// Baseline per-frame framebuffer hashes — what the verify run replays
@@ -308,7 +320,11 @@ pub const GenSession = struct {
 
     fn runOneFrame(self: *GenSession) !u64 {
         const con = self.con.?;
-        if (self.buttons != 0) con.setButtons(0, self.buttons);
+        if (self.movie_frames) |mf| {
+            const f: [2]u16 = if (self.i < mf.len) mf[self.i] else .{ 0, 0 };
+            con.setButtons(0, f[0]);
+            con.setButtons(1, f[1]);
+        } else if (self.buttons != 0) con.setButtons(0, self.buttons);
         con.runFrame();
         try drainAudio(con, &self.audio, {}, null);
         if (con.takeProfile()) |smp| {
@@ -394,9 +410,11 @@ pub fn generateFastromVerified(
     frames: u32,
     skip: u32,
     buttons: u16,
+    movie_frames: ?[]const [2]u16,
     failure: *?GenFailure,
 ) !GenOutcome {
     var s = try GenSession.start(gpa, image, frames, skip, buttons);
+    s.movie_frames = movie_frames;
     defer s.deinit();
     while (true) {
         switch (try s.step(std.math.maxInt(u32))) {

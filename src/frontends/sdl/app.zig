@@ -60,6 +60,17 @@ pub const Options = struct {
     /// Rewind ring, resolved from the config; off in `--frames` CI runs.
     rewind_enabled: bool,
     rewind_budget_mib: u32,
+    /// `<pref>/movies`, where the record hotkey writes .ymv playthroughs;
+    /// null means recording is off for the session.
+    movies_dir: ?[]const u8,
+    /// CRC32 of the copier-stripped image as booted (post soft-patch) — the
+    /// identity a recorded movie carries.
+    rom_crc: u32,
+    /// The core the console was built on, echoed into recorded movies.
+    accuracy: core.Accuracy,
+    /// `--movie`: a validated recorded playthrough to replay from power-on.
+    /// Live input takes over when it ends.
+    movie: ?util.movie.Movie,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -334,6 +345,16 @@ pub fn run(
     var exit_to_library = false;
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
+    // Input-movie state. Recording appends the masks actually fed to each
+    // EXECUTED frame; anything that breaks the input-stream model (reset,
+    // load state, rewind) discards it rather than writing a movie that
+    // cannot replay. Playback drives both pads from power-on until the
+    // movie runs out, then live input takes over; its end hashes are
+    // checked right after the final frame's audio drain.
+    var rec: ?std.array_list.Managed([2]u16) = null;
+    var play_movie: ?util.movie.Movie = opts.movie;
+    var play_idx: usize = 0;
+    var movie_end_check = false;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
 
     while (running) {
@@ -424,6 +445,7 @@ pub fn run(
                             .pal => con.setRegion(.pal),
                         }
                         if (rw) |*r| r.clear();
+                        discardMovieModes(&rec, &play_movie, "reset", err);
                         mnu = null;
                     },
                     .save_state => {
@@ -437,6 +459,7 @@ pub fn run(
                             if (sram) |*s| s.flush(io, con, err);
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
+                            discardMovieModes(&rec, &play_movie, "load state", err);
                         }
                         mnu = null;
                     },
@@ -491,12 +514,43 @@ pub fn run(
                         .pal => con.setRegion(.pal),
                     }
                     if (rw) |*r| r.clear();
+                    discardMovieModes(&rec, &play_movie, "reset", err);
                 },
                 .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
+                        discardMovieModes(&rec, &play_movie, "load state", err);
+                    }
+                },
+                .record_movie => {
+                    if (rec != null) {
+                        // Stop: the movie's hashes describe the machine as it
+                        // stands right now, after the last recorded frame.
+                        writeMovie(io, gpa, &opts, con, rec.?.items, audio_hash, err);
+                        rec.?.deinit();
+                        rec = null;
+                    } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
+                        try err.print("movie: cannot record during playback\n", .{});
+                        try err.flush();
+                    } else if (opts.movies_dir == null) {
+                        try err.print("movie: recording unavailable — no per-user data directory\n", .{});
+                        try err.flush();
+                    } else {
+                        // Start from power-on: that is the only state a
+                        // replay can reconstruct.
+                        con.repower();
+                        switch (opts.region) {
+                            .auto => {},
+                            .ntsc => con.setRegion(.ntsc),
+                            .pal => con.setRegion(.pal),
+                        }
+                        if (rw) |*r| r.clear();
+                        audio_hash = core.console.audio_hash_init;
+                        rec = .init(gpa);
+                        try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
+                        try err.flush();
                     }
                 },
                 .slot_next => {
@@ -543,13 +597,29 @@ pub fn run(
         const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
         const halted = paused or mnu != null or rewinding;
         fast_forward = inp.ffHeld() and !halted;
-        con.setButtons(0, inp.masks[0]);
-        con.setButtons(1, inp.masks[1]);
+        // During playback the movie owns both pads; live input resumes the
+        // frame after it ends.
+        const feed: [2]u16 = if (play_movie) |m|
+            (if (play_idx < m.frames.len) m.frames[play_idx] else .{ inp.masks[0], inp.masks[1] })
+        else
+            .{ inp.masks[0], inp.masks[1] };
+        con.setButtons(0, feed[0]);
+        con.setButtons(1, feed[1]);
         if (rewinding) {
             _ = rw.?.rewindStep(con);
+            discardMovieModes(&rec, &play_movie, "rewind", err);
         } else if (!halted) {
             con.runFrame();
             frames_run += 1;
+            if (rec) |*r| r.append(feed) catch {};
+            if (play_movie) |m| {
+                if (play_idx < m.frames.len) {
+                    play_idx += 1;
+                    // The frame the movie ends on is the one its hashes
+                    // describe — checked below, after its audio drains.
+                    if (play_idx == m.frames.len) movie_end_check = true;
+                }
+            }
             if (sram) |*s| s.tick(io, con, err);
             if (opts.cfg.rewind.enabled) {
                 if (rw) |*r| r.onFrame(con);
@@ -578,6 +648,11 @@ pub fn run(
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.drawText(&surf, 4, 4, "<< REWIND", ui.color.accent);
+            break :blk compose[0..fb.len];
+        } else if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len)) blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            ui.drawText(&surf, 4, 4, if (rec != null) "* REC" else "> MOVIE", ui.color.accent);
             break :blk compose[0..fb.len];
         } else fb;
 
@@ -705,6 +780,28 @@ pub fn run(
             .stream = if (audio_on) audio else null,
             .fast_forward = fast_forward,
         }, AudioSink.push);
+
+        // End of a replay: the movie's hashes describe the machine right
+        // after its final frame (and that frame's audio), which is now.
+        if (movie_end_check) {
+            movie_end_check = false;
+            if (play_movie) |m| {
+                if (m.end_frame_hash == 0) {
+                    try err.print("movie: {} frames replayed (no end hashes recorded — sync unverified); input is live\n", .{m.frames.len});
+                } else {
+                    const fh = core.console.hashFrame(con.framebuffer());
+                    const audio_ok = m.end_audio_hash == 0 or audio_hash == m.end_audio_hash;
+                    if (fh == m.end_frame_hash and audio_ok) {
+                        try err.print("movie: sync verified — {} frames replayed; input is live\n", .{m.frames.len});
+                    } else {
+                        try err.print("movie: DESYNC — end frame hash {x:0>16} (movie {x:0>16}), audio {s}\n", .{
+                            fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged",
+                        });
+                    }
+                }
+                try err.flush();
+            }
+        }
 
         if (opts.frames != 0 and frames_run >= opts.frames) running = false;
 
@@ -1627,6 +1724,71 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
 
 /// Encode and write one screenshot, named by the first free index — no
 /// wall-clock dependency, and the names sort in capture order.
+/// Reset, load-state, and rewind rewrite history, which an input stream
+/// cannot follow: a recording in progress is discarded (a movie that cannot
+/// replay must not be written) and a replay in progress hands input back.
+fn discardMovieModes(
+    rec: *?std.array_list.Managed([2]u16),
+    play: *?util.movie.Movie,
+    why: []const u8,
+    err: *std.Io.Writer,
+) void {
+    if (rec.*) |*r| {
+        r.deinit();
+        rec.* = null;
+        err.print("movie: recording discarded ({s} breaks replay determinism)\n", .{why}) catch {};
+        err.flush() catch {};
+    }
+    if (play.* != null) {
+        play.* = null;
+        err.print("movie: playback stopped ({s}); input is live\n", .{why}) catch {};
+        err.flush() catch {};
+    }
+}
+
+/// Write a finished recording as `<movies>/<game_id>-NNNN.ymv`. The end
+/// hashes are taken from the machine as it stands — the frame after the
+/// last recorded input, exactly what a replay reproduces.
+fn writeMovie(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    opts: *const Options,
+    con: *core.AnyConsole,
+    frames: []const [2]u16,
+    audio_hash: u64,
+    err: *std.Io.Writer,
+) void {
+    const dir = opts.movies_dir orelse return;
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var path_buf: [512]u8 = undefined;
+    var n: u32 = 1;
+    const path = while (n <= 9999) : (n += 1) {
+        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}-{d:0>4}{s}", .{ dir, opts.game_id, n, util.movie.file_ext }) catch return;
+        std.Io.Dir.cwd().access(io, p, .{}) catch break p;
+    } else return;
+    const m: util.movie.Movie = .{
+        .accuracy = if (opts.accuracy == .accurate) 1 else 0,
+        .region = if (con.region() == .pal) 1 else 0,
+        .rom_crc = opts.rom_crc,
+        .end_frame_hash = core.console.hashFrame(con.framebuffer()),
+        .end_audio_hash = audio_hash,
+        .frames = @constCast(frames),
+    };
+    const data = util.movie.encode(gpa, m) catch |e| {
+        err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    defer gpa.free(data);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch |e| {
+        err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    err.print("movie: {s} ({} frames, end hashes recorded)\n", .{ path, frames.len }) catch {};
+    err.flush() catch {};
+}
+
 fn writeScreenshot(
     io: std.Io,
     gpa: std.mem.Allocator,

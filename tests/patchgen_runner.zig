@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     const image = core.header.stripCopierHeader(raw);
 
     var failure: ?util.GenFailure = null;
-    const res = util.generateFastromVerified(gpa, image, verify_frames, verify_skip, 0, &failure) catch |e| {
+    const res = util.generateFastromVerified(gpa, image, verify_frames, verify_skip, 0, null, &failure) catch |e| {
         if (e == error.GenFailed) {
             switch (failure.?) {
                 .refused => |r| try out.print("FAIL: refused: {s}\n", .{r.reason.describe()}),
