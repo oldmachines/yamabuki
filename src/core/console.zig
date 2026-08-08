@@ -21,7 +21,9 @@ const Bus = @import("memory/bus.zig").Bus;
 const Cartridge = @import("cart/cartridge.zig").Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
 const CpuFlags = @import("cpu/wdc65816.zig").Flags;
+const Dma = @import("memory/dma.zig").Dma;
 const profile = @import("profile.zig");
+const usage_map = @import("usage_map.zig");
 
 /// Save-state container magic ("YMBK") and format version. The version bumps
 /// whenever the serialized field layout changes (there is no migration —
@@ -52,7 +54,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof" };
+        pub const serialize_skip = .{ "steps", "prof", "usage" };
 
         cart: Cartridge,
         bus: Bus,
@@ -60,6 +62,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         /// Zero-sized (and every use of it compiled away) unless `cfg.profile`.
         prof: if (cfg.profile) profile.Profiler else void,
+        /// Stage-S1 coverage: the bsnes-plus-format usage map the frontend
+        /// attaches when exporting (`--usage-map`); null otherwise. A pointer
+        /// on purpose — the 16 MiB map lives on the frontend's heap, never
+        /// inside the console. Zero-sized unless `cfg.profile`.
+        usage: if (cfg.profile) ?*const usage_map.UsageMap else void,
 
         region: timing.Region,
         /// Current scanline within the frame (0-based).
@@ -100,7 +107,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.line_start = self.bus.clock;
             self.frame = 0;
             self.steps = 0;
-            if (cfg.profile) self.prof = .init;
+            if (cfg.profile) {
+                self.prof = .init;
+                self.usage = null;
+            }
         }
 
         /// Re-wire the internal self-pointers after deserialization. The ROM
@@ -258,13 +268,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // business — the CPU core carries no instrumentation.
             const sp_before = self.cpu.regs.s;
             var kind: profile.Event.Kind = .none;
+            // The opcode about to execute — null when this step is really an
+            // interrupt dispatch (or a WAI), so the usage map marks nothing.
+            var op: ?u8 = null;
             if (!waiting) {
                 if (self.cpu.nmi_pending) {
                     kind = .nmi;
                 } else if (self.cpu.irq_line and (self.cpu.regs.p & CpuFlags.i) == 0) {
                     kind = .irq;
-                } else if (self.bus.peek8(pc)) |op| {
-                    kind = switch (op) {
+                } else if (self.bus.peek8(pc)) |o| {
+                    op = o;
+                    kind = switch (o) {
                         0x20, 0x22, 0xFC => .call, // JSR abs / JSL / JSR (abs,X)
                         0x60, 0x6B, 0x40 => .ret, // RTS / RTL / RTI
                         0x00, 0x02 => .irq, // BRK / COP enter a handler too
@@ -272,6 +286,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     };
                 }
             }
+            // The widths the instruction will decode with, for the usage
+            // map's M/X record — the same derivation the CPU's own dispatch
+            // makes (wdc65816.step).
+            const m8 = self.cpu.regs.e or (self.cpu.regs.p & CpuFlags.m) != 0;
+            const x8 = self.cpu.regs.e or (self.cpu.regs.p & CpuFlags.x) != 0;
             self.bus.last_data_read = Bus.no_data_access;
             self.bus.last_data_write = Bus.no_data_access;
             self.cpu.step();
@@ -288,6 +307,36 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     .sp_after = self.cpu.regs.s,
                 },
             );
+            // DMA/HDMA arming, blamed on the routine the store ran under.
+            // GDMA state is consumed (and the mask cleared) so a later $420B
+            // write of zero cannot re-count the previous trigger; HDMA regs
+            // survive arming, so its snapshot reads live.
+            if (dataAddr(self.bus.last_data_write)) |w| {
+                const a16: u16 = @truncate(w);
+                if (((w >> 16) & 0x7F) <= 0x3F) {
+                    var arms_buf: [8]Dma.ArmInfo = undefined;
+                    if (a16 == 0x420B and self.bus.dma.last_gdma_mask != 0) {
+                        for (self.bus.dma.gdmaArms(&arms_buf)) |a| {
+                            self.prof.noteDmaArm(.gdma, a.channel, a.src, a.bytes, a.b_reg, a.a_is_dest, null);
+                        }
+                        self.bus.dma.last_gdma_mask = 0;
+                    } else if (a16 == 0x420C and self.bus.dma.hdmaen != 0) {
+                        for (self.bus.dma.hdmaArms(&arms_buf)) |a| {
+                            self.prof.noteDmaArm(.hdma, a.channel, a.src, 0, a.b_reg, false, a.indirect_bank);
+                        }
+                    }
+                }
+            }
+            // Stage-S1 coverage, when a map is attached. A recorded access
+            // with no decoded width (an interrupt dispatch's vector read, an
+            // opcode the table calls access-free) still factually touched
+            // its last byte, so at least one byte is marked.
+            if (self.usage) |u| {
+                if (op) |o| u.noteInstr(pc, o, m8, x8);
+                const width: u8 = if (op) |o| @max(1, usage_map.dataWidth(o, m8, x8)) else 1;
+                if (dataAddr(self.bus.last_data_read)) |a| u.noteRead(a, width);
+                if (dataAddr(self.bus.last_data_write)) |a| u.noteWrite(a, width);
+            }
         }
 
         fn dataAddr(v: u32) ?u24 {
@@ -1304,4 +1353,46 @@ test "a $4210 edge-wait can win the race against the NMI handler's own ack" {
     }
     try std.testing.expect(con.bus.wram.data[0] & 0x80 != 0); // the wait exited
     try std.testing.expect(con.bus.wram.data[1] > 0); // and the handler kept running
+}
+
+test "usage map records opcode, operand, and data flags through a profiled run" {
+    const alloc = std.testing.allocator;
+    const rom = try buildNmiRom(alloc);
+    defer alloc.free(rom);
+
+    const bytes = try alloc.alloc(u8, usage_map.cpu_map_len);
+    defer alloc.free(bytes);
+    @memset(bytes, 0);
+    const map: usage_map.UsageMap = .{ .bytes = bytes };
+
+    const cart = try Cartridge.load(alloc, rom);
+    const con = try alloc.create(ProfilingConsole);
+    defer {
+        con.cart.deinit(alloc);
+        alloc.destroy(con);
+    }
+    con.init(cart);
+    con.usage = &map;
+    con.runFrame();
+    con.runFrame(); // the NMI handler runs at least once
+
+    const F = usage_map;
+    // LDA #$80 at $00:8000 — emulation mode at reset, so M and X read 8-bit.
+    try std.testing.expectEqual(F.flag_opcode | F.flag_exec | F.flag_m | F.flag_x, bytes[0x00_8000]);
+    try std.testing.expectEqual(F.flag_exec, bytes[0x00_8001]);
+    // STA $4200 at $00:8002: opcode, two operand bytes, and the MMIO write.
+    try std.testing.expect(bytes[0x00_8002] & F.flag_opcode != 0);
+    try std.testing.expect(bytes[0x00_8003] & F.flag_exec != 0);
+    try std.testing.expect(bytes[0x00_8004] & F.flag_exec != 0);
+    try std.testing.expect(bytes[0x00_4200] & F.flag_write != 0);
+    // The spin: BRA at $00:8005 executes; its target byte is its own operand.
+    try std.testing.expect(bytes[0x00_8005] & F.flag_opcode != 0);
+    // The NMI handler: INC $00 reads AND writes WRAM through the low mirror,
+    // and the RTI behind it is marked as an opcode.
+    try std.testing.expect(bytes[0x00_8010] & F.flag_opcode != 0);
+    try std.testing.expect(bytes[0x00_0000] & F.flag_read != 0);
+    try std.testing.expect(bytes[0x00_0000] & F.flag_write != 0);
+    try std.testing.expect(bytes[0x00_8012] & F.flag_opcode != 0);
+    // Nothing marked the header or empty space as executed.
+    try std.testing.expectEqual(@as(u8, 0), bytes[0x00_9000]);
 }

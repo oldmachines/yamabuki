@@ -89,7 +89,7 @@ pub const Cartridge = struct {
     }
 };
 
-fn identifyChip(h: Header) ChipKind {
+pub fn identifyChip(h: Header) ChipKind {
     // $FFD6 chipset byte: high nibble selects the coprocessor family for
     // values >= 0x03 (in combination with the map mode for some).
     return switch (h.chipset) {

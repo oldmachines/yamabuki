@@ -95,6 +95,18 @@ pub const Config = struct {
         /// core, and a conflicting accuracy override is refused at boot.
         wide: ?u32 = null,
         rewind: ?bool = null,
+        /// When a patch is discovered for this game (patchfind.zig): play it
+        /// patched or original. Keyed by the ORIGINAL image's game_id — a
+        /// patched game gets its own id (and saves) once booted, so the
+        /// choice has to hang off the entity the user picked in the library.
+        /// Null = never chosen; the library asks at launch.
+        patch: ?enum { patched, original } = null,
+        /// The library's FastROM-generation offer for a SlowROM game with no
+        /// patch: null = ask at launch, false = never offer this game again
+        /// (chosen by the user, or set after a refused/failed generation so
+        /// an unconvertible game is not re-offered). Same original-image
+        /// keying as `patch`.
+        offer_gen: ?bool = null,
     };
 
     pub fn perGame(self: *const Config, game_id: []const u8) ?*const PerGame {

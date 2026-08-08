@@ -24,6 +24,7 @@ const png = @import("png.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
 const dirpicker = @import("dirpicker.zig");
+const patchfind = @import("patchfind.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -59,6 +60,17 @@ pub const Options = struct {
     /// Rewind ring, resolved from the config; off in `--frames` CI runs.
     rewind_enabled: bool,
     rewind_budget_mib: u32,
+    /// `<pref>/movies`, where the record hotkey writes .ymv playthroughs;
+    /// null means recording is off for the session.
+    movies_dir: ?[]const u8,
+    /// CRC32 of the copier-stripped image as booted (post soft-patch) — the
+    /// identity a recorded movie carries.
+    rom_crc: u32,
+    /// The core the console was built on, echoed into recorded movies.
+    accuracy: core.Accuracy,
+    /// `--movie`: a validated recorded playthrough to replay from power-on.
+    /// Live input takes over when it ends.
+    movie: ?util.movie.Movie,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -333,6 +345,16 @@ pub fn run(
     var exit_to_library = false;
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
+    // Input-movie state. Recording appends the masks actually fed to each
+    // EXECUTED frame; anything that breaks the input-stream model (reset,
+    // load state, rewind) discards it rather than writing a movie that
+    // cannot replay. Playback drives both pads from power-on until the
+    // movie runs out, then live input takes over; its end hashes are
+    // checked right after the final frame's audio drain.
+    var rec: ?std.array_list.Managed([2]u16) = null;
+    var play_movie: ?util.movie.Movie = opts.movie;
+    var play_idx: usize = 0;
+    var movie_end_check = false;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
 
     while (running) {
@@ -423,6 +445,7 @@ pub fn run(
                             .pal => con.setRegion(.pal),
                         }
                         if (rw) |*r| r.clear();
+                        discardMovieModes(&rec, &play_movie, "reset", err);
                         mnu = null;
                     },
                     .save_state => {
@@ -436,6 +459,7 @@ pub fn run(
                             if (sram) |*s| s.flush(io, con, err);
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
+                            discardMovieModes(&rec, &play_movie, "load state", err);
                         }
                         mnu = null;
                     },
@@ -490,12 +514,43 @@ pub fn run(
                         .pal => con.setRegion(.pal),
                     }
                     if (rw) |*r| r.clear();
+                    discardMovieModes(&rec, &play_movie, "reset", err);
                 },
                 .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
+                        discardMovieModes(&rec, &play_movie, "load state", err);
+                    }
+                },
+                .record_movie => {
+                    if (rec != null) {
+                        // Stop: the movie's hashes describe the machine as it
+                        // stands right now, after the last recorded frame.
+                        writeMovie(io, gpa, &opts, con, rec.?.items, audio_hash, err);
+                        rec.?.deinit();
+                        rec = null;
+                    } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
+                        try err.print("movie: cannot record during playback\n", .{});
+                        try err.flush();
+                    } else if (opts.movies_dir == null) {
+                        try err.print("movie: recording unavailable — no per-user data directory\n", .{});
+                        try err.flush();
+                    } else {
+                        // Start from power-on: that is the only state a
+                        // replay can reconstruct.
+                        con.repower();
+                        switch (opts.region) {
+                            .auto => {},
+                            .ntsc => con.setRegion(.ntsc),
+                            .pal => con.setRegion(.pal),
+                        }
+                        if (rw) |*r| r.clear();
+                        audio_hash = core.console.audio_hash_init;
+                        rec = .init(gpa);
+                        try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
+                        try err.flush();
                     }
                 },
                 .slot_next => {
@@ -542,13 +597,29 @@ pub fn run(
         const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
         const halted = paused or mnu != null or rewinding;
         fast_forward = inp.ffHeld() and !halted;
-        con.setButtons(0, inp.masks[0]);
-        con.setButtons(1, inp.masks[1]);
+        // During playback the movie owns both pads; live input resumes the
+        // frame after it ends.
+        const feed: [2]u16 = if (play_movie) |m|
+            (if (play_idx < m.frames.len) m.frames[play_idx] else .{ inp.masks[0], inp.masks[1] })
+        else
+            .{ inp.masks[0], inp.masks[1] };
+        con.setButtons(0, feed[0]);
+        con.setButtons(1, feed[1]);
         if (rewinding) {
             _ = rw.?.rewindStep(con);
+            discardMovieModes(&rec, &play_movie, "rewind", err);
         } else if (!halted) {
             con.runFrame();
             frames_run += 1;
+            if (rec) |*r| r.append(feed) catch {};
+            if (play_movie) |m| {
+                if (play_idx < m.frames.len) {
+                    play_idx += 1;
+                    // The frame the movie ends on is the one its hashes
+                    // describe — checked below, after its audio drains.
+                    if (play_idx == m.frames.len) movie_end_check = true;
+                }
+            }
             if (sram) |*s| s.tick(io, con, err);
             if (opts.cfg.rewind.enabled) {
                 if (rw) |*r| r.onFrame(con);
@@ -577,6 +648,11 @@ pub fn run(
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.drawText(&surf, 4, 4, "<< REWIND", ui.color.accent);
+            break :blk compose[0..fb.len];
+        } else if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len)) blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            ui.drawText(&surf, 4, 4, if (rec != null) "* REC" else "> MOVIE", ui.color.accent);
             break :blk compose[0..fb.len];
         } else fb;
 
@@ -705,6 +781,28 @@ pub fn run(
             .fast_forward = fast_forward,
         }, AudioSink.push);
 
+        // End of a replay: the movie's hashes describe the machine right
+        // after its final frame (and that frame's audio), which is now.
+        if (movie_end_check) {
+            movie_end_check = false;
+            if (play_movie) |m| {
+                if (m.end_frame_hash == 0) {
+                    try err.print("movie: {} frames replayed (no end hashes recorded — sync unverified); input is live\n", .{m.frames.len});
+                } else {
+                    const fh = core.console.hashFrame(con.framebuffer());
+                    const audio_ok = m.end_audio_hash == 0 or audio_hash == m.end_audio_hash;
+                    if (fh == m.end_frame_hash and audio_ok) {
+                        try err.print("movie: sync verified — {} frames replayed; input is live\n", .{m.frames.len});
+                    } else {
+                        try err.print("movie: DESYNC — end frame hash {x:0>16} (movie {x:0>16}), audio {s}\n", .{
+                            fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged",
+                        });
+                    }
+                }
+                try err.flush();
+            }
+        }
+
         if (opts.frames != 0 and frames_run >= opts.frames) running = false;
 
         // Pacing: sleep up to the next NTSC frame boundary.
@@ -751,6 +849,7 @@ pub fn runLibrary(
     cfg: *config.Config,
     config_path: ?[]const u8,
     cache_path: ?[]const u8,
+    patches_dir: ?[]const u8,
     err: *std.Io.Writer,
 ) !?[]const u8 {
     if (!sdl.SDL_Init(sdl3.init_video | sdl3.init_audio)) {
@@ -810,13 +909,39 @@ pub fn runLibrary(
     // Hold-to-scroll for both the game list and the folder browser.
     var repeater: menu.Repeater = .{};
 
+    // Patch availability: the folder index is built once, and every entry's
+    // PATCH tag is refreshed from it now (cached entries) and again when a
+    // scan completes (fresh ones).
+    var patch_index = patchfind.FolderIndex.build(io, gpa, patches_dir);
+    refreshPatchTags(io, gpa, lib, &patch_index);
+
     // Row 0 of the list is always the ADD ROM FOLDER action, so the browser
-    // never depends on a hand-edited config.zon. `.picker` owns the folder
-    // browser while it's open; `.list` is the game list.
-    const Mode = enum { list, picker };
+    // never depends on a hand-edited config.zon. `.prompt` is the two-row
+    // patched-or-original question for a game with a patch available;
+    // `.offer` proposes generating a FastROM patch for a SlowROM game that
+    // has none; `.generating` runs that session incrementally with a
+    // progress screen (the scanner's budget pattern — no thread) and lands
+    // in `.prompt` on success or `.genfail` on failure; `.picker` owns the
+    // folder browser while it's open; `.list` is the game list.
+    const Mode = enum { list, picker, prompt, offer, generating, genfail };
     var mode: Mode = .list;
     var picker: ?dirpicker.Picker = null;
     defer if (picker) |*pk| pk.deinit();
+    // The entry the prompt/offer/generation is about, and where the list
+    // cursor goes back to.
+    var prompt_entry: usize = 0;
+    var saved_cursor: usize = 0;
+    // The generation session, the ROM bytes it borrows, the latest progress
+    // for the screen, the failure for `.genfail`, and the measured-effect
+    // note a successful generation adds to the patched-or-original prompt.
+    var gen_session: ?util.GenSession = null;
+    var gen_rom: ?[]u8 = null;
+    var gen_progress: util.GenSession.Progress = .{ .phase = .baseline, .frame = 0, .total = 1 };
+    var gen_failure: ?util.GenFailure = null;
+    var gen_note: [48]u8 = undefined;
+    var gen_note_len: usize = 0;
+    defer if (gen_session) |*s| s.deinit();
+    defer if (gen_rom) |r| gpa.free(r);
 
     while (true) {
         var ev: sdl3.Event = undefined;
@@ -847,6 +972,10 @@ pub fn runLibrary(
             const n = switch (mode) {
                 .list => lib.entries.items.len + 1,
                 .picker => picker.?.rowCount(),
+                .prompt => 2,
+                .offer => 3,
+                .generating => 0,
+                .genfail => 1,
             };
             switch (menu.navFromEvent(nev) orelse continue) {
                 .up => if (n != 0) {
@@ -866,7 +995,84 @@ pub fn runLibrary(
                         cursor = 0;
                         scroll = 0;
                     } else if (cursor - 1 < lib.entries.items.len) {
-                        picked = cursor - 1;
+                        const e = &lib.entries.items[cursor - 1];
+                        if (e.has_patch) {
+                            // Ask patched-or-original, preselecting the
+                            // remembered choice (default: original — the
+                            // saves the player already has stay in front).
+                            mode = .prompt;
+                            prompt_entry = cursor - 1;
+                            saved_cursor = cursor;
+                            gen_note_len = 0;
+                            cursor = blk: {
+                                if (cfg.perGame(e.game_id)) |p| if (p.patch) |c| {
+                                    break :blk if (c == .patched) 0 else 1;
+                                };
+                                break :blk 1;
+                            };
+                        } else if (genCandidate(e, cfg, patches_dir)) {
+                            // No patch, but this SlowROM game could have one
+                            // made: offer it, defaulting to just playing.
+                            mode = .offer;
+                            prompt_entry = cursor - 1;
+                            saved_cursor = cursor;
+                            cursor = 0;
+                        } else {
+                            picked = cursor - 1;
+                        }
+                    },
+                    .prompt => {
+                        const e = &lib.entries.items[prompt_entry];
+                        if (cfg.perGameMut(gpa, e.game_id)) |pg| {
+                            pg.patch = if (cursor == 0) .patched else .original;
+                            if (config_path) |p| config.save(io, gpa, cfg.*, p) catch |se| {
+                                err.print("warning: cannot write {s}: {s}\n", .{ p, @errorName(se) }) catch {};
+                                err.flush() catch {};
+                            };
+                        } else |_| {}
+                        picked = prompt_entry;
+                        cursor = saved_cursor;
+                        mode = .list;
+                    },
+                    .offer => switch (cursor) {
+                        0 => { // PLAY ORIGINAL (ask again next time)
+                            picked = prompt_entry;
+                            cursor = saved_cursor;
+                            mode = .list;
+                        },
+                        1 => { // GENERATE FASTROM PATCH
+                            const e = &lib.entries.items[prompt_entry];
+                            if (startGeneration(io, gpa, e.path, &gen_rom, err)) |session| {
+                                gen_session = session;
+                                gen_progress = .{ .phase = .baseline, .frame = 0, .total = session.total };
+                                mode = .generating;
+                            } else {
+                                // Could not even start (unreadable ROM, OOM):
+                                // the reason is on stderr; just play.
+                                picked = prompt_entry;
+                                cursor = saved_cursor;
+                                mode = .list;
+                            }
+                        },
+                        else => { // PLAY, NEVER ASK FOR THIS GAME
+                            const e = &lib.entries.items[prompt_entry];
+                            if (cfg.perGameMut(gpa, e.game_id)) |pg| {
+                                pg.offer_gen = false;
+                                if (config_path) |p| config.save(io, gpa, cfg.*, p) catch |se| {
+                                    err.print("warning: cannot write {s}: {s}\n", .{ p, @errorName(se) }) catch {};
+                                    err.flush() catch {};
+                                };
+                            } else |_| {}
+                            picked = prompt_entry;
+                            cursor = saved_cursor;
+                            mode = .list;
+                        },
+                    },
+                    .generating => {}, // nothing to confirm; B cancels
+                    .genfail => { // PLAY ORIGINAL
+                        picked = prompt_entry;
+                        cursor = saved_cursor;
+                        mode = .list;
                     },
                     .picker => switch (picker.?.activate(io, cursor)) {
                         .use_folder => |path| {
@@ -907,6 +1113,19 @@ pub fn runLibrary(
                         cursor = 0;
                         scroll = 0;
                     },
+                    .prompt, .offer, .genfail => {
+                        cursor = saved_cursor;
+                        mode = .list;
+                    },
+                    .generating => {
+                        // Cancel: throw the half-done session away.
+                        if (gen_session) |*s| s.deinit();
+                        gen_session = null;
+                        if (gen_rom) |r| gpa.free(r);
+                        gen_rom = null;
+                        cursor = saved_cursor;
+                        mode = .list;
+                    },
                 },
             }
         }
@@ -917,6 +1136,10 @@ pub fn runLibrary(
             const n = switch (mode) {
                 .list => lib.entries.items.len + 1,
                 .picker => picker.?.rowCount(),
+                .prompt => 2,
+                .offer => 3,
+                .generating => 0,
+                .genfail => 1,
             };
             switch (nav) {
                 .up => if (n != 0) {
@@ -936,13 +1159,73 @@ pub fn runLibrary(
         const deadline = sdl.SDL_GetTicksNS() + 6 * std.time.ns_per_ms;
         while (!scanner.done and sdl.SDL_GetTicksNS() < deadline) {
             if (scanner.stepOne(io, lib)) {
+                refreshPatchTags(io, gpa, lib, &patch_index);
                 if (cache_path) |p| lib.saveCache(io, gpa, p) catch {};
+            }
+        }
+
+        // The generation session gets the same treatment as the scanner: a
+        // per-frame time budget on the main loop, one emulated frame per
+        // step, screen still live in between.
+        if (mode == .generating) {
+            const gen_deadline = sdl.SDL_GetTicksNS() + 12 * std.time.ns_per_ms;
+            step: while (sdl.SDL_GetTicksNS() < gen_deadline) {
+                const status = gen_session.?.step(1) catch |e| {
+                    err.print("generation failed: {s}\n", .{@errorName(e)}) catch {};
+                    err.flush() catch {};
+                    gen_session.?.deinit();
+                    gen_session = null;
+                    gpa.free(gen_rom.?);
+                    gen_rom = null;
+                    cursor = saved_cursor;
+                    mode = .list;
+                    break :step;
+                };
+                switch (status) {
+                    .running => |p| gen_progress = p,
+                    .done => |outcome| {
+                        gen_failure = null; // a write failure below is its own story
+                        finishGeneration(io, gpa, lib, patches_dir.?, prompt_entry, outcome, &gen_note, &gen_note_len, err);
+                        gen_session.?.deinit();
+                        gen_session = null;
+                        gpa.free(gen_rom.?);
+                        gen_rom = null;
+                        // Rebuild the index so the new patch is discovered,
+                        // then land in the patched-or-original prompt with
+                        // PLAY PATCHED preselected.
+                        patch_index = patchfind.FolderIndex.build(io, gpa, patches_dir);
+                        refreshPatchTags(io, gpa, lib, &patch_index);
+                        mode = if (lib.entries.items[prompt_entry].has_patch) .prompt else .genfail;
+                        cursor = 0;
+                        break :step;
+                    },
+                    .failed => |f| {
+                        gen_failure = f;
+                        // A game that cannot convert is not offered again.
+                        const e = &lib.entries.items[prompt_entry];
+                        if (cfg.perGameMut(gpa, e.game_id)) |pg| {
+                            pg.offer_gen = false;
+                            if (config_path) |p| config.save(io, gpa, cfg.*, p) catch {};
+                        } else |_| {}
+                        gen_session.?.deinit();
+                        gen_session = null;
+                        gpa.free(gen_rom.?);
+                        gen_rom = null;
+                        mode = .genfail;
+                        cursor = 0;
+                        break :step;
+                    },
+                }
             }
         }
 
         const total = switch (mode) {
             .list => lib.entries.items.len + 1,
             .picker => picker.?.rowCount(),
+            .prompt => 2,
+            .offer => 3,
+            .generating => 1,
+            .genfail => 1,
         };
         if (cursor >= total and total != 0) cursor = total - 1;
         if (cursor < scroll) scroll = cursor;
@@ -951,6 +1234,10 @@ pub fn runLibrary(
         switch (mode) {
             .list => drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, cfg.library.rom_dirs.len == 0, if (scanner.done) null else scanner.remaining()),
             .picker => drawPickerScreen(&canvas, &picker.?, cursor, scroll, visible_rows),
+            .prompt => drawPatchPromptScreen(&canvas, lib.entries.items[prompt_entry].title, cursor, if (gen_note_len != 0) gen_note[0..gen_note_len] else null),
+            .offer => drawOfferScreen(&canvas, lib.entries.items[prompt_entry].title, cursor),
+            .generating => drawGeneratingScreen(&canvas, lib.entries.items[prompt_entry].title, gen_progress),
+            .genfail => drawGenFailScreen(&canvas, lib.entries.items[prompt_entry].title, gen_failure),
         }
 
         _ = sdl.SDL_UpdateTexture(texture, null, &canvas, 256 * 2);
@@ -1003,9 +1290,12 @@ fn drawLibraryScreen(
         const e = lib.entries.items[i - 1];
         const max_title = 32;
         ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, max_title)], fg);
-        var tag: [16]u8 = undefined;
+        var tag: [24]u8 = undefined;
+        const patch_txt = if (e.has_patch) "PATCH " else "";
         const tag_txt = if (e.chip.len != 0)
-            std.fmt.bufPrint(&tag, "{s} {s}", .{ e.chip, e.region }) catch e.region
+            std.fmt.bufPrint(&tag, "{s}{s} {s}", .{ patch_txt, e.chip, e.region }) catch e.region
+        else if (e.has_patch)
+            std.fmt.bufPrint(&tag, "{s}{s}", .{ patch_txt, e.region }) catch e.region
         else
             e.region;
         ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(tag_txt))), y, tag_txt, ui.color.text_dim);
@@ -1018,6 +1308,219 @@ fn drawLibraryScreen(
     } else {
         ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B QUIT", ui.color.text_dim);
     }
+}
+
+/// Refresh every entry's PATCH tag from the current filesystem state: a
+/// same-basename softpatch or a patch-folder match by cached CRC32. Cheap —
+/// one stat-or-small-read per entry plus the prebuilt folder index.
+fn refreshPatchTags(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    lib: *library.Library,
+    idx: *const patchfind.FolderIndex,
+) void {
+    for (lib.entries.items) |*e| {
+        e.has_patch = e.crc32 != 0 and
+            patchfind.quickAvailable(io, gpa, e.path, e.crc32, idx);
+    }
+}
+
+/// The patched-or-original question for a game with a patch available — the
+/// same pure-pixel shape as the other screens, so it rides the same tests.
+/// Row 0 = PLAY PATCHED, row 1 = PLAY ORIGINAL. `note` is the measured-effect
+/// line a just-finished generation adds.
+fn drawPatchPromptScreen(canvas: *[256 * 224]u16, title: []const u8, cursor: usize, note: ?[]const u8) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "PATCH FOUND", ui.color.accent);
+
+    ui.drawTextCentered(&surf, 70, title[0..@min(title.len, 32)], ui.color.text);
+    ui.drawTextCentered(&surf, 88, "A PATCH IS AVAILABLE FOR THIS GAME", ui.color.text_dim);
+    if (note) |txt| ui.drawTextCentered(&surf, 100, txt, ui.color.accent);
+
+    const rows = [_][]const u8{ "PLAY PATCHED", "PLAY ORIGINAL" };
+    for (rows, 0..) |label, i| {
+        const y: i32 = @intCast(116 + i * ui.line_h);
+        const selected = i == cursor;
+        if (selected) ui.drawText(&surf, 92, y, ">", ui.color.accent);
+        ui.drawText(&surf, 102, y, label, if (selected) ui.color.text else ui.color.text_dim);
+    }
+
+    ui.drawTextCentered(&surf, 170, "PATCHED AND ORIGINAL KEEP SEPARATE SAVES", ui.color.text_dim);
+    ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B BACK  CHOICE IS REMEMBERED", ui.color.text_dim);
+}
+
+/// Is this library entry worth offering FastROM generation for? SlowROM, no
+/// coprocessor (the generator would refuse those anyway), no patch already,
+/// somewhere writable/discoverable to put the result, and the user has not
+/// said never-ask. `map_mode == 0` means an entry the scanner has not
+/// re-identified yet — unknown, so no offer.
+fn genCandidate(e: *const library.Entry, cfg: *const config.Config, patches_dir: ?[]const u8) bool {
+    if (patches_dir == null) return false;
+    if (e.has_patch) return false;
+    if (e.chip.len != 0) return false;
+    if (e.map_mode == 0 or (e.map_mode & 0x10) != 0) return false;
+    if (cfg.perGame(e.game_id)) |p| if (p.offer_gen) |v| if (!v) return false;
+    return true;
+}
+
+/// Generation runs the same window the CLI defaults to — the standard the
+/// fastrom-compat list is verified to.
+const gen_frames: u32 = 1800;
+const gen_skip: u32 = 300;
+
+/// Read the ROM and open a generation session over it. On success the raw
+/// file bytes are parked in `gen_rom` (the session borrows the stripped
+/// view); on failure the reason is printed and null returned.
+fn startGeneration(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    rom_path: []const u8,
+    gen_rom: *?[]u8,
+    err: *std.Io.Writer,
+) ?util.GenSession {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        err.print("error: cannot read ROM '{s}'\n", .{rom_path}) catch {};
+        err.flush() catch {};
+        return null;
+    };
+    const image = core.header.stripCopierHeader(raw);
+    const session = util.GenSession.start(gpa, image, gen_frames, gen_skip, 0) catch |e| {
+        err.print("error: cannot start generation: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        gpa.free(raw);
+        return null;
+    };
+    gen_rom.* = raw;
+    return session;
+}
+
+/// A successful generation: write the BPS into the patches folder (footer
+/// CRC is what discovery matches, so the name is cosmetic) and format the
+/// measured-effect note for the prompt. Failures print; the caller decides
+/// what screen follows based on whether discovery then finds the patch.
+fn finishGeneration(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    lib: *library.Library,
+    patches_dir: []const u8,
+    entry_idx: usize,
+    outcome: util.GenOutcome,
+    note: *[48]u8,
+    note_len: *usize,
+    err: *std.Io.Writer,
+) void {
+    defer gpa.free(outcome.image);
+    defer gpa.free(outcome.bps);
+
+    const e = &lib.entries.items[entry_idx];
+    const base = std.fs.path.basename(e.path);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}.bps", .{ patches_dir, base[0..dot] }) catch return;
+    defer gpa.free(path);
+
+    std.Io.Dir.cwd().createDirPath(io, patches_dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = outcome.bps }) catch {
+        err.print("error: cannot write '{s}'\n", .{path}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    err.print("generated {s} ({} bytes; verified {} frames)\n", .{
+        path, outcome.bps.len, gen_skip + gen_frames,
+    }) catch {};
+    err.flush() catch {};
+
+    const txt = std.fmt.bufPrint(note, "GENERATED + VERIFIED  UTIL {d:.0}% > {d:.0}%", .{
+        outcome.base.mean_util * 100, outcome.fast.mean_util * 100,
+    }) catch return;
+    note_len.* = txt.len;
+}
+
+/// The generation offer: play as-is, make a patch, or never ask again.
+fn drawOfferScreen(canvas: *[256 * 224]u16, title: []const u8, cursor: usize) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "FASTROM CANDIDATE", ui.color.accent);
+
+    ui.drawTextCentered(&surf, 62, title[0..@min(title.len, 32)], ui.color.text);
+    ui.drawTextCentered(&surf, 80, "THIS SLOWROM GAME MIGHT RUN FASTER WITH A", ui.color.text_dim);
+    ui.drawTextCentered(&surf, 90, "GENERATED FASTROM PATCH, VERIFIED IN-EMULATOR", ui.color.text_dim);
+
+    const rows = [_][]const u8{ "PLAY ORIGINAL", "GENERATE FASTROM PATCH", "PLAY, NEVER ASK FOR THIS GAME" };
+    for (rows, 0..) |label, i| {
+        const y: i32 = @intCast(116 + i * ui.line_h);
+        const selected = i == cursor;
+        if (selected) ui.drawText(&surf, 44, y, ">", ui.color.accent);
+        ui.drawText(&surf, 54, y, label, if (selected) ui.color.text else ui.color.text_dim);
+    }
+
+    ui.drawTextCentered(&surf, 176, "GENERATION PLAYS THE GAME TWICE TO PROVE THE", ui.color.text_dim);
+    ui.drawTextCentered(&surf, 186, "PATCH CHANGES NOTHING YOU SEE OR HEAR", ui.color.text_dim);
+    ui.drawText(&surf, 8, 212, "ENTER/A SELECT  ESC/B BACK", ui.color.text_dim);
+}
+
+/// The progress screen while a generation session runs on the main loop.
+fn drawGeneratingScreen(canvas: *[256 * 224]u16, title: []const u8, p: util.GenSession.Progress) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "GENERATING FASTROM PATCH", ui.color.accent);
+
+    ui.drawTextCentered(&surf, 70, title[0..@min(title.len, 32)], ui.color.text);
+    ui.drawTextCentered(&surf, 96, switch (p.phase) {
+        .baseline => "PASS 1/2: PROFILING THE ORIGINAL",
+        .verify => "PASS 2/2: VERIFYING THE PATCHED RUN",
+        .finished => "FINISHING",
+    }, ui.color.text);
+
+    var buf: [32]u8 = undefined;
+    const count = std.fmt.bufPrint(&buf, "{d} / {d} FRAMES", .{ p.frame, p.total }) catch "";
+    ui.drawTextCentered(&surf, 110, count, ui.color.text_dim);
+
+    // A plain bar: outline plus fill proportional to this pass's progress.
+    const bar_x: i32 = 48;
+    const bar_w: u32 = 160;
+    ui.fillRect(&surf, bar_x, 126, bar_w, 8, ui.color.text_dim);
+    ui.fillRect(&surf, bar_x + 1, 127, bar_w - 2, 6, ui.color.panel);
+    const frac: u64 = if (p.total == 0) 0 else @as(u64, p.frame) * (bar_w - 2) / p.total;
+    if (frac != 0) ui.fillRect(&surf, bar_x + 1, 127, @intCast(frac), 6, ui.color.accent);
+
+    ui.drawText(&surf, 8, 212, "ESC/B CANCEL", ui.color.text_dim);
+}
+
+/// Why no patch was produced, in library-screen shorthand; the full sentence
+/// is on stderr for anyone at a terminal.
+fn drawGenFailScreen(canvas: *[256 * 224]u16, title: []const u8, failure: ?util.GenFailure) void {
+    const surf = ui.Surface.init(canvas, 256, 224);
+    ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
+    ui.drawText(&surf, 8, 6, "NO PATCH GENERATED", ui.color.accent);
+
+    ui.drawTextCentered(&surf, 70, title[0..@min(title.len, 32)], ui.color.text);
+
+    var buf: [48]u8 = undefined;
+    const line1: []const u8, const line2: []const u8 = if (failure) |f| switch (f) {
+        .refused => |r| .{ "THE GENERATOR REFUSED:", switch (r.reason) {
+            .already_fastrom => "THE GAME IS ALREADY FASTROM",
+            .coprocessor => "COPROCESSOR CARTRIDGE",
+            .exhirom => "EXHIROM MAPPING UNSUPPORTED",
+            .reset_vector_not_rom => "RESET VECTOR NOT IN ROM",
+            .no_free_space => "NO FREE SPACE FOR THE STUB",
+            .memsel_store_unpatchable => "UNPATCHABLE MEMSEL STORE",
+        } },
+        .frame_mismatch => |frame| .{
+            std.fmt.bufPrint(&buf, "VERIFY FAILED AT FRAME {d}:", .{frame}) catch "VERIFY FAILED:",
+            "FASTROM TIMING CHANGES WHAT YOU SEE",
+        },
+        .audio_mismatch => .{ "VERIFY FAILED:", "FASTROM TIMING CHANGES WHAT YOU HEAR" },
+        .memsel_lost => |frame| .{
+            std.fmt.bufPrint(&buf, "VERIFY FAILED AT FRAME {d}:", .{frame}) catch "VERIFY FAILED:",
+            "THE GAME DISABLED FASTROM ITSELF",
+        },
+    } else .{ "THE PATCH COULD NOT BE WRITTEN", "SEE THE TERMINAL FOR THE REASON" };
+    ui.drawTextCentered(&surf, 96, line1, ui.color.text);
+    ui.drawTextCentered(&surf, 108, line2, ui.color.text_dim);
+
+    ui.drawTextCentered(&surf, 150, "THIS GAME WILL NOT BE OFFERED AGAIN", ui.color.text_dim);
+    ui.drawText(&surf, 8, 212, "ENTER/A PLAY ORIGINAL  ESC/B BACK", ui.color.text_dim);
 }
 
 /// The folder browser's whole frame — same pure-pixel shape as
@@ -1070,7 +1573,8 @@ test "library screen: every state draws without out-of-bounds writes" {
     drawLibraryScreen(canvas, &lib, 0, 0, 17, true, null);
     drawLibraryScreen(canvas, &lib, 0, 0, 17, false, null);
     drawLibraryScreen(canvas, &lib, 0, 0, 17, false, 42);
-    // A list longer than the window, cursor at the end, scrolled.
+    // A list longer than the window, cursor at the end, scrolled; every tag
+    // combination including the PATCH prefix.
     for (0..40) |i| {
         var name: [16]u8 = undefined;
         try lib.entries.append(a, .{
@@ -1078,9 +1582,62 @@ test "library screen: every state draws without out-of-bounds writes" {
             .title = try a.dupe(u8, std.fmt.bufPrint(&name, "GAME {d}", .{i}) catch "G"),
             .region = "NTSC",
             .chip = if (i % 3 == 0) "SA-1" else "",
+            .has_patch = i % 2 == 0,
         });
     }
     drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null);
+}
+
+test "patch prompt screen draws both cursor rows without out-of-bounds writes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const canvas = try arena.allocator().create([256 * 224]u16);
+    drawPatchPromptScreen(canvas, "SOME VERY LONG GAME TITLE THAT IS TRUNCATED", 0, null);
+    drawPatchPromptScreen(canvas, "GAME", 1, "GENERATED + VERIFIED  UTIL 44% > 31%");
+}
+
+test "offer, progress, and failure screens draw every state without OOB writes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const canvas = try arena.allocator().create([256 * 224]u16);
+
+    for (0..3) |c| drawOfferScreen(canvas, "GAME", c);
+
+    drawGeneratingScreen(canvas, "GAME", .{ .phase = .baseline, .frame = 0, .total = 2100 });
+    drawGeneratingScreen(canvas, "GAME", .{ .phase = .verify, .frame = 2099, .total = 2100 });
+    drawGeneratingScreen(canvas, "GAME", .{ .phase = .verify, .frame = 0, .total = 0 });
+
+    drawGenFailScreen(canvas, "GAME", null);
+    drawGenFailScreen(canvas, "GAME", .{ .refused = .{ .reason = .no_free_space } });
+    drawGenFailScreen(canvas, "GAME", .{ .frame_mismatch = 123456 });
+    drawGenFailScreen(canvas, "GAME", .{ .audio_mismatch = {} });
+    drawGenFailScreen(canvas, "GAME", .{ .memsel_lost = 7 });
+}
+
+test "genCandidate: SlowROM no-chip games without a patch, unless declined" {
+    var cfg: config.Config = .{};
+    var e: library.Entry = .{ .path = "x", .game_id = "id-x", .map_mode = 0x20 };
+    try std.testing.expect(genCandidate(&e, &cfg, "patches"));
+    // No writable patches dir: never offer.
+    try std.testing.expect(!genCandidate(&e, &cfg, null));
+    // Already has a patch, has a chip, is FastROM, or unknown map mode.
+    e.has_patch = true;
+    try std.testing.expect(!genCandidate(&e, &cfg, "patches"));
+    e.has_patch = false;
+    e.chip = "SA-1";
+    try std.testing.expect(!genCandidate(&e, &cfg, "patches"));
+    e.chip = "";
+    e.map_mode = 0x30;
+    try std.testing.expect(!genCandidate(&e, &cfg, "patches"));
+    e.map_mode = 0;
+    try std.testing.expect(!genCandidate(&e, &cfg, "patches"));
+    e.map_mode = 0x20;
+    // The user said never-ask.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const pg = try cfg.perGameMut(arena.allocator(), "id-x");
+    pg.offer_gen = false;
+    try std.testing.expect(!genCandidate(&e, &cfg, "patches"));
 }
 
 test "picker screen: drive list, a real listing, and an error message all draw cleanly" {
@@ -1167,6 +1724,71 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
 
 /// Encode and write one screenshot, named by the first free index — no
 /// wall-clock dependency, and the names sort in capture order.
+/// Reset, load-state, and rewind rewrite history, which an input stream
+/// cannot follow: a recording in progress is discarded (a movie that cannot
+/// replay must not be written) and a replay in progress hands input back.
+fn discardMovieModes(
+    rec: *?std.array_list.Managed([2]u16),
+    play: *?util.movie.Movie,
+    why: []const u8,
+    err: *std.Io.Writer,
+) void {
+    if (rec.*) |*r| {
+        r.deinit();
+        rec.* = null;
+        err.print("movie: recording discarded ({s} breaks replay determinism)\n", .{why}) catch {};
+        err.flush() catch {};
+    }
+    if (play.* != null) {
+        play.* = null;
+        err.print("movie: playback stopped ({s}); input is live\n", .{why}) catch {};
+        err.flush() catch {};
+    }
+}
+
+/// Write a finished recording as `<movies>/<game_id>-NNNN.ymv`. The end
+/// hashes are taken from the machine as it stands — the frame after the
+/// last recorded input, exactly what a replay reproduces.
+fn writeMovie(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    opts: *const Options,
+    con: *core.AnyConsole,
+    frames: []const [2]u16,
+    audio_hash: u64,
+    err: *std.Io.Writer,
+) void {
+    const dir = opts.movies_dir orelse return;
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var path_buf: [512]u8 = undefined;
+    var n: u32 = 1;
+    const path = while (n <= 9999) : (n += 1) {
+        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}-{d:0>4}{s}", .{ dir, opts.game_id, n, util.movie.file_ext }) catch return;
+        std.Io.Dir.cwd().access(io, p, .{}) catch break p;
+    } else return;
+    const m: util.movie.Movie = .{
+        .accuracy = if (opts.accuracy == .accurate) 1 else 0,
+        .region = if (con.region() == .pal) 1 else 0,
+        .rom_crc = opts.rom_crc,
+        .end_frame_hash = core.console.hashFrame(con.framebuffer()),
+        .end_audio_hash = audio_hash,
+        .frames = @constCast(frames),
+    };
+    const data = util.movie.encode(gpa, m) catch |e| {
+        err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    defer gpa.free(data);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch |e| {
+        err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    err.print("movie: {s} ({} frames, end hashes recorded)\n", .{ path, frames.len }) catch {};
+    err.flush() catch {};
+}
+
 fn writeScreenshot(
     io: std.Io,
     gpa: std.mem.Allocator,

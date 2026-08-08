@@ -222,6 +222,43 @@ pub fn build(b: *std.Build) void {
     const roms_step = b.step("test-roms", "Render PeterLemon ROMs and check golden hashes (needs test-data/)");
     roms_step.dependOn(&run_roms.step);
 
+    // The whole-game-migration demo ROM builder: the smallest honest game
+    // that passes `--gen-sa1-patch --whole-game` end to end. The module is
+    // shared with the patchgen runner so CI drives the pipeline over the
+    // exact image `zig build wg-demo` writes.
+    const wgdemo_mod = b.createModule(.{
+        .root_source_file = b.path("tools/wgdemo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wgdemo = b.addExecutable(.{ .name = "wgdemo", .root_module = wgdemo_mod });
+    const run_wgdemo = b.addRunArtifact(wgdemo);
+    run_wgdemo.addArg(b.pathJoin(&.{ b.install_path, "wg-demo.sfc" }));
+    run_wgdemo.step.dependOn(b.getInstallStep());
+    const wgdemo_step = b.step("wg-demo", "Write zig-out/wg-demo.sfc, the whole-game-migration demo game");
+    wgdemo_step.dependOn(&run_wgdemo.step);
+
+    // FastROM patch generator end-to-end: generate, verify in-emulator, and
+    // re-apply the emitted BPS through the public applier. Same test data as
+    // test-roms.
+    const patchgen_runner = b.addExecutable(.{
+        .name = "patchgen-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/patchgen_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
+                .{ .name = "wgdemo", .module = wgdemo_mod },
+            },
+        }),
+    });
+    const run_patchgen = b.addRunArtifact(patchgen_runner);
+    run_patchgen.setCwd(b.path("."));
+    const patchgen_step = b.step("test-patchgen", "Generate + verify + re-apply a FastROM patch end-to-end (needs test-data/)");
+    patchgen_step.dependOn(&run_patchgen.step);
+
     // Commercial-boot golden gate (M13): opt-in, local ROMs only — commercial
     // ROMs cannot be fetched or vendored. With no directory every pinned game
     // prints SKIP and the step exits 0, so CI needs no special casing.

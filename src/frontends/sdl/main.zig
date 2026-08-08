@@ -40,6 +40,7 @@ const config = @import("config.zig");
 const input = @import("input.zig");
 const paths = @import("paths.zig");
 const saves = @import("saves.zig");
+const patchfind = @import("patchfind.zig");
 const library = @import("library.zig");
 
 const Args = struct {
@@ -70,6 +71,9 @@ const Args = struct {
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
+    /// `--movie <file>`: replay a recorded playthrough (.ymv) from power-on;
+    /// live input takes over when it ends. Needs an explicit ROM argument.
+    movie: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -87,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
         if (e == error.ShotNeedsFrames) {
             try err.print("error: --shot without --shot-frames captures the last frame, which needs --frames N\n", .{});
         } else if (e == error.NeedsRom) {
-            try err.print("error: --frames/--shot/--patch/--auto-fastrom need an explicit ROM argument\n", .{});
+            try err.print("error: --frames/--shot/--patch/--auto-fastrom/--movie need an explicit ROM argument\n", .{});
         } else if (e == error.WideNeedsFast) {
             try err.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
         } else if (e == error.WideTooBig) {
@@ -98,10 +102,12 @@ pub fn main(init: std.process.Init) !void {
                 "  (no ROM argument opens the library: config.zon's library.rom_dirs, scanned)\n" ++
                 "                    [--region ntsc|pal|auto] [--shader NAME] [--shader-dir DIR]\n" ++
                 "                    [--patch p.bps|p.ips] [--auto-fastrom] [--wide N]\n" ++
-                "                    [--shot PREFIX [--shot-frames a,b,c]]\n" ++
+                "                    [--movie f.ymv] [--shot PREFIX [--shot-frames a,b,c]]\n" ++
                 "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
                 "  --wide N    widen the framebuffer by N columns on each side, e.g. 32 -> 320x224\n" ++
                 "              (fast core only; for widescreen game patches such as wide-snes)\n" ++
+                "  --movie f   replay a recorded playthrough (.ymv) from power-on; live input\n" ++
+                "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -157,8 +163,12 @@ pub fn main(init: std.process.Init) !void {
     const bindings = input.resolve(&cfg.input, err);
     if (args.rom) |rom_path| {
         // Classic direct launch: boot failures are fatal, CLOSE GAME quits.
-        const b = bootConsole(io, gpa, rom_path, args, &cfg, err) catch std.process.exit(1);
-        _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        const b = bootConsole(io, gpa, rom_path, args, &cfg, if (user_paths) |p| p.patches else null, err) catch std.process.exit(1);
+        const mov: ?util.movie.Movie = if (args.movie) |mp|
+            loadMovieFor(io, gpa, mp, b, err) catch std.process.exit(1)
+        else
+            null;
+        _ = try app.run(io, gpa, sdl, b.con, makeOptions(rom_path, b, args, &cfg, config_path, user_paths, bindings, mov, err), err, out);
         return;
     }
 
@@ -179,10 +189,11 @@ pub fn main(init: std.process.Init) !void {
             &cfg,
             config_path,
             if (user_paths) |p| p.library else null,
+            if (user_paths) |p| p.patches else null,
             err,
         ) orelse break;
-        const b = bootConsole(io, gpa, picked, args, &cfg, err) catch continue;
-        const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b, args, &cfg, config_path, user_paths, bindings, err), err, out);
+        const b = bootConsole(io, gpa, picked, args, &cfg, if (user_paths) |p| p.patches else null, err) catch continue;
+        const result = try app.run(io, gpa, sdl, b.con, makeOptions(picked, b, args, &cfg, config_path, user_paths, bindings, null, err), err, out);
         lib.touch(picked, result.frames / 60);
         if (user_paths) |p| lib.saveCache(io, gpa, p.library) catch {};
         if (result.reason == .quit) break;
@@ -197,6 +208,7 @@ fn makeOptions(
     config_path: ?[]const u8,
     user_paths: ?paths.Paths,
     bindings: input.Resolved,
+    mov: ?util.movie.Movie,
     err: *std.Io.Writer,
 ) app.Options {
     // Defaults ← config ← per-game ← CLI, resolved here once; app.zig never
@@ -223,7 +235,54 @@ fn makeOptions(
         .shots_dir = if (user_paths) |p| p.screenshots else null,
         .rewind_enabled = args.frames == 0 and (booted.rewind orelse cfg.rewind.enabled),
         .rewind_budget_mib = cfg.effectiveRewindBudgetMib(),
+        .movies_dir = if (user_paths) |p| p.movies else null,
+        .rom_crc = booted.rom_crc,
+        .accuracy = booted.accuracy,
+        .movie = mov,
     };
+}
+
+/// Load and validate a `--movie` against the console it will drive: the
+/// image CRC (as played, post soft-patch), the core accuracy, and the
+/// region the console actually resolved to. Any mismatch is fatal — a
+/// replay that cannot reproduce must not silently run.
+fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted, err: *std.Io.Writer) !util.movie.Movie {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
+        try err.print("error: cannot read movie '{s}'\n", .{path});
+        try err.flush();
+        return error.BootFailed;
+    };
+    const m = util.movie.parse(gpa, bytes) catch |e| {
+        try err.print("error: '{s}' is not a valid movie: {s}\n", .{ path, @errorName(e) });
+        try err.flush();
+        return error.BootFailed;
+    };
+    if (m.rom_crc != b.rom_crc) {
+        try err.print(
+            "error: movie '{s}' was recorded on image crc32 {x:0>8}; this session plays {x:0>8}\n" ++
+                "       (the movie identifies the image as played — a soft-patched game needs the same patch choice)\n",
+            .{ path, m.rom_crc, b.rom_crc },
+        );
+        try err.flush();
+        return error.BootFailed;
+    }
+    if ((m.accuracy == 1) != (b.accuracy == .accurate)) {
+        try err.print("error: movie '{s}' was recorded on the {s} core; this session uses the other\n", .{
+            path, if (m.accuracy == 1) "accurate" else "fast",
+        });
+        try err.flush();
+        return error.BootFailed;
+    }
+    if ((m.region == 1) != (b.con.region() == .pal)) {
+        try err.print("error: movie '{s}' was recorded in {s}; this session resolved the other region\n", .{
+            path, if (m.region == 1) "PAL" else "NTSC",
+        });
+        try err.flush();
+        return error.BootFailed;
+    }
+    try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+    try err.flush();
+    return m;
 }
 
 const MergedBoot = struct { accuracy: core.Accuracy, region: app.RegionArg, wide: u32 };
@@ -301,41 +360,77 @@ const Booted = struct {
     /// inherits the global config.
     shader: ?[]const u8,
     rewind: ?bool,
+    /// CRC32 of the copier-stripped image as booted (post soft-patch) —
+    /// what recorded movies identify themselves by.
+    rom_crc: u32,
+    /// The core the console was built on (movies replay only on their own).
+    accuracy: core.Accuracy,
 };
 
 /// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
 /// load, per-game merge, region/wide setup, save-file identity. Every
 /// failure prints its reason and returns an error — the direct-launch path
 /// exits on it, the library path goes back to the list.
-fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, err: *std.Io.Writer) !Booted {
+/// Read and apply one patch file to `image`, with the same refusals and
+/// warnings whichever way the patch was chosen (a `--patch` flag or launch
+/// discovery).
+fn applySoftPatch(io: std.Io, gpa: std.mem.Allocator, image: []const u8, patch_path: []const u8, err: *std.Io.Writer) ![]u8 {
+    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try err.print("error: cannot read patch '{s}'\n", .{patch_path});
+        try err.flush();
+        return error.BootFailed;
+    };
+    var mm: core.patch.CrcMismatch = .{};
+    const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
+        switch (e) {
+            error.WrongSource => try err.print(
+                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
+                .{ patch_path, mm.expected, mm.actual },
+            ),
+            else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
+        }
+        try err.flush();
+        return error.BootFailed;
+    };
+    if (!res.verified) {
+        try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
+        try err.flush();
+    }
+    return res.image;
+}
+
+fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, patches_dir: ?[]const u8, err: *std.Io.Writer) !Booted {
     var image = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read ROM '{s}'\n", .{rom_path});
         try err.flush();
         return error.BootFailed;
     };
     if (args.patch) |patch_path| {
-        const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
-            try err.print("error: cannot read patch '{s}'\n", .{patch_path});
-            try err.flush();
-            return error.BootFailed;
-        };
-        var mm: core.patch.CrcMismatch = .{};
-        const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
-            switch (e) {
-                error.WrongSource => try err.print(
-                    "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
-                    .{ patch_path, mm.expected, mm.actual },
-                ),
-                else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
+        image = try applySoftPatch(io, gpa, image, patch_path, err);
+    } else if (args.frames == 0) {
+        // Launch discovery: a same-basename softpatch, a patch-folder match,
+        // or a registry entry. Whether it is used is the per-game choice the
+        // library's prompt records — keyed by the ORIGINAL image's game_id,
+        // since the patched game gets its own id (and saves) once booted.
+        const stripped = core.header.stripCopierHeader(image);
+        if (core.header.detect(stripped)) |h| {
+            const sha = core.registry.sha256Hex(stripped);
+            const orig_id = try saves.gameId(gpa, &sha, &h.title);
+            if (patchfind.findForRom(io, gpa, rom_path, stripped, patches_dir)) |found| {
+                const pref = if (cfg.perGame(orig_id)) |p| p.patch else null;
+                if (pref) |choice| switch (choice) {
+                    .patched => {
+                        image = try applySoftPatch(io, gpa, image, found.path, err);
+                        try err.print("patch applied: {s}\n", .{found.path});
+                        try err.flush();
+                    },
+                    .original => {},
+                } else {
+                    try err.print("note: a patch is available for this game ({s}) — pick it in the library to choose PLAY PATCHED\n", .{found.path});
+                    try err.flush();
+                }
             }
-            try err.flush();
-            return error.BootFailed;
-        };
-        if (!res.verified) {
-            try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
-            try err.flush();
-        }
-        image = res.image;
+        } else |_| {} // not a SNES ROM: the loader below prints the real error
     }
     if (args.auto_fastrom) {
         const hex = core.registry.sha256Hex(core.header.stripCopierHeader(image));
@@ -398,6 +493,8 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         .wide = wide,
         .shader = if (pg) |p| p.shader else null,
         .rewind = if (pg) |p| p.rewind else null,
+        .rom_crc = util.movie.imageCrc(core.header.stripCopierHeader(image)),
+        .accuracy = accuracy,
     };
 }
 
@@ -449,13 +546,15 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             args.wide = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--movie")) {
+            args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
     }
     args.rom = rom;
     // These flags act on one specific ROM; the library picker has none.
-    if (rom == null and (args.frames != 0 or args.shot != null or args.patch != null or args.auto_fastrom))
+    if (rom == null and (args.frames != 0 or args.shot != null or args.patch != null or args.auto_fastrom or args.movie != null))
         return error.NeedsRom;
     // A bare `--shot` captures the final frame — which only exists when the
     // run has one. Refuse the run-until-quit combination up front instead of

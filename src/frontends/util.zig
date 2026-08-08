@@ -8,6 +8,13 @@
 const std = @import("std");
 const core = @import("snes_core");
 
+/// Input movies (TAS-style record/replay); see movie.zig.
+pub const movie = @import("movie.zig");
+
+test {
+    _ = movie;
+}
+
 /// Expand one RGB565 pixel to RGB888 by bit-replicating the 5/6-bit channels
 /// into 8 bits, so white (0x1F/0x3F/0x1F) lands on 0xFF/0xFF/0xFF instead of
 /// the 0xF8/0xFC/0xF8 a naive left-shift gives. This is the one expansion
@@ -130,6 +137,451 @@ pub fn drainAudio(
 pub fn drainAudioDiscard(con: anytype) void {
     var drain: [4096]i16 = undefined;
     while (con.readAudio(&drain) != 0) {}
+}
+
+// --- FastROM patch generation, verified in-emulator ---------------------------
+
+/// Why a generation attempt produced no patch.
+pub const GenFailure = union(enum) {
+    /// The transform refused; see `core.patchgen.Reason.describe`.
+    refused: core.patchgen.Refusal,
+    /// First frame whose framebuffer hash diverged from the unpatched run —
+    /// the faster bus changed something the player would see.
+    frame_mismatch: u32,
+    /// The 32 kHz audio streams diverged over the run.
+    audio_mismatch,
+    /// Frame at whose end MEMSEL read back disabled in the patched run: the
+    /// game cleared it from a code path the baseline never exercised.
+    memsel_lost: u32,
+};
+
+/// A generated, verified patch and its measured effect.
+pub const GenOutcome = struct {
+    /// The transformed image and the encoded BPS, both caller-owned.
+    image: []u8,
+    bps: []u8,
+    stub_addr: u16,
+    trampolines: u8,
+    memsel_stores_nopped: u8,
+    /// Profiled frames (after the skipped boot) in each run.
+    frames: u32,
+    /// The profiler's frame-budget summary, unpatched and patched. FastROM
+    /// cuts ~2 master cycles from every ROM access, which shows up here as
+    /// idle headroom — the proof the patch does something.
+    base: core.profile.Summary,
+    fast: core.profile.Summary,
+};
+
+/// The generation pipeline as a resumable session, so a UI can run it in
+/// slices on its main loop — the same incremental-not-threaded stance as the
+/// SDL library scanner — while the headless one-shot wrapper below just steps
+/// it to completion. Phases: profile the unpatched ROM (which also observes
+/// the MEMSEL stores the generator must neutralise) → transform → replay and
+/// compare frame-for-frame → encode. A failure at any point carries its
+/// reason; nothing is handed out unless every gate passed.
+pub const GenSession = struct {
+    gpa: std.mem.Allocator,
+    /// Borrowed; must outlive the session (it is also the BPS source).
+    image: []const u8,
+    frames: u32,
+    skip: u32,
+    buttons: u16,
+    /// Optional recorded playthrough driving both pads, one entry per frame
+    /// (borrowed; must outlive the session). Set after `start`. Overrides
+    /// `buttons`; past its end both pads read released — deterministic in
+    /// both runs either way, which is all the pipeline requires.
+    movie_frames: ?[]const [2]u16 = null,
+    total: u32,
+
+    /// Baseline per-frame framebuffer hashes — what the verify run replays
+    /// against.
+    hashes: []u64,
+    samples: []core.profile.FrameSample,
+    scratch: []f64,
+
+    phase: Phase = .baseline,
+    con: ?*core.ProfilingConsole = null,
+    i: u32 = 0,
+    n_samples: usize = 0,
+    audio: u64 = core.console.audio_hash_init,
+
+    base_audio: u64 = 0,
+    base_summary: core.profile.Summary = undefined,
+
+    /// The transformed image, owned by the session until `finish` hands it
+    /// out in a `GenOutcome` (then null).
+    gen_image: ?[]u8 = null,
+    stub_addr: u16 = 0,
+    trampolines: u8 = 0,
+    nopped: u8 = 0,
+
+    pub const Phase = enum { baseline, verify, finished };
+    pub const Progress = struct { phase: Phase, frame: u32, total: u32 };
+    pub const Status = union(enum) { running: Progress, done: GenOutcome, failed: GenFailure };
+
+    pub fn start(
+        gpa: std.mem.Allocator,
+        image: []const u8,
+        frames: u32,
+        skip: u32,
+        buttons: u16,
+    ) !GenSession {
+        const total = skip + frames;
+        var s: GenSession = .{
+            .gpa = gpa,
+            .image = image,
+            .frames = frames,
+            .skip = skip,
+            .buttons = buttons,
+            .total = total,
+            .hashes = try gpa.alloc(u64, total),
+            .samples = undefined,
+            .scratch = undefined,
+        };
+        errdefer gpa.free(s.hashes);
+        s.samples = try gpa.alloc(core.profile.FrameSample, total);
+        errdefer gpa.free(s.samples);
+        s.scratch = try gpa.alloc(f64, total);
+        errdefer gpa.free(s.scratch);
+        try s.bootConsole(image);
+        return s;
+    }
+
+    /// Safe on every path: cancel mid-run, after a failure, or after `done`
+    /// (the handed-out image/bps are the caller's and are not touched).
+    pub fn deinit(self: *GenSession) void {
+        self.dropConsole();
+        if (self.gen_image) |gi| self.gpa.free(gi);
+        self.gpa.free(self.hashes);
+        self.gpa.free(self.samples);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
+    fn bootConsole(self: *GenSession, image: []const u8) !void {
+        const cart = try core.Cartridge.load(self.gpa, image);
+        const con = self.gpa.create(core.ProfilingConsole) catch |e| {
+            self.gpa.free(cart.rom);
+            return e;
+        };
+        con.init(cart);
+        self.con = con;
+        self.i = 0;
+        self.n_samples = 0;
+        self.audio = core.console.audio_hash_init;
+    }
+
+    fn dropConsole(self: *GenSession) void {
+        if (self.con) |c| {
+            self.gpa.free(c.cart.rom);
+            self.gpa.destroy(c);
+            self.con = null;
+        }
+    }
+
+    /// Advance up to `max_frames` emulated frames. Phase transitions
+    /// (transform, encode) happen inside a step and cost no frame budget.
+    /// After `.done` or `.failed` the session must not be stepped again.
+    pub fn step(self: *GenSession, max_frames: u32) !Status {
+        std.debug.assert(self.phase != .finished);
+        var budget = max_frames;
+        while (budget > 0) : (budget -= 1) {
+            switch (self.phase) {
+                .baseline => {
+                    const idx = self.i;
+                    self.hashes[idx] = try self.runOneFrame();
+                    if (self.i == self.total) if (try self.finishBaseline()) |f| {
+                        self.phase = .finished;
+                        return .{ .failed = f };
+                    };
+                },
+                .verify => {
+                    const idx = self.i;
+                    const h = try self.runOneFrame();
+                    if (h != self.hashes[idx]) {
+                        self.phase = .finished;
+                        return .{ .failed = .{ .frame_mismatch = idx } };
+                    }
+                    if (!self.con.?.bus.fastrom) {
+                        self.phase = .finished;
+                        return .{ .failed = .{ .memsel_lost = idx } };
+                    }
+                    if (self.i == self.total) {
+                        const status = try self.finish();
+                        self.phase = .finished;
+                        return status;
+                    }
+                },
+                .finished => unreachable,
+            }
+        }
+        return .{ .running = .{ .phase = self.phase, .frame = self.i, .total = self.total } };
+    }
+
+    fn runOneFrame(self: *GenSession) !u64 {
+        const con = self.con.?;
+        if (self.movie_frames) |mf| {
+            const f: [2]u16 = if (self.i < mf.len) mf[self.i] else .{ 0, 0 };
+            con.setButtons(0, f[0]);
+            con.setButtons(1, f[1]);
+        } else if (self.buttons != 0) con.setButtons(0, self.buttons);
+        con.runFrame();
+        try drainAudio(con, &self.audio, {}, null);
+        if (con.takeProfile()) |smp| {
+            if (self.i >= self.skip) {
+                self.samples[self.n_samples] = smp;
+                self.n_samples += 1;
+            }
+        }
+        self.i += 1;
+        return core.console.hashFrame(con.framebuffer());
+    }
+
+    /// Close the baseline run and transform. Returns a failure to report, or
+    /// null when the session has moved on to the verify run.
+    fn finishBaseline(self: *GenSession) !?GenFailure {
+        const con = self.con.?;
+        self.base_summary = core.profile.summarise(self.samples[0..self.n_samples], self.scratch);
+        self.base_audio = self.audio;
+        if (con.prof.memsel_overflow) {
+            self.dropConsole();
+            return .{ .refused = .{ .reason = .memsel_store_unpatchable } };
+        }
+        const memsel_pcs: [core.profile.memsel_pc_cap]u24 = con.prof.memsel_pcs;
+        const n_memsel: usize = con.prof.n_memsel_pcs;
+        self.dropConsole();
+
+        var refusal: ?core.patchgen.Refusal = null;
+        const res = core.patchgen.generate(self.gpa, self.image, .{
+            .memsel_store_pcs = memsel_pcs[0..n_memsel],
+        }, &refusal) catch |e| switch (e) {
+            error.Refused => return .{ .refused = refusal.? },
+            else => return e,
+        };
+        self.gen_image = res.image;
+        self.stub_addr = res.stub_addr;
+        self.trampolines = res.trampolines;
+        self.nopped = res.memsel_stores_nopped;
+
+        try self.bootConsole(res.image);
+        self.phase = .verify;
+        return null;
+    }
+
+    /// Close the verify run: the audio gate, then the encode and hand-off.
+    fn finish(self: *GenSession) !Status {
+        if (self.audio != self.base_audio) {
+            return .{ .failed = .audio_mismatch };
+        }
+        const fast_summary = core.profile.summarise(self.samples[0..self.n_samples], self.scratch);
+        self.dropConsole();
+        const bps = try core.patch.writeBps(self.gpa, self.image, self.gen_image.?);
+        const image = self.gen_image.?;
+        self.gen_image = null; // ownership moves to the outcome
+        return .{ .done = .{
+            .image = image,
+            .bps = bps,
+            .stub_addr = self.stub_addr,
+            .trampolines = self.trampolines,
+            .memsel_stores_nopped = self.nopped,
+            .frames = self.frames,
+            .base = self.base_summary,
+            .fast = fast_summary,
+        } };
+    }
+};
+
+/// Generate the FastROM transformation of a copier-stripped `image` and
+/// verify it in-emulator before encoding anything: the patched ROM must
+/// render every one of `skip + frames` frames pixel-identical to the
+/// unpatched ROM (boot included) and produce an identical audio stream — the
+/// faster bus may change nothing the player sees or hears — and MEMSEL must
+/// read enabled at every frame boundary of the patched run. MEMSEL stores the
+/// baseline run observes are handed to the generator for neutralisation, so
+/// the stock `STZ $420D` init idiom does not silently undo the patch.
+///
+/// On failure, `failure` names what went wrong and nothing is returned; a
+/// patch that cannot be verified is a patch that does not get written.
+/// (This is `GenSession` stepped to completion — the SDL player runs the
+/// same session incrementally with a progress screen.)
+pub fn generateFastromVerified(
+    gpa: std.mem.Allocator,
+    image: []const u8,
+    frames: u32,
+    skip: u32,
+    buttons: u16,
+    movie_frames: ?[]const [2]u16,
+    failure: *?GenFailure,
+) !GenOutcome {
+    var s = try GenSession.start(gpa, image, frames, skip, buttons);
+    s.movie_frames = movie_frames;
+    defer s.deinit();
+    while (true) {
+        switch (try s.step(std.math.maxInt(u32))) {
+            .running => {},
+            .done => |o| return o,
+            .failed => |f| {
+                failure.* = f;
+                return error.GenFailed;
+            },
+        }
+    }
+}
+
+// --- stage S4: the timing-tolerant differential gate ---------------------------
+
+/// How two runs' per-frame framebuffer hash sequences relate.
+pub const Equivalence = enum {
+    /// Every frame identical: nothing observable moved. The only acceptable
+    /// verdict for a transformation that promises no timing change (FastROM
+    /// verification, the SA-1 shell, pure state relocation on a headroom
+    /// capture).
+    identical,
+    /// The runs show the SAME distinct pictures in the same order, but with
+    /// different numbers of consecutive repeats — exactly the signature of a
+    /// speedup: a lag frame re-shows the previous picture, and a faster run
+    /// repeats it fewer times. This is the strongest mechanical equivalence
+    /// a working offload can satisfy, and it is falsifiable: any new,
+    /// missing, or reordered picture is a divergence.
+    equivalent,
+    /// The converted run rendered something the original never showed (or
+    /// vice versa): the transformation changed behavior, not just timing.
+    divergent,
+};
+
+/// Classify two hash sequences. The dedup view collapses consecutive equal
+/// hashes; equality of the collapsed sequences is the "same pictures, fewer
+/// repeats" test. Honest limits, for the caller to print: a game that
+/// animates from an NMI-side frame counter does not re-show identical
+/// pictures during lag, so its speedup can legitimately read `divergent` —
+/// the gate refuses rather than guesses; and audio equivalence is not
+/// checkable across a timing shift at all.
+/// Frame-granular audio-envelope comparison, for a converted run whose
+/// FRAMES are pixel-identical but whose sample stream is not hash-equal.
+/// Why that happens: state relocation changes a handful of access timings
+/// by a few master cycles, which slides the S-CPU→APU handshake; a voice
+/// triggered one sample later makes every subsequent MIXED sample differ
+/// numerically, so the stream hash is unrecoverable even though what the
+/// player hears is unchanged. What can still be verified — and what this
+/// checks — is that the same sounds happen at the same frames: each
+/// frame's energy (sum of |sample|) must sit inside the other run's
+/// neighbouring-frame min/max window widened by 10% plus a small
+/// absolute floor (near-silence wobble), checked in BOTH directions so a
+/// missing sound and an extra sound both fail. The ±1-frame window
+/// forgives an effect landing across a frame boundary. Two voices whose
+/// relative phase moved by a sample can also beat constructively for a
+/// frame or two — a brief, bounded energy blip — so RARE excursions are
+/// tolerated: at most one frame per thousand may exceed the 10% window,
+/// and even those must stay inside a hard 35% bound. A sound silenced,
+/// invented, or moved further than the window always exceeds the cap or
+/// the count. Returns the first offending frame, or null when the
+/// envelopes are equivalent.
+pub fn audioEnvelopeMismatch(base: []const u64, conv: []const u64) ?u32 {
+    std.debug.assert(base.len == conv.len);
+    var excursions: usize = 0;
+    var first: ?u32 = null;
+    const allowed = @max(2, base.len / 1000);
+    for (0..base.len) |i| {
+        if (envelopeOutside(base[i], conv, i, 10) or envelopeOutside(conv[i], base, i, 10)) {
+            if (envelopeOutside(base[i], conv, i, 35) or envelopeOutside(conv[i], base, i, 35))
+                return @intCast(i); // beyond the hard bound: never acceptable
+            excursions += 1;
+            if (first == null) first = @intCast(i);
+            if (excursions > allowed) return first;
+        }
+    }
+    return null;
+}
+
+const envelope_floor: u64 = 50_000;
+
+fn envelopeOutside(v: u64, other: []const u64, i: usize, pct: u64) bool {
+    const lo_i = i -| 1;
+    const hi_i = @min(other.len - 1, i + 1);
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    for (other[lo_i .. hi_i + 1]) |c| {
+        lo = @min(lo, c);
+        hi = @max(hi, c);
+    }
+    return v + envelope_floor < lo - lo * pct / 100 or v > hi + hi * pct / 100 + envelope_floor;
+}
+
+test "audioEnvelopeMismatch: sub-sample wobble passes, silenced and invented sounds fail" {
+    // Identical envelopes.
+    const a = [_]u64{ 0, 0, 4_000_000, 4_100_000, 3_900_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &a));
+    // A sample-scale phase shift: energies wobble well under 10%.
+    const wobble = [_]u64{ 0, 0, 4_010_000, 4_070_000, 3_930_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &wobble));
+    // A sound landing one frame late crosses a boundary the window forgives.
+    const late = [_]u64{ 0, 0, 0, 4_000_000, 4_100_000, 0 };
+    const late_base = [_]u64{ 0, 0, 4_000_000, 4_100_000, 0, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&late_base, &late));
+    // A silenced sound fails — in either argument order.
+    const silenced = [_]u64{ 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &silenced) != null);
+    try std.testing.expect(audioEnvelopeMismatch(&silenced, &a) != null);
+    // An invented sound (nothing near it in the original) fails.
+    const invented = [_]u64{ 0, 0, 4_000_000, 4_100_000, 3_900_000, 9_000_000 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &invented) != null);
+    // A rare, bounded excursion — the constructive-overlap blip of two
+    // voices whose phase moved a sample — is tolerated...
+    const blip = [_]u64{ 0, 0, 4_000_000, 4_800_000, 3_900_000, 0 };
+    try std.testing.expectEqual(@as(?u32, null), audioEnvelopeMismatch(&a, &blip));
+    // ...but not one beyond the hard bound,
+    const loud_blip = [_]u64{ 0, 0, 4_000_000, 6_000_000, 3_900_000, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&a, &loud_blip) != null);
+    // and not more of them than one per thousand frames (here: > 2 of 6).
+    const many_blips = [_]u64{ 0, 4_800_000, 4_800_000, 4_900_000, 4_700_000, 0 };
+    const quiet_base = [_]u64{ 0, 4_000_000, 4_000_000, 4_100_000, 3_900_000, 0 };
+    try std.testing.expect(audioEnvelopeMismatch(&quiet_base, &many_blips) != null);
+}
+
+pub fn framesEquivalent(base: []const u64, conv: []const u64) Equivalence {
+    if (std.mem.eql(u64, base, conv)) return .identical;
+    var bi: usize = 0;
+    var ci: usize = 0;
+    while (bi < base.len and ci < conv.len) {
+        if (base[bi] != conv[ci]) return .divergent;
+        const h = base[bi];
+        while (bi < base.len and base[bi] == h) bi += 1;
+        while (ci < conv.len and conv[ci] == h) ci += 1;
+    }
+    // A tail of repeats on one side only is still the same picture stream;
+    // any NEW picture in a tail is not.
+    while (bi < base.len) : (bi += 1) {
+        if (bi > 0 and base[bi] != base[bi - 1]) return .divergent;
+    }
+    while (ci < conv.len) : (ci += 1) {
+        if (ci > 0 and conv[ci] != conv[ci - 1]) return .divergent;
+    }
+    return .equivalent;
+}
+
+test "framesEquivalent: identity, speedup-shaped repeats, and real divergence" {
+    const a = [_]u64{ 1, 1, 2, 2, 2, 3 };
+    try std.testing.expectEqual(Equivalence.identical, framesEquivalent(&a, &a));
+    // The sped-up run shows the same pictures with fewer lag repeats.
+    const fast = [_]u64{ 1, 2, 2, 3, 3, 3 };
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&a, &fast));
+    // Symmetric: a slower run is still the same picture stream (the caller
+    // judges whether slower is acceptable — the gate only judges sameness).
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&fast, &a));
+    // A picture the original never showed: divergent.
+    const wrong = [_]u64{ 1, 2, 9, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &wrong));
+    // A missing picture: divergent.
+    const skipped = [_]u64{ 1, 3, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &skipped));
+    // Reordered pictures: divergent.
+    const reordered = [_]u64{ 2, 1, 3 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &reordered));
+    // Tails: extra repeats of the last picture are fine, new pictures not.
+    const tail_repeat = [_]u64{ 1, 2, 2, 3, 3, 3, 3, 3 };
+    try std.testing.expectEqual(Equivalence.equivalent, framesEquivalent(&a, &tail_repeat));
+    const tail_new = [_]u64{ 1, 1, 2, 2, 2, 3, 4 };
+    try std.testing.expectEqual(Equivalence.divergent, framesEquivalent(&a, &tail_new));
 }
 
 /// argv with argv[0] already skipped: the boilerplate every frontend's arg

@@ -29,6 +29,13 @@ pub const Paths = struct {
     screenshots: []const u8,
     /// `<root>library.zon` — the ROM scanner's metadata cache.
     library: []const u8,
+    /// `<root>patches` — `.bps` files matched to library games by the source
+    /// CRC32 in their footer (see patchfind.zig). Drop a patch here and the
+    /// matching game offers it at launch.
+    patches: []const u8,
+    /// `<root>movies` — recorded input playthroughs (`.ymv`, see
+    /// frontends/movie.zig), written by the record hotkey.
+    movies: []const u8,
 
     /// Resolve the per-user data directory. Requires the SDL3 runtime `load`
     /// already found — the extra symbols come from the same library.
@@ -45,6 +52,8 @@ pub const Paths = struct {
             .states = std.fmt.allocPrint(gpa, "{s}states", .{root}) catch return null,
             .screenshots = std.fmt.allocPrint(gpa, "{s}screenshots", .{root}) catch return null,
             .library = std.fmt.allocPrint(gpa, "{s}library.zon", .{root}) catch return null,
+            .patches = std.fmt.allocPrint(gpa, "{s}patches", .{root}) catch return null,
+            .movies = std.fmt.allocPrint(gpa, "{s}movies", .{root}) catch return null,
         };
     }
 };

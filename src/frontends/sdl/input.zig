@@ -258,6 +258,7 @@ pub const Hotkey = enum(u4) {
     slot_prev,
     screenshot,
     reset,
+    record_movie,
 };
 
 pub const n_hotkeys = @typeInfo(Hotkey).@"enum".fields.len;
@@ -334,6 +335,9 @@ pub const HotkeyStrings = struct {
     slot_prev: []const u8 = "key:f6",
     screenshot: []const u8 = "key:f12",
     reset: []const u8 = "key:f1",
+    /// Toggle input-movie recording: starts with a repower (movies replay
+    /// from power-on), stops by writing the .ymv into the movies directory.
+    record_movie: []const u8 = "key:f10",
 
     pub fn get(self: *const HotkeyStrings, hk: Hotkey) []const u8 {
         return switch (hk) {
@@ -449,6 +453,7 @@ pub const Action = union(enum) {
     slot_prev,
     screenshot,
     reset,
+    record_movie,
     /// A pad was assigned to a player slot — open it and keep the handle.
     pad_opened: struct { pad: u32, slot: u1 },
     /// A pad left its slot — close the handle.
@@ -635,6 +640,7 @@ fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
                 .slot_prev => .slot_prev,
                 .screenshot => .screenshot,
                 .reset => .reset,
+                .record_movie => .record_movie,
                 .fast_forward, .rewind => unreachable,
             };
         }

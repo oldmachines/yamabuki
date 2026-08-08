@@ -9,6 +9,8 @@ pub const serialize = @import("serialize.zig");
 pub const header = @import("cart/header.zig");
 pub const cartridge = @import("cart/cartridge.zig");
 pub const patch = @import("cart/patch.zig");
+pub const patchgen = @import("cart/patchgen.zig");
+pub const sa1gen = @import("cart/sa1gen.zig");
 pub const registry = @import("cart/registry.zig");
 pub const fastrom_compat = @import("cart/fastrom_compat.zig");
 pub const bus = @import("memory/bus.zig");
@@ -32,6 +34,7 @@ pub const sa1 = @import("chips/sa1.zig");
 pub const cx4 = @import("chips/cx4.zig");
 pub const console = @import("console.zig");
 pub const profile = @import("profile.zig");
+pub const usage_map = @import("usage_map.zig");
 
 pub const Cartridge = cartridge.Cartridge;
 pub const Bus = bus.Bus;

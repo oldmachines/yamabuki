@@ -5,6 +5,7 @@
 //!   yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav]
 //!                     [--accurate] [--patch p.bps|p.ips] [--save-patched out.sfc] [--wide N]
 //!   yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
+//!   yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N]
 //!
 //! This is the primary in-development verification tool: `--ppm`/`--wav` give
 //! output to inspect, and the printed hashes are what `zig build test-roms`
@@ -22,13 +23,21 @@
 //! against the registry. A missing patch prints where to fetch it and runs
 //! unpatched; the emulator never downloads anything.
 //!
-//! `--sa1-report` is step one of the SA-1 candidacy analyser (M12): it runs the
-//! game with the frame-budget profiler compiled in and answers the question that
-//! comes before every other one — *is this game CPU-bound at all?* `--routines`
-//! adds steps two and three: which routines cost the frame, and each hot
-//! routine's WRAM working set, MMIO blockers, and page-sharing with the rest —
-//! the numbers that decide whether it is worth moving to the SA-1. See
-//! `core/profile.zig` for what is being measured and why.
+//! `--sa1-report` is the SA-1 candidacy analyser (M12): it runs the game with
+//! the frame-budget profiler compiled in and answers the question that comes
+//! before every other one — *is this game CPU-bound at all?* — then ties
+//! everything into a graded `conversion:` verdict. `--routines` adds the
+//! detail tables: which routines cost the frame, each hot routine's WRAM
+//! working set, MMIO blockers, DMA/HDMA arms, and page-sharing with the rest.
+//! See `core/profile.zig` for what is being measured and why.
+//!
+//! `--gen-fastrom-patch` makes the emulator *write* a patch: it derives the
+//! FastROM transformation mechanically (see `core/cart/patchgen.zig`), runs
+//! the game unpatched and patched, and only when every frame's framebuffer
+//! and the whole audio stream are identical — and MEMSEL stayed enabled —
+//! encodes the result as a BPS (default: `<rom>.bps` beside the ROM, the
+//! softpatch convention the SDL player discovers by name). A patch that
+//! cannot be verified is never written; every refusal names its reason.
 
 const std = @import("std");
 const core = @import("snes_core");
@@ -66,6 +75,13 @@ const Args = struct {
     /// Steps two and three of the analyser: the per-routine cycle attribution
     /// table, and each hot routine's WRAM working set and blockers.
     routines: bool = false,
+    /// Stage S1 of the SA-1 arc: export execution/access coverage from the
+    /// profiled run as a bsnes-plus `-usage.bin` file (DiztinGUIsh imports
+    /// it). A `--sa1-report` modifier, like `--hot`.
+    usage_map_out: ?[]const u8 = null,
+    /// Stage S2: print the relocation plan — the WRAM -> I-RAM/BW-RAM
+    /// allocation map for the conversion verdict's hot set.
+    plan: bool = false,
     /// `--wide N` (M12): extra columns rendered on each side of the standard
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
@@ -74,10 +90,33 @@ const Args = struct {
     /// 0x1000 = Start). A title screen that waits for input renders the same
     /// frame forever otherwise, so this is what gets a game past it.
     buttons: u16 = 0,
+    /// A recorded playthrough (.ymv) driving both pads from power-on. In a
+    /// normal run it replays and verifies the movie's end hashes; in the
+    /// generator/report modes it drives the profiled runs, so coverage and
+    /// verification come from real gameplay instead of the attract mode.
+    movie: ?[]const u8 = null,
+    /// Generate a FastROM patch for this ROM, verified in-emulator before
+    /// anything is written (see `util.generateFastromVerified`).
+    gen_fastrom: bool = false,
+    /// Stage S3: generate an SA-1 conversion patch — the shell (SA-1 cart +
+    /// parked SA-1) plus the plan's clean state relocations — verified
+    /// frame- and audio-identical before anything is written.
+    gen_sa1: bool = false,
+    /// With --gen-sa1-patch: whole-game migration (SA-1 Root) — the entire
+    /// game executes on the SA-1 and the S-CPU becomes an MMIO service
+    /// loop — instead of the routine-offload ladder.
+    whole_game: bool = false,
+    /// Where to write the generated patch. Default: `<rom>.bps` next to the
+    /// ROM — the softpatch convention every frontend picks up by name.
+    gen_out: ?[]const u8 = null,
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
 const report_frames_default: u32 = 3600;
+
+/// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
+/// same standard patches/fastrom-compat.zon entries are verified to.
+const gen_frames_default: u32 = 1800;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -92,12 +131,22 @@ pub fn main(init: std.process.Init) !void {
             try out.print("error: --wide needs the fast core (--accurate's dot renderer doesn't support it)\n", .{});
         } else if (e == error.WideTooBig) {
             try out.print("error: --wide margin exceeds {d}\n", .{core.ppu.wide_margin_max});
+        } else if (e == error.GenConflicts) {
+            try out.print("error: --gen-fastrom-patch runs its own baseline and verify passes; it cannot be combined\n" ++
+                "       with --patch/--auto-patch/--save-patched/--auto-fastrom/--accurate/--wide/--sa1-report\n", .{});
+        } else if (e == error.UsageNeedsReport) {
+            try out.print("error: --usage-map is a --sa1-report modifier (coverage comes from the profiled run)\n", .{});
+        } else if (e == error.MovieConflicts) {
+            try out.print("error: --movie and --buttons are both input sources; pick one\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
             \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
+            \\                         [--plan] [--usage-map out.bin]
+            \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
+            \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--whole-game] [--out p.bps] [--frames N]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
             \\  --patch p     apply a BPS/IPS patch to the ROM in memory at load (BPS verified, IPS not)
@@ -106,13 +155,35 @@ pub fn main(init: std.process.Init) !void {
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
             \\  --buttons M   pad-1 buttons held all run, as a hex mask (0x1000 = Start)
+            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\                from power-on, verifying its end hashes; with --sa1-report or a
+            \\                --gen-* mode the movie drives the profiled runs instead, so
+            \\                coverage and verification come from real gameplay
             \\  --wide N      widen the framebuffer by N columns on each side, e.g. 32 -> 320x224
             \\                (fast core only; for widescreen game patches such as wide-snes)
+            \\  --gen-fastrom-patch  derive a FastROM conversion for this SlowROM game and verify it
+            \\                in-emulator (every frame pixel- and audio-identical to the unpatched
+            \\                run, MEMSEL held); only a verified patch is written, as BPS
+            \\  --out p       where --gen-fastrom-patch writes the patch (default: <rom>.bps)
+            \\  --gen-sa1-patch  stage S3: convert to an SA-1 cart (shell + the relocation plan's
+            \\                clean state moves), verified pixel- and audio-identical; the game
+            \\                still runs on the S-CPU — execution migration is stage S3b
+            \\                (default output: <rom>-sa1.bps)
+            \\  --whole-game  with --gen-sa1-patch: whole-game migration (SA-1 Root) — the game
+            \\                executes entirely on the SA-1, the S-CPU becomes an MMIO service
+            \\                loop; needs the WRAM working set inside I-RAM's identity window
+            \\                and refuses by name when it cannot prove the move
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
             \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
             \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
+            \\  --usage-map f export the profiled run's execution/access coverage as a bsnes-plus
+            \\                -usage.bin (code vs data with M/X widths, plus the RAM access map;
+            \\                DiztinGUIsh imports it directly)
+            \\  --plan        print the relocation plan for the hot set: which WRAM state moves to
+            \\                SA-1 I-RAM vs BW-RAM, with the dp window, DMA feeds, and sharing
+            \\                called out per region
             \\
         , .{});
         try out.flush();
@@ -149,6 +220,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The movie identifies itself against the image AS PLAYED (post
+    // soft-patching): loaded here, after the patch stage, and checked
+    // against the same stripped image the run will use.
+    var mov: ?util.movie.Movie = null;
+    if (args.movie) |mpath| mov = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+
+    if (args.gen_fastrom) {
+        try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
+        return;
+    }
+    if (args.gen_sa1) {
+        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
+        return;
+    }
+
     if (args.auto_fastrom) checkFastromCompat(out, core.header.stripCopierHeader(image)) catch std.process.exit(1);
 
     const cart = core.Cartridge.load(gpa, image) catch |e| {
@@ -158,7 +244,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (args.sa1_report) {
-        try runReport(io, gpa, out, args, cart);
+        try runReport(io, gpa, out, args, cart, mov);
         return;
     }
 
@@ -169,6 +255,10 @@ pub fn main(init: std.process.Init) !void {
         .ntsc => con.setRegion(.ntsc),
         .pal => con.setRegion(.pal),
     }
+    // The movie dictates the region it was recorded under — a replay on the
+    // wrong timing cannot reproduce (an explicit conflicting --region was
+    // already refused in loadMovie).
+    if (mov) |m| con.setRegion(if (m.region == 1) .pal else .ntsc);
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
 
@@ -177,14 +267,37 @@ pub fn main(init: std.process.Init) !void {
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
-    const frames = args.frames orelse 1;
-    for (0..frames) |_| {
-        if (args.buttons != 0) con.setButtons(0, args.buttons);
+    const frames = args.frames orelse if (mov) |m| @as(u32, @intCast(m.frames.len)) else 1;
+    for (0..frames) |i| {
+        if (mov) |m| {
+            const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
+            con.setButtons(0, f[0]);
+            con.setButtons(1, f[1]);
+        } else if (args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
             .wav = if (args.wav != null) &audio_all else null,
         }, AudioSink.collect);
+        // The frame the movie ends on is the one its hashes describe.
+        if (mov) |m| if (i + 1 == m.frames.len) {
+            if (m.end_frame_hash == 0) {
+                try out.print("movie: {} frames replayed (no end hashes recorded — sync unverified)\n", .{m.frames.len});
+            } else {
+                const fh = core.console.hashFrame(con.framebuffer());
+                const audio_ok = m.end_audio_hash == 0 or audio_hash == m.end_audio_hash;
+                if (fh == m.end_frame_hash and audio_ok) {
+                    try out.print("movie: sync verified — {} frames replayed, end hashes match\n", .{m.frames.len});
+                } else {
+                    try out.print(
+                        "movie: DESYNC at end of replay — frame hash {x:0>16} (movie {x:0>16}), audio {s}\n",
+                        .{ fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged" },
+                    );
+                    try out.flush();
+                    std.process.exit(1);
+                }
+            }
+        };
     }
 
     const fb = con.framebuffer();
@@ -206,6 +319,108 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
     }
 }
+
+/// Load a .ymv and refuse every mismatch that would make the replay a lie:
+/// wrong image (CRC of the stripped, post-patch image), wrong core accuracy,
+/// or a conflicting explicit --region. Exits with a message rather than
+/// returning an error — a bad movie is a usage problem, not a crash.
+fn loadMovie(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    path: []const u8,
+    image: []const u8,
+) util.movie.Movie {
+    const fail = struct {
+        fn f(o: *std.Io.Writer) noreturn {
+            o.flush() catch {};
+            std.process.exit(1);
+        }
+    }.f;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
+        out.print("error: cannot read movie '{s}'\n", .{path}) catch {};
+        fail(out);
+    };
+    const m = util.movie.parse(gpa, bytes) catch |e| {
+        out.print("error: '{s}' is not a valid movie: {s}\n", .{ path, @errorName(e) }) catch {};
+        fail(out);
+    };
+    const crc = util.movie.imageCrc(image);
+    if (m.rom_crc != crc) {
+        out.print(
+            "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
+            .{ path, m.rom_crc, crc },
+        ) catch {};
+        fail(out);
+    }
+    const acc: u8 = if (args.accuracy == .accurate) 1 else 0;
+    if (m.accuracy != acc) {
+        out.print("error: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+            path,
+            if (m.accuracy == 1) "accurate" else "fast",
+            if (acc == 1) "accurate" else "fast",
+        }) catch {};
+        fail(out);
+    }
+    const explicit_conflict = switch (args.region) {
+        .auto => false,
+        .ntsc => m.region != 0,
+        .pal => m.region != 1,
+    };
+    if (explicit_conflict) {
+        out.print("error: movie '{s}' was recorded in {s}; --region conflicts\n", .{
+            path, if (m.region == 1) "PAL" else "NTSC",
+        }) catch {};
+        fail(out);
+    }
+    // The generator/report consoles run on the cart's auto-detected region
+    // and take no override, so a movie recorded under one cannot reproduce
+    // there. The normal run path applies the movie's region instead.
+    if (args.gen_fastrom or args.gen_sa1 or args.sa1_report) {
+        const auto_pal = core.header.detect(image) catch null;
+        if (auto_pal) |h| {
+            const auto_region: u8 = if (core.timing.regionFromHeaderByte(h.region) == .pal) 1 else 0;
+            if (m.region != auto_region) {
+                out.print(
+                    "error: movie '{s}' was recorded under a region override ({s}); the profiled runs use the cart's own region\n",
+                    .{ path, if (m.region == 1) "PAL" else "NTSC" },
+                ) catch {};
+                fail(out);
+            }
+        }
+    }
+    out.print("movie: {s} — {} frames, {s}, end hashes {s}\n", .{
+        path,
+        m.frames.len,
+        if (m.region == 1) "PAL" else "NTSC",
+        if (m.end_frame_hash != 0) "recorded" else "absent",
+    }) catch {};
+    return m;
+}
+
+/// Feed frame `i` of a movie into a console — both ports, released past the
+/// movie's end. A no-op without a movie.
+fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
+    const m = mov orelse return;
+    const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
+    con.setButtons(0, f[0]);
+    con.setButtons(1, f[1]);
+}
+
+/// The `drainAudio` sink for the SA-1 gate's runs: fold each chunk into the
+/// current frame's energy cell, building the per-frame envelope the
+/// audio-tolerant tier compares.
+const EnergySink = struct {
+    cell: *u64,
+
+    fn add(self: EnergySink, chunk: []const i16) anyerror!void {
+        var sum: u64 = 0;
+        for (chunk) |s| sum += @abs(s);
+        self.cell.* += sum;
+    }
+};
 
 /// The `drainAudio` sink for the main run loop: track peak amplitude always,
 /// and accumulate samples for a WAV dump when one was requested.
@@ -431,29 +646,614 @@ test "auto-patch decides all four flows" {
 /// on its own — the attract/demo loop for most carts, a title screen for the
 /// rest. That is a real limitation and the report says so, because a title
 /// screen idling at 8% utilisation is not evidence of anything.
+/// The default output path for a generated patch: `<rom>.bps` next to the
+/// ROM file — the softpatch naming every frontend discovers by basename.
+fn defaultBpsPath(gpa: std.mem.Allocator, rom_path: []const u8) ![]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, rom_path, '.') orelse rom_path.len;
+    const slash = std.mem.lastIndexOfScalar(u8, rom_path, '/') orelse 0;
+    const stem = if (dot > slash) rom_path[0..dot] else rom_path;
+    return std.fmt.allocPrint(gpa, "{s}.bps", .{stem});
+}
+
+/// `--gen-fastrom-patch`: derive the FastROM conversion, verify it
+/// in-emulator, and only then write the BPS. `image` is copier-stripped.
+fn runGenerate(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+    mov: ?util.movie.Movie,
+) !void {
+    // A movie sets the capture length: cover the whole recorded playthrough.
+    const frames = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        gen_frames_default;
+    const total = args.skip + frames;
+
+    try out.print("baseline + verify runs, {} frames each ({d:.0}s)...\n", .{ total, @as(f64, @floatFromInt(total)) / 60.0 });
+    try out.flush();
+
+    var failure: ?util.GenFailure = null;
+    const res = util.generateFastromVerified(gpa, image, frames, args.skip, args.buttons, if (mov) |m| m.frames else null, &failure) catch |e| switch (e) {
+        error.GenFailed => {
+            switch (failure.?) {
+                .refused => |r| {
+                    try out.print("refused: {s}\n", .{r.reason.describe()});
+                    switch (r.reason) {
+                        .memsel_store_unpatchable => if (r.detail != 0) try out.print(
+                            "  the store at ${x:0>2}:{x:0>4} is not a plain STZ/STA $420D\n",
+                            .{ r.detail >> 16, r.detail & 0xFFFF },
+                        ),
+                        .no_free_space => try out.print(
+                            "  needed {} bytes of $00/$FF padding in bank $00\n",
+                            .{r.detail},
+                        ),
+                        else => {},
+                    }
+                },
+                .frame_mismatch => |f| try out.print(
+                    \\verification FAILED at frame {}: the patched run renders differently.
+                    \\  FastROM timing changed something visible — this game has code timed
+                    \\  against SlowROM latency and is not mechanically convertible.
+                    \\
+                , .{f}),
+                .memsel_lost => |f| try out.print(
+                    \\verification FAILED at frame {}: the game disabled MEMSEL from a code
+                    \\  path the baseline run never exercised.
+                    \\
+                , .{f}),
+                .audio_mismatch => try out.print(
+                    \\verification FAILED: the audio streams diverge. FastROM timing moved an
+                    \\  APU handshake — this game is not mechanically convertible.
+                    \\
+                , .{}),
+            }
+            try out.print("no patch written.\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        },
+        else => return e,
+    };
+
+    const path = args.gen_out orelse try defaultBpsPath(gpa, args.rom);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = res.bps }) catch {
+        try out.print("error: cannot write '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+
+    const header = try core.header.detect(image);
+    const title = std.mem.trim(u8, &header.title, " \x00");
+    const src_sha = core.registry.sha256Hex(image);
+    const patch_sha = core.registry.sha256Hex(res.bps);
+    const base_name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+
+    try out.print("wrote {s} ({} bytes)\n\n", .{ path, res.bps.len });
+    try out.print("{s}\n", .{title});
+    try out.print("  stub at $00:{x:0>4}, {} vector trampoline(s), {} MEMSEL store(s) neutralised\n", .{
+        res.stub_addr, res.trampolines, res.memsel_stores_nopped,
+    });
+    try out.print("  verified: {} frames pixel- and audio-identical to the unpatched ROM\n", .{total});
+    try out.print("  measured: mean CPU utilisation {d:.0}% -> {d:.0}%, slowdown {} -> {} frames\n", .{
+        res.base.mean_util * 100, res.fast.mean_util * 100,
+        res.base.slow_frames,     res.fast.slow_frames,
+    });
+    try out.print(
+        \\  caveat: verified from power-on for {} frames with buttons ${x:0>4} held; code
+        \\  paths beyond that window (menus, later levels) ran at FastROM timing untested.
+        \\
+        \\ready to paste into patches/registry.zon for --auto-patch:
+        \\    .{{
+        \\        .source_sha256 = "{s}",
+        \\        .title = "{s}",
+        \\        .patch_name = "{s}",
+        \\        .patch_sha256 = "{s}",
+        \\        .url = "generated locally: yamabuki-headless --gen-fastrom-patch",
+        \\        .license_note = "machine-generated FastROM conversion, verified {} frames from power-on",
+        \\    }},
+        \\
+    , .{
+        total,     args.buttons,
+        &src_sha,  title,
+        base_name, &patch_sha,
+        total,
+    });
+    try out.flush();
+}
+
+/// `--gen-sa1-patch` (stage S3): profile, plan, convert (shell + clean state
+/// relocations), verify frame- and audio-identical, and only then write the
+/// BPS. `image` is copier-stripped.
+fn runSa1Gen(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+    mov: ?util.movie.Movie,
+) !void {
+    const frames = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        gen_frames_default;
+    const total = args.skip + frames;
+    try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    try out.flush();
+
+    // Baseline ONCE: per-frame hashes, audio (hash + per-frame energy
+    // envelope), the profile, and the coverage map the rewriter walks.
+    // Every verification attempt below replays against this.
+    const env_base = try gpa.alloc(u64, total);
+    @memset(env_base, 0);
+    const env_conv = try gpa.alloc(u64, total);
+    const hashes = try gpa.alloc(u64, total);
+    const conv_hashes = try gpa.alloc(u64, total);
+    const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    @memset(ub, 0);
+    const umap: core.usage_map.UsageMap = .{ .bytes = ub };
+    var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+    try samples.ensureTotalCapacity(total);
+    var base_audio = core.console.audio_hash_init;
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.ProfilingConsole);
+    con.init(cart);
+    con.usage = &umap;
+    for (0..total) |i| {
+        feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
+        con.runFrame();
+        try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
+        hashes[i] = core.console.hashFrame(con.framebuffer());
+        if (con.takeProfile()) |smp| {
+            if (i >= args.skip) samples.appendAssumeCapacity(smp);
+        }
+    }
+    const scratch = try gpa.alloc(f64, samples.items.len);
+    const sum = profile.summarise(samples.items, scratch);
+
+    // The verdict, plan, and candidate set are fixed by the baseline; only
+    // the candidate FILTER changes across bisect attempts.
+    var conv: profile.Conversion = undefined;
+    var plan: profile.Plan = undefined;
+    var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+    var n_cands: usize = 0;
+    var neighbours: []const core.sa1gen.Candidate = &.{};
+    if (!args.whole_game) {
+        conv = profile.assessConversion(&con.prof, sum.verdict);
+        plan = profile.planRelocation(&con.prof, conv);
+        for (conv.entries[0..conv.n], 0..) |e, i| {
+            cands[i] = .{ .entry = e };
+            if (con.prof.routineInfo(e)) |r| {
+                cands[i].pages = r.wram_pages;
+                cands[i].self_cycles = r.self_cycles;
+                cands[i].calls = r.calls;
+            }
+        }
+        n_cands = conv.n;
+        // Sibling evidence: every other profiled routine, so an alternate
+        // entry point into an offloaded body folds its working set into
+        // the marshal even though it is far too cold to be a candidate.
+        var nb: std.array_list.Managed(core.sa1gen.Candidate) = .init(gpa);
+        for (&con.prof.routines) |*r| {
+            if (r.entry == profile.Routine.empty) continue;
+            const in_set = for (conv.entries[0..conv.n]) |e| {
+                if (e == r.entry) break true;
+            } else false;
+            if (in_set) continue;
+            try nb.append(.{
+                .entry = @intCast(r.entry & 0xFF_FFFF),
+                .pages = r.wram_pages,
+                .self_cycles = r.self_cycles,
+                .calls = r.calls,
+            });
+        }
+        neighbours = nb.items;
+    }
+
+    // The auto-bisect loop: convert, verify, and on a failure that an
+    // offloaded routine could explain, diagnose (first divergent frame +
+    // a WRAM diff attributed against the offloads' working sets), drop
+    // the culprit, and retry. The loop terminates: every retry removes
+    // one offloaded routine, and a failure with none left is terminal.
+    var dropped: [profile.conversion_set_max]u24 = undefined;
+    var dropped_why: [profile.conversion_set_max][]const u8 = undefined;
+    var n_dropped: usize = 0;
+    var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+    try conv_samples.ensureTotalCapacity(total);
+
+    while (true) {
+        // Candidates minus the dropped culprits.
+        var act: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+        var n_act: usize = 0;
+        for (cands[0..n_cands]) |c| {
+            const is_dropped = for (dropped[0..n_dropped]) |d| {
+                if (d == c.entry) break true;
+            } else false;
+            if (!is_dropped) {
+                act[n_act] = c;
+                n_act += 1;
+            }
+        }
+
+        var refusal: ?core.sa1gen.Refusal = null;
+        const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
+            core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
+        else
+            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, &refusal);
+        const res = converted catch |e| switch (e) {
+            error.Refused => {
+                try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
+                try out.flush();
+                std.process.exit(1);
+            },
+            else => return e,
+        };
+
+        // The verify run for this attempt.
+        @memset(env_conv, 0);
+        var fast_audio = core.console.audio_hash_init;
+        conv_samples.clearRetainingCapacity();
+        {
+            const cart2 = try core.Cartridge.load(gpa, res.image);
+            const con2 = try gpa.create(core.ProfilingConsole);
+            con2.init(cart2);
+            for (0..total) |i| {
+                feedMovie(con2, mov, i);
+                if (mov == null and args.buttons != 0) con2.setButtons(0, args.buttons);
+                con2.runFrame();
+                try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
+                conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
+                if (con2.takeProfile()) |smp| {
+                    if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
+                }
+            }
+            con2.cart.deinit(gpa);
+            gpa.destroy(con2);
+        }
+        const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
+        const conv_sum = profile.summarise(conv_samples.items, conv_scratch);
+
+        // Stage-S4 gate, three tiers: strict identity; frames identical
+        // with envelope-equivalent audio; equivalent modulo timing with a
+        // non-negative lag improvement.
+        const equiv = util.framesEquivalent(hashes, conv_hashes);
+        var fail_why: []const u8 = "";
+        var fail_frame: u32 = 0;
+        const passed: ?SaTier = switch (equiv) {
+            .identical => blk: {
+                if (fast_audio == base_audio) break :blk .strict;
+                if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
+                    fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
+                    fail_frame = bad;
+                    break :blk null;
+                }
+                break :blk .envelope;
+            },
+            .equivalent => blk: {
+                if (conv_sum.lag_frames > sum.lag_frames) {
+                    fail_why = "same pictures but MORE dropped frames — a regression";
+                    break :blk null;
+                }
+                break :blk .equivalent;
+            },
+            .divergent => blk: {
+                fail_why = "renders pictures the original never showed";
+                fail_frame = firstDiff(hashes, conv_hashes);
+                break :blk null;
+            },
+        };
+
+        if (passed) |tier| {
+            // Success: write the patch and the report.
+            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped]);
+            return;
+        }
+
+        // Failure. Terminal when no offloaded routine could explain it.
+        if (args.whole_game or res.stats.offload_count == 0) {
+            try out.print("verification FAILED: {s}", .{fail_why});
+            if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
+            try out.print(".\n  No patch written.\n", .{});
+            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv, fail_frame, total);
+            if (equiv == .divergent) try out.print(
+                \\  Either uncovered code touches moved state, or the game animates through
+                \\  lag (an NMI-side frame counter), which this gate cannot tell apart from
+                \\  breakage.
+                \\
+            , .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+
+        // Diagnose and drop a culprit, then go around again.
+        const culprit = try diagnoseCulprit(gpa, out, args, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why);
+        dropped[n_dropped] = culprit;
+        dropped_why[n_dropped] = fail_why;
+        n_dropped += 1;
+        try out.print("  auto-bisect: dropping offload $00:{x:0>4} and retrying ({} attempt(s) so far)\n", .{ culprit, n_dropped });
+        try out.flush();
+    }
+}
+
+/// Which S4 tier a successful SA-1 conversion verified under.
+const SaTier = enum { strict, envelope, equivalent };
+
+/// First index where the two per-frame hash streams differ (streams are
+/// equal length by construction). Only meaningful for the divergent case,
+/// where it anchors the forensics.
+fn firstDiff(a: []const u64, b: []const u64) u32 {
+    for (a, b, 0..) |x, y, i| {
+        if (x != y) return @intCast(i);
+    }
+    return 0;
+}
+
+/// On a failed attempt with offloads active: replay BOTH images to the
+/// first bad frame, diff WRAM, attribute the differing bytes against the
+/// offloaded routines' profiled working sets, and pick the routine to
+/// drop — the attributed one when the evidence names it, the last
+/// offloaded one otherwise.
+fn diagnoseCulprit(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    base_image: []const u8,
+    res: core.sa1gen.Result,
+    cands: []const core.sa1gen.Candidate,
+    mov: ?util.movie.Movie,
+    equiv: util.Equivalence,
+    fail_frame: u32,
+    fail_why: []const u8,
+) !u24 {
+    const n_off = res.stats.offload_count;
+    const entries = res.stats.offload_entries[0..n_off];
+    try out.print("verification failed with {} offload(s) active: {s}\n", .{ n_off, fail_why });
+
+    var culprit: u24 = entries[n_off - 1];
+    if (equiv == .divergent) {
+        // Replay both sides to the divergence and diff WRAM.
+        const wram_a = try replayWram(gpa, base_image, fail_frame + 1, args, mov);
+        const wram_b = try replayWram(gpa, res.image, fail_frame + 1, args, mov);
+        var n_shown: u32 = 0;
+        var attributed: ?u24 = null;
+        for (wram_a, wram_b, 0..) |x, y, off| {
+            if (x == y) continue;
+            const page: u16 = @intCast(off >> 8);
+            var owner: ?u24 = null;
+            var shared = false;
+            for (entries) |e| {
+                for (cands) |c| {
+                    if (c.entry == e and page < 512 and profile.getPage(c.pages, page)) {
+                        if (owner != null) shared = true;
+                        owner = e;
+                    }
+                }
+            }
+            if (n_shown < 4) {
+                try out.print("  diverged by frame {}: WRAM $7E:{x:0>4} = {x:0>2} -> {x:0>2}{s}", .{
+                    fail_frame, off, x, y,
+                    if (owner != null) " — inside the working set of $00:" else " — outside every offloaded set",
+                });
+                if (owner) |o| try out.print("{x:0>4}{s}", .{ o, if (shared) " (shared)" else "" });
+                try out.print("\n", .{});
+            }
+            if (attributed == null and owner != null and !shared) attributed = owner;
+            n_shown += 1;
+        }
+        if (n_shown > 4) try out.print("  ({} differing WRAM byte(s) total)\n", .{n_shown});
+        if (n_shown == 0) try out.print("  WRAM identical at the divergent frame — the difference is in PPU state\n  (timing-visible mid-flight rendering, not corrupted memory)\n", .{});
+        if (attributed) |a| culprit = a;
+    }
+    return culprit;
+}
+
+/// Replay an image for `n` frames and return its WRAM (caller-owned copy).
+fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, args: Args, mov: ?util.movie.Movie) ![]u8 {
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..n) |i| {
+        feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
+        con.runFrame();
+    }
+    return gpa.dupe(u8, &con.bus.wram.data);
+}
+
+/// The envelope-failure neighbourhood diagnostic (terminal failures only).
+fn printEnvelopeDiag(out: *std.Io.Writer, env_base: []const u64, env_conv: []const u64, bad: u32, total: u32) !void {
+    const from = bad -| 5;
+    const to = @min(total, bad + 6);
+    try out.print("  frame:    ", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{i});
+    try out.print("\n  original: ", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{env_base[i] / 1000});
+    try out.print("\n  converted:", .{});
+    for (from..to) |i| try out.print("{d:>9}", .{env_conv[i] / 1000});
+    var n_bad: u32 = 0;
+    for (0..total) |i| {
+        var one = [1]u64{env_base[i]};
+        var other = [1]u64{env_conv[i]};
+        if (util.audioEnvelopeMismatch(one[0..], other[0..]) != null) n_bad += 1;
+    }
+    try out.print("\n  (energies in thousands; {} of {} frames outside the window point-wise)\n", .{ n_bad, total });
+}
+
+/// The success report for an SA-1 conversion attempt, including what the
+/// auto-bisect dropped along the way.
+fn reportSa1(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    image: []const u8,
+    res: core.sa1gen.Result,
+    tier: SaTier,
+    total: u32,
+    sum: profile.Summary,
+    conv_sum: profile.Summary,
+    dropped: []const u24,
+    dropped_why: []const []const u8,
+) !void {
+    const bps = try core.patch.writeBps(gpa, image, res.image);
+    const stem = args.rom[0 .. std.mem.lastIndexOfScalar(u8, args.rom, '.') orelse args.rom.len];
+    const path = args.gen_out orelse try std.fmt.allocPrint(gpa, "{s}-sa1.bps", .{stem});
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bps }) catch {
+        try out.print("error: cannot write '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+
+    try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
+    if (args.whole_game) {
+        try out.print(
+            \\whole-game migration (SA-1 Root):
+            \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
+            \\  the game executes ENTIRELY on the SA-1 — its WRAM working set lives in
+            \\  identity-mapped I-RAM; {d} MMIO site(s) proxied through the I-RAM mailbox
+            \\  (NMI masked per transaction), {d} long site(s) re-banked into the window;
+            \\  NMI forwarded S-CPU -> SA-1 through CCNT/CNV
+            \\
+        , .{
+            res.stats.shim_addr,     res.stats.park_addr,
+            res.stats.offload_sites, res.stats.rewritten_long,
+        });
+    } else {
+        try out.print(
+            \\SA-1 conversion (stages S3 + S4):
+            \\  shim at $00:{x:0>4}, SA-1 booted at $00:{x:0>4}
+            \\  regions moved {d} / blocked {d}; rewrites: {d} long, {d} abs; {d} dp site(s){s}
+            \\
+        , .{
+            res.stats.shim_addr,      res.stats.park_addr,
+            res.stats.regions_moved,  res.stats.regions_blocked,
+            res.stats.rewritten_long, res.stats.rewritten_abs,
+            res.stats.dp_sites,       if (res.stats.d_moved) " (D=$3000)" else "",
+        });
+        if (res.stats.offload_count != 0) {
+            try out.print(
+                "  S3b: {} routine(s) execute ON THE SA-1 (first: $00:{x:0>4}; {} call site(s)\n" ++
+                    "  re-pointed through message-port stubs, registers marshalled via the I-RAM\n" ++
+                    "  mailbox)\n",
+                .{ res.stats.offload_count, res.stats.offloaded, res.stats.offload_sites },
+            );
+            if (res.stats.pointer_offloads != 0) {
+                try out.print(
+                    "  of those, {} pointer routine(s) (JSL/RTL, runtime-pointer data) run against\n" ++
+                        "  an identity-offset BW-RAM shadow of their profiled working set, marshalled\n" ++
+                        "  per call; their bodies are COPIES — unseen S-CPU callers see original code\n" ++
+                        "  marshal: {} bytes/call both ways, {} sibling entry point(s) folded into the\n" ++
+                        "  working set, within the cost budget (marshal < half the measured compute)\n",
+                    .{ res.stats.pointer_offloads, res.stats.marshal_bytes, res.stats.marshal_siblings },
+                );
+            }
+        } else {
+            try out.print("  S3b: no hot routine passed the offload walks; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
+        }
+        for (dropped, dropped_why) |d, why| {
+            try out.print("  auto-bisect: offload $00:{x:0>4} DROPPED — with it, verification {s}\n", .{ d, why });
+        }
+    }
+    switch (tier) {
+        .strict => try out.print(
+            "  verified: IDENTICAL — {} frames pixel- and audio-identical (no timing shift)\n",
+            .{total},
+        ),
+        .envelope => try out.print(
+            \\  verified: FRAMES IDENTICAL — every one of {} frames pixel-identical; the
+            \\  audio stream is phase-shifted (relocated access timing slides the APU
+            \\  handshake by a sample) but its per-frame envelope matches: the same sounds
+            \\  at the same frames. Sample-exactness is the one thing left UNVERIFIED.
+            \\
+        , .{total}),
+        .equivalent => try out.print(
+            \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same
+            \\  order, redistributed across {} frames (a speedup's exact signature); audio
+            \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
+            \\
+        , .{total}),
+    }
+    try out.print(
+        "  measured: dropped frames {} -> {}, mean utilisation {d:.0}% -> {d:.0}%\n",
+        .{ sum.lag_frames, conv_sum.lag_frames, sum.mean_util * 100, conv_sum.mean_util * 100 },
+    );
+    try out.print(
+        \\  caveat: code the profile never executed is invisible to the rewriter; a longer
+        \\  or more varied capture widens coverage.
+        \\
+    , .{});
+    try out.flush();
+}
+
 fn runReport(
     io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     args: Args,
     cart: core.Cartridge,
+    mov: ?util.movie.Movie,
 ) !void {
-    _ = io;
-    const want = args.frames orelse report_frames_default;
+    const want = args.frames orelse if (mov) |m|
+        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    else
+        report_frames_default;
 
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
+
+    // Coverage wants the boot code too, so the map is attached before the
+    // skipped frames run, not after.
+    var umap: core.usage_map.UsageMap = undefined;
+    if (args.usage_map_out != null) {
+        const bytes = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        @memset(bytes, 0);
+        umap = .{ .bytes = bytes };
+        con.usage = &umap;
+    }
 
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(want);
 
     var drain: [4096]i16 = undefined;
     for (0..args.skip + want) |i| {
+        feedMovie(con, mov, i);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
         if (i >= args.skip) samples.appendAssumeCapacity(s);
+    }
+
+    if (args.usage_map_out) |path| {
+        writeUsageMap(io, path, umap.bytes, con.cart.chip) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const extra: usize = switch (con.cart.chip) {
+            .sa1 => 1 << 24,
+            .superfx => 1 << 23,
+            else => 0,
+        };
+        try out.print(
+            "wrote {s} ({d:.1} MiB — S-CPU block recorded, SMP{s} zero-filled; " ++
+                "bsnes-plus -usage.bin layout, DiztinGUIsh-importable)\n",
+            .{
+                path,
+                @as(f64, @floatFromInt(core.usage_map.cpu_map_len + core.usage_map.smp_map_len + extra)) / (1024 * 1024),
+                switch (con.cart.chip) {
+                    .sa1 => " and SA-1 blocks",
+                    .superfx => " and Super FX blocks",
+                    else => " block",
+                },
+            },
+        );
     }
 
     const scratch = try gpa.alloc(f64, samples.items.len);
@@ -486,16 +1286,63 @@ fn runReport(
                 @tagName(sum.verdict),
             },
         );
+        {
+            const c = profile.assessConversion(&con.prof, sum.verdict);
+            try out.print(
+                ",\"conversion\":{{\"warranted\":{},\"concentrated\":{},\"covered\":{d:.4}," ++
+                    "\"slow_work\":{},\"main_share\":{d:.4},\"wram_min\":{},\"wram_max\":{}," ++
+                    "\"wram_exact\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}," ++
+                    "\"shared_pages\":{},\"mmio\":{},\"wram_dma\":{},\"entries\":[",
+                .{
+                    c.warranted,      c.concentrated, c.covered,
+                    c.slow_work,      c.main_share,   c.wram.min_bytes,
+                    c.wram.max_bytes, c.wram.exact,   c.pages,
+                    c.fits_iram,      c.fits_bwram,   c.shared_pages,
+                    c.mmio_regs,      c.wram_dma,
+                },
+            );
+            for (c.entries[0..c.n], 0..) |e, i| {
+                if (i != 0) try out.print(",", .{});
+                try out.print("\"{x:0>2}:{x:0>4}\"", .{ e >> 16, e & 0xFFFF });
+            }
+            try out.print("]}}", .{});
+            if (args.plan) {
+                const plan = profile.planRelocation(&con.prof, c);
+                try out.print(",\"plan\":{{\"viable\":{},\"iram_used\":{},\"bwram_used\":{}," ++
+                    "\"has_dp\":{},\"overflow\":{},\"regions\":[", .{
+                    plan.viable, plan.iram_used,       plan.bwram_used,
+                    plan.has_dp, plan.region_overflow,
+                });
+                for (plan.regions[0..plan.n], 0..) |r, ri| {
+                    if (ri != 0) try out.print(",", .{});
+                    try out.print(
+                        "{{\"start\":{},\"len\":{},\"exact\":{},\"heat\":{},\"dest\":\"{s}\"," ++
+                            "\"dest_off\":{},\"dp\":{},\"shared\":{},\"dma_fed\":{}}}",
+                        .{
+                            r.start, r.len,            r.exact,
+                            r.heat,  @tagName(r.dest), r.dest_off,
+                            r.dp,    r.shared_outside, r.dma_fed,
+                        },
+                    );
+                }
+                try out.print("]}}", .{});
+            }
+        }
         if (args.routines) {
             const rows = try routineRows(gpa, &con.prof);
             const total = attributedTotal(rows);
             const verdict = wramVerdict(topCodeRows(rows));
             try out.print(",\"stack_resets\":{},\"routines_dropped\":{},\"wram_verdict\":" ++
-                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"routines\":[", .{
+                "{{\"bytes\":{},\"pages\":{},\"fits_iram\":{},\"fits_bwram\":{}}},\"main_dma\":[", .{
                 con.prof.stack_resets, con.prof.routines_dropped,
                 verdict.union_bytes,   verdict.union_pages,
                 verdict.fits_iram,     verdict.fits_bwram,
             });
+            for (con.prof.main_dma[0..con.prof.n_main_dma], 0..) |d, di| {
+                if (di != 0) try out.print(",", .{});
+                try printDmaUseJson(out, d);
+            }
+            try out.print("],\"routines\":[", .{});
             for (rows, 0..) |r, i| {
                 if (i != 0) try out.print(",", .{});
                 switch (r.what) {
@@ -512,6 +1359,11 @@ fn runReport(
                         for (r.mmio_regs, 0..) |reg, mi| {
                             if (mi != 0) try out.print(",", .{});
                             try out.print("\"${x:0>4}\"", .{reg});
+                        }
+                        try out.print("],\"dma\":[", .{});
+                        for (r.dma, 0..) |d, di| {
+                            if (di != 0) try out.print(",", .{});
+                            try printDmaUseJson(out, d);
                         }
                         try out.print("]", .{});
                     },
@@ -586,6 +1438,10 @@ fn runReport(
         , .{sum.frames}),
     }
 
+    const conv = profile.assessConversion(&con.prof, sum.verdict);
+    try printConversion(out, conv);
+    if (args.plan) try printPlan(out, profile.planRelocation(&con.prof, conv));
+
     if (args.hot) {
         // Where every cycle went, loop or not.
         const Page = struct { pc: u32, cycles: u64 };
@@ -643,9 +1499,16 @@ fn runReport(
                 .waiting => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
                     "(waiting)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
                 }),
-                .main => try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
-                    "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
-                }),
+                .main => {
+                    try out.print("     {s:<10} {s:>9} {d:>14} {d:>6.1}% {s:>7} {d:>6.1}%\n", .{
+                        "(main)", "-", r.self, pct(r.self, total), "-", pct(r.slow, r.self),
+                    });
+                    for (con.prof.main_dma[0..con.prof.n_main_dma]) |d| {
+                        try out.print("                dma  ", .{});
+                        try printDmaUse(out, d);
+                        try out.print("\n", .{});
+                    }
+                },
                 .code => {
                     try out.print("     ${x:0>2}:{x:0>4}   {d:>9} {d:>14} {d:>6.1}% {d:>6.1}% {d:>6.1}%  {s}\n", .{
                         r.entry >> 16,       r.entry & 0xFFFF,
@@ -672,6 +1535,16 @@ fn runReport(
                         }
                     }
                     try out.print("\n", .{});
+                    // The DMA it arms: a WRAM-sourced transfer is a blocker —
+                    // relocate the state and the transfer ships garbage
+                    // unless it is re-sourced or proxied.
+                    for (r.dma) |d| {
+                        try out.print("                dma  ", .{});
+                        try printDmaUse(out, d);
+                        try out.print("\n", .{});
+                    }
+                    if (r.dma_overflow)
+                        try out.print("                dma  (more channel uses than the {} tracked)\n", .{profile.dma_use_cap});
                 },
             }
         }
@@ -722,6 +1595,246 @@ fn runReport(
 
 const routine_rows_shown: usize = 16;
 
+/// Write a usage map in bsnes-plus's `-usage.bin` layout: the CPU block
+/// verbatim, then a zero-filled SMP block, then a zero-filled coprocessor
+/// block when the cart carries one (SA-1: 16 MiB, Super FX: 8 MiB) — so the
+/// byte layout matches what bsnes-plus writes for the same cart and existing
+/// importers need no special-casing.
+fn writeUsageMap(io: std.Io, path: []const u8, cpu: []const u8, chip: core.cartridge.ChipKind) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    const wr = &fw.interface;
+
+    try wr.writeAll(cpu);
+    const zeros: [4096]u8 = @splat(0);
+    var left: usize = core.usage_map.smp_map_len + @as(usize, switch (chip) {
+        .sa1 => 1 << 24,
+        .superfx => 1 << 23,
+        else => 0,
+    });
+    while (left != 0) {
+        const n = @min(left, zeros.len);
+        try wr.writeAll(zeros[0..n]);
+        left -= n;
+    }
+    try wr.flush();
+}
+
+test "usage-map file layout: block sizes per chip, CPU bytes verbatim" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = ".usage-map-test-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const cpu = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    defer gpa.free(cpu);
+    @memset(cpu, 0);
+    cpu[0x00_8000] = core.usage_map.flag_opcode | core.usage_map.flag_exec;
+    cpu[0xFF_FFFF] = core.usage_map.flag_read;
+
+    // A plain cart: CPU + SMP blocks only.
+    try writeUsageMap(io, root ++ "/plain-usage.bin", cpu, .none);
+    const plain = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/plain-usage.bin", gpa, .limited(64 << 20));
+    defer gpa.free(plain);
+    try std.testing.expectEqual(core.usage_map.cpu_map_len + core.usage_map.smp_map_len, plain.len);
+    try std.testing.expectEqual(cpu[0x00_8000], plain[0x00_8000]);
+    try std.testing.expectEqual(cpu[0xFF_FFFF], plain[0xFF_FFFF]);
+    try std.testing.expectEqual(@as(u8, 0), plain[core.usage_map.cpu_map_len]); // SMP zeros
+
+    // A Super FX cart appends its (zero) 8 MiB block.
+    try writeUsageMap(io, root ++ "/sfx-usage.bin", cpu, .superfx);
+    const st = try std.Io.Dir.cwd().statFile(io, root ++ "/sfx-usage.bin", .{});
+    try std.testing.expectEqual(
+        @as(u64, core.usage_map.cpu_map_len + core.usage_map.smp_map_len + (1 << 23)),
+        st.size,
+    );
+}
+
+/// Stage S2: the relocation plan — where each region of the hot set's WRAM
+/// state lands on the SA-1 side, and what each move costs.
+fn printPlan(out: *std.Io.Writer, plan: core.profile.Plan) !void {
+    if (!plan.viable) {
+        try out.print("\n  relocation plan: none — the conversion verdict above gave the planner no hot set.\n", .{});
+        return;
+    }
+    var total_heat: u64 = 0;
+    for (plan.regions[0..plan.n]) |r| total_heat += r.heat;
+
+    try out.print("\n  relocation plan (stage S2): {} region(s), I-RAM {}/{} bytes, BW-RAM ", .{
+        plan.n, plan.iram_used, core.profile.iram_bytes,
+    });
+    try printByteCount(out, plan.bwram_used);
+    if (plan.has_dp) try out.print("; SA-1 boots with D=$3000 (dp window in I-RAM)", .{});
+    try out.print("\n", .{});
+    try out.print("     {s:<16} {s:>6}  {s:<16} {s:>5}  {s}\n", .{ "wram", "size", "dest", "heat", "" });
+    for (plan.regions[0..plan.n]) |r| {
+        const bank: u32 = 0x7E + (r.start >> 16);
+        const lo: u32 = r.start & 0xFFFF;
+        var range_buf: [16]u8 = undefined;
+        const range = if (r.len == 1)
+            std.fmt.bufPrint(&range_buf, "${x:0>2}:{x:0>4}", .{ bank, lo }) catch ""
+        else
+            std.fmt.bufPrint(&range_buf, "${x:0>2}:{x:0>4}-{x:0>4}", .{ bank, lo, (r.start + r.len - 1) & 0xFFFF }) catch "";
+        var dest_buf: [16]u8 = undefined;
+        const dest = switch (r.dest) {
+            .iram => std.fmt.bufPrint(&dest_buf, "I-RAM ${x:0>4}", .{0x3000 + r.dest_off}) catch "",
+            .bwram => std.fmt.bufPrint(&dest_buf, "BW-RAM ${x:0>2}:{x:0>4}", .{ 0x40 + (r.dest_off >> 16), r.dest_off & 0xFFFF }) catch "",
+        };
+        try out.print("     {s:<16} {d:>6}  {s:<16} {d:>4.0}%  {s}{s}{s}{s}\n", .{
+            range,
+            r.len,
+            dest,
+            pct(r.heat, total_heat),
+            if (r.dp) "dp " else "",
+            if (r.dma_fed) "feeds-DMA " else "",
+            if (r.shared_outside) "SHARED " else "",
+            if (r.exact) "" else "page-bound",
+        });
+    }
+    if (plan.region_overflow)
+        try out.print("     (more regions than the {} tracked — this plan is a prefix)\n", .{core.profile.plan_region_cap});
+    try out.print(
+        \\    (heat is each region's share of the hot set's slow-frame work. A page-bound
+        \\    row is an upper bound: the whole touched page moves. SHARED rows need the
+        \\    resident side re-pointed too — I-RAM and BW-RAM are visible to both CPUs,
+        \\    so sharing is rewrite work, not a refusal. feeds-DMA rows sit in BW-RAM
+        \\    because a transfer's A-bus side needs a linear address.)
+        \\
+    , .{});
+}
+
+/// The unified `conversion:` paragraph — the report's bottom line, tying the
+/// slow-frame concentration to the WRAM fit and the blockers. Graded: not
+/// warranted / worth attempting (with any blockers each on their own line) /
+/// warranted but diffuse.
+fn printConversion(out: *std.Io.Writer, c: core.profile.Conversion) !void {
+    if (!c.warranted) {
+        try out.print("\n  conversion: not warranted — the game is not short of CPU (see the verdict above).\n", .{});
+        return;
+    }
+    if (c.slow_work == 0 or c.n == 0) {
+        try out.print(
+            \\
+            \\  conversion: warranted, but no slow-frame work was attributed to any routine
+            \\  (all of it ran while waiting, or the capture was too short). Nothing to rank.
+            \\
+        , .{});
+        return;
+    }
+    if (!c.concentrated) {
+        try out.print(
+            \\
+            \\  conversion: warranted but diffuse — the top {} routine(s) cover only {d:.0}% of
+            \\  the work in dropped frames
+        , .{ c.n, c.covered * 100 });
+        if (c.main_share >= 0.10) try out.print(
+            \\, and {d:.0}% of it runs at the top level, under no
+            \\  call frame
+        , .{c.main_share * 100});
+        try out.print(
+            \\. There is no small set to move; this is a restructuring, not a
+            \\  relocation.
+            \\
+        , .{});
+        return;
+    }
+
+    try out.print("\n  conversion: {d:.0}% of the work in dropped frames lands in {} routine(s) (", .{
+        c.covered * 100, c.n,
+    });
+    for (c.entries[0..c.n], 0..) |e, i| {
+        if (i != 0) try out.print(", ", .{});
+        try out.print("${x:0>2}:{x:0>4}", .{ e >> 16, e & 0xFFFF });
+    }
+    try out.print(")\n  whose combined WRAM working set is ", .{});
+    if (c.pages == 0) {
+        try out.print("empty (no WRAM access recorded)", .{});
+    } else {
+        try printWramFootprint(out, c.wram);
+        try out.print(" across {} page(s)", .{c.pages});
+    }
+    if (c.fits_iram) {
+        try out.print(" — fits I-RAM (2 KiB).\n", .{});
+    } else if (c.fits_bwram) {
+        try out.print(" — too big for I-RAM (2 KiB) but fits\n  cartridge BW-RAM (256 KiB).\n", .{});
+    } else {
+        try out.print(" — exceeds even BW-RAM (256 KiB); a straight\n  port cannot hold it.\n", .{});
+    }
+
+    var blockers = false;
+    if (c.shared_pages != 0) {
+        blockers = true;
+        try out.print(
+            "  BUT: {} WRAM page(s) of that set are shared with code that stays behind —\n" ++
+                "  moving the set strands state both sides touch.\n",
+            .{c.shared_pages},
+        );
+    }
+    if (c.wram_dma) {
+        blockers = true;
+        try out.print(
+            "  BUT: a DMA/HDMA the set arms is WRAM-sourced — relocate the state and the\n" ++
+                "  transfer must be re-sourced or proxied.\n",
+            .{},
+        );
+    }
+    if (c.mmio_regs != 0) {
+        try out.print("  It reaches {}{s} MMIO register(s) the SA-1 cannot touch — each access needs\n  an S-CPU stub.\n", .{
+            c.mmio_regs, if (c.mmio_overflow) "+" else "",
+        });
+    }
+    if (!c.fits_bwram) {
+        try out.print("  Not worth attempting as a relocation at this size.\n", .{});
+    } else if (blockers) {
+        try out.print("  Worth attempting only with the blockers above priced in.\n", .{});
+    } else {
+        try out.print("  No page of it is shared with resident code and no DMA sources it. Worth\n  attempting.\n", .{});
+    }
+}
+
+/// One DMA use as the routine table's detail line shows it, e.g.
+/// `gdma ch1 $7E:2000 -> $2118 (4.0 KiB, 214 arms) WRAM` — the arrow shows
+/// which side the A-bus address is; the WRAM tag is the blocker call-out.
+fn printDmaUse(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
+    switch (d.kind) {
+        .gdma => {
+            try out.print("gdma ch{d} ${x:0>2}:{x:0>4} {s} $21{x:0>2} (", .{
+                d.channel,                       d.src >> 16, d.src & 0xFFFF,
+                if (d.a_is_dest) "<-" else "->", d.b_reg,
+            });
+            try printByteCount(out, d.bytes_max);
+            try out.print(", {d} arm(s))", .{d.arms});
+            if (d.src_wram) try out.print("  WRAM", .{});
+        },
+        .hdma => {
+            try out.print("hdma ch{d} table ${x:0>2}:{x:0>4} -> $21{x:0>2} ({d} arm(s))", .{
+                d.channel, d.src >> 16, d.src & 0xFFFF, d.b_reg, d.arms,
+            });
+            if (d.src_wram) try out.print("  WRAM TABLE", .{});
+            if (d.indirect_wram) try out.print("  WRAM INDIRECT", .{});
+        },
+    }
+}
+
+/// The same use as a JSON object (no trailing separator).
+fn printDmaUseJson(out: *std.Io.Writer, d: core.profile.DmaUse) !void {
+    try out.print(
+        "{{\"kind\":\"{s}\",\"ch\":{d},\"src\":\"{x:0>2}:{x:0>4}\",\"b_reg\":\"$21{x:0>2}\"," ++
+            "\"bytes\":{d},\"a_is_dest\":{},\"arms\":{d},\"src_wram\":{},\"indirect_wram\":{}}}",
+        .{
+            @tagName(d.kind), d.channel, d.src >> 16,
+            d.src & 0xFFFF,   d.b_reg,   d.bytes_max,
+            d.a_is_dest,      d.arms,    d.src_wram,
+            d.indirect_wram,
+        },
+    );
+}
+
 /// One row of the `--routines` table: a named routine, or one of the two
 /// synthetic rows the attribution invariant needs — "(waiting)" (idle cycles,
 /// wherever the wait lived) and "(main)" (code under no call frame).
@@ -740,6 +1853,9 @@ const RoutineRow = struct {
     /// (i.e. `con.prof`) outlives the report, which it does.
     mmio_regs: []const u16 = &.{},
     touches_sram: bool = false,
+    /// DMA/HDMA channels this routine armed (same lifetime note).
+    dma: []const core.profile.DmaUse = &.{},
+    dma_overflow: bool = false,
 };
 
 /// Collect and rank every routine with self time, synthetics included.
@@ -763,6 +1879,8 @@ fn routineRows(gpa: std.mem.Allocator, prof: *const core.profile.Profiler) ![]Ro
             .wram_pages = r.wram_pages,
             .mmio_regs = prof.routines[i].mmio_regs[0..r.n_mmio_regs],
             .touches_sram = r.touches_sram,
+            .dma = prof.routines[i].dma[0..r.n_dma],
+            .dma_overflow = r.dma_overflow,
         });
     }
     std.mem.sort(RoutineRow, rows.items, {}, struct {
@@ -780,10 +1898,12 @@ test "routine rows carry the WRAM footprint and shared flag into the report" {
     p.step(0x00_9000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
     p.step(0x00_A000, cyc, false, 0x7E_1000, null, .{});
     p.step(0x00_A003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
-    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212.
+    // main -> B: touches $7E:1005 (same 256-byte page as A) and MMIO $4212,
+    // and arms a WRAM-sourced GDMA while on top.
     p.step(0x00_9006, cyc, false, null, null, .{ .kind = .call, .target = 0x00_B000, .sp_before = 0x1FF, .sp_after = 0x1FD });
     p.step(0x00_B000, cyc, false, 0x7E_1005, null, .{});
     p.step(0x00_B003, cyc, false, 0x00_4212, null, .{});
+    p.noteDmaArm(.gdma, 1, 0x7E_2000, 0x400, 0x18, false, null);
     p.step(0x00_B006, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -807,6 +1927,9 @@ test "routine rows carry the WRAM footprint and shared flag into the report" {
     try std.testing.expectEqual(@as(usize, 1), b.mmio_regs.len);
     try std.testing.expectEqual(@as(u16, 0x4212), b.mmio_regs[0]);
     try std.testing.expect(!b.touches_sram);
+    try std.testing.expectEqual(@as(usize, 1), b.dma.len);
+    try std.testing.expect(b.dma[0].src_wram);
+    try std.testing.expectEqual(@as(usize, 0), a.dma.len);
 
     // Same 256-byte page ($7E1000 and $7E1005): each names the other.
     try std.testing.expect(wramShared(rows, a_idx.?));
@@ -864,8 +1987,8 @@ const WramVerdict = struct {
     fits_bwram: bool,
 };
 
-const iram_bytes: u32 = 2 * 1024;
-const bwram_bytes: u32 = 256 * 1024;
+const iram_bytes = core.profile.iram_bytes;
+const bwram_bytes = core.profile.bwram_bytes;
 
 fn wramVerdict(rows: []const RoutineRow) WramVerdict {
     var union_pages: core.profile.WramPages = @splat(0);
@@ -942,6 +2065,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--usage-map")) {
+            out.usage_map_out = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--plan")) {
+            out.plan = true;
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
@@ -949,6 +2076,16 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             const digits = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
             out.buttons = try std.fmt.parseInt(u16, digits, 16);
+        } else if (std.mem.eql(u8, a, "--movie")) {
+            out.movie = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
+            out.gen_fastrom = true;
+        } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
+            out.gen_sa1 = true;
+        } else if (std.mem.eql(u8, a, "--whole-game")) {
+            out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            out.gen_out = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
             rom = a;
         } else return error.TooManyArgs;
@@ -958,5 +2095,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         if (out.accuracy == .accurate) return error.WideNeedsFast;
         if (out.wide > core.ppu.wide_margin_max) return error.WideTooBig;
     }
+    if ((out.gen_fastrom or out.gen_sa1) and (out.patch != null or out.auto_patch or
+        out.save_patched != null or out.auto_fastrom or
+        out.accuracy == .accurate or out.wide != 0 or out.sa1_report))
+        return error.GenConflicts;
+    if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
+    if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
+    if (out.movie != null and out.buttons != 0) return error.MovieConflicts;
+    if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }
