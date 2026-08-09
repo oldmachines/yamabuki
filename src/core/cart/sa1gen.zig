@@ -578,6 +578,16 @@ fn tryOffload(
         // sharing one working set. Marshalling only the entry we offload
         // ships a partial view of that state — the exact failure the
         // auto-bisector caught on a real cart.
+        // The direct page is MANDATORY, not evidence-driven: the SA-1
+        // runs the body with D over the shadow window, so every dp
+        // operand it executes resolves into the shadow. If the dp page
+        // is not marshalled the routine runs on whatever the shadow
+        // happened to hold — which is exactly how a resumable state
+        // machine reads its own progress cursor as "already finished"
+        // and returns having done nothing. The profiled page set does
+        // not reliably carry it (a routine's dp traffic can be
+        // attributed elsewhere, and coldness is not absence), so the
+        // mechanism supplies it unconditionally.
         var marshal_pages = c.pages;
         var siblings: u32 = 0;
         for ([_][]const Candidate{ candidates, neighbours }) |list| {
@@ -627,7 +637,7 @@ fn tryOffload(
                 leaf_stubs += 1;
             },
             .ptr => {
-                blocks_len += 25;
+                blocks_len += 33;
                 ptr_stub_len += ptrStubLen(c.spec, c.runs) + c.spec.span;
             },
         };
@@ -671,7 +681,7 @@ fn tryOffload(
             },
             .ptr => {
                 const stub_file = ptr_cur;
-                const emitted = emitPtrStub(out[stub_file..], id, c.spec, c.runs);
+                const emitted = emitPtrStub(out[stub_file..], id, c.entry, c.spec, c.runs);
                 std.debug.assert(emitted == ptrStubLen(c.spec, c.runs));
                 ptr_cur += emitted;
                 // The SA-1's copy of the body, immediately after the stub:
@@ -725,9 +735,15 @@ fn tryOffload(
             // JSL of the SA-1's body copy (which returns RTL), then back
             // to the base D.
             .ptr => {
-                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x15 });
+                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x1D });
+                // D = $6000 + the caller's own D, so every dp operand in
+                // the body lands on that page's mirror in the shadow.
+                // Set before the unmarshal, whose PLP restores the entry
+                // widths last.
+                // SEP #$20 again before the unmarshal: it assembles B:A
+                // bytewise and pairs PHA with PLP, so it must run 8-bit.
+                put(d, &cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x18, 0x69, 0x00, 0x60, 0x5B, 0xE2, 0x20 });
                 putJsr(d, &cur, unm_addr);
-                put(d, &cur, &.{ 0xF4, 0x00, 0x60, 0x2B }); // PEA $6000 / PLD
                 put(d, &cur, &.{ 0x22, @truncate(c.copy_addr), @truncate(c.copy_addr >> 8), c.copy_bank });
                 put(d, &cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
                 putJsr(d, &cur, mar_addr);
@@ -971,7 +987,7 @@ fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
 
 /// Byte-exact length of a pointer stub (the emitter asserts against it).
 fn ptrStubLen(spec: PtrSpec, runs: Runs) u32 {
-    return 100 + 24 * @as(u32, @intCast(runs.n)) + 28 * @as(u32, @intCast(spec.n_slots));
+    return 151 + 24 * @as(u32, @intCast(runs.n)) + 54 * @as(u32, @intCast(spec.n_slots));
 }
 
 /// The S-CPU side of a pointer offload, emitted per routine. Everything is
@@ -983,8 +999,29 @@ fn ptrStubLen(spec: PtrSpec, runs: Runs) u32 {
 /// message id and spin the double handshake -> translate back -> copy the
 /// shadow back -> restore DB -> unmarshal with the routine's exit state ->
 /// RTL.
-fn emitPtrStub(d: []u8, id: u8, spec: PtrSpec, runs: Runs) u32 {
+fn emitPtrStub(d: []u8, id: u8, entry: u16, spec: PtrSpec, runs: Runs) u32 {
     var cur: usize = 0;
+    // Precondition, checked rather than assumed: the marshal mirrors the
+    // caller's direct page at WRAM $0000-$00FF into the shadow, and the
+    // SA-1 runs the body with D over that mirror. A caller whose D is
+    // something else would have the SA-1 resolve dp operands to the wrong
+    // shadow bytes, so this hands such a call straight back to the
+    // ORIGINAL routine on the S-CPU — always correct, merely not
+    // accelerated. (JML, not JSL: the original's own RTL returns to our
+    // caller.)
+    put(d, &cur, &.{
+        0x08, // PHP
+        0xC2, 0x20, // REP #$20
+        0x48, // PHA
+        0x0B, 0x68, // PHD / PLA  -> A = caller D
+        0xC9, 0x01, 0x1F, // CMP #$1F01
+        0x90, 0x06, // BCC ok  (a whole dp page fits the 8 KiB window)
+        0x68, 0x28, // PLA / PLP  (restore exactly what we found)
+        0x5C, @truncate(entry), @truncate(entry >> 8), 0x00, // JML original
+        // ok:
+        0x8F, 0x88, 0x37, 0x00, // STA $00:3788 — caller D into the mailbox
+        0x68, 0x28, // PLA / PLP
+    });
     // Register marshal in (33). PHB first so the caller P (pushed second)
     // is on top for the PLA below.
     put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 }); // PHB / PHP / SEP #$20
@@ -993,25 +1030,53 @@ fn emitPtrStub(d: []u8, id: u8, spec: PtrSpec, runs: Runs) u32 {
     put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 }); // caller P
     // Shadow copy-in (2 + 12/run). MVN encoding: opcode, DEST bank, SRC bank.
     put(d, &cur, &.{ 0xC2, 0x30 });
+    // The caller's direct page, wherever it is: MVN takes its offsets
+    // from X/Y, so one emitted copy serves every D the guard admits.
+    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, shadow_bank, 0x7E });
     for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], false);
-    // Slot translate-in (2 + 14/slot): $7E bank bytes -> the shadow bank.
-    // (A plain LoROM game has no $40+ pointers to collide with the exact
-    // compare; $7F pointers stay untranslated and fail S4 if followed.)
-    put(d, &cur, &.{ 0xE2, 0x20 });
+    // Slot translate-in: $7E pointer bank bytes -> the shadow bank. The
+    // slots are DIRECT-PAGE offsets, so each is indexed by the caller's
+    // own D — the pointers live wherever its direct page is, not at
+    // $0000. (A plain LoROM game has no $40+ pointers to collide with
+    // the exact compare; $7F pointers stay untranslated and fail S4 if
+    // followed.)
     for (spec.slots[0..spec.n_slots]) |s| {
-        put(d, &cur, &.{ 0xAF, s, 0x00, shadow_bank, 0xC9, 0x7E, 0xD0, 0x06, 0xA9, shadow_bank, 0x8F, s, 0x00, shadow_bank });
+        put(d, &cur, &.{
+            0xAF, 0x88, 0x37, 0x00, // LDA $00:3788  (caller D)
+            0x18, 0x69, s, 0x00, // CLC / ADC #slot
+            0xAA, // TAX
+            0xE2, 0x20, // SEP #$20
+            0xBF, 0x00, 0x00, shadow_bank, // LDA $41:0000,x
+            0xC9, 0x7E, // CMP #$7E
+            0xD0, 0x06, // BNE skip
+            0xA9, shadow_bank, // LDA #$41
+            0x9F, 0x00, 0x00, shadow_bank, // STA $41:0000,x
+            0xC2, 0x20, // skip: REP #$20
+        });
     }
+    put(d, &cur, &.{ 0xE2, 0x20 });
     // Send + double handshake (30), all long-addressed.
     put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 }); // message id -> CFR
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 }); // await echo
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // ack
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 }); // await clear
-    // Slot translate-back (14/slot).
+    // Slot translate-back, indexed the same way.
+    put(d, &cur, &.{ 0xC2, 0x20 });
     for (spec.slots[0..spec.n_slots]) |s| {
-        put(d, &cur, &.{ 0xAF, s, 0x00, shadow_bank, 0xC9, shadow_bank, 0xD0, 0x06, 0xA9, 0x7E, 0x8F, s, 0x00, shadow_bank });
+        put(d, &cur, &.{
+            0xAF,        0x88, 0x37,        0x00,
+            0x18,        0x69, s,           0x00,
+            0xAA,        0xE2, 0x20,        0xBF,
+            0x00,        0x00, shadow_bank, 0xC9,
+            shadow_bank, 0xD0, 0x06,        0xA9,
+            0x7E,        0x9F, 0x00,        0x00,
+            shadow_bank, 0xC2, 0x20,
+        });
     }
+    put(d, &cur, &.{ 0xE2, 0x20 });
     // Shadow copy-out (2 + 12/run).
     put(d, &cur, &.{ 0xC2, 0x30 });
+    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, 0x7E, shadow_bank });
     for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], true);
     // Restore caller DB, then unmarshal — long-addressed, so DB-proof (30).
     put(d, &cur, &.{0xAB}); // PLB
