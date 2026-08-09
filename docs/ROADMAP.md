@@ -414,22 +414,44 @@ manual process (profile, transform, verify against the original), automated:
   copy and prints what it finds, so "which path did the SA-1 take, on
   what state" is a direct read.
 
-  It answered the question on the first run. Of the offloaded
-  decompressor's 214 instructions the SA-1 covers **52**, entering the
-  body 7 times and executing 14,672 instructions inside those 52 —
-  and the first instruction it never reaches is the original's
-  `$00:9bda`, the state machine's RESUME entry. The register ring shows
-  the exit path taken every time: `LDY $06 / CPY $08 / BCS` straight to
-  the routine's `STZ $10 / PLB / RTL`. In other words the offloaded copy
-  reads its own progress cursor as already past the end of the input and
-  returns immediately, doing no work — a divergence in the small dp
-  state the machine resumes from, not in the buffers the marshal was
-  built around. The `D=$6000` window and the shadow data bank (`DB=$41`)
-  are visibly correct in the trace, so the remaining suspect is narrow
-  and named: which of those dp cells the marshal actually delivers, and
-  when relative to the sibling entry's own S-CPU calls. That is the next
-  rung, and the auto-bisector keeps it safe to leave open — every wrong
-  guess is caught, named, and dropped without a bad patch being written. **Whole-game
+  It answered the question on the first run, and the answer was a bug in
+  the offload's model of the direct page — since **fixed**. The trace
+  showed the SA-1 covering only 52 of the decompressor's 214
+  instructions, taking the same exit every time (`LDY $06 / CPY $08 /
+  BCS` straight to `STZ $10 / PLB / RTL`): the body was reading its own
+  progress cursor as already finished. Printing the marshal runs showed
+  why — pages `$12`, `$1a`, `$1f`, `$30-$3b` and **no dp page at all**.
+  The routine ran on whatever the shadow happened to hold.
+
+  Fixing it properly meant dropping an assumption the mechanism had
+  never stated: that a pointer routine's direct page is at `$0000`. It
+  is not — the trace's `D=$7a00` (the shadow window plus `$1A00`) says
+  this game calls the routine with its direct page at WRAM `$1A00`. So
+  the offload is now **D-relative throughout**: the stub reads the
+  caller's `D`, publishes it to the mailbox, and MVN-copies that page
+  into the shadow wherever it is (MVN takes its offsets from registers,
+  so one emitted copy serves every `D`); the dispatcher sets the SA-1's
+  `D` to the shadow window plus the caller's own `D`; and the pointer
+  bank-slot translation indexes by it too, since the slots are dp
+  offsets and the pointers live on that page rather than at `$0000`.
+  What cannot be handled is refused rather than assumed: a caller whose
+  direct page will not fit the 8 KiB window is checked at runtime and
+  handed straight back to the original routine on the S-CPU — correct,
+  merely not accelerated.
+
+  The result on the cart: coverage goes from **52 to 187 of 214**
+  instructions, 76,010 instructions of real work across 6 calls, with
+  `D` and the shadow data bank correct in the trace. The conversion
+  still does not verify — around 1,500 WRAM bytes differ, now including
+  the routine's own dp cells, so it computes a different amount of work
+  rather than none. The next suspect is named and structural: the S-CPU
+  spins in the handshake with NMI live, so the game's NMI handler can
+  write WRAM pages that the marshal-back then overwrites with the
+  shadow's older copy. That is a property of per-call marshalling, not
+  of this routine, and it is what the next rung has to address. The
+  auto-bisector keeps all of it safe to leave open — the offload is
+  caught, named, and dropped, and the relocation patch still ships
+  verified. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,
   a different execution model from routine offload — is built as a narrow
   vertical slice: the ENTIRE game executes on the SA-1 and the S-CPU becomes
