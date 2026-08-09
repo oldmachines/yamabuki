@@ -352,24 +352,20 @@ compounding — which is the main reason for keeping both signals.
 
 The upper bound on utilisation is the direction that *flatters* a conversion,
 which is exactly why the tool prints the caveat every run instead of rounding in
-its own favour. And by default nothing presses any buttons: what gets profiled is
-the attract loop, which for most carts is real gameplay and for some is a title
-screen idling at 12%.
+its own favour. And on its own the profiler presses no buttons: what gets
+profiled is the attract loop, which for most carts is real gameplay and for some
+is a title screen idling at 12%.
 
-**`--movie` is the answer to that**: a recorded playthrough, replayed from
-power-on and verified against the hashes it carries, so the profile is measured
-over real gameplay rather than whatever the demo happened to exercise. Two
-lighter flags cover the case where no recording exists yet. `--state <file>`
-resumes from a save state written by the SDL frontend (F5), so the run starts
-where you already are; `--skip` then defaults to 0, because the state already
-*is* the moment of interest. `--buttons M` holds a pad-1 mask for every frame.
-
-Neither substitutes for a movie, because neither is a player. A held mask never
-taps, aims, or reacts, so it sustains a scene rather than playing one — hold
-Start on a game that edge-detects presses and nothing happens at all. A resumed
-state winds down from whatever it captured once nothing is driving it. The
-report names which of the three drove the run, so a number is never read as
-more than it is.
+**`--movie` is the answer to that**, and deliberately the only one: a recorded
+playthrough, replayed from power-on and verified against the hashes it carries,
+so the profile is measured over real gameplay rather than whatever the demo
+happened to exercise. Cruder substitutes were tried and removed. A held button
+mask is not a player — it never taps, aims, or reacts, so on a game that
+edge-detects presses it does nothing at all — and resuming a save state fixes
+where a run begins without supplying anyone to play it, so the scene winds down
+within seconds. Both invite a number that reads like gameplay and is not. The
+report says which of the two modes drove it, so it is never mistaken for the
+other.
 
 The profiler is a third comptime instantiation of the core (`ProfilingConsole`),
 so the shipped emulator carries no branch for it — the same trick as `accuracy`.

@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     const image = core.header.stripCopierHeader(raw);
 
     var failure: ?util.GenFailure = null;
-    const res = util.generateFastromVerified(gpa, image, verify_frames, verify_skip, 0, null, &failure) catch |e| {
+    const res = util.generateFastromVerified(gpa, image, verify_frames, verify_skip, null, &failure) catch |e| {
         if (e == error.GenFailed) {
             switch (failure.?) {
                 .refused => |r| try out.print("FAIL: refused: {s}\n", .{r.reason.describe()}),
@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
     // main loop; stepping it in ragged chunks must produce the identical
     // patch, or the two entry points have quietly diverged.
     {
-        var session = try util.GenSession.start(gpa, image, verify_frames, verify_skip, 0);
+        var session = try util.GenSession.start(gpa, image, verify_frames, verify_skip);
         defer session.deinit();
         const inc: util.GenOutcome = loop: while (true) {
             switch (try session.step(7)) {

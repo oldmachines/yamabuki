@@ -1385,7 +1385,7 @@ fn startGeneration(
         return null;
     };
     const image = core.header.stripCopierHeader(raw);
-    const session = util.GenSession.start(gpa, image, gen_frames, gen_skip, 0) catch |e| {
+    const session = util.GenSession.start(gpa, image, gen_frames, gen_skip) catch |e| {
         err.print("error: cannot start generation: {s}\n", .{@errorName(e)}) catch {};
         err.flush() catch {};
         gpa.free(raw);

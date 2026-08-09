@@ -185,11 +185,11 @@ pub const GenSession = struct {
     image: []const u8,
     frames: u32,
     skip: u32,
-    buttons: u16,
     /// Optional recorded playthrough driving both pads, one entry per frame
-    /// (borrowed; must outlive the session). Set after `start`. Overrides
-    /// `buttons`; past its end both pads read released — deterministic in
-    /// both runs either way, which is all the pipeline requires.
+    /// (borrowed; must outlive the session). Set after `start`. Without one
+    /// the run is unattended from power-on; past the movie's end both pads
+    /// read released — deterministic either way, which is all the pipeline
+    /// requires.
     movie_frames: ?[]const [2]u16 = null,
     total: u32,
 
@@ -224,7 +224,6 @@ pub const GenSession = struct {
         image: []const u8,
         frames: u32,
         skip: u32,
-        buttons: u16,
     ) !GenSession {
         const total = skip + frames;
         var s: GenSession = .{
@@ -232,7 +231,6 @@ pub const GenSession = struct {
             .image = image,
             .frames = frames,
             .skip = skip,
-            .buttons = buttons,
             .total = total,
             .hashes = try gpa.alloc(u64, total),
             .samples = undefined,
@@ -324,7 +322,7 @@ pub const GenSession = struct {
             const f: [2]u16 = if (self.i < mf.len) mf[self.i] else .{ 0, 0 };
             con.setButtons(0, f[0]);
             con.setButtons(1, f[1]);
-        } else if (self.buttons != 0) con.setButtons(0, self.buttons);
+        }
         con.runFrame();
         try drainAudio(con, &self.audio, {}, null);
         if (con.takeProfile()) |smp| {
@@ -409,11 +407,10 @@ pub fn generateFastromVerified(
     image: []const u8,
     frames: u32,
     skip: u32,
-    buttons: u16,
     movie_frames: ?[]const [2]u16,
     failure: *?GenFailure,
 ) !GenOutcome {
-    var s = try GenSession.start(gpa, image, frames, skip, buttons);
+    var s = try GenSession.start(gpa, image, frames, skip);
     s.movie_frames = movie_frames;
     defer s.deinit();
     while (true) {
