@@ -669,7 +669,13 @@ where the movie drives the profiled runs — S1 coverage, the conversion verdict
 and S4 verification all measured over real gameplay instead of whatever the
 attract loop happened to exercise. The determinism this rests on is not new: the
 whole differential ladder already runs on it, and CI would catch a violation
-instantly.
+instantly. Two lighter-weight flags cover the case where no recording exists yet:
+`--state` resumes a `--sa1-report` run from an SDL save state (F5) so the
+profiler starts where you already are, defaulting `--skip` to 0 since the state
+already *is* the moment of interest, and `--buttons` holds a pad-1 mask for the
+run. Neither supplies a player — a held mask never taps, aims, or reacts, and a
+resumed state winds down once nothing drives it — so the report names whichever
+of the three drove it rather than letting a number stand unqualified.
 
 The profiler is a third comptime instantiation of the core (`ProfilingConsole`),
 so the shipped emulator carries no branch for it — the same trick as `accuracy`.
