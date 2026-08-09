@@ -244,17 +244,40 @@ const is_windows = builtin.os.tag == .windows;
 
 pub const LoadError = error{ SdlNotFound, SdlTooOld };
 
+/// The bare library names, most canonical first. Tried unqualified so the
+/// platform loader's own search runs first — which is what makes an explicit
+/// `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` override win. Exposed so the
+/// "not found" error can name the file this platform actually looks for.
+pub const lib_names: []const [:0]const u8 = switch (builtin.os.tag) {
+    .windows => &.{"SDL3.dll"},
+    .macos => &.{ "libSDL3.dylib", "libSDL3.0.dylib" },
+    else => &.{ "libSDL3.so.0", "libSDL3.so" },
+};
+
+/// Fallbacks tried after `lib_names`, for installs the loader does not search
+/// by default. dyld expands `@loader_path` in a dlopen path, so a copy shipped
+/// beside the binary (an .app bundle, a release tarball) is found with no
+/// rpath or environment variable; Homebrew's prefixes are not on the default
+/// search path on either arm64 or x86_64 macOS. Linux needs no equivalent:
+/// distro packages land in ldconfig's path.
+const extra_paths: []const [:0]const u8 = switch (builtin.os.tag) {
+    .macos => &.{
+        "@loader_path/libSDL3.dylib",
+        "/opt/homebrew/lib/libSDL3.dylib",
+        "/usr/local/lib/libSDL3.dylib",
+    },
+    else => &.{},
+};
+
 fn open() LoadError!*anyopaque {
-    const names: []const [:0]const u8 = switch (builtin.os.tag) {
-        .windows => &.{"SDL3.dll"},
-        .macos => &.{ "libSDL3.dylib", "libSDL3.0.dylib" },
-        else => &.{ "libSDL3.so.0", "libSDL3.so" },
-    };
-    for (names) |name| {
+    for (lib_names) |name| {
         // Both loaders are refcounted and hand back the same handle for the
         // same library, so calling this again from loadGl is free.
         const h = if (is_windows) LoadLibraryA(name) else dlopen(name, rtld_now);
         if (h) |handle| return handle;
+    }
+    for (extra_paths) |path| {
+        if (dlopen(path, rtld_now)) |handle| return handle;
     }
     return error.SdlNotFound;
 }

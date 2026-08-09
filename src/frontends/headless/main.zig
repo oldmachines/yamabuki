@@ -69,6 +69,18 @@ const Args = struct {
     /// the game is decompressing, clearing RAM, and handshaking with the APU,
     /// and none of that is representative of the frame budget in play.
     skip: u32 = 300,
+    /// Start from a save state written by the SDL frontend (F5) instead of from
+    /// power-on, to profile a moment the attract loop never reaches. `--movie`
+    /// answers the same question more rigorously — it replays real input from
+    /// power-on and can prove it stayed in sync — but it has to be recorded
+    /// first; a state is the one-keypress version when you just want to point
+    /// the profiler at where you already are. Refused together with `--movie`,
+    /// whose frame stream is indexed from power-on and means nothing here.
+    state: ?[]const u8 = null,
+    /// Whether `--skip` was given explicitly. With `--state` the skip default
+    /// is 0 — the state already is the moment of interest, and skipping 300
+    /// frames past it profiles the wrong five seconds.
+    skip_set: bool = false,
     json: bool = false,
     /// Dump the hottest loops and how each was classified.
     hot: bool = false,
@@ -137,13 +149,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (e == error.UsageNeedsReport) {
             try out.print("error: --usage-map is a --sa1-report modifier (coverage comes from the profiled run)\n", .{});
         } else if (e == error.MovieConflicts) {
-            try out.print("error: --movie and --buttons are both input sources; pick one\n", .{});
+            try out.print("error: --movie replays from power-on; it cannot combine with --buttons or --state\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
-            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot] [--routines]
+            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--state s]
+            \\                         [--buttons M] [--json] [--hot] [--routines]
             \\                         [--plan] [--usage-map out.bin]
             \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
             \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--whole-game] [--out p.bps] [--frames N]
@@ -174,7 +187,11 @@ pub fn main(init: std.process.Init) !void {
             \\                loop; needs the WRAM working set inside I-RAM's identity window
             \\                and refuses by name when it cannot prove the move
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
-            \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
+            \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay,
+            \\                but 0 with --state, which already is the moment of interest)
+            \\  --state s     resume from an SDL-frontend save state (F5) instead of powering on, to
+            \\                profile a busy stage the attract loop never reaches (--movie is the
+            \\                rigorous version: recorded input, replayed and verified from power-on)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
             \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
             \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
@@ -398,6 +415,37 @@ fn loadMovie(
         if (m.end_frame_hash != 0) "recorded" else "absent",
     }) catch {};
     return m;
+}
+
+/// Read a save state and restore it into `con`, which may be any console type
+/// with the `loadState` API. Exits with a diagnostic rather than returning:
+/// every failure here means the run would profile something other than what
+/// was asked for, and silently starting from power-on instead is the one
+/// outcome that produces a plausible, wrong report.
+fn restoreState(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    con: anytype,
+    path: []const u8,
+) !void {
+    const Con = @typeInfo(@TypeOf(con)).pointer.child;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(Con.state_size + 1)) catch {
+        try out.print("error: cannot read save state '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    con.loadState(data) catch |e| {
+        try out.print("error: cannot load save state '{s}': {s}\n", .{ path, @errorName(e) });
+        try out.print("{s}\n", .{switch (e) {
+            error.BadMagic => "  not a Yamabuki save state.",
+            error.UnsupportedVersion => "  written by a different build — states are not portable across core versions.",
+            error.WrongSize => "  truncated, or from a build with a different state layout.",
+            error.Corrupt => "  the state's core does not match this run (a --accurate state needs --accurate, and vice versa).",
+        }});
+        try out.flush();
+        std.process.exit(1);
+    };
 }
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
@@ -1289,6 +1337,9 @@ fn runReport(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
+    // After init (which powers on), so the state wins; the profiler itself is
+    // `serialize_skip`, so restoring cannot disturb the accounting.
+    if (args.state) |path| try restoreState(io, gpa, out, con, path);
 
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.
@@ -1306,6 +1357,7 @@ fn runReport(
     var drain: [4096]i16 = undefined;
     for (0..args.skip + want) |i| {
         feedMovie(con, mov, i);
+        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
@@ -1662,10 +1714,51 @@ fn runReport(
         }
     }
 
-    // Everything a reader could over-trust, said out loud.
+    // Everything a reader could over-trust, said out loud. What drove the run
+    // is the first thing a reader needs, because every number below is a
+    // number *about that run* — a demo loop, a chosen moment, and a recorded
+    // playthrough are three different games as far as the frame budget cares.
+    if (args.movie) |path| {
+        try out.print(
+            \\
+            \\  Replayed {s} — real recorded input, so this is gameplay rather than a demo.
+            \\
+        , .{path});
+    } else if (args.state) |path| {
+        // The attract-loop caveat is the report's biggest one, and resuming a
+        // state is precisely what lifts it — but only for whatever that state
+        // actually holds, which the reader is the one who knows.
+        try out.print(
+            \\
+            \\  Resumed from {s} — this measures that moment, not the attract loop.
+            \\
+        , .{path});
+    } else {
+        try out.print(
+            \\
+            \\  Measured from the game's own attract/demo loop.
+            \\
+        , .{});
+    }
+    // A held mask is a weaker thing than a player, and the difference is the
+    // kind a reader would otherwise assume away: it never taps (one-shot fire
+    // stays one shot), never aims, and never reacts. Saying so costs a line.
+    if (args.buttons != 0) {
+        try out.print(
+            \\  Pad 1 held at 0x{X:0>4} for every frame — a held mask does not tap, aim,
+            \\  or react, so it sustains a scene rather than playing one.
+            \\
+        , .{args.buttons});
+    } else if (args.movie == null) {
+        // Worth saying even after `--state`: resuming fixes where the run
+        // starts, not the absence of a player, and a game whose action depends
+        // on input winds down from whatever the state captured.
+        try out.print(
+            \\  No buttons were pressed.
+            \\
+        , .{});
+    }
     try out.print(
-        \\
-        \\  Measured from the game's own attract/demo loop — no buttons were pressed.
         \\  Idle is WAI plus loops that change nothing, so a wait this misses reads as
         \\  work: utilisation is an UPPER bound. A game that polls the pad in its NMI
         \\  handler never registers a dropped frame at all, so slowdown is a LOWER
@@ -2120,6 +2213,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--skip")) {
             const v = it.next() orelse return error.MissingValue;
             out.skip = try std.fmt.parseInt(u32, v, 10);
+            out.skip_set = true;
+        } else if (std.mem.eql(u8, a, "--state")) {
+            out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--ppm")) {
             out.ppm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wav")) {
@@ -2184,6 +2280,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
     if (out.movie != null and out.buttons != 0) return error.MovieConflicts;
+    // A movie's frame stream is indexed from power-on, so resuming somewhere
+    // else first would replay the wrong inputs against the wrong machine.
+    if (out.movie != null and out.state != null) return error.MovieConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
+    // Boot already happened inside the state, so the boot-skip default would
+    // just discard the first five seconds of the very thing being profiled.
+    if (out.state != null and !out.skip_set) out.skip = 0;
     return out;
 }
