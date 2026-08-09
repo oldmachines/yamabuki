@@ -118,7 +118,8 @@ pub fn main(init: std.process.Init) !void {
 
     const sdl = sdl3.load() catch |e| {
         try err.print("error: {s}\n", .{switch (e) {
-            error.SdlNotFound => "SDL3 runtime not found — install SDL3 (libSDL3.so.0)",
+            error.SdlNotFound => "SDL3 runtime not found — install SDL3 (" ++
+                sdl3.lib_names[0] ++ ")",
             error.SdlTooOld => "found an SDL library, but it is not SDL3",
         }});
         try err.flush();
