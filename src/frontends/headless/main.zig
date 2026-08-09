@@ -868,6 +868,7 @@ fn runSa1Gen(
     var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
     var n_cands: usize = 0;
     var neighbours: []const core.sa1gen.Candidate = &.{};
+    var dma_pages: profile.WramPages = @splat(0);
     if (!args.whole_game) {
         conv = profile.assessConversion(&con.prof, sum.verdict);
         plan = profile.planRelocation(&con.prof, conv);
@@ -877,6 +878,8 @@ fn runSa1Gen(
                 cands[i].pages = r.wram_pages;
                 cands[i].self_cycles = r.self_cycles;
                 cands[i].calls = r.calls;
+                cands[i].entry_d = r.entry_d;
+                cands[i].d_varies = r.d_varies;
             }
         }
         n_cands = conv.n;
@@ -895,9 +898,27 @@ fn runSa1Gen(
                 .pages = r.wram_pages,
                 .self_cycles = r.self_cycles,
                 .calls = r.calls,
+                .entry_d = r.entry_d,
+                .d_varies = r.d_varies,
             });
         }
         neighbours = nb.items;
+        // Every WRAM page a DMA/HDMA arm reads: those can never become
+        // BW-RAM-resident, since the transfer's A-bus side names a WRAM
+        // address and re-sourcing DMA is not part of this slice.
+        for (&con.prof.routines) |*r| {
+            if (r.entry == profile.Routine.empty) continue;
+            for (r.dma[0..r.n_dma]) |use| {
+                if (!use.src_wram and !use.indirect_wram) continue;
+                const base: u32 = use.src & 0x1_FFFF;
+                const span: u32 = @max(1, use.bytes_max);
+                var off: u32 = base;
+                while (off < base + span and off < 0x2_0000) : (off += 256) {
+                    const pg: u16 = @intCast(off >> 8);
+                    dma_pages[pg / 64] |= @as(u64, 1) << @intCast(pg % 64);
+                }
+            }
+        }
     }
 
     // The auto-bisect loop: convert, verify, and on a failure that an
@@ -929,7 +950,7 @@ fn runSa1Gen(
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
             core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
         else
-            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, &refusal);
+            core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
             error.Refused => {
                 try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
@@ -1281,6 +1302,12 @@ fn reportSa1(
                         "  marshal: {} bytes/call both ways, {} sibling entry point(s) folded into the\n" ++
                         "  working set, within the cost budget (marshal < half the measured compute)\n",
                     .{ res.stats.pointer_offloads, res.stats.marshal_bytes, res.stats.marshal_siblings },
+                );
+                if (res.stats.resident_offloads != 0) try out.print(
+                    "  {} of them are BW-RAM RESIDENT: their data is not marshalled at all — the\n" ++
+                        "  original body's data bank is rewritten too, so both CPUs address one copy\n" ++
+                        "  in BW-RAM (only the direct page is still copied, per call)\n",
+                    .{res.stats.resident_offloads},
                 );
             }
         } else {

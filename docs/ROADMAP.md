@@ -444,12 +444,47 @@ manual process (profile, transform, verify against the original), automated:
   `D` and the shadow data bank correct in the trace. The conversion
   still does not verify — around 1,500 WRAM bytes differ, now including
   the routine's own dp cells, so it computes a different amount of work
-  rather than none. The next suspect is named and structural: the S-CPU
+  rather than none. The suspect that named itself was structural — the S-CPU
   spins in the handshake with NMI live, so the game's NMI handler can
   write WRAM pages that the marshal-back then overwrites with the
-  shadow's older copy. That is a property of per-call marshalling, not
-  of this routine, and it is what the next rung has to address. The
-  auto-bisector keeps all of it safe to leave open — the offload is
+  shadow's older copy — and that is a property of per-call marshalling
+  rather than of any routine. So the answer is not a smaller race but
+  no copy at all: **persistent BW-RAM residency**, built.
+
+  A resident routine's data lives in BW-RAM permanently, at the same
+  16-bit offset under bank $41, which BOTH CPUs address identically.
+  Nothing is marshalled, so there is nothing to synchronise and no
+  window for an NMI to write the side that gets overwritten. The
+  mechanism is one byte: the `LDA #$7E / PHA / PLB` data-bank idiom is
+  rewritten in the ORIGINAL body as well as the SA-1's copy, so the
+  S-CPU's own calls — including the sibling entry points that were
+  never re-pointed — reach the same single copy. Only the direct page is
+  still copied per call, and it must be: the 65816's direct page is
+  always bank $00, so the S-CPU cannot see BW-RAM through it.
+
+  Residency is earned, and the tests are deliberately harsh because the
+  failure mode is silent. It is all-or-nothing (one data bank serves
+  every access the routine makes, so a half-resident routine would send
+  some writes to BW-RAM and leave the rest in WRAM); every page must be
+  private by the DYNAMIC evidence (no other profiled routine touches it,
+  no DMA arm names it — DMA's A-bus side names a WRAM address and
+  re-sourcing it is not in this slice) *and* by the STATIC evidence
+  (no executed instruction outside the routine's own span names those
+  pages through a long or low-mirror-absolute operand). The profile says
+  who touched the bytes; the coverage map says who names them; residency
+  needs both to agree. A routine whose direct page varies between calls
+  is refused outright, since no single page is "the" direct page to
+  exclude — which is why the profiler now records D at routine entry.
+
+  Unit-held end to end: a private-data routine converts, its data is
+  observed living in BW-RAM, WRAM never receives it, and the original
+  body's data bank is confirmed rewritten. On both commercial carts
+  measured so far the guards refuse — Gradius III's hot pages are shared
+  with resident code, and Super R-Type has no routine that passes the
+  offload walk at all — so residency changes nothing there, which is the
+  honest outcome rather than a disappointing one: the mechanism exists,
+  and the evidence says these two games do not qualify for it. The
+  auto-bisector keeps the whole area safe to iterate in — offloads are
   caught, named, and dropped, and the relocation patch still ships
   verified. **Whole-game
   migration** (`--gen-sa1-patch --whole-game`) — the SA-1 Root architecture,

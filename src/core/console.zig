@@ -305,6 +305,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     .target = (@as(u24, self.cpu.regs.pbr) << 16) | self.cpu.regs.pc,
                     .sp_before = sp_before,
                     .sp_after = self.cpu.regs.s,
+                    .d = self.cpu.regs.d,
                 },
             );
             // DMA/HDMA arming, blamed on the routine the store ran under.
