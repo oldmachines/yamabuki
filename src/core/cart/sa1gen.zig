@@ -133,6 +133,9 @@ pub const Stats = struct {
     /// sibling entry points whose working sets were folded in.
     marshal_bytes: u32 = 0,
     marshal_siblings: u32 = 0,
+    /// Pointer offloads whose data is BW-RAM-RESIDENT: not marshalled at
+    /// all, addressed in place by both CPUs.
+    resident_offloads: u8 = 0,
     /// Where each offload's SA-1-side body copy landed (full 24-bit
     /// address), in message-id order; 0 for leaf offloads, which run the
     /// original body in place. Lets a diagnosis point the SA-1 execution
@@ -166,6 +169,11 @@ pub const Candidate = struct {
     /// computing is a regression however correct it is.
     self_cycles: u64 = 0,
     calls: u64 = 0,
+    /// The direct page observed on entry, and whether it ever varied. A
+    /// varying dp means no single page is "the" direct page, so the
+    /// residency test cannot exclude one and residency is refused.
+    entry_d: u16 = 0,
+    d_varies: bool = false,
 };
 
 /// Convert a plain LoROM image into an SA-1 cart per `plan`. `usage` is the
@@ -186,6 +194,12 @@ pub fn convert(
     /// itself is far too cold to be a candidate. Empty is safe (the union
     /// simply finds nothing) — it is evidence, not correctness.
     neighbours: []const Candidate,
+    /// Every WRAM page a profiled DMA/HDMA arm reads or writes. Such a
+    /// page can never become BW-RAM-resident: the transfer's A-bus side
+    /// names a WRAM address, and re-sourcing DMA is not part of this
+    /// slice. Empty is safe — it only costs residency, never correctness,
+    /// because a page left non-resident is marshalled as before.
+    dma_pages: profile.WramPages,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -223,7 +237,7 @@ pub fn convert(
 
     // --- S3b: execution offload, before the shim (it decides CRV) ---------
     var crv: u16 = 0x8000 + @as(u16, @intCast(carve)) + @as(u16, @intCast(shim_len_max));
-    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, neighbours, carve, &res, &crv);
+    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, neighbours, dma_pages, carve, &res, &crv);
     // The pointer-offload shadow lives at BW-RAM linear $10000+ (bank
     // $41): the cart must carry the full 128 KiB.
     if (res.stats.pointer_offloads > 0 and out[header.offset + 0x18] < 0x07)
@@ -514,7 +528,7 @@ fn pageRuns(pages: profile.WramPages) ?Runs {
             runs.n += 1;
         }
     }
-    if (total == 0 or total > ptr_pages_cap) return null;
+    if (total > ptr_pages_cap) return null;
     return runs;
 }
 
@@ -528,6 +542,10 @@ const Chosen = struct {
     /// Sibling entry points inside this routine's span whose page sets
     /// were folded into the marshal set.
     siblings: u32 = 0,
+    /// This routine's data lives in BW-RAM permanently instead of being
+    /// marshalled: the original body's data-bank idiom is rewritten too,
+    /// so the S-CPU's own calls address the same single copy.
+    resident: bool = false,
     /// Where the SA-1's rewritten copy of a pointer routine landed (the
     /// dispatcher JSLs it; the original body is never modified).
     copy_addr: u16 = 0,
@@ -540,6 +558,7 @@ fn tryOffload(
     usage: []const u8,
     candidates: []const Candidate,
     neighbours: []const Candidate,
+    dma_pages: profile.WramPages,
     shim_carve: u32,
     res: *Result,
     crv: *u16,
@@ -598,7 +617,74 @@ fn tryOffload(
                 siblings += 1;
             }
         }
-        const runs = pageRuns(marshal_pages) orelse continue;
+        // --- persistent BW-RAM residency -------------------------------
+        // Marshalling is a copy of state that exists in two places; every
+        // copy is a chance for the two to disagree, and the window
+        // between them is exactly where an NMI can write WRAM that the
+        // copy-back then overwrites. Residency removes the copy instead
+        // of shrinking the race: the routine's data lives in BW-RAM
+        // permanently, which BOTH CPUs address identically (bank $41 at
+        // the same 16-bit offset), so there is one copy and nothing to
+        // synchronise.
+        //
+        // It is earned, not assumed. The routine must reach its data
+        // through the LDA #$7E / PHA / PLB data-bank idiom (so rewriting
+        // that one immediate re-points every access it makes, on both
+        // CPUs — the ORIGINAL body is rewritten too, which is what makes
+        // the S-CPU's own calls agree), and every page it touches must
+        // be PRIVATE to it: no other profiled routine reads or writes
+        // them, and no DMA arm names them. It is all-or-nothing, because
+        // one data bank serves every access the routine makes: a
+        // half-resident routine would send some writes to BW-RAM and
+        // leave the rest in WRAM.
+        //
+        // The direct page is never resident: the 65816's direct page is
+        // always bank $00, so the S-CPU cannot see BW-RAM through it.
+        // It stays marshalled — 256 bytes instead of kilobytes.
+        const dp_page: u16 = @intCast((c.entry_d >> 8) & 0xFF);
+        var resident = spec.n_db > 0 and !c.d_varies;
+        if (resident) {
+            var p: u16 = 0;
+            while (p < 512) : (p += 1) {
+                if (!profile.getPage(marshal_pages, p) or p == dp_page) continue;
+                if (profile.getPage(dma_pages, p)) {
+                    resident = false;
+                    break;
+                }
+                for (neighbours) |o| {
+                    // Siblings share the body and get the same rewrite,
+                    // so their traffic is this routine's traffic.
+                    if (o.entry >= c.entry and o.entry - c.entry < spec.span) continue;
+                    if (profile.getPage(o.pages, p)) {
+                        resident = false;
+                        break;
+                    }
+                }
+                if (!resident) break;
+                for (candidates) |o| {
+                    if (o.entry == c.entry) continue;
+                    if (o.entry >= c.entry and o.entry - c.entry < spec.span) continue;
+                    if (profile.getPage(o.pages, p)) {
+                        resident = false;
+                        break;
+                    }
+                }
+                if (!resident) break;
+            }
+            // The profile says who TOUCHED these pages; the coverage map
+            // says who NAMES them. Both matter: a routine the profile
+            // never separated out, or one that reads the data once from
+            // a long operand, still breaks if the bytes move. So refuse
+            // residency when any executed instruction outside this
+            // routine's own span statically names a page we would move.
+            if (resident and namedOutside(out, usage, e, spec.span, marshal_pages, dp_page))
+                resident = false;
+        }
+        // Resident pages are not copied: only the direct page is, and
+        // that one dynamically (the stub reads D at run time).
+        var static_pages = marshal_pages;
+        if (resident) static_pages = @splat(0);
+        const runs = pageRuns(static_pages) orelse Runs{};
         // Economics: the marshal must be cheaper than the compute it
         // enables. Candidates with no measured calls skip the test (the
         // synthetic unit tests, which carry no profile).
@@ -610,7 +696,7 @@ fn tryOffload(
             if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) continue;
         }
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
-        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings };
+        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings, .resident = resident };
         n += 1;
     }
     if (n == 0) return;
@@ -694,7 +780,17 @@ fn tryOffload(
                 for (c.spec.db_sites[0..c.spec.n_db]) |site| {
                     std.debug.assert(out[copy_file + (site - entry_file)] == 0x7E);
                     out[copy_file + (site - entry_file)] = shadow_bank;
+                    // Residency: the ORIGINAL body's data bank moves too,
+                    // so the S-CPU's own calls — including the sibling
+                    // entry points that were never re-pointed — address
+                    // the one BW-RAM copy rather than a stale WRAM one.
+                    // This is the whole difference between residency and
+                    // marshalling: one copy, no synchronisation, no
+                    // window for an NMI to write the side we then
+                    // overwrite.
+                    if (c.resident) out[site] = shadow_bank;
                 }
+                if (c.resident) res.stats.resident_offloads += 1;
                 c.copy_bank = @intCast(copy_file / 0x8000);
                 c.copy_addr = @intCast(0x8000 + (copy_file % 0x8000));
                 res.stats.offload_copy[i] = @as(u24, c.copy_bank) << 16 | c.copy_addr;
@@ -791,6 +887,57 @@ fn bwramLive(plan: *const profile.Plan, res: *const Result) u32 {
         live = @max(live, r.dest_off + r.len);
     }
     return live;
+}
+
+/// Does any executed instruction OUTSIDE [entry, entry+span) statically
+/// name a byte of `pages` (excluding the direct page, which never becomes
+/// resident)? Long and low-mirror-absolute operands are the forms that
+/// name WRAM without depending on a runtime register, so they are exactly
+/// the references that would break if the bytes moved to BW-RAM.
+fn namedOutside(
+    out: []const u8,
+    usage: []const u8,
+    entry: u16,
+    span: u32,
+    pages: profile.WramPages,
+    dp_page: u16,
+) bool {
+    var bank: u32 = 0;
+    while (bank < 0x40) : (bank += 1) {
+        const bank_file = bank * 0x8000;
+        if (bank_file >= out.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu_addr = (bank << 16) | a16;
+            const fl = usage[cpu_addr] | usage[0x80_0000 | cpu_addr];
+            if (fl & usage_map.flag_opcode == 0) continue;
+            // Inside the routine's own body: its accesses are the ones
+            // the data-bank rewrite re-points.
+            if (bank == 0 and a16 >= entry and a16 - entry < span) continue;
+            const file = bank_file + (a16 - 0x8000);
+            if (file + 4 > out.len) continue;
+            const op = out[file];
+            const wram_off: u32 = switch (usage_map.mode(op)) {
+                .abs, .abs_x, .abs_y => blk: {
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (v >= 0x2000) continue;
+                    break :blk v;
+                },
+                .long, .long_x => blk: {
+                    const b = out[file + 3];
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (b == 0x7E) break :blk v;
+                    if (b == 0x7F) break :blk 0x10000 + @as(u32, v);
+                    if ((b & 0x7F) <= 0x3F and v < 0x2000) break :blk v;
+                    continue;
+                },
+                else => continue,
+            };
+            const pg: u16 = @intCast(wram_off >> 8);
+            if (pg != dp_page and profile.getPage(pages, pg)) return true;
+        }
+    }
+    return false;
 }
 
 /// Re-base intra-span JMP abs targets in a pointer routine's copy. All
@@ -1682,7 +1829,7 @@ test "shell: header, shim, park, and vector all land; refusals name reasons" {
 
     var ref: ?Refusal = null;
     const empty: profile.Plan = .{};
-    const res = try convert(gpa, rom, &empty, null, &.{}, &.{}, &ref);
+    const res = try convert(gpa, rom, &empty, null, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
 
     const h = try header_mod.detect(res.image);
@@ -1699,7 +1846,7 @@ test "shell: header, shim, park, and vector all land; refusals name reasons" {
 
     // Refusals: SRAM carts and non-LoROM.
     rom[0x7FC0 + 0x18] = 3;
-    try testing.expectError(error.Refused, convert(gpa, rom, &empty, null, &.{}, &.{}, &ref));
+    try testing.expectError(error.Refused, convert(gpa, rom, &empty, null, &.{}, &.{}, @splat(0), &ref));
     try testing.expectEqual(Reason.has_sram, ref.?.reason);
 }
 
@@ -1750,7 +1897,7 @@ test "rewriter: long and low-abs sites move; indexed sites block their region" {
     // Clean move to I-RAM offset $80.
     var plan = onePlan(0x1F00, 0x40, .iram, 0x80, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.clean, res.fate[0]);
     try testing.expectEqual(@as(u32, 1), res.stats.rewritten_long);
@@ -1766,7 +1913,7 @@ test "rewriter: long and low-abs sites move; indexed sites block their region" {
     // is rewritten, and the shell still converts.
     @memcpy(rom[0x010A..0x010D], &[_]u8{ 0xBD, 0x10, 0x1F }); // LDA $1F10,X
     markOp(usage, 0x00_810A);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res2.image);
     try testing.expectEqual(RegionFate.blocked_indexed, res2.fate[0]);
     try testing.expectEqual(@as(u32, 0), res2.stats.rewritten_long);
@@ -1790,7 +1937,7 @@ test "rewriter: the dp window moves as a unit with D=$3000, or not at all" {
 
     var plan = onePlan(0x40, 0x10, .iram, 0x40, true);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.d_moved);
     try testing.expectEqual(@as(u32, 1), res.stats.dp_sites);
@@ -1803,7 +1950,7 @@ test "rewriter: the dp window moves as a unit with D=$3000, or not at all" {
     // A dp,X site into the window blocks the whole window: D stays 0.
     @memcpy(rom[0x0106..0x0108], &[_]u8{ 0xB5, 0x40 }); // LDA $40,X
     markOp(usage, 0x00_8106);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res2.image);
     try testing.expect(!res2.stats.d_moved);
     try testing.expectEqual(RegionFate.blocked_indexed, res2.fate[0]);
@@ -1826,7 +1973,7 @@ test "rewriter: an abs site whose region went to BW-RAM blocks it" {
 
     var plan = onePlan(0x1F00, 0x40, .bwram, 0x200, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.blocked_abs_to_bwram, res.fate[0]);
     try testing.expectEqual(@as(u32, 0), res.stats.rewritten_long);
@@ -1834,7 +1981,7 @@ test "rewriter: an abs site whose region went to BW-RAM blocks it" {
     // Long-only access to a BW-RAM region rewrites to $40:xxxx.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA }); // drop the abs site
     markOp(usage, 0x00_8100);
-    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res2 = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res2.image);
     try testing.expectEqual(RegionFate.clean, res2.fate[0]);
     try testing.expectEqualSlices(u8, &.{ 0xAF, 0x21, 0x02, 0x40 }, res2.image[0x0103..0x0107]);
@@ -1872,7 +2019,7 @@ test "semantic: a converted cart boots, parks the SA-1, and relocated state land
     // The conversion relocates $7E:1F00 to I-RAM offset $40.
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(RegionFate.clean, res.fate[0]);
 
@@ -1924,7 +2071,7 @@ test "S3b: an offloaded leaf routine runs on the SA-1 and its results marshal ba
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8020 }}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8020 }}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u24, 0x8020), res.stats.offloaded);
     try testing.expectEqual(@as(u32, 1), res.stats.offload_sites);
@@ -1988,7 +2135,7 @@ test "S3b: two routines offload to distinct message ids and both round-trip" {
 
     var plan = onePlan(0x1F00, 0x10, .iram, 0x40, false);
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{ .{ .entry = 0x00_8020 }, .{ .entry = 0x00_8030 } }, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{ .{ .entry = 0x00_8020 }, .{ .entry = 0x00_8030 } }, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 2), res.stats.offload_count);
     try testing.expectEqual(@as(u32, 2), res.stats.offload_sites);
@@ -2069,7 +2216,7 @@ test "S3b pointer offload: a JSL/RTL pointer routine runs on the SA-1 against th
     pages[0] |= 1 << 0;
     pages[0] |= 1 << 0x1F;
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
     try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
@@ -2098,6 +2245,94 @@ test "S3b pointer offload: a JSL/RTL pointer routine runs on the SA-1 against th
     try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.sa1.bwram[0x11F00..0x11F04]);
     try testing.expectEqual(@as(u8, 0xEF), con.bus.sa1.iram[0x780]);
     try testing.expectEqual(@as(u8, 0x04), con.bus.sa1.iram[0x784]);
+}
+
+test "residency: private data lives in BW-RAM, is never marshalled, and both CPUs share it" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0xE000..0x10000], 0xFF);
+
+    // Same shape as the marshalling test, with ONE difference that
+    // decides residency: nothing outside the routine names the buffer.
+    // The caller sets the pointers, calls, and publishes the routine's
+    // returned A — it never reads $7E:1Fxx itself, so those pages are
+    // private and can move to BW-RAM for good.
+    @memcpy(rom[0x0000..0x0024], &[_]u8{
+        0x18, 0xFB,
+        0xE2, 0x30,
+        0x64, 0x00,
+        0xA9, 0x90,
+        0x85, 0x01,
+        0x64, 0x02,
+        0x64, 0x03,
+        0xA9, 0x1F,
+        0x85, 0x04,
+        0xA9, 0x7E,
+        0x85, 0x05,
+        0x22, 0x40, 0x80, 0x00, // JSL $00:8040
+        0xEA, 0xEA, 0xEA, 0xEA, // (no read of the buffer)
+        0x8F, 0x00, 0x01, 0x7E, // STA $7E:0100 — page $01, not the buffer
+        0x80, 0xFE,
+    });
+    @memcpy(rom[0x0040..0x0052], &[_]u8{
+        0x8B,
+        0xA9,
+        0x7E,
+        0x48,
+        0xAB,
+        0xA0,
+        0x00,
+        0xB7,
+        0x00,
+        0x91,
+        0x03,
+        0xC8,
+        0xC0,
+        0x04,
+        0xD0,
+        0xF7,
+        0xAB,
+        0x6B,
+    });
+    @memcpy(rom[0x1000..0x1004], &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8008, 0x800A, 0x800C, 0x800E, 0x8010, 0x8012, 0x8014, 0x8016, 0x801A, 0x801B, 0x801C, 0x801D, 0x801E, 0x8022 }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8043, 0x8044, 0x8045, 0x8047, 0x8049, 0x804B, 0x804C, 0x804E, 0x8050, 0x8051 }) |a| markOp(usage, a);
+
+    var plan = onePlan(0x0F00, 0x10, .iram, 0x80, false);
+    var pages: profile.WramPages = @splat(0);
+    pages[0] |= 1 << 0; // dp page (stays marshalled — dp is always bank $00)
+    pages[0] |= 1 << 0x1F; // the buffer: private, so it becomes resident
+    var ref: ?Refusal = null;
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, @splat(0), &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
+    try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
+    // Residency rewrote the ORIGINAL body's data bank, not just the copy:
+    // that is what makes the S-CPU's own calls address the same bytes.
+    try testing.expectEqual(shadow_bank, res.image[0x0042]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+    // One copy, in BW-RAM. WRAM never receives it — there is no marshal
+    // to bring it back, and nothing left that would read it there.
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.sa1.bwram[0x11F00..0x11F04]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, con.bus.wram.data[0x1F00..0x1F04]);
+    // The routine still ran and returned: its last loaded byte reached
+    // the caller through the register marshal.
+    try testing.expectEqual(@as(u8, 0xEF), con.bus.wram.data[0x0100]);
 }
 
 test "sa1 trace: the SA-1's path through an offloaded body is observable" {
@@ -2166,7 +2401,7 @@ test "sa1 trace: the SA-1's path through an offloaded body is observable" {
     pages[0] |= 1 << 0;
     pages[0] |= 1 << 0x1F;
     var ref: ?Refusal = null;
-    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, &ref);
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, @splat(0), &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
 

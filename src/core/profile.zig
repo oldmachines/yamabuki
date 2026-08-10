@@ -445,6 +445,10 @@ pub const Event = struct {
     sp_before: u16 = 0,
     /// S after the instruction: what a return resyncs the stack against.
     sp_after: u16 = 0,
+    /// D as the callee sees it. A call does not change the direct page, so
+    /// this is the caller's D — the page the callee's dp operands resolve
+    /// against, which an SA-1 offload has to reproduce.
+    d: u16 = 0,
 };
 
 /// One routine, keyed by entry address.
@@ -479,6 +483,10 @@ pub const Routine = struct {
     wram_overflow: bool,
     /// Distinct MMIO registers touched — a list, not just a count, because
     /// *which* registers are the blocker the report needs to name.
+    /// Direct page observed on entry, and whether it was ever different.
+    entry_d: u16,
+    d_seen: bool,
+    d_varies: bool,
     mmio_regs: [mmio_reg_cap]u16,
     n_mmio_regs: u8,
     mmio_overflow: bool,
@@ -729,6 +737,9 @@ pub const Profiler = struct {
             .wram_addrs = @splat(0),
             .n_wram_addrs = 0,
             .wram_overflow = false,
+            .entry_d = 0,
+            .d_seen = false,
+            .d_varies = false,
             .mmio_regs = @splat(0),
             .n_mmio_regs = 0,
             .mmio_overflow = false,
@@ -965,9 +976,9 @@ pub const Profiler = struct {
     fn applyEvent(self: *Profiler, ev: Event) void {
         switch (ev.kind) {
             .none => {},
-            .call => self.pushFrame(ev.target, ev.sp_before),
+            .call => self.pushFrame(ev.target, ev.sp_before, ev.d),
             .nmi, .irq => {
-                self.pushFrame(ev.target, ev.sp_before);
+                self.pushFrame(ev.target, ev.sp_before, ev.d);
                 // Tag the handler. First insert wins; a routine both called
                 // and interrupted into keeps whichever it was seen as first.
                 if (self.depth > 0) {
@@ -989,7 +1000,7 @@ pub const Profiler = struct {
         }
     }
 
-    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16) void {
+    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16) void {
         if (self.depth == call_stack_max) {
             // Deeper than the model follows — recursion, or a game using the
             // stack in ways no model survives. Start over and count it rather
@@ -998,6 +1009,15 @@ pub const Profiler = struct {
             self.stack_resets += 1;
         }
         const slot = self.routineSlot(entry) orelse return;
+        {
+            // First-seen direct page, and whether it ever differed: an
+            // offload can only reproduce a dp the routine actually uses.
+            const r = &self.routines[slot];
+            if (r.calls == 0 and !r.d_seen) {
+                r.entry_d = d;
+                r.d_seen = true;
+            } else if (r.entry_d != d) r.d_varies = true;
+        }
         const r = &self.routines[slot];
         r.calls += 1;
         r.on_stack += 1;
