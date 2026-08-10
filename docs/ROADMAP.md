@@ -510,6 +510,34 @@ manual process (profile, transform, verify against the original), automated:
   its reason, and a game the generator cannot convert honestly is a game it
   hands to a human with the map already drawn.
 
+### Two signals the third commercial game forced
+
+Measuring a third cart (a polygon racer) exposed a hole in the verdict
+model and a blind spot in every conversion failure so far.
+
+**CPU-SATURATED.** The verdict was driven entirely by *missed deadlines*,
+which silently assumes a game is trying to hit 60 Hz. A software
+rasteriser is not: it renders one picture over several frames on its own
+schedule, so it cannot drop a frame it never promised. The racer's median
+frame is 100% busy with 0.1% slowdown — the most CPU-starved game
+measured, and the model gave it the weakest reading in the library
+(`DROPS FRAMES`). `CPU-SATURATED` names that case (median essentially
+full, mean high, deadlines rarely missed) and counts it as a conversion
+candidate, because a faster CPU there raises the frame rate rather than
+removing slowdown. The three carts now separate cleanly: SATURATED,
+CPU-BOUND, DROPS FRAMES.
+
+**Coverage growth.** Every conversion failure across three games traced
+back to the same root — code the profile never executed — and the tool
+could only ever say so as a standing caveat. It is now a number: the
+generator counts instructions first seen in the LAST TENTH of the
+capture, and reports whether the profile had settled. Its limit is worth
+stating plainly, because it is easy to over-read: it measures the *rate
+of discovery when the capture ended*, not how much of the game was seen.
+A short capture parked in an attract loop also reads "settled" — it
+answers "did this run stop finding new code?", not "did it see the
+game?". The second question is what `--movie` is for.
+
 ### The candidacy analyser — `--sa1-report`
 
 The headline feature: a tool you trigger *from the emulator*, while the game

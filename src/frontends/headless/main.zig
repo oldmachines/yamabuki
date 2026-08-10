@@ -781,11 +781,18 @@ fn runSa1Gen(
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
     var base_audio = core.console.audio_hash_init;
+    // Coverage growth: how much code the profile was STILL discovering in
+    // the last tenth of the capture. Every conversion failure measured so
+    // far traces back to code the rewriter never saw, so this turns "the
+    // capture might be too short" from a caveat into a number.
+    var cov_early: u32 = 0;
+    const cov_mark: usize = total - total / 10;
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
     for (0..total) |i| {
+        if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
         feedMovie(con, mov, i);
         con.runFrame();
         try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
@@ -796,6 +803,8 @@ fn runSa1Gen(
     }
     const scratch = try gpa.alloc(f64, samples.items.len);
     const sum = profile.summarise(samples.items, scratch);
+    const cov_total = core.usage_map.countOpcodes(ub);
+    const cov_late = cov_total - cov_early;
 
     // The verdict, plan, and candidate set are fixed by the baseline; only
     // the candidate FILTER changes across bisect attempts.
@@ -930,7 +939,7 @@ fn runSa1Gen(
 
         if (passed) |tier| {
             // Success: write the patch and the report.
-            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped]);
+            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
             return;
         }
 
@@ -940,12 +949,15 @@ fn runSa1Gen(
             if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
             try out.print(".\n  No patch written.\n", .{});
             if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv, fail_frame, total);
-            if (equiv == .divergent) try out.print(
-                \\  Either uncovered code touches moved state, or the game animates through
-                \\  lag (an NMI-side frame counter), which this gate cannot tell apart from
-                \\  breakage.
-                \\
-            , .{});
+            if (equiv == .divergent) {
+                try out.print(
+                    \\  Either uncovered code touches moved state, or the game animates through
+                    \\  lag (an NMI-side frame counter), which this gate cannot tell apart from
+                    \\  breakage.
+                    \\
+                , .{});
+                try printCoverage(out, cov_total, cov_late, total);
+            }
             try out.flush();
             std.process.exit(1);
         }
@@ -1161,6 +1173,8 @@ fn reportSa1(
     conv_sum: profile.Summary,
     dropped: []const u24,
     dropped_why: []const []const u8,
+    cov_total: u32,
+    cov_late: u32,
 ) !void {
     const bps = try core.patch.writeBps(gpa, image, res.image);
     const stem = args.rom[0 .. std.mem.lastIndexOfScalar(u8, args.rom, '.') orelse args.rom.len];
@@ -1249,8 +1263,35 @@ fn reportSa1(
         \\  or more varied capture widens coverage.
         \\
     , .{});
+    try printCoverage(out, cov_total, cov_late, total);
     try out.flush();
 }
+
+/// Report the capture's coverage and, more usefully, whether it had
+/// stopped growing. New instructions still appearing in the last tenth of
+/// a run mean the profile had not settled — so whatever the rewriter did,
+/// it did on partial evidence.
+fn printCoverage(out: *std.Io.Writer, total_ops: u32, late_ops: u32, frames: u32) !void {
+    const late_pct = @as(f64, @floatFromInt(late_ops)) * 100 /
+        @as(f64, @floatFromInt(@max(1, total_ops)));
+    try out.print("  coverage: {} instruction(s) seen executing; {} of them ({d:.1}%) first\n" ++
+        "  appeared in the last tenth of {} frames", .{ total_ops, late_ops, late_pct, frames });
+    // A handful of stragglers is normal — a rare branch, a one-off path.
+    // The signal worth acting on is a capture that was still finding code
+    // at a real rate when it ended, because then whatever the rewriter
+    // did, it did on evidence that had not settled.
+    if (late_pct >= coverage_unsettled_pct) {
+        try out.print(" — the profile had NOT settled, so\n" ++
+            "  this rests on partial evidence. Extend --frames, or drive a real playthrough\n" ++
+            "  with --movie.\n", .{});
+    } else {
+        try out.print(": effectively settled.\n", .{});
+    }
+}
+
+/// Late-discovery share above which a capture counts as unsettled. Below
+/// it, the stragglers are rare branches rather than unexplored game.
+const coverage_unsettled_pct: f64 = 1.0;
 
 /// `--sa1-report`: run the game with the frame-budget profiler and report
 /// whether it is CPU-bound.
@@ -1493,6 +1534,14 @@ fn runReport(
             \\    Worth finding out where before drawing any conclusion.
             \\
         , .{sum.slowRatio() * 100}),
+        .saturated => try out.print(
+            \\    Its MEDIAN frame is {d:.0}% busy, yet it loses only {d:.1}% of its frames to
+            \\    slowdown: this game is not trying to hit 60. It renders on its own slower
+            \\    schedule, so it cannot miss a deadline it never set — which is why a
+            \\    dropped-frame count understates it. A faster CPU would not remove
+            \\    slowdown here; it would raise the frame rate.
+            \\
+        , .{ sum.median_util * 100, sum.slowRatio() * 100 }),
         .cpu_bound => try out.print(
             \\    Loses {d:.1}% of its frames to slowdown, spread through the capture rather
             \\    than bunched into loads. This is a game genuinely short of CPU, and the
