@@ -987,51 +987,6 @@ test "versioned save state roundtrips and rejects bad headers" {
     try std.testing.expectError(error.Corrupt, b.loadState(buf));
 }
 
-test "a played state loads into the profiling core" {
-    // What `--sa1-report --state` rests on: the profiler is a *different*
-    // comptime instantiation, so a state written by the shipped core is only
-    // loadable into it because `prof` is `serialize_skip` — and skipped fields
-    // are excluded from the layout fingerprint as well as the byte count. If
-    // either ever stopped being true, profiling a save state would break, and
-    // the header check would (correctly) refuse the state rather than misread
-    // it. Assert both the sizes and a real restore.
-    try std.testing.expectEqual(FastConsole.state_size, ProfilingConsole.state_size);
-
-    const alloc = std.testing.allocator;
-    const rom = try buildNmiRom(alloc);
-    defer alloc.free(rom);
-    const a = try alloc.create(FastConsole);
-    defer {
-        a.cart.deinit(alloc);
-        alloc.destroy(a);
-    }
-    a.init(try Cartridge.load(alloc, rom));
-    for (0..3) |_| a.runFrame();
-
-    const buf = try alloc.alloc(u8, FastConsole.state_size);
-    defer alloc.free(buf);
-    _ = a.saveState(buf);
-
-    const rom_b = try buildNmiRom(alloc);
-    defer alloc.free(rom_b);
-    const p = try alloc.create(ProfilingConsole);
-    defer {
-        p.cart.deinit(alloc);
-        alloc.destroy(p);
-    }
-    p.init(try Cartridge.load(alloc, rom_b));
-    try p.loadState(buf);
-
-    // Resumed, the profiling core steps the same machine as the one that saved
-    // it — the whole premise of profiling a state rather than a boot.
-    a.runFrame();
-    p.runFrame();
-    try std.testing.expectEqual(hashFrame(a.framebuffer()), hashFrame(p.framebuffer()));
-    try std.testing.expectEqual(a.frame, p.frame);
-    // And the profiler is live on the resumed machine, not carried over.
-    try std.testing.expect(p.takeProfile() != null);
-}
-
 test "V-IRQ timer fires once per frame on its scanline and TIMEUP acks it" {
     const alloc = std.testing.allocator;
     const rom = try alloc.alloc(u8, 0x8000);

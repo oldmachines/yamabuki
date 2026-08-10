@@ -69,18 +69,6 @@ const Args = struct {
     /// the game is decompressing, clearing RAM, and handshaking with the APU,
     /// and none of that is representative of the frame budget in play.
     skip: u32 = 300,
-    /// Start from a save state written by the SDL frontend (F5) instead of from
-    /// power-on, to profile a moment the attract loop never reaches. `--movie`
-    /// answers the same question more rigorously — it replays real input from
-    /// power-on and can prove it stayed in sync — but it has to be recorded
-    /// first; a state is the one-keypress version when you just want to point
-    /// the profiler at where you already are. Refused together with `--movie`,
-    /// whose frame stream is indexed from power-on and means nothing here.
-    state: ?[]const u8 = null,
-    /// Whether `--skip` was given explicitly. With `--state` the skip default
-    /// is 0 — the state already is the moment of interest, and skipping 300
-    /// frames past it profiles the wrong five seconds.
-    skip_set: bool = false,
     json: bool = false,
     /// Dump the hottest loops and how each was classified.
     hot: bool = false,
@@ -98,10 +86,6 @@ const Args = struct {
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
-    /// Pad-1 buttons held for the whole run (core.joypad.Button bits, e.g.
-    /// 0x1000 = Start). A title screen that waits for input renders the same
-    /// frame forever otherwise, so this is what gets a game past it.
-    buttons: u16 = 0,
     /// A recorded playthrough (.ymv) driving both pads from power-on. In a
     /// normal run it replays and verifies the movie's end hashes; in the
     /// generator/report modes it drives the profiled runs, so coverage and
@@ -148,17 +132,14 @@ pub fn main(init: std.process.Init) !void {
                 "       with --patch/--auto-patch/--save-patched/--auto-fastrom/--accurate/--wide/--sa1-report\n", .{});
         } else if (e == error.UsageNeedsReport) {
             try out.print("error: --usage-map is a --sa1-report modifier (coverage comes from the profiled run)\n", .{});
-        } else if (e == error.MovieConflicts) {
-            try out.print("error: --movie replays from power-on; it cannot combine with --buttons or --state\n", .{});
         }
         try out.print(
             \\usage: yamabuki-headless <rom.sfc> [--frames N] [--ppm out.ppm] [--wav out.wav] [--accurate]
             \\                         [--region ntsc|pal|auto] [--patch p.bps|p.ips] [--auto-patch]
             \\                         [--patch-dir DIR] [--save-patched out.sfc] [--wide N]
-            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--state s]
-            \\                         [--buttons M] [--json] [--hot] [--routines]
-            \\                         [--plan] [--usage-map out.bin]
-            \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N] [--buttons M]
+            \\       yamabuki-headless <rom.sfc> --sa1-report [--frames N] [--skip N] [--json] [--hot]
+            \\                         [--routines] [--plan] [--usage-map out.bin]
+            \\       yamabuki-headless <rom.sfc> --gen-fastrom-patch [--out p.bps] [--frames N]
             \\       yamabuki-headless <rom.sfc> --gen-sa1-patch [--whole-game] [--out p.bps] [--frames N]
             \\
             \\  --region r    ntsc|pal|auto (default auto: detect from the cart header)
@@ -167,7 +148,6 @@ pub fn main(init: std.process.Init) !void {
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
-            \\  --buttons M   pad-1 buttons held all run, as a hex mask (0x1000 = Start)
             \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
             \\                from power-on, verifying its end hashes; with --sa1-report or a
             \\                --gen-* mode the movie drives the profiled runs instead, so
@@ -187,11 +167,7 @@ pub fn main(init: std.process.Init) !void {
             \\                loop; needs the WRAM working set inside I-RAM's identity window
             \\                and refuses by name when it cannot prove the move
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
-            \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay,
-            \\                but 0 with --state, which already is the moment of interest)
-            \\  --state s     resume from an SDL-frontend save state (F5) instead of powering on, to
-            \\                profile a busy stage the attract loop never reaches (--movie is the
-            \\                rigorous version: recorded input, replayed and verified from power-on)
+            \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
             \\  --routines    which routines cost the frame (self/inclusive cycles per call site), and
             \\                each one's WRAM working set, MMIO blockers, and page-sharing with the rest
@@ -290,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
             const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
             con.setButtons(0, f[0]);
             con.setButtons(1, f[1]);
-        } else if (args.buttons != 0) con.setButtons(0, args.buttons);
+        }
         con.runFrame();
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
@@ -415,37 +391,6 @@ fn loadMovie(
         if (m.end_frame_hash != 0) "recorded" else "absent",
     }) catch {};
     return m;
-}
-
-/// Read a save state and restore it into `con`, which may be any console type
-/// with the `loadState` API. Exits with a diagnostic rather than returning:
-/// every failure here means the run would profile something other than what
-/// was asked for, and silently starting from power-on instead is the one
-/// outcome that produces a plausible, wrong report.
-fn restoreState(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    out: *std.Io.Writer,
-    con: anytype,
-    path: []const u8,
-) !void {
-    const Con = @typeInfo(@TypeOf(con)).pointer.child;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(Con.state_size + 1)) catch {
-        try out.print("error: cannot read save state '{s}'\n", .{path});
-        try out.flush();
-        std.process.exit(1);
-    };
-    con.loadState(data) catch |e| {
-        try out.print("error: cannot load save state '{s}': {s}\n", .{ path, @errorName(e) });
-        try out.print("{s}\n", .{switch (e) {
-            error.BadMagic => "  not a Yamabuki save state.",
-            error.UnsupportedVersion => "  written by a different build — states are not portable across core versions.",
-            error.WrongSize => "  truncated, or from a build with a different state layout.",
-            error.Corrupt => "  the state's core does not match this run (a --accurate state needs --accurate, and vice versa).",
-        }});
-        try out.flush();
-        std.process.exit(1);
-    };
 }
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
@@ -687,13 +632,6 @@ test "auto-patch decides all four flows" {
     );
 }
 
-/// `--sa1-report`: run the game with the frame-budget profiler and report
-/// whether it is CPU-bound.
-///
-/// Nothing presses any buttons, so what gets profiled is whatever the game does
-/// on its own — the attract/demo loop for most carts, a title screen for the
-/// rest. That is a real limitation and the report says so, because a title
-/// screen idling at 8% utilisation is not evidence of anything.
 /// The default output path for a generated patch: `<rom>.bps` next to the
 /// ROM file — the softpatch naming every frontend discovers by basename.
 fn defaultBpsPath(gpa: std.mem.Allocator, rom_path: []const u8) ![]const u8 {
@@ -724,7 +662,7 @@ fn runGenerate(
     try out.flush();
 
     var failure: ?util.GenFailure = null;
-    const res = util.generateFastromVerified(gpa, image, frames, args.skip, args.buttons, if (mov) |m| m.frames else null, &failure) catch |e| switch (e) {
+    const res = util.generateFastromVerified(gpa, image, frames, args.skip, if (mov) |m| m.frames else null, &failure) catch |e| switch (e) {
         error.GenFailed => {
             switch (failure.?) {
                 .refused => |r| {
@@ -789,8 +727,8 @@ fn runGenerate(
         res.base.slow_frames,     res.fast.slow_frames,
     });
     try out.print(
-        \\  caveat: verified from power-on for {} frames with buttons ${x:0>4} held; code
-        \\  paths beyond that window (menus, later levels) ran at FastROM timing untested.
+        \\  caveat: verified from power-on for {} frames; code paths beyond that window
+        \\  (menus, later levels) ran at FastROM timing untested — pass --movie to widen it.
         \\
         \\ready to paste into patches/registry.zon for --auto-patch:
         \\    .{{
@@ -803,10 +741,9 @@ fn runGenerate(
         \\    }},
         \\
     , .{
-        total,     args.buttons,
-        &src_sha,  title,
-        base_name, &patch_sha,
-        total,
+        total,      &src_sha,
+        title,      base_name,
+        &patch_sha, total,
     });
     try out.flush();
 }
@@ -850,7 +787,6 @@ fn runSa1Gen(
     con.usage = &umap;
     for (0..total) |i| {
         feedMovie(con, mov, i);
-        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
         hashes[i] = core.console.hashFrame(con.framebuffer());
@@ -949,7 +885,6 @@ fn runSa1Gen(
             con2.init(cart2);
             for (0..total) |i| {
                 feedMovie(con2, mov, i);
-                if (mov == null and args.buttons != 0) con2.setButtons(0, args.buttons);
                 con2.runFrame();
                 try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
                 conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
@@ -1016,7 +951,7 @@ fn runSa1Gen(
         }
 
         // Diagnose and drop a culprit, then go around again.
-        const culprit = try diagnoseCulprit(gpa, out, args, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
+        const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
         dropped[n_dropped] = culprit;
         dropped_why[n_dropped] = fail_why;
         n_dropped += 1;
@@ -1046,7 +981,6 @@ fn firstDiff(a: []const u64, b: []const u64) u32 {
 fn diagnoseCulprit(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    args: Args,
     base_image: []const u8,
     res: core.sa1gen.Result,
     cands: []const core.sa1gen.Candidate,
@@ -1063,8 +997,8 @@ fn diagnoseCulprit(
     var culprit: u24 = entries[n_off - 1];
     if (equiv == .divergent) {
         // Replay both sides to the divergence and diff WRAM.
-        const wram_a = try replayWram(gpa, base_image, fail_frame + 1, args, mov);
-        const wram_b = try replayWram(gpa, res.image, fail_frame + 1, args, mov);
+        const wram_a = try replayWram(gpa, base_image, fail_frame + 1, mov);
+        const wram_b = try replayWram(gpa, res.image, fail_frame + 1, mov);
         var n_shown: u32 = 0;
         var attributed: ?u24 = null;
         for (wram_a, wram_b, 0..) |x, y, off| {
@@ -1104,7 +1038,7 @@ fn diagnoseCulprit(
         const copy = res.stats.offload_copy[i];
         if (copy == 0) continue; // leaf offload: no copy to watch
         const span = res.stats.offload_copy_len[i];
-        const trace = try replayTrace(gpa, res.image, fail_frame + 1, args, mov, copy);
+        const trace = try replayTrace(gpa, res.image, fail_frame + 1, mov, copy);
         defer gpa.destroy(trace);
         try out.print(
             "  sa1 trace of $00:{x:0>4}'s body copy at ${x:0>2}:{x:0>4} ({} bytes): {} instruction(s)\n" ++
@@ -1156,7 +1090,6 @@ fn replayTrace(
     gpa: std.mem.Allocator,
     image: []const u8,
     n: u32,
-    args: Args,
     mov: ?util.movie.Movie,
     lo: u24,
 ) !*core.sa1_trace.Trace {
@@ -1173,14 +1106,13 @@ fn replayTrace(
     con.bus.sa1.trace = trace;
     for (0..n) |i| {
         feedMovie(con, mov, i);
-        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
     }
     return trace;
 }
 
 /// Replay an image for `n` frames and return its WRAM (caller-owned copy).
-fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, args: Args, mov: ?util.movie.Movie) ![]u8 {
+fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, mov: ?util.movie.Movie) ![]u8 {
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.FastConsole);
     defer {
@@ -1190,7 +1122,6 @@ fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, args: Args, mov
     con.init(cart);
     for (0..n) |i| {
         feedMovie(con, mov, i);
-        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
     }
     return gpa.dupe(u8, &con.bus.wram.data);
@@ -1321,6 +1252,15 @@ fn reportSa1(
     try out.flush();
 }
 
+/// `--sa1-report`: run the game with the frame-budget profiler and report
+/// whether it is CPU-bound.
+///
+/// Without `--movie` nothing presses any buttons, so what gets profiled is
+/// whatever the game does on its own — the attract/demo loop for most carts, a
+/// title screen for the rest. That is a real limitation and the report says so,
+/// because a title screen idling at 8% utilisation is not evidence of anything.
+/// A recorded playthrough is the way out: it replays real input from power-on
+/// and verifies it stayed in sync, so the profile describes gameplay.
 fn runReport(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -1337,9 +1277,6 @@ fn runReport(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
-    // After init (which powers on), so the state wins; the profiler itself is
-    // `serialize_skip`, so restoring cannot disturb the accounting.
-    if (args.state) |path| try restoreState(io, gpa, out, con, path);
 
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.
@@ -1357,7 +1294,6 @@ fn runReport(
     var drain: [4096]i16 = undefined;
     for (0..args.skip + want) |i| {
         feedMovie(con, mov, i);
-        if (mov == null and args.buttons != 0) con.setButtons(0, args.buttons);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
@@ -1724,37 +1660,10 @@ fn runReport(
             \\  Replayed {s} — real recorded input, so this is gameplay rather than a demo.
             \\
         , .{path});
-    } else if (args.state) |path| {
-        // The attract-loop caveat is the report's biggest one, and resuming a
-        // state is precisely what lifts it — but only for whatever that state
-        // actually holds, which the reader is the one who knows.
-        try out.print(
-            \\
-            \\  Resumed from {s} — this measures that moment, not the attract loop.
-            \\
-        , .{path});
     } else {
         try out.print(
             \\
-            \\  Measured from the game's own attract/demo loop.
-            \\
-        , .{});
-    }
-    // A held mask is a weaker thing than a player, and the difference is the
-    // kind a reader would otherwise assume away: it never taps (one-shot fire
-    // stays one shot), never aims, and never reacts. Saying so costs a line.
-    if (args.buttons != 0) {
-        try out.print(
-            \\  Pad 1 held at 0x{X:0>4} for every frame — a held mask does not tap, aim,
-            \\  or react, so it sustains a scene rather than playing one.
-            \\
-        , .{args.buttons});
-    } else if (args.movie == null) {
-        // Worth saying even after `--state`: resuming fixes where the run
-        // starts, not the absence of a player, and a game whose action depends
-        // on input winds down from whatever the state captured.
-        try out.print(
-            \\  No buttons were pressed.
+            \\  Measured from the game's own attract/demo loop — no buttons were pressed.
             \\
         , .{});
     }
@@ -2213,9 +2122,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--skip")) {
             const v = it.next() orelse return error.MissingValue;
             out.skip = try std.fmt.parseInt(u32, v, 10);
-            out.skip_set = true;
-        } else if (std.mem.eql(u8, a, "--state")) {
-            out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--ppm")) {
             out.ppm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wav")) {
@@ -2250,10 +2156,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
-        } else if (std.mem.eql(u8, a, "--buttons")) {
-            const v = it.next() orelse return error.MissingValue;
-            const digits = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
-            out.buttons = try std.fmt.parseInt(u16, digits, 16);
         } else if (std.mem.eql(u8, a, "--movie")) {
             out.movie = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
@@ -2279,13 +2181,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         return error.GenConflicts;
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
-    if (out.movie != null and out.buttons != 0) return error.MovieConflicts;
-    // A movie's frame stream is indexed from power-on, so resuming somewhere
-    // else first would replay the wrong inputs against the wrong machine.
-    if (out.movie != null and out.state != null) return error.MovieConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
-    // Boot already happened inside the state, so the boot-skip default would
-    // just discard the first five seconds of the very thing being profiled.
-    if (out.state != null and !out.skip_set) out.skip = 0;
     return out;
 }
