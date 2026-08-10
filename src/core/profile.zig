@@ -1260,6 +1260,15 @@ pub const Verdict = enum {
     at_the_limit,
     /// Misses its deadline occasionally. Real, visible slowdown, in bursts.
     drops_frames,
+    /// Busy essentially every frame, yet almost never misses a deadline —
+    /// because it is not trying to hit 60. A game that renders one picture
+    /// over several frames (a polygon engine, a software rasteriser) paces
+    /// itself: it cannot "drop" a frame it never promised. The
+    /// frame-budget model measures missed deadlines, so without this it
+    /// reads as merely `drops_frames` and the most CPU-starved game in the
+    /// library gets the weakest verdict. A faster CPU here does not remove
+    /// slowdown; it raises the frame rate.
+    saturated,
     /// Misses its deadline routinely. This is what a conversion is *for*.
     cpu_bound,
     /// The game never read the controller — not once, in the whole capture. That
@@ -1276,6 +1285,7 @@ pub const Verdict = enum {
             .at_the_limit => "AT THE LIMIT",
             .drops_frames => "DROPS FRAMES",
             .cpu_bound => "CPU-BOUND",
+            .saturated => "CPU-SATURATED",
             .no_signal => "NO SIGNAL",
         };
     }
@@ -1383,7 +1393,7 @@ pub const Conversion = struct {
 /// boundary to move.
 pub fn assessConversion(prof: *const Profiler, verdict: Verdict) Conversion {
     var out: Conversion = .{};
-    out.warranted = verdict == .cpu_bound or verdict == .drops_frames;
+    out.warranted = verdict == .cpu_bound or verdict == .drops_frames or verdict == .saturated;
 
     var slow_work: u64 = prof.main_slow;
     for (prof.routines) |r| {
@@ -1753,6 +1763,13 @@ pub const cpu_bound_slow_ratio: f64 = 0.02;
 /// never actually misses.
 pub const at_the_limit_util: f64 = 0.90;
 
+/// A game is CPU-SATURATED when its MEDIAN frame is essentially full and
+/// its mean is high: busy every frame, yet not missing deadlines. The
+/// median is the load-bearing test — a game that merely spikes has a high
+/// p95 and a modest median, which is `at_the_limit`, not this.
+pub const saturated_median_util: f64 = 0.99;
+pub const saturated_mean_util: f64 = 0.85;
+
 /// Fold a run of frames into a verdict. `util_scratch` must be at least
 /// `samples.len` long; it is used for the percentiles (the core does not
 /// allocate, so the caller supplies the buffer).
@@ -1852,6 +1869,10 @@ pub fn summarise(samples: []const FrameSample, util_scratch: []f64) Summary {
             .no_signal
         else if (slow_ratio >= cpu_bound_slow_ratio)
             .cpu_bound
+        else if (percentile(utils, 50) >= saturated_median_util and
+            sum / @as(f64, @floatFromInt(n)) >= saturated_mean_util)
+            // Pinned, but keeping its own (slower) schedule.
+            .saturated
         else if (slow_frames > 0)
             .drops_frames
         else if (p95 >= at_the_limit_util)
@@ -2205,6 +2226,28 @@ test "a game that idles half of every frame is not a candidate" {
     try std.testing.expectEqual(Verdict.not_cpu_bound, s.verdict);
     try std.testing.expectEqual(@as(u64, 0), s.lag_frames);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), s.mean_util, 0.01);
+}
+
+test "a self-paced game reads CPU-SATURATED rather than merely dropping frames" {
+    // A polygon engine's shape: every frame essentially full, and a lone
+    // missed deadline in the whole capture. It is not trying to hit 60, so
+    // a dropped-frame count understates it — and before this verdict
+    // existed, that single lag frame demoted it to `drops_frames`, the
+    // weakest reading in the library for the most CPU-starved game.
+    var buf: [600]FrameSample = undefined;
+    var scratch: [600]f64 = undefined;
+    const fs = frames(&buf, 0.995, 0);
+    fs[7].lag = true;
+    const s = summarise(fs, &scratch);
+    try std.testing.expectEqual(Verdict.saturated, s.verdict);
+    // And it counts as a conversion candidate: a faster CPU raises its
+    // frame rate even though it removes no "slowdown".
+    try std.testing.expect(s.verdict != .drops_frames);
+
+    // A game that merely SPIKES is not saturated: its median has slack.
+    var buf2: [600]FrameSample = undefined;
+    const s2 = summarise(frames(&buf2, 0.60, 0), &scratch);
+    try std.testing.expect(s2.verdict != .saturated);
 }
 
 test "a game that never drops a frame but has no slack is at the limit" {

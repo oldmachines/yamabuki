@@ -36,6 +36,16 @@
 
 const std = @import("std");
 
+/// How many distinct bytes the map has marked as instruction starts —
+/// the size of "the code the profile actually saw run", and the number a
+/// caller compares across two points in a capture to ask whether the
+/// profile is still discovering code.
+pub fn countOpcodes(bytes: []const u8) u32 {
+    var n: u32 = 0;
+    for (bytes) |b| n += @intFromBool(b & flag_opcode != 0);
+    return n;
+}
+
 pub const flag_read: u8 = 0x80;
 pub const flag_write: u8 = 0x40;
 pub const flag_exec: u8 = 0x20;
