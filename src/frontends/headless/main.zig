@@ -898,7 +898,25 @@ fn runSa1Gen(
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
             error.Refused => {
-                try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
+                const r = refusal.?;
+                try out.print("refused: {s}\n", .{r.reason.describe()});
+                // Most whole-game refusals name the instruction that caused
+                // them; without the address the message is a dead end.
+                switch (r.reason) {
+                    .wg_wram_beyond_iram,
+                    .wg_wram_beyond_bwram,
+                    .wg_dp_dynamic,
+                    .wg_stack_dynamic,
+                    .wg_mmio_shape,
+                    .wg_mmio_outside_bank0,
+                    .wg_unsupported_op,
+                    => if (r.detail != 0) try out.print(
+                        "  at ${x:0>2}:{x:0>4}\n",
+                        .{ r.detail >> 16, r.detail & 0xFFFF },
+                    ),
+                    .no_free_space => try out.print("  needs {} bytes\n", .{r.detail}),
+                    else => {},
+                }
                 try out.flush();
                 std.process.exit(1);
             },

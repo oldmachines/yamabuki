@@ -75,6 +75,9 @@ pub const Reason = enum {
     wg_uses_irq,
     wg_nmi_ambiguous,
     wg_unsupported_op,
+    wg_wram_beyond_bwram,
+    wg_dp_dynamic,
+    wg_stack_dynamic,
 
     pub fn describe(self: Reason) []const u8 {
         return switch (self) {
@@ -86,6 +89,9 @@ pub const Reason = enum {
             .reset_vector_not_rom => "the reset vector does not point into ROM",
             .no_free_space => "no padding run in bank $00 is large enough for the boot shim",
             .wg_wram_beyond_iram => "whole-game migration needs the WRAM working set inside $0000-$07FF (the SA-1's identity-mapped I-RAM)",
+            .wg_wram_beyond_bwram => "the WRAM working set does not fit the BW-RAM window either: bank $7E/$7F beyond 128 KiB, or a low-bank address at or above $2000",
+            .wg_dp_dynamic => "the game loads the direct page from something other than an immediate; the BW-RAM window move needs every D provable at build time",
+            .wg_stack_dynamic => "the game loads the stack pointer from something other than an immediate; the BW-RAM window move needs every S provable at build time",
             .wg_mmio_shape => "an MMIO access is not a plain LDA/STA/STZ absolute — not proxyable in place",
             .wg_mmio_outside_bank0 => "an MMIO site executes outside bank $00 code; its in-place JSR can only reach helpers carved in its own bank",
             .wg_uses_irq => "the game takes IRQs; whole-game migration forwards only NMI so far",
@@ -1403,8 +1409,17 @@ const wg_mailbox: u16 = 0x37F0;
 const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16 };
 const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16 };
 const wg_sites_max = 96;
+/// Executed TCD/TCS sites the BW-RAM window move can adjust.
+const wg_moves_max = 64;
+/// Where the BW-RAM window sits on both buses ($6000-$7FFF of every system
+/// bank). WRAM's low mirror $0000-$1FFF shifts here; $7E/$7F re-bank to
+/// $40/$41 instead, reaching the same bytes linearly.
+const wg_bw_window: u16 = 0x6000;
 
 const wg_prologue_len = 21;
+/// Extra prologue the BW-RAM window needs: select block 0, unprotect, and
+/// reproduce the power-on D and S inside the window (native mode first).
+const wg_prologue_bw_extra = 20;
 const wg_sa1_nmi_len = 18;
 const wg_scpu_nmi_len = 19;
 const wg_shim_len = 37;
@@ -1483,11 +1498,23 @@ pub fn convertWholeGame(
         return refuse(refusal, .{ .reason = .wg_nmi_ambiguous });
     const nmi_target: u16 = if (emu_used and !nat_used) nmi_emu else nmi_native;
 
-    // Every WRAM byte the game touched — by effective address, so dp,
-    // stack, and indirect accesses are all covered — must sit inside the
-    // identity window, clear of the mailbox tail this conversion reserves.
+    // Which identity window carries the game's WRAM?
+    //
+    // I-RAM first: the SA-1's 2 KiB sits at $0000-$07FF of its bus, exactly
+    // where the S-CPU sees WRAM's low mirror, so a set that fits needs NO
+    // WRAM rewriting at all — the cheapest and safest conversion, and the
+    // only one this generator used to attempt.
+    //
+    // Otherwise BW-RAM, which is what every shipped SA-1 Root conversion
+    // actually uses (checked against Vitor Vilela's Gradius III v17: it
+    // re-banks $7E:xxxx to $40:xxxx and adds $6000 to low-bank absolute
+    // addresses, nothing else). BW-RAM is 128 KiB+ against I-RAM's 2 KiB,
+    // so the sets that fit are a different order of game. The price is that
+    // every WRAM-naming operand must be rewritten, and D and S must move
+    // with them — see the walk below.
+    const touched = usage_map.flag_read | usage_map.flag_write | usage_map.flag_exec;
+    var wram_fits_iram = true;
     {
-        const touched = usage_map.flag_read | usage_map.flag_write | usage_map.flag_exec;
         var b: u32 = 0;
         while (b < 0x100) : (b += 1) {
             const sys = b < 0x40 or (b >= 0x80 and b < 0xC0);
@@ -1495,15 +1522,26 @@ pub fn convertWholeGame(
             var a: u32 = 0;
             while (a < top) : (a += 1) {
                 if (usage[(b << 16) | a] & touched == 0) continue;
-                if (b == 0x7F or a >= 0x7F0)
-                    return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = (b << 16) | a });
+                if (b == 0x7F or a >= 0x7F0) {
+                    wram_fits_iram = false;
+                    break;
+                }
             }
+            if (!wram_fits_iram) break;
         }
     }
+    // The BW-RAM window is uniform: WRAM $7E/$7F:xxxx -> BW-RAM $40/$41:xxxx
+    // and low-bank $0000-$1FFF -> $6000-$7FFF, the same byte reached either
+    // way. A low-bank address at or above $2000 is not WRAM at all, so
+    // nothing in that range can be carried by this move.
+    const bwram = !wram_fits_iram;
 
     // Eligibility walk + MMIO site collection over every executed opcode.
     var sites: [wg_sites_max]WgSite = undefined;
     var n_sites: usize = 0;
+    // File offsets of `LDA #imm` operands feeding a TCD/TCS (BW-RAM mode).
+    var moves: [wg_moves_max]u32 = undefined;
+    var n_moves: usize = 0;
     var bank: u32 = 0;
     while (bank < 0x40) : (bank += 1) {
         const bank_file = bank * 0x8000;
@@ -1524,15 +1562,94 @@ pub fn convertWholeGame(
                 fl_hi & usage_map.flag_opcode != 0 and
                 (fl_lo ^ fl_hi) & usage_map.flag_m != 0;
             switch (op) {
-                0x44, 0x54, 0x00, 0x02, 0xDB => return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr }),
+                // MVN/MVP name their banks in the operand, so a move between
+                // WRAM banks re-banks like any long access. A move naming
+                // bank $00 does not: bank $00 is WRAM below $2000 and ROM
+                // above $8000, and which one this move walks is in X/Y at
+                // run time. The destination alone would be decidable (ROM is
+                // not writable), but re-banking one side of a move and not
+                // the other is worse than refusing, so both stay refused.
+                0x44, 0x54 => {
+                    const dst = image[file + 1];
+                    const src = image[file + 2];
+                    const wram_pair = (dst == 0x7E or dst == 0x7F) and (src == 0x7E or src == 0x7F);
+                    if (!bwram or !wram_pair)
+                        return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr });
+                },
+                0x00, 0x02, 0xDB => return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr }),
                 else => {},
             }
+            // Moving WRAM into the BW-RAM window moves the direct page and
+            // the stack with it: both live in bank $00's low half, which is
+            // exactly the range being displaced by $6000. Every D and S the
+            // game installs must therefore be adjustable at build time, so
+            // each executed TCD/TCS has to be fed by an adjacent 16-bit
+            // `LDA #imm` we can add $6000 to. Anything else — a D or S
+            // pulled from the stack or computed — cannot be proven and is
+            // refused by name rather than silently left pointing at WRAM
+            // that no longer exists on this bus.
+            if (bwram) switch (op) {
+                0x2B, 0x5B, 0x1B, 0x9A => { // PLD, TCD, TCS, TXS
+                    const dyn: Reason = if (op == 0x2B or op == 0x5B) .wg_dp_dynamic else .wg_stack_dynamic;
+                    // Three shapes reach D or S from an immediate, and each
+                    // is fed by a register whose load carries its own width
+                    // flag: TCD/TCS take A (M), TXS takes X (X), and
+                    // `LDX/LDA #imm : PHX/PHA : PLD` — the idiom Gradius III
+                    // uses, and the very byte Vilela's v17 patches — reaches
+                    // D through the stack. Distance from the immediate's
+                    // operand back to this opcode is all that differs.
+                    var back: u32 = 3; // LD? #imm | this
+                    var want_ld: u8 = 0xA9;
+                    var want_w: u8 = usage_map.flag_m;
+                    if (op == 0x9A) {
+                        want_ld = 0xA2;
+                        want_w = usage_map.flag_x;
+                    } else if (op == 0x2B) {
+                        if (file < 1) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                        switch (image[file - 1]) { // the push feeding PLD
+                            0xDA => { // PHX
+                                want_ld = 0xA2;
+                                want_w = usage_map.flag_x;
+                            },
+                            0x48 => {}, // PHA: defaults
+                            else => return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr }),
+                        }
+                        back = 4; // LD? #imm | PH? | this
+                    }
+                    if (file < back) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    if (image[file - back] != want_ld)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    const ld = cpu_addr - back;
+                    const lf = usage[ld] | usage[0x80_0000 | ld];
+                    // The load must have executed, and in 16-bit width — an
+                    // 8-bit load leaves the high half of D/S carrying
+                    // whatever was there, which no static shift can follow.
+                    if (lf & usage_map.flag_opcode == 0 or lf & want_w != 0)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    const imm = std.mem.readInt(u16, image[file - back + 1 ..][0..2], .little);
+                    if (imm >= 0x2000 or n_moves == wg_moves_max)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    // One immediate can feed two consumers (a TXS and a
+                    // later PHX/PLD); shifting it twice would land at
+                    // $C000. Record each operand once.
+                    const at = file - back + 1;
+                    for (moves[0..n_moves]) |m| {
+                        if (m == at) break;
+                    } else {
+                        moves[n_moves] = at;
+                        n_moves += 1;
+                    }
+                },
+                else => {},
+            };
             switch (usage_map.mode(op)) {
                 .none, .dp => {},
                 .dp_idx => {},
                 .abs, .abs_x, .abs_y => {
                     const v = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                    if (v < 0x800 or v >= 0x8000) continue; // I-RAM window / ROM: fine as-is
+                    if (v >= 0x8000) continue; // ROM: identical on both buses
+                    if (!bwram and v < 0x800) continue; // I-RAM window: fine as-is
+                    if (bwram and v < 0x2000) continue; // rewritten to the window below
                     if (v >= 0x2100 and v < 0x4380) {
                         if (bank != 0)
                             return refuse(refusal, .{ .reason = .wg_mmio_outside_bank0, .detail = cpu_addr });
@@ -1548,7 +1665,10 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         sites[n_sites] = .{ .file = file, .kind = kind, .reg = v };
                         n_sites += 1;
-                    } else return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = cpu_addr });
+                    } else return refuse(refusal, .{
+                        .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
+                        .detail = cpu_addr,
+                    });
                 },
                 .long, .long_x => {
                     const b = image[file + 3];
@@ -1556,7 +1676,9 @@ pub fn convertWholeGame(
                     if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380)
                         return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                     const wram = b == 0x7E or b == 0x7F or ((b & 0x7F) <= 0x3F and v < 0x2000);
-                    if (wram and (b == 0x7F or v >= 0x800))
+                    // BW-RAM carries all of WRAM: $7E/$7F re-bank to $40/$41
+                    // and low-bank forms shift into the window, both below.
+                    if (wram and !bwram and (b == 0x7F or v >= 0x800))
                         return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = cpu_addr });
                     // $7E:0000-07FF long sites are re-banked to $00 below.
                 },
@@ -1566,7 +1688,8 @@ pub fn convertWholeGame(
 
     var helper_len: u32 = 0;
     for (sites[0..n_sites]) |site| helper_len += wgHelperLen(site.kind);
-    const need: u32 = wg_prologue_len + wg_sa1_nmi_len + wg_scpu_nmi_len +
+    const need: u32 = wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
+        wg_sa1_nmi_len + wg_scpu_nmi_len +
         @as(u32, wg_service.len) + wg_shim_len + helper_len;
     const carve = patchgen.findFreeSpace(image[0..header.offset], need) orelse
         return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
@@ -1589,15 +1712,51 @@ pub fn convertWholeGame(
             const op = out[file];
             switch (usage_map.mode(op)) {
                 .long, .long_x => {
-                    if (out[file + 3] == 0x7E and std.mem.readInt(u16, out[file + 1 ..][0..2], .little) < 0x800) {
+                    const b = out[file + 3];
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (bwram) {
+                        // $7E/$7F are not on the SA-1's bus; $40/$41 are the
+                        // same bytes of BW-RAM, at the same offsets.
+                        if (b == 0x7E or b == 0x7F) {
+                            out[file + 3] = b - 0x3E;
+                            res.stats.rewritten_long += 1;
+                        } else if ((b & 0x7F) <= 0x3F and v < 0x2000) {
+                            std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                            res.stats.rewritten_long += 1;
+                        }
+                    } else if (b == 0x7E and v < 0x800) {
                         out[file + 3] = 0x00;
                         res.stats.rewritten_long += 1;
+                    }
+                },
+                .abs, .abs_x, .abs_y => if (bwram) {
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (v < 0x2000) {
+                        std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                        res.stats.rewritten_abs += 1;
+                    }
+                },
+                // MVN/MVP: only the $7E/$7F pairs reached the walk (see the
+                // opcode filter), and both banks re-bank the same way.
+                .none => if (bwram and (op == 0x44 or op == 0x54)) {
+                    for (1..3) |k| {
+                        if (out[file + k] == 0x7E or out[file + k] == 0x7F) {
+                            out[file + k] -= 0x3E;
+                            res.stats.rewritten_long += 1;
+                        }
                     }
                 },
                 else => {},
             }
         }
     }
+    // D and S follow their memory into the window.
+    for (moves[0..n_moves]) |off| {
+        const imm = std.mem.readInt(u16, out[off..][0..2], .little);
+        std.mem.writeInt(u16, out[off..][0..2], imm + wg_bw_window, .little);
+        res.stats.dp_sites += 1;
+    }
+    res.stats.d_moved = bwram;
 
     // Emit: helpers first (their addresses feed the site rewrites).
     var cur: usize = 0;
@@ -1622,8 +1781,24 @@ pub fn convertWholeGame(
         0xA9, 0x80, 0x8D, 0x27, 0x22, // CBWE
         0xA9, 0x10, 0x8D, 0x0B, 0x22, // CIC: NMI clear latch primed
         0x8D, 0x0A,             0x22, // CIE: NMI from the SNES enabled (A still $10)
-        0x4C, @truncate(reset), @truncate(reset >> 8),
     });
+    if (bwram) {
+        // Reproduce the power-on direct page and stack *inside the window*.
+        // The game's own TCD/TCS/TXS were shifted by $6000 with everything
+        // else, but a game that simply inherits D=$0000 / S=$01FF would
+        // otherwise land in I-RAM while its absolute accesses to the same
+        // variables went to BW-RAM — the two would silently disagree.
+        // Native mode first: emulation pins S to page 1.
+        put(d, &cur, &.{
+            0x9C, 0x25, 0x22, // STZ $2225 (CBM: BW-RAM block 0)
+            0x9C, 0x28, 0x22, // STZ $2228 (BWPA: unprotect)
+            0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+            0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, // LDA #$6000 / TCD
+            0xA9, 0xFF, 0x61, 0x1B, // LDA #$61FF / TCS
+            0xE2, 0x30, // SEP #$30
+        });
+    }
+    put(d, &cur, &.{ 0x4C, @truncate(reset), @truncate(reset >> 8) });
     // SA-1 NMI entry (CNV, native and emulation pulls alike): ack the
     // message via CIC — the game's handler has never heard of it, and a
     // stale flag would re-fire on every helper unmask — preserving A and
@@ -1675,7 +1850,9 @@ pub fn convertWholeGame(
 
     out[header.offset + 0x15] = 0x23;
     out[header.offset + 0x16] = 0x35;
-    out[header.offset + 0x18] = 0x05;
+    // BW-RAM size: 32 KiB is plenty when the game's state stayed in I-RAM,
+    // but the window mode maps all 128 KiB of WRAM into it.
+    out[header.offset + 0x18] = if (bwram) 0x07 else 0x05;
     patchgen.recomputeChecksum(out, header.offset);
 
     res.stats.shim_addr = shim;
@@ -2605,6 +2782,65 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     try testing.expect(con.bus.wram.data[0x2100] >= frames - 2);
 }
 
+test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // The same shape as the I-RAM test, but the game's state sits at $0900
+    // and $7E:4000 — one beyond I-RAM's 2 KiB, one in a bank that is not on
+    // the SA-1's bus at all. Both are ordinary BW-RAM once the window moves
+    // them, and the two must land on the SAME byte from either form: $0900
+    // absolute and $7E:0900 long are one variable to the game.
+    @memcpy(rom[0x0000..0x001C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x5A, 0x8D, 0x00, 0x09, // LDA #$5A / STA $0900
+        0xAF, 0x00, 0x40, 0x7E, // LDA $7E:4000  (reads the long form)
+        0xA9, 0xC3, 0x8F, 0x00, 0x40, 0x7E, // LDA #$C3 / STA $7E:4000
+        0xAD, 0x00, 0x09, 0x8F, 0x01, 0x40, 0x7E, // LDA $0900 / STA $7E:4001
+        0x80, 0xFE, // spin
+    });
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800D, 0x800F, 0x8013, 0x8016, 0x801A }) |a| markOp(usage, a);
+    usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
+
+    var ref: ?Refusal = null;
+    const res = convertWholeGame(gpa, rom, usage, &ref) catch |e| {
+        std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
+        return e;
+    };
+    defer gpa.free(res.image);
+    try testing.expect(res.stats.d_moved);
+    try testing.expect(res.stats.rewritten_abs >= 2);
+    try testing.expect(res.stats.rewritten_long >= 3);
+    // The operands really moved: $0900 -> $6900, and $7E -> $40.
+    try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, res.image[0x0007..0x0009], .little));
+    try testing.expectEqual(@as(u8, 0x40), res.image[0x000C]);
+    // BW-RAM, not 32 KiB of it: the window maps all of WRAM.
+    try testing.expectEqual(@as(u8, 0x07), res.image[0x7FC0 + 0x18]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..8) |_| con.runFrame();
+
+    // State lives in BW-RAM at its own offsets, reached identically by the
+    // absolute-window and long-rebanked forms.
+    try testing.expectEqual(@as(u8, 0x5A), con.cart.sram[0x0900]);
+    try testing.expectEqual(@as(u8, 0xC3), con.cart.sram[0x4000]);
+    try testing.expectEqual(@as(u8, 0x5A), con.cart.sram[0x4001]);
+    // ...and nothing was left behind in the WRAM the game no longer owns.
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0900]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x4000]);
+}
+
 test "whole-game: refusals name their reasons" {
     const gpa = testing.allocator;
     const rom = try makeWgRom(gpa);
@@ -2613,17 +2849,56 @@ test "whole-game: refusals name their reasons" {
     defer gpa.free(usage);
     var ref: ?Refusal = null;
 
-    // WRAM touched beyond the identity window.
+    // WRAM beyond the I-RAM window — and the reserved mailbox tail inside
+    // it — no longer refuse: they select the BW-RAM window instead, which
+    // carries all 128 KiB of WRAM. (`wg_wram_beyond_iram` now only reports
+    // an operand no window can carry; the beyond-BW-RAM case is below.)
+    for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
+        @memset(usage, 0);
+        usage[a] = usage_map.flag_write;
+        const r = try convertWholeGame(gpa, rom, usage, &ref);
+        defer gpa.free(r.image);
+        try testing.expect(r.stats.d_moved);
+    }
+
+    // An executed absolute operand that is neither WRAM, MMIO, nor ROM has
+    // no home on the SA-1's bus in either window.
+    @memset(usage, 0);
+    usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
+    markOp(usage, 0x00_8100);
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
+    try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
+
+    // D and S must be provable at build time once the window moves them.
+    // `PLD` fed by a push of an immediate is fine; fed by anything else is
+    // not, and neither is a computed stack pointer.
     @memset(usage, 0);
     usage[0x00_0900] = usage_map.flag_write;
+    @memcpy(rom[0x0100..0x0106], &[_]u8{ 0xA2, 0x00, 0x00, 0xDA, 0x2B, 0x60 }); // LDX #0 / PHX / PLD
+    markOp(usage, 0x00_8100);
+    markOp(usage, 0x00_8103);
+    markOp(usage, 0x00_8104);
+    usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
+    {
+        const r = try convertWholeGame(gpa, rom, usage, &ref);
+        defer gpa.free(r.image);
+        // The immediate moved into the window with everything else.
+        try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
+    }
+    rom[0x0103] = 0xEA; // NOP where the push was: D now comes from nowhere provable
     try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
-    try testing.expectEqual(Reason.wg_wram_beyond_iram, ref.?.reason);
+    try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
 
-    // The reserved mailbox tail, even inside the window.
     @memset(usage, 0);
-    usage[0x7E_07F4] = usage_map.flag_read;
+    usage[0x00_0900] = usage_map.flag_write;
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
+    markOp(usage, 0x00_8100);
+    markOp(usage, 0x00_8101);
     try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
-    try testing.expectEqual(Reason.wg_wram_beyond_iram, ref.?.reason);
+    try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
     // An executed IRQ handler.
     @memset(usage, 0);
