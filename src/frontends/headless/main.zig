@@ -907,6 +907,7 @@ fn runSa1Gen(
                     .wg_wram_beyond_bwram,
                     .wg_dp_dynamic,
                     .wg_stack_dynamic,
+                    .wg_blockmove_source,
                     .wg_mmio_shape,
                     .wg_mmio_outside_bank0,
                     .wg_unsupported_op,
