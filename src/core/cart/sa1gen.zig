@@ -1780,7 +1780,7 @@ pub fn convertWholeGame(
         0xA9, 0xFF, 0x8D, 0x2A, 0x22, // CIWP: all I-RAM blocks writable
         0xA9, 0x80, 0x8D, 0x27, 0x22, // CBWE
         0xA9, 0x10, 0x8D, 0x0B, 0x22, // CIC: NMI clear latch primed
-        0x8D, 0x0A,             0x22, // CIE: NMI from the SNES enabled (A still $10)
+        0x8D, 0x0A, 0x22, // CIE: NMI from the SNES enabled (A still $10)
     });
     if (bwram) {
         // Reproduce the power-on direct page and stack *inside the window*.
