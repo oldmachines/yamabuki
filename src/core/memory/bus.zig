@@ -48,7 +48,7 @@ pub const Bus = struct {
     // configuration, set once at startup — it must survive a loadState
     // (skipped fields keep their in-memory value), so an old save does not
     // silently turn the option off.
-    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "coproc_irq_line", "auto_fastrom" };
+    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "vector_pull", "coproc_irq_line", "auto_fastrom" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
@@ -79,6 +79,12 @@ pub const Bus = struct {
     /// frame in which it stays false is a frame the main loop never came around:
     /// a dropped frame. Diagnostic only; nothing in the core reads it.
     input_polled: bool,
+    /// True only for the duration of a CPU vector pull (`Cpu.readVector16`
+    /// calls `vectorRead8`). The SA-1's SNV/SIV substitution is gated on it:
+    /// hardware swaps the SNES NMI/IRQ vectors during the pull, not when game
+    /// code reads the vector table as data. Transient — always false between
+    /// instructions, so it is not machine state.
+    vector_pull: bool,
     /// Memory data register: the value of the last bus transfer (open bus).
     mdr: u8,
     /// $420D MEMSEL bit 0: FastROM enabled.
@@ -141,6 +147,7 @@ pub const Bus = struct {
         self.last_data_read = no_data_access;
         self.last_data_write = no_data_access;
         self.input_polled = false;
+        self.vector_pull = false;
         self.mdr = 0;
         self.fastrom = false;
         self.auto_fastrom = false;
@@ -290,6 +297,16 @@ pub const Bus = struct {
         return self.slowRead(addr);
     }
 
+    /// One byte of a CPU vector pull (`Cpu.readVector16` routes here because
+    /// this bus declares the hook). Identical to `read8` except that it flags
+    /// the access, which is what lets the SA-1's SNV/SIV substitution fire on
+    /// the pull and stay out of the way of ordinary reads of the vector table.
+    pub fn vectorRead8(self: *Bus, addr: u24) u8 {
+        self.vector_pull = true;
+        defer self.vector_pull = false;
+        return self.read8(addr);
+    }
+
     pub inline fn write8(self: *Bus, addr: u24, value: u8) void {
         self.mdr = value;
         const idx = addr >> 13;
@@ -414,10 +431,16 @@ pub const Bus = struct {
                         return self.mdr;
                     }
                     if (a16 >= 0xE000 and bank & 0x7F == 0) {
-                        // Vector page, kept off the fast path so the SA-1
-                        // can substitute the SNES NMI/IRQ vectors.
+                        // Vector page, kept off the fast path so the SA-1 can
+                        // substitute the SNES NMI/IRQ vectors — but only on a
+                        // real vector pull. Game code reading its own vector
+                        // table as data must see ROM, the same distinction the
+                        // SA-1-side CRV/CNV/CIV overlay makes.
                         self.sa1.catchUp(self.clock);
-                        self.mdr = self.sa1.snesVectorRead(addr);
+                        self.mdr = if (self.vector_pull)
+                            self.sa1.snesVectorRead(addr)
+                        else
+                            self.sa1.romRead(addr);
                         return self.mdr;
                     }
                 }
@@ -835,14 +858,22 @@ test "sa1 cart boots the coprocessor through the bus" {
     tc.bus.write8(0x00_2220, 0x81);
     try std.testing.expectEqual(before, tc.bus.read8(0x00_8000));
 
-    // SNES NMI vector substitution when the SA-1 flips NVSW.
+    // SNES NMI vector substitution when the SA-1 flips NVSW — on the vector
+    // pull only. A plain read of $00:FFEA is game code inspecting its own
+    // vector table, and must still see ROM: that is exactly what an SA-1
+    // bootstrap does to copy the original handlers into SNV/SIV.
     const rom_vec = tc.bus.read8(0x00_FFEA);
+    const rom_vec_hi = tc.bus.read8(0x00_FFEB);
     tc.bus.sa1.snv = 0x1234;
     tc.bus.sa1.cpu_nvsw = true;
-    try std.testing.expectEqual(@as(u8, 0x34), tc.bus.read8(0x00_FFEA));
-    try std.testing.expectEqual(@as(u8, 0x12), tc.bus.read8(0x00_FFEB));
-    tc.bus.sa1.cpu_nvsw = false;
+    try std.testing.expectEqual(@as(u8, 0x34), tc.bus.vectorRead8(0x00_FFEA));
+    try std.testing.expectEqual(@as(u8, 0x12), tc.bus.vectorRead8(0x00_FFEB));
     try std.testing.expectEqual(rom_vec, tc.bus.read8(0x00_FFEA));
+    try std.testing.expectEqual(rom_vec_hi, tc.bus.read8(0x00_FFEB));
+    // The flag is transient: it must not leak past the pull it was set for.
+    try std.testing.expect(!tc.bus.vector_pull);
+    tc.bus.sa1.cpu_nvsw = false;
+    try std.testing.expectEqual(rom_vec, tc.bus.vectorRead8(0x00_FFEA));
 }
 
 test "bus state serialize roundtrip rebuilds pages" {
