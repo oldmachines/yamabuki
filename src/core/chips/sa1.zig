@@ -25,9 +25,6 @@
 //!    well-behaved software enforces anyway.
 //!  - Timer IRQs fire on the instruction boundary that crosses the target
 //!    count, not the exact cycle.
-//!  - SA-1-side data reads of $00:FFEA-$00:FFFF return the vector
-//!    registers instead of ROM (hardware only substitutes them during
-//!    vector pulls).
 
 const std = @import("std");
 const wdc65816 = @import("../cpu/wdc65816.zig");
@@ -418,24 +415,38 @@ pub const Sa1 = struct {
         self.budget -= 2;
     }
 
+    /// A *vector pull* by the SA-1's own core (`Cpu` calls this instead of
+    /// `read8` for reset/NMI/IRQ/BRK). CRV/CNV/CIV overlay $00:FFEA-FFFF here
+    /// and nowhere else: hardware substitutes them on the pull only, and the
+    /// SA-1 Root bootstrap depends on the difference — it reads $00:FFEA and
+    /// $00:FFEE as ordinary data to copy the game's *original* SNES handlers
+    /// into SNV/SIV before switching the SNES over to them. Overlaying those
+    /// data reads too handed it CNV/CIV instead, so the SNES got a vector
+    /// pointing at the SA-1's own `RTI` stub: every vblank returned
+    /// immediately, the game's NMI handler never ran, and the console sat in
+    /// its main loop forever on a black screen.
+    pub fn vectorRead8(self: *Sa1, addr: u24) u8 {
+        if (addr <= 0x00_FFFF and addr >= 0x00_FFEA) {
+            const vec: ?u16 = switch (@as(u16, @truncate(addr))) {
+                0xFFEA, 0xFFEB, 0xFFFA, 0xFFFB => self.cnv,
+                0xFFEE, 0xFFEF, 0xFFFE, 0xFFFF => self.civ,
+                0xFFFC, 0xFFFD => self.crv,
+                else => null, // reserved slots fall through to ROM
+            };
+            if (vec) |v| {
+                self.budget -= 2;
+                self.mdr = if (addr & 1 == 0) @truncate(v) else @truncate(v >> 8);
+                return self.mdr;
+            }
+        }
+        return self.read8(addr);
+    }
+
     pub fn read8(self: *Sa1, addr: u24) u8 {
         // ROM $00-$3F/$80-$BF:8000-FFFF — the dominant case (SA-1 code and
         // operand fetch), tested first so the common path is one branch.
         if (addr & 0x40_8000 == 0x00_8000) {
             self.budget -= 2;
-            // CRV/CNV/CIV vectors overlay $00:FFEA-FFFF (bank $00 only).
-            if (addr <= 0x00_FFFF and addr >= 0x00_FFEA) {
-                const vec: ?u16 = switch (@as(u16, @truncate(addr))) {
-                    0xFFEA, 0xFFEB, 0xFFFA, 0xFFFB => self.cnv,
-                    0xFFEE, 0xFFEF, 0xFFFE, 0xFFFF => self.civ,
-                    0xFFFC, 0xFFFD => self.crv,
-                    else => null, // reserved slots fall through to ROM
-                };
-                if (vec) |v| {
-                    self.mdr = if (addr & 1 == 0) @truncate(v) else @truncate(v >> 8);
-                    return self.mdr;
-                }
-            }
             self.mdr = self.rom[self.mmcTranslate(squashLo(addr), true)];
             return self.mdr;
         }
@@ -1047,6 +1058,46 @@ test "sa1 irq delivery via civ vector" {
     tc.sa1.mmioWrite(300, 0x2200, 0x80);
     tc.sa1.catchUp(800);
     try testing.expectEqual(@as(u8, 0x01), tc.sa1.iram[1]);
+}
+
+test "sa1 vector registers overlay pulls only, never data reads" {
+    var tc = try TestChip.create();
+    defer tc.destroy();
+    const s = &tc.sa1;
+    // The game's own SNES vectors, sitting in ROM where every cart keeps them.
+    tc.rom[0x7FEA] = 0x34; // $00:FFEA — SNES NMI
+    tc.rom[0x7FEB] = 0x12;
+    tc.rom[0x7FEE] = 0x78; // $00:FFEE — SNES IRQ
+    tc.rom[0x7FEF] = 0x56;
+    // The SA-1's own handlers live somewhere else entirely.
+    s.mmioWrite(0, 0x2205, 0xCE); // CNV = $FBCE
+    s.mmioWrite(0, 0x2206, 0xFB);
+    s.mmioWrite(0, 0x2207, 0xCE); // CIV = $FBCE
+    s.mmioWrite(0, 0x2208, 0xFB);
+
+    // What an SA-1 Root bootstrap actually does: go native, unlock IRAM, then
+    // read the two SNES vectors *as data* and stash them (the real thing
+    // forwards them to SNV/SIV so the SNES keeps using its own handlers).
+    const prog = [_]u8{
+        0x18, 0xFB, // CLC; XCE
+        0xA9, 0xFF, 0x8D, 0x2A, 0x22, // LDA #$FF; STA $222A (CIWP)
+        0xC2, 0x20, // REP #$20
+        0xAF, 0xEA, 0xFF, 0x00, 0x8D, 0x00, 0x00, // LDA $00FFEA; STA $0000
+        0xAF, 0xEE, 0xFF, 0x00, 0x8D, 0x02, 0x00, // LDA $00FFEE; STA $0002
+        0xDB, // STP
+    };
+    @memcpy(tc.rom[0..prog.len], &prog);
+    tc.boot(2000);
+    try testing.expectEqual(wdc65816.ExecState.stopped, s.cpu.state);
+    // Data reads must see ROM. Overlaying CNV/CIV here is what pointed the
+    // SNES at the SA-1's own RTI stub and hung every SA-1 Root conversion.
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, s.iram[0..2], .little));
+    try testing.expectEqual(@as(u16, 0x5678), std.mem.readInt(u16, s.iram[2..4], .little));
+    // A genuine vector pull still gets the registers.
+    try testing.expectEqual(@as(u8, 0xCE), s.vectorRead8(0x00_FFEA));
+    try testing.expectEqual(@as(u8, 0xFB), s.vectorRead8(0x00_FFEB));
+    try testing.expectEqual(@as(u8, 0xCE), s.vectorRead8(0x00_FFEE));
+    try testing.expectEqual(@as(u8, 0xFB), s.vectorRead8(0x00_FFEF));
 }
 
 test "sa1 mmc translation and remap flag" {
