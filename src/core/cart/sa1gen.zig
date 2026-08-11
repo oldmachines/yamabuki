@@ -1408,9 +1408,20 @@ comptime {
 /// 4 read16 filed, $FE read served — >= 5 means busy, not a request.
 const wg_mailbox: u16 = 0x37F0;
 
-const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16 };
-const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16 };
-const wg_sites_max = 96;
+const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16, c8, c16, ry8, ry16, rx8, rx16, wx8, wx16, wy8, wy16 };
+/// Which index register the site's addressing mode adds, if any. An indexed
+/// site's helper computes base+index at run time — in the caller's own index
+/// width, since TXA/TYA zero-extend exactly when the hardware would — and
+/// files the *effective* register; the mailbox protocol never sees the
+/// difference.
+const WgIndex = enum { none, x, y };
+const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16, idx: WgIndex = .none };
+const wg_sites_max = 768;
+/// A helper is a pure function of (kind, reg, idx), so sites sharing all
+/// three share one helper — Gradius III alone has hundreds of MMIO sites
+/// but only a few dozen distinct shapes, and the carve is sized by the
+/// latter.
+const wg_uniq_max = 160;
 /// Executed TCD/TCS sites the BW-RAM window move can adjust.
 const wg_moves_max = 64;
 /// Where the BW-RAM window sits on both buses ($6000-$7FFF of every system
@@ -1589,10 +1600,15 @@ pub fn convertWholeGame(
             const fl = if (fl_lo & usage_map.flag_opcode != 0) fl_lo else fl_hi;
             const m8 = fl & usage_map.flag_m != 0;
             // Executed in both mirrors with different M widths: the site
-            // has two shapes and a single helper cannot serve both.
+            // has two shapes and a single helper cannot serve both. Index-
+            // register loads (LDY/LDX) size by the X flag instead.
             const m_mixed = fl_lo & usage_map.flag_opcode != 0 and
                 fl_hi & usage_map.flag_opcode != 0 and
                 (fl_lo ^ fl_hi) & usage_map.flag_m != 0;
+            const x_mixed = fl_lo & usage_map.flag_opcode != 0 and
+                fl_hi & usage_map.flag_opcode != 0 and
+                (fl_lo ^ fl_hi) & usage_map.flag_x != 0;
+            const x8 = fl & usage_map.flag_x != 0;
             switch (op) {
                 // MVN/MVP name their banks in the operand, so a move between
                 // WRAM banks re-banks like any long access. A move naming
@@ -1611,9 +1627,21 @@ pub fn convertWholeGame(
                     // hold. $7E/$7F are unambiguous either way.
                     if (!(dst == 0x7E or dst == 0x7F or dst == 0x00))
                         return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr });
-                    if (dst != 0x00) { // $7E/$7F: both ends unambiguous
-                        if (!(src == 0x7E or src == 0x7F))
-                            return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                    if (dst != 0x00) {
+                        // Destination $7E/$7F re-banks to $40/$41. The source
+                        // needs nothing: another WRAM bank re-banks the same
+                        // way, and any other bank is ROM whose mapping is
+                        // identical on the SA-1's bus (Gradius III unpacks
+                        // graphics with `MVN $7E,$04`, and v17 ships it as
+                        // `MVN $40,$04`). Bank $00 as source is the one
+                        // ambiguous case — accept it only when X provably
+                        // points at ROM, where the byte passes through
+                        // unchanged.
+                        if (src == 0x00) {
+                            const sx = ldx_at != null and cpu_addr - ldx_at.? <= 16;
+                            if (!sx or ldx_imm < 0x8000)
+                                return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                        }
                         dbr_bw = true;
                         break :blockmove;
                     }
@@ -1761,7 +1789,11 @@ pub fn convertWholeGame(
                 // DBR: the `LDA #bank : PHA : PLB` idiom is the only shape
                 // that names a bank statically. A WRAM bank there re-banks
                 // like any other $7E/$7F reference; anything else leaves DBR
-                // system-bank as far as this walk can tell.
+                // system-bank as far as this walk can tell. Like the X/Y
+                // carries, the knowledge dies at any control transfer — the
+                // next linear instruction may be a different routine that
+                // arrives with a different DBR.
+                if (branches(op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = false;
                     if (file >= 3 and image[file - 3] == 0xA9 and image[file - 1] == 0x48) {
@@ -1792,17 +1824,37 @@ pub fn convertWholeGame(
                     if (v >= 0x2100 and v < 0x4380) {
                         if (bank != 0)
                             return refuse(refusal, .{ .reason = .wg_mmio_outside_bank0, .detail = cpu_addr });
-                        if (m_mixed)
+                        const mixed = switch (op) {
+                            0xBC, 0xBE, 0x8E, 0x8C => x_mixed,
+                            else => m_mixed,
+                        };
+                        if (mixed)
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         const kind: WgSiteKind = switch (op) {
-                            0xAD => if (m8) WgSiteKind.r8 else .r16,
-                            0x8D => if (m8) WgSiteKind.w8 else .w16,
+                            0xAD, 0xBD, 0xB9 => if (m8) WgSiteKind.r8 else .r16,
+                            0x8D, 0x9D, 0x99 => if (m8) WgSiteKind.w8 else .w16,
                             0x9C => if (m8) WgSiteKind.stz8 else .stz16,
+                            // CMP against an MMIO register: an APU-port
+                            // handshake spin, in every Konami boot.
+                            0xCD => if (m8) WgSiteKind.c8 else .c16,
+                            // Index-register loads size by the X flag: the
+                            // auto-joypad read loop is LDY $4218,X.
+                            0xBC => if (x8) WgSiteKind.ry8 else .ry16,
+                            0xBE => if (x8) WgSiteKind.rx8 else .rx16,
+                            // ...and index-register stores (STX $2116 sets
+                            // the VRAM address in Gradius III's NMI path).
+                            0x8E => if (x8) WgSiteKind.wx8 else .wx16,
+                            0x8C => if (x8) WgSiteKind.wy8 else .wy16,
                             else => return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr }),
+                        };
+                        const idx: WgIndex = switch (op) {
+                            0xBD, 0x9D, 0xBC => .x,
+                            0xB9, 0x99, 0xBE => .y,
+                            else => .none,
                         };
                         if (n_sites == wg_sites_max)
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
-                        sites[n_sites] = .{ .file = file, .kind = kind, .reg = v };
+                        sites[n_sites] = .{ .file = file, .kind = kind, .reg = v, .idx = idx };
                         n_sites += 1;
                     } else return refuse(refusal, .{
                         .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
@@ -1826,12 +1878,54 @@ pub fn convertWholeGame(
     }
 
     var helper_len: u32 = 0;
-    for (sites[0..n_sites]) |site| helper_len += wgHelperLen(site.kind);
-    const need: u32 = wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
+    // Dedup: sites sharing (kind, reg, idx) share one emitted helper.
+    var uniq: [wg_uniq_max]WgSite = undefined;
+    var n_uniq: usize = 0;
+    for (sites[0..n_sites]) |site| {
+        const seen = for (uniq[0..n_uniq]) |u| {
+            if (u.kind == site.kind and u.reg == site.reg and u.idx == site.idx) break true;
+        } else false;
+        if (seen) continue;
+        if (n_uniq == wg_uniq_max)
+            return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = site.file });
+        uniq[n_uniq] = site;
+        n_uniq += 1;
+    }
+    for (uniq[0..n_uniq]) |u| helper_len += wgHelperLen(u);
+    // The scaffolding is bank-$00-only: the shim is the reset vector's
+    // target, the service loop is `JMP`ed from it, and CRV/CNV are 16-bit
+    // registers, so the SA-1 prologue and NMI shim must be reachable in
+    // bank $00 too. The helpers are not: they run on the SA-1, and every
+    // absolute they touch (the mailbox, CIE, CIC) mirrors across all system
+    // banks, so they can live in ANY bank's padding — which matters, because
+    // a real game's bank $00 is nearly full (Gradius III has 1.5 KiB of
+    // padding against ~3.6 KiB of helpers). Each unique helper gets a
+    // 4-byte `JML` trampoline in bank $00 for the sites' in-place `JSR` to
+    // land on; the helper ends with `JML` back to a shared bank-$00 `RTS`.
+    const scaffold: u32 = wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
         wg_sa1_nmi_len + wg_scpu_nmi_len +
-        @as(u32, wg_service.len) + wg_shim_len + helper_len;
-    const carve = patchgen.findFreeSpace(image[0..header.offset], need) orelse
-        return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
+        @as(u32, wg_service.len) + wg_shim_len;
+    var carve: u32 = undefined; // bank $00: scaffold (+ trampolines if split)
+    var hcarve: u32 = undefined; // wherever the helpers land
+    var split = false;
+    if (patchgen.findFreeSpace(image[0..header.offset], scaffold + helper_len)) |c| {
+        carve = c;
+        hcarve = 0; // unused: helpers emit sequentially after the scaffold
+    } else {
+        // Split: trampolines + 1-byte RTS stub in bank $00, helpers in the
+        // first other bank with room.
+        split = true;
+        const b0_need = scaffold + 4 * @as(u32, @intCast(n_uniq)) + 1;
+        carve = patchgen.findFreeSpace(image[0..header.offset], b0_need) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = b0_need });
+        // Each far helper trades its RTS for a 4-byte JML: +3 bytes.
+        const far_need = helper_len + 3 * @as(u32, @intCast(n_uniq));
+        var hb: u32 = 1;
+        hcarve = while (hb * 0x8000 < image.len) : (hb += 1) {
+            const win = image[hb * 0x8000 .. @min((hb + 1) * 0x8000, image.len)];
+            if (patchgen.findFreeSpace(win, far_need)) |c| break hb * 0x8000 + c;
+        } else return refuse(refusal, .{ .reason = .no_free_space, .detail = far_need });
+    }
 
     const out = try gpa.dupe(u8, image);
     errdefer gpa.free(out);
@@ -1855,6 +1949,7 @@ pub fn convertWholeGame(
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
             if (bwram) {
+                if (branches(op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
                         (out[file - 2] == 0x7E or out[file - 2] == 0x7F);
@@ -1893,23 +1988,40 @@ pub fn convertWholeGame(
                         res.stats.rewritten_abs += 1;
                     }
                 },
-                // MVN/MVP: $7E/$7F re-bank like any long access, and bank
-                // $00 re-banks only where the walk proved both halves (the
-                // sites it recorded in `bm`).
-                .none => if (bwram and (op == 0x44 or op == 0x54)) {
-                    const proved = for (bm[0..n_bm]) |f| {
-                        if (f == file) break true;
-                    } else false;
-                    for (1..3) |k| {
-                        const b = out[file + k];
-                        if (b == 0x7E or b == 0x7F) {
-                            out[file + k] = b - 0x3E;
-                            res.stats.rewritten_long += 1;
-                        } else if (b == 0x00 and proved) {
-                            out[file + k] = 0x40;
-                            res.stats.rewritten_long += 1;
+                // Indirect control flow reads its *pointer* from bank $00:
+                // `JMP ($0000)` names a WRAM word that just moved into the
+                // window, and mode() files these as .none because the
+                // operand is not a data address the offload rewriter cares
+                // about. Here it is exactly a data address. JMP (abs) and
+                // JMP/JSR (abs,X) pointers under $2000 shift with their
+                // memory; [abs] (JML) reads 3 bytes but shifts the same way.
+                .none => if (bwram) switch (op) {
+                    0x6C, 0x7C, 0xFC, 0xDC => {
+                        const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                        if (v < 0x2000) {
+                            std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                            res.stats.rewritten_abs += 1;
                         }
-                    }
+                    },
+                    // MVN/MVP: $7E/$7F re-bank like any long access, and
+                    // bank $00 re-banks only where the walk proved both
+                    // halves (the sites it recorded in `bm`).
+                    0x44, 0x54 => {
+                        const proved = for (bm[0..n_bm]) |f| {
+                            if (f == file) break true;
+                        } else false;
+                        for (1..3) |k| {
+                            const b = out[file + k];
+                            if (b == 0x7E or b == 0x7F) {
+                                out[file + k] = b - 0x3E;
+                                res.stats.rewritten_long += 1;
+                            } else if (b == 0x00 and proved) {
+                                out[file + k] = 0x40;
+                                res.stats.rewritten_long += 1;
+                            }
+                        }
+                    },
+                    else => {},
                 },
                 else => {},
             }
@@ -1933,11 +2045,51 @@ pub fn convertWholeGame(
     var cur: usize = 0;
     const base16: u16 = 0x8000 + @as(u16, @intCast(carve));
     const d = out[carve..];
+    // Where each unique helper's JSR target lives in bank $00: the helper
+    // itself when everything fits, its trampoline when split.
+    var uniq_addr: [wg_uniq_max]u16 = undefined;
+    if (!split) {
+        for (uniq[0..n_uniq], 0..) |u, ui| {
+            uniq_addr[ui] = base16 + @as(u16, @intCast(cur));
+            const before = cur;
+            wgEmitHelper(d, &cur, u);
+            std.debug.assert(cur - before == wgHelperLen(u));
+        }
+    } else {
+        // Helpers in the far bank, each ending in a JML back to the shared
+        // bank-$00 RTS stub instead of its own RTS (a JSR pushes 16 bits, so
+        // an RTS with PB stuck in the helper's bank would return into it).
+        const hbank: u8 = @intCast(hcarve / 0x8000);
+        const rts16: u16 = base16 + @as(u16, @intCast(scaffold)) + 4 * @as(u16, @intCast(n_uniq));
+        const hd = out[hcarve..];
+        var hcur: usize = 0;
+        var helper16: [wg_uniq_max]u16 = undefined;
+        for (uniq[0..n_uniq], 0..) |u, ui| {
+            helper16[ui] = 0x8000 + @as(u16, @intCast(hcarve % 0x8000 + hcur));
+            const before = hcur;
+            wgEmitHelper(hd, &hcur, u);
+            if (hcur - before != wgHelperLen(u))
+                std.debug.panic("helper len mismatch: kind={s} idx={s} actual={} table={}", .{
+                    @tagName(u.kind), @tagName(u.idx), hcur - before, wgHelperLen(u),
+                });
+            std.debug.assert(hd[hcur - 1] == 0x60); // every helper ends RTS
+            hcur -= 1;
+            put(hd, &hcur, &.{ 0x5C, @truncate(rts16), @truncate(rts16 >> 8), 0x00 });
+        }
+        // Bank $00: trampolines after the scaffold, then the RTS stub. The
+        // scaffold is emitted below at `cur`; reserve its span now.
+        var tcur: usize = scaffold;
+        for (uniq[0..n_uniq], 0..) |_, ui| {
+            uniq_addr[ui] = base16 + @as(u16, @intCast(tcur));
+            put(d, &tcur, &.{ 0x5C, @truncate(helper16[ui]), @truncate(helper16[ui] >> 8), hbank });
+        }
+        d[tcur] = 0x60; // the shared RTS
+        std.debug.assert(base16 + @as(u16, @intCast(tcur)) == rts16);
+    }
     for (sites[0..n_sites]) |site| {
-        const haddr = base16 + @as(u16, @intCast(cur));
-        const before = cur;
-        wgEmitHelper(d, &cur, site);
-        std.debug.assert(cur - before == wgHelperLen(site.kind));
+        const haddr = for (uniq[0..n_uniq], 0..) |u, ui| {
+            if (u.kind == site.kind and u.reg == site.reg and u.idx == site.idx) break uniq_addr[ui];
+        } else unreachable;
         out[site.file] = 0x20; // JSR (same length as the LDA/STA/STZ it replaces)
         std.mem.writeInt(u16, out[site.file + 1 ..][0..2], haddr, .little);
         res.stats.offload_sites += 1;
@@ -2012,7 +2164,7 @@ pub fn convertWholeGame(
     w2[n2 + 2] = @truncate(svc >> 8);
     n2 += 3;
     std.debug.assert(n2 == wg_shim_len);
-    std.debug.assert(cur + n2 == need);
+    std.debug.assert(cur + n2 == scaffold + if (split) @as(usize, 0) else helper_len);
 
     // Vectors: reset -> shim; NMI (native + emulation) -> the forward stub.
     std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], shim, .little);
@@ -2065,13 +2217,25 @@ fn branches(op: u8) bool {
     };
 }
 
-fn wgHelperLen(kind: WgSiteKind) u32 {
-    return switch (kind) {
+fn wgHelperLen(site: WgSite) u32 {
+    if (site.idx != .none) return switch (site.kind) {
+        .w8 => 40,
+        .w16 => 42,
+        .r8 => 48,
+        .r16 => 49,
+        .ry8, .ry16, .rx8, .rx16 => 49,
+        .stz8, .stz16, .c8, .c16, .wx8, .wx16, .wy8, .wy16 => unreachable,
+    };
+    return switch (site.kind) {
         .w8, .stz8 => 36,
         .w16 => 46,
         .r8 => 39,
         .r16 => 47,
         .stz16 => 43,
+        .c8 => 49,
+        .c16 => 55,
+        .wx8, .wx16, .wy8, .wy16 => 38,
+        .ry8, .ry16, .rx8, .rx16 => unreachable, // only collected indexed
     };
 }
 
@@ -2087,6 +2251,7 @@ fn wgHelperLen(kind: WgSiteKind) u32 {
 fn wgEmitHelper(d: []u8, cur: *usize, site: WgSite) void {
     const lo: u8 = @truncate(site.reg);
     const hi: u8 = @truncate(site.reg >> 8);
+    if (site.idx != .none) return wgEmitIndexedHelper(d, cur, site);
     switch (site.kind) {
         .w8 => put(d, cur, &.{
             0x9C, 0x0A, 0x22, // STZ CIE: mask (STZ leaves flags alone)
@@ -2168,6 +2333,186 @@ fn wgEmitHelper(d: []u8, cur: *usize, site: WgSite) void {
             0xA9, 0x04, 0x8D, 0xF0, 0x37,
             0xAD, 0xF0, 0x37, 0x10, 0xFB,
             0xC2, 0x20, // 16-bit again (the entry width)
+            0xAD, 0xF3, 0x37, // 16-bit result
+            0x9C, 0xF0, 0x37, // 16-bit release (also zeroes $37F1)
+            0x08, 0x48, 0xE2,
+            0x20, 0xA9, 0x10,
+            0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68,
+            0x28, 0x60,
+        }),
+        // CMP against an MMIO register: an r8/r16 read whose result is then
+        // compared against the caller's preserved A — N/Z/C land exactly as
+        // the original CMP left them, and V (which CMP never touches)
+        // survives inside the pushed P.
+        .c8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // mask
+            0x08, // PHP
+            0xC2, 0x20, 0x48, // REP / PHA: full C, the request loads clobber it
+            0xE2, 0x20, 0xA9,
+            lo,   0x8D, 0xF1,
+            0x37, 0xA9, hi,
+            0x8D, 0xF2, 0x37,
+            0xA9, 0x02, 0x8D, 0xF0, 0x37, // filed: r8
+            0xAD, 0xF0, 0x37, 0x10, 0xFB, // BPL: wait for the $FE marker
+            0xC2, 0x20, 0x68, // A back
+            0x28, // PLP: caller flags and widths (m8 by construction)
+            0xCD, 0xF3, 0x37, // CMP result: N/Z/C as the original
+            0x9C, 0xF0, 0x37, // release (no flags)
+            0x08, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask, flags kept
+            0x60,
+        }),
+        .c16 => put(d, cur, &.{
+            0x08, // PHP
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, 0x48, // REP / PHA
+            0xE2, 0x20, 0xA9,
+            lo,   0x8D, 0xF1,
+            0x37, 0xA9, hi,
+            0x8D, 0xF2, 0x37,
+            0xA9, 0x04, 0x8D, 0xF0, 0x37, // filed: r16
+            0xAD, 0xF0, 0x37, 0x10, 0xFB,
+            0xC2, 0x20, 0x68, // A back (16)
+            0x28, // PLP (m=16 by construction)
+            0xCD, 0xF3, 0x37, // 16-bit CMP
+            0x9C, 0xF0, 0x37, // 16-bit release
+            0x08, 0x48, 0xE2,
+            0x20, 0xA9, 0x10,
+            0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68,
+            0x28, 0x60,
+        }),
+        .ry8, .ry16, .rx8, .rx16 => unreachable, // only collected indexed
+        // STX/STY to MMIO: flag-neutral stores whose width follows X. The
+        // value store runs first, at the caller's own index width, before
+        // any P munging; the PLP restores every flag exactly as the
+        // original left them (STX/STY touch none).
+        .wx8, .wx16, .wy8, .wy16 => {
+            const st: u8 = if (site.kind == .wx8 or site.kind == .wx16) 0x8E else 0x8C;
+            const rk: u8 = if (site.kind == .wx8 or site.kind == .wy8) 0x01 else 0x03;
+            put(d, cur, &.{
+                0x9C, 0x0A, 0x22, // mask
+                0x08, // PHP
+                st, 0xF3, 0x37, // value, caller's X width
+                0xE2, 0x20, // m8 for the immediates below
+                0x48, // PHA (AL; B untouched by anything after)
+                0xA9,
+                lo,
+                0x8D,
+                0xF1,
+                0x37,
+                0xA9,
+                hi,
+                0x8D,
+                0xF2,
+                0x37,
+                0xA9, rk, 0x8D, 0xF0, 0x37, // filed
+                0xAD, 0xF0, 0x37, 0xD0, 0xFB, // until served
+                0xA9, 0x10, 0x8D, 0x0A, 0x22, // unmask
+                0x68, 0x28, 0x60, // PLA / PLP / RTS
+            });
+        },
+    }
+}
+
+/// An indexed MMIO helper: same mailbox, same mask protocol, but the
+/// register field is computed at run time — TXA/TYA into a 16-bit A, add
+/// the base, file the sum. TXA/TYA read the index in the *caller's* index
+/// width (x=1 zero-extends), which is exactly the address arithmetic the
+/// original `abs,X`/`abs,Y` performed, so no width case-split is needed.
+/// What IS needed is more preservation than the plain helpers: the 16-bit
+/// transfer clobbers B, and ADC clobbers C and V, all of which the original
+/// store/load left alone — hence the 16-bit PHA and the PLP placed after
+/// the arithmetic. An effective address that leaves the MMIO range would be
+/// performed verbatim on the S-CPU bus (where low addresses are WRAM the
+/// game no longer owns); no shipped game does that from a $21xx/$42xx base,
+/// and one that did would fail S4 verification, not ship wrong.
+fn wgEmitIndexedHelper(d: []u8, cur: *usize, site: WgSite) void {
+    const lo: u8 = @truncate(site.reg);
+    const hi: u8 = @truncate(site.reg >> 8);
+    const txa: u8 = if (site.idx == .x) 0x8A else 0x98; // TXA / TYA
+    switch (site.kind) {
+        .w8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // STZ CIE: mask
+            0x08, // PHP
+            0x8D, 0xF3, 0x37, // value (A is the caller's, 8-bit)
+            0xC2, 0x20, // REP #$20
+            0x48, // PHA: the full C=B:A, which the transfer clobbers
+            txa, 0x18, 0x69, lo, hi, // index + base, caller's index width
+            0x8D, 0xF1, 0x37, // effective reg
+            0xE2, 0x20, // SEP #$20
+            0xA9, 0x01, 0x8D, 0xF0, 0x37, // filed: w8
+            0xAD, 0xF0, 0x37, 0xD0, 0xFB, // until served
+            0xA9, 0x10, 0x8D, 0x0A, 0x22, // unmask
+            0xC2, 0x20, 0x68, // REP / PLA: B:A back
+            0x28, 0x60, // PLP / RTS
+        }),
+        .stz8, .stz16, .c8, .c16, .wx8, .wx16, .wy8, .wy16 => unreachable,
+        // Loads into an index register (LDY abs,X / LDX abs,Y): the result
+        // width is the caller's X width, which conveniently is also the
+        // request width. The unmask tail is width-agnostic — PHP right after
+        // the load captures its N/Z, SEP pins m for the immediate, and the
+        // final PLP restores both the caller's widths and the load's flags.
+        .ry8, .ry16, .rx8, .rx16 => {
+            const req: u8 = if (site.kind == .ry8 or site.kind == .rx8) 0x02 else 0x04;
+            const ld: u8 = if (site.kind == .ry8 or site.kind == .ry16) 0xAC else 0xAE; // LDY/LDX abs
+            put(d, cur, &.{
+                0x9C, 0x0A, 0x22, // mask
+                0x08, // PHP
+                0xC2, 0x20, 0x48, // REP / PHA: A survives (the original preserved it)
+                txa,  0x18, 0x69, lo,   hi, // effective reg, caller's index width
+                0x8D, 0xF1, 0x37, 0xE2, 0x20,
+                0xA9, req, 0x8D, 0xF0, 0x37, // filed
+                0xAD, 0xF0, 0x37, 0x10, 0xFB, // until the $FE marker
+                0xC2, 0x20, 0x68, // A back
+                0x28, // PLP: caller widths (X width sizes the load below)
+                ld, 0xF3, 0x37, // result -> Y or X, N/Z as the original
+                0x9C, 0xF0, 0x37, // release (no flags)
+                0x08, 0xE2, 0x20, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask
+                0x60,
+            });
+        },
+        .w16 => put(d, cur, &.{
+            0x08, 0x48, // PHP / PHA (16-bit)
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, // 16-bit again (A untouched by SEP/REP)
+            0x8D, 0xF3, 0x37, // 16-bit value
+            txa,  0x18, 0x69, lo,   hi, // effective reg
+            0x8D, 0xF1, 0x37, 0xE2, 0x20,
+            0xA9, 0x03, 0x8D, 0xF0, 0x37, // filed: w16
+            0xAD, 0xF0, 0x37, 0xD0, 0xFB,
+            0xA9, 0x10, 0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68, 0x28, 0x60,
+        }),
+        .r8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // mask
+            0x08, // PHP: C and V survive the ADC below
+            0xC2, 0x20, 0x48, // REP / PHA: B survives the transfer
+            txa,  0x18, 0x69,
+            lo,   hi,   0x8D,
+            0xF1, 0x37, 0xE2,
+            0x20,
+            0xA9, 0x02, 0x8D, 0xF0, 0x37, // filed: r8
+            0xAD, 0xF0, 0x37, 0x10, 0xFB, // BPL: wait for the $FE marker
+            0xC2, 0x20, 0x68, 0xE2, 0x20, // B back (old AL too — about to be replaced)
+            0x28, // PLP: caller's flags and widths
+            0xAD, 0xF3, 0x37, // result — N/Z now match the original LDA
+            0x9C, 0xF0, 0x37, // release the mailbox (no flags)
+            0x08, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask, flags kept
+            0x60,
+        }),
+        .r16 => put(d, cur, &.{
+            0x08, // PHP
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, // A is dead (16-bit load overwrites all of it)
+            txa,  0x18,
+            0x69, lo,
+            hi,   0x8D,
+            0xF1, 0x37,
+            0xE2, 0x20,
+            0xA9, 0x04, 0x8D, 0xF0, 0x37, // filed: r16
+            0xAD, 0xF0, 0x37, 0x10, 0xFB,
+            0x28, // PLP: caller widths back (m=16 for r16 by construction)
             0xAD, 0xF3, 0x37, // 16-bit result
             0x9C, 0xF0, 0x37, // 16-bit release (also zeroes $37F1)
             0x08, 0x48, 0xE2,
@@ -3138,9 +3483,11 @@ test "whole-game: refusals name their reasons" {
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
 
-    // An indexed MMIO store: not proxyable in place.
+    // A read-modify-write on MMIO: not proxyable in place. (Plain indexed
+    // stores and loads ARE, since the helper computes the effective
+    // register at run time — Gradius III's `STA $210D,Y`, `LDY $4218,X`.)
     @memset(usage, 0);
-    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x9D, 0x00, 0x21 });
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
     try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
