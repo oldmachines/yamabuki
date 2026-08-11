@@ -13,10 +13,10 @@
 // target checksums green).
 //
 // Not yet listed, same upstreams, for whoever holds the matching dumps:
-// SA-1 Root also publishes Gradius III (JPN/USA) and Super R-Type (USA), and
-// Project FastROM also publishes Axelay and U.N. Squadron. Add an entry by
-// hashing your dump: `zig build test-commercial -Dcommercial-mint` prints the
-// sha256 of any ROM it identifies.
+// SA-1 Root also publishes Gradius III (JPN), its two "Origin" variants and
+// Super R-Type (USA), and Project FastROM also publishes Axelay and U.N.
+// Squadron. Add an entry by hashing your dump: `zig build test-commercial
+// -Dcommercial-mint` prints the sha256 of any ROM it identifies.
 .{
     .patches = .{
         .{
@@ -34,6 +34,14 @@
             .patch_sha256 = "994dab97f29468fd6421884e3d3c82f4ecae4fb7cf6aee0b155711a6a9b6871a",
             .url = "https://github.com/VitorVilela7/fastrom/releases/tag/v1.40",
             .license_note = "Project FastROM by Vitor Vilela; patch distributed via GitHub releases",
+        },
+        .{
+            .source_sha256 = "93da752a0c76167d0907efa832367e5d14aab8e835b864f345c386071a9af718",
+            .title = "Gradius III (USA)",
+            .patch_name = "Gradius-III-USA-v17.bps",
+            .patch_sha256 = "b79c0e3a1e8e4292f53d7d371355e0b5a6f7b9d01c2edc63196049af8733911b",
+            .url = "https://github.com/VitorVilela7/SA1-Root/releases/tag/v1.8",
+            .license_note = "SA-1 Root by Vitor Vilela; patch distributed via GitHub releases",
         },
         .{
             .source_sha256 = "0ef6f4cce5a2273fa49fe1ce724e0048a8e39c91da6b00dbb693fe1ba909177d",
