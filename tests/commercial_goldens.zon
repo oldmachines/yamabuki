@@ -45,5 +45,22 @@
         // boot spins in a $4210 edge-wait that races its own NMI handler's
         // ack. Frame 900 is the intro; by 1800 the attract demo is fighting.
         .{ .sha256 = "4001418ceb26f38efbea10b7bcc8233adc7bfcaa7e11dfb401d820f3254f06ef", .title = "STREET FIGHTER ALPHA2", .region = 2, .checksum = 0x535a, .frames = 900, .fb = 0x3f1d235d4b130a97, .audio = 0x52d937ac9745dfae },
+        // The first pinned *conversion*: the dump above is stock Gradius III,
+        // booted through Vitor Vilela's SA-1 Root patch (see the same entry in
+        // patches/registry.zon). It exists because every other row here is a
+        // cart as shipped, and that blind spot cost a whole milestone — the
+        // SA-1 served CRV/CNV/CIV to ordinary data reads as well as to vector
+        // pulls, which breaks every SA-1 Root bootstrap and nothing else. All
+        // 13 rows above stayed green throughout, including the two native
+        // SA-1 carts, because neither runs a bootstrap that reads its own
+        // vector table.
+        //
+        // Frame 900, not 600: 600 is the shared Konami logo (see above), and
+        // the converted build reaches it on the same frame as the stock one.
+        // 900 is the launch-bay intro, which only renders if the SA-1 is
+        // actually executing the offloaded game.
+        //
+        // The .bps is gitignored like the ROMs, so this row SKIPs without it.
+        .{ .sha256 = "93da752a0c76167d0907efa832367e5d14aab8e835b864f345c386071a9af718", .title = "gradius 3", .region = 1, .checksum = 0x27a2, .frames = 900, .fb = 0xc3dff8d023e3ea45, .audio = 0x3a80ce89818ee647, .patch = "Gradius-III-USA-v17.bps", .patch_sha256 = "b79c0e3a1e8e4292f53d7d371355e0b5a6f7b9d01c2edc63196049af8733911b" },
     },
 }
