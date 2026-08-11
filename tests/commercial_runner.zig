@@ -40,6 +40,20 @@ const Entry = struct {
     frames: u32,
     fb: u64,
     audio: u64,
+    /// Optional: pin the game *as converted by a community patch* rather than
+    /// as dumped. `sha256` still identifies the source dump the user owns —
+    /// this names a patch file in `-Dcommercial-patches` (default `patches/`)
+    /// that is applied in memory before booting. Patches are gitignored like
+    /// the ROMs, so an absent one is a SKIP, not a failure, and the message
+    /// points at the registry's upstream URL.
+    ///
+    /// This exists because nothing else in the suite runs converted code: the
+    /// SA-1 vector-pull bug broke every SA-1 Root conversion for a whole
+    /// milestone while all 13 pinned dumps stayed green.
+    patch: ?[]const u8 = null,
+    /// sha256 of that patch file. A file that does not match is a FAILURE, not
+    /// a silent hash mismatch later — same rule as `patches/registry.zon`.
+    patch_sha256: ?[]const u8 = null,
 };
 
 const Golden = struct {
@@ -145,8 +159,19 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (exact) |id| {
+            const image = switch (try resolveImage(io, gpa, out, id, entry)) {
+                .ready => |img| img,
+                .skip => {
+                    skipped += 1;
+                    continue;
+                },
+                .bad_patch => {
+                    failed += 1;
+                    continue;
+                },
+            };
             gated += 1;
-            const ok = runOne(gpa, out, id, entry) catch |e| blk: {
+            const ok = runOne(gpa, out, image, entry) catch |e| blk: {
                 try out.print("ERROR {s}: {s}\n", .{ entry.title, @errorName(e) });
                 break :blk false;
             };
@@ -169,17 +194,70 @@ pub fn main(init: std.process.Init) !void {
     if (failed > 0) std.process.exit(1);
 }
 
-fn runOne(
+/// What to boot for a pinned entry: the dump as found, or the dump with its
+/// pinned conversion patch applied — or nothing, when the patch is absent
+/// (skip) or wrong (fail).
+const Resolved = union(enum) { ready: []const u8, skip, bad_patch };
+
+fn resolveImage(
+    io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     id: *const Identified,
     entry: Entry,
+) !Resolved {
+    const patch_name = entry.patch orelse return .{ .ready = id.image };
+
+    const path = try std.fs.path.join(gpa, &.{ options.patches, patch_name });
+    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch {
+        // Patches are the authors' work and are never vendored or fetched.
+        // Point at the registry's upstream URL when it knows this dump.
+        const url = if (core.registry.find(&id.sha_hex)) |e| e.url else "the patch author's release page";
+        try out.print("SKIP {s} [{s}] (patch not in {s}{c} — fetch it from {s})\n", .{
+            entry.title, patch_name, options.patches, std.fs.path.sep, url,
+        });
+        return .skip;
+    };
+
+    if (entry.patch_sha256) |want| {
+        const got = core.registry.sha256Hex(pbytes);
+        if (!std.ascii.eqlIgnoreCase(&got, want)) {
+            try out.print("FAIL {s} [{s}]\n    patch file sha256 {s}\n    manifest pins      {s}\n    refusing to boot a patch that is not the pinned one\n", .{
+                entry.title, patch_name, &got, want,
+            });
+            return .bad_patch;
+        }
+    }
+
+    var mm: core.patch.CrcMismatch = .{};
+    const res = core.patch.apply(gpa, id.image, pbytes, &mm) catch |e| {
+        try out.print("FAIL {s} [{s}]: patch did not apply ({s}", .{ entry.title, patch_name, @errorName(e) });
+        if (e == error.WrongSource)
+            try out.print("; wants source crc32 {x:0>8}, dump is {x:0>8}", .{ mm.expected, mm.actual });
+        try out.print(")\n", .{});
+        return .bad_patch;
+    };
+    return .{ .ready = res.image };
+}
+
+fn runOne(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    image: []const u8,
+    entry: Entry,
 ) !bool {
-    const hashes = try bootAndHash(gpa, id.image, entry.frames);
+    const hashes = try bootAndHash(gpa, image, entry.frames);
     const ok = hashes.fb == entry.fb and hashes.audio == entry.audio;
-    try out.print("{s} {s} ({} frames)\n    fb    got {x:0>16} want {x:0>16}\n    audio got {x:0>16} want {x:0>16}\n", .{
-        if (ok) "PASS" else "FAIL", entry.title, entry.frames,
-        hashes.fb,                  entry.fb,    hashes.audio,
+    try out.print("{s} {s}{s}{s}{s} ({} frames)\n    fb    got {x:0>16} want {x:0>16}\n    audio got {x:0>16} want {x:0>16}\n", .{
+        if (ok) "PASS" else "FAIL",
+        entry.title,
+        if (entry.patch != null) " [" else "",
+        entry.patch orelse "",
+        if (entry.patch != null) "]" else "",
+        entry.frames,
+        hashes.fb,
+        entry.fb,
+        hashes.audio,
         entry.audio,
     });
     return ok;

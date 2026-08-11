@@ -266,11 +266,15 @@ pub fn build(b: *std.Build) void {
     const commercial_mint = b.option(bool, "commercial-mint", "Print ready-to-paste manifest entries for every ROM in the directory") orelse false;
     const commercial_filter = b.option([]const u8, "commercial-filter", "Only pinned games whose title (or file, when minting) contains this");
     const commercial_frames = b.option(u32, "commercial-frames", "Frames per game when minting (0 = default 600)") orelse 0;
+    // Where a pinned *conversion* finds its patch. Patches are gitignored like
+    // the ROMs, so a missing one is a SKIP, never a failure.
+    const commercial_patches = b.option([]const u8, "commercial-patches", "Directory of patch files for pinned conversions (default: patches/)") orelse "patches";
     const commercial_opts = b.addOptions();
     commercial_opts.addOption(?[]const u8, "roms", commercial_roms);
     commercial_opts.addOption(bool, "mint", commercial_mint);
     commercial_opts.addOption(?[]const u8, "filter", commercial_filter);
     commercial_opts.addOption(u32, "frames", commercial_frames);
+    commercial_opts.addOption([]const u8, "patches", commercial_patches);
 
     const commercial_runner = b.addExecutable(.{
         .name = "commercial-runner",
