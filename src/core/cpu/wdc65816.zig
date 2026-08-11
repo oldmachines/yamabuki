@@ -88,7 +88,7 @@ pub fn Cpu(comptime BusT: type) type {
             self.state = .running;
             self.nmi_pending = false;
             self.nmi_delay = false;
-            self.regs.pc = self.read16(0x00FFFC);
+            self.regs.pc = self.readVector16(0x00FFFC);
         }
 
         pub fn setNmi(self: *Self) void {
@@ -173,7 +173,7 @@ pub fn Cpu(comptime BusT: type) type {
             self.push8(pushed);
             self.regs.p = (self.regs.p | Flags.i) & ~Flags.d;
             self.regs.pbr = 0;
-            self.regs.pc = self.read16(vector);
+            self.regs.pc = self.readVector16(vector);
             self.fixStackE();
         }
 
@@ -201,6 +201,20 @@ pub fn Cpu(comptime BusT: type) type {
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             self.bus.write8(addr, value);
+        }
+
+        /// The two bytes of a reset/NMI/IRQ/BRK *vector pull*, as opposed to a
+        /// data read that happens to land on the vector table. A bus that
+        /// overlays registers onto the vector slots (the SA-1 serves its own
+        /// CRV/CNV/CIV there) must distinguish the two: hardware substitutes
+        /// only during the pull, and SA-1 bootstraps read the ROM's original
+        /// vectors as plain data to re-publish them to the other processor.
+        /// Buses without the hook are unaffected — the pull is a normal read.
+        fn readVector16(self: *Self, addr: u24) u16 {
+            if (!@hasDecl(BusT, "vectorRead8")) return self.read16(addr);
+            const lo: u16 = self.bus.vectorRead8(addr);
+            const hi: u16 = self.bus.vectorRead8(addr +% 1);
+            return lo | hi << 8;
         }
 
         /// 16-bit read, linear 24-bit address increment (crosses banks).
