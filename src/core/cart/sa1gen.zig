@@ -1907,9 +1907,10 @@ pub fn convertWholeGame(
                             n_moves += 1;
                             break :dpmove;
                         }
-                        const pushed = file >= 1 and (image[file - 1] == 0xDA or image[file - 1] == 0x48);
+                        const pushed = file >= 1 and
+                            (image[file - 1] == 0xDA or image[file - 1] == 0x5A or image[file - 1] == 0x48);
                         const from_imm = pushed and file >= 4 and
-                            (image[file - 4] == 0xA2 or image[file - 4] == 0xA9);
+                            (image[file - 4] == 0xA2 or image[file - 4] == 0xA0 or image[file - 4] == 0xA9);
                         if (!from_imm) break :dpmove; // restore shape: nothing to do
                     }
                     // Three shapes reach D or S from an immediate, and each
@@ -1930,6 +1931,10 @@ pub fn convertWholeGame(
                         switch (image[file - 1]) { // the push feeding PLD
                             0xDA => { // PHX
                                 want_ld = 0xA2;
+                                want_w = usage_map.flag_x;
+                            },
+                            0x5A => { // PHY — Gradius III's main-loop shape
+                                want_ld = 0xA0;
                                 want_w = usage_map.flag_x;
                             },
                             0x48 => {}, // PHA: defaults
@@ -1968,6 +1973,41 @@ pub fn convertWholeGame(
             // whose branches `continue`.
             if (bwram) {
                 const x16 = fl & usage_map.flag_x == 0;
+                // A D argument passed through a call: `LDY/LDX #imm` still
+                // live at a `JSR f` where f opens `PHY/PHX : PLD` — the
+                // callee establishes D from the caller's immediate, which
+                // Gradius III does at every main-loop iteration
+                // (`LDY #$1F00 : ... : JSR $9857` / `$9857: PHY : PLD`).
+                // The adjacency matcher above cannot see across the call,
+                // but the carried immediate can, and v17 confirms the fix:
+                // it shifts exactly these immediates.
+                if (op == 0x20) jsr: {
+                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    if (t < 0x8000) break :jsr;
+                    const tf = bank_file + (t - 0x8000);
+                    if (tf + 1 >= image.len or image[tf + 1] != 0x2B) break :jsr;
+                    const imm_file: u32 = switch (image[tf]) {
+                        0x5A => blk: { // PHY : PLD — needs the Y carry
+                            const at = ldy_at orelse break :jsr;
+                            if (cpu_addr - at > 16 or ldy_imm >= 0x2000) break :jsr;
+                            break :blk ldy_file + 1;
+                        },
+                        0xDA => blk: { // PHX : PLD — the X carry
+                            const at = ldx_at orelse break :jsr;
+                            if (cpu_addr - at > 16 or ldx_imm >= 0x2000) break :jsr;
+                            break :blk bank_file + ((at & 0xFFFF) - 0x8000) + 1;
+                        },
+                        else => break :jsr,
+                    };
+                    if (n_moves == wg_moves_max)
+                        return refuse(refusal, .{ .reason = .wg_dp_dynamic, .detail = cpu_addr });
+                    for (moves[0..n_moves]) |m| {
+                        if (m == imm_file) break;
+                    } else {
+                        moves[n_moves] = imm_file;
+                        n_moves += 1;
+                    }
+                }
                 if (op == 0xA2) { // LDX #
                     if (x16) {
                         ldx_at = cpu_addr;
@@ -2179,6 +2219,27 @@ pub fn convertWholeGame(
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
             if (bwram) {
+                // A WRAM bank byte materialized by an immediate and stored —
+                // the bank slot of a long pointer the game will dereference
+                // at run time (`LDA #$7E : STA $05` builds [$03] = $7E:xxxx
+                // in Gradius III's decompressor). The pointer VALUE is
+                // runtime data no static rewrite can reach, but its bank
+                // byte comes from this immediate, and $40 names the same
+                // bytes. The store opcode is checked against the coverage
+                // map, so this never fires mid-instruction. v17 rewrites
+                // exactly these immediates (and none of the arithmetic uses
+                // of the constant $7E, which have no adjacent store).
+                if (op == 0xA9 and (out[file + 1] == 0x7E or out[file + 1] == 0x7F)) {
+                    const fl2 = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                    const next = cpu_addr + 2;
+                    const next_op = (cov[next] | cov[0x80_0000 | next]) & usage_map.flag_opcode != 0;
+                    if (fl2 & usage_map.flag_m != 0 and next_op and file + 2 < out.len and
+                        (out[file + 2] == 0x85 or out[file + 2] == 0x8D))
+                    {
+                        out[file + 1] -= 0x3E;
+                        res.stats.rewritten_long += 1;
+                    }
+                }
                 if (branches(op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
