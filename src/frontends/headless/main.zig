@@ -166,7 +166,10 @@ pub fn main(init: std.process.Init) !void {
             \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
             \\  --verify-behavioral  S4: on pixel divergence, accept a conversion whose logic
             \\                state matches at every tick (for timing-changing offloads)
-            \\  --state f     resume from an SDL-player save state instead of power-on
+            \\  --state f     resume from an SDL-player save state instead of power-on;
+            \\                with --gen-sa1-patch, anchors the profile AND verify runs at
+            \\                the state, so candidates come from a scene with real slowdown
+            \\                (a state saved playing an earlier conversion of this game works)
             \\                (plain runs and --sa1-report; same image and core only)
             \\                from power-on, verifying its end hashes; with --sa1-report or a
             \\                --gen-* mode the movie drives the profiled runs instead, so
@@ -442,7 +445,7 @@ fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov
 /// where the game legitimately rewrites great swaths of WRAM — learning
 /// from them buries real corruption inside the mask (a 23%-of-WRAM blind
 /// spot on Gradius III; short-run learning masks ~500 bytes).
-fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Movie, total: u32) ![]u8 {
+fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Movie, state: ?[]const u8, total: u32) ![]u8 {
     const wram_len = core.bus.Bus.TickSnap.wram_len;
     const lag_run_max = 3;
     const cart = try core.Cartridge.load(gpa, image);
@@ -452,6 +455,10 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
         gpa.destroy(con);
     }
     con.init(cart);
+    // Anchored runs learn the mask from the anchored scene — a mask
+    // learned at the attract demo says nothing about a gameplay stage's
+    // wall-coupled bytes.
+    if (state) |sb| try con.loadState(sb);
     const snap = try gpa.create(core.bus.Bus.TickSnap);
     defer gpa.destroy(snap);
     snap.* = .{};
@@ -543,10 +550,11 @@ fn verifyBehavioral(
     plan: *const profile.Plan,
     res: *const core.sa1gen.Result,
     mov: ?util.movie.Movie,
+    state: ?[]const u8,
     total: u32,
 ) !Behavioral {
     const wram_len = core.bus.Bus.TickSnap.wram_len;
-    const mask = try learnWallMask(gpa, base_image, mov, total);
+    const mask = try learnWallMask(gpa, base_image, mov, state, total);
     defer gpa.free(mask);
 
     const Side = struct {
@@ -579,6 +587,10 @@ fn verifyBehavioral(
 
     var base = try Side.init(gpa, base_image);
     var conv = try Side.init(gpa, conv_image);
+    if (state) |sb| {
+        try base.con.loadState(sb);
+        try seedConverted(conv.con, sb, plan, res);
+    }
 
     var out: Behavioral = .{
         .verdict = .{ .pass = .clean },
@@ -779,6 +791,43 @@ fn loadStateInto(
     };
     try out.print("state loaded: {s}\n", .{path});
     try out.flush();
+}
+
+/// Seed a CONVERTED image's console from a save state recorded on a
+/// DIFFERENT image of the same game — the stock ROM, or an earlier
+/// conversion (the S3 stage leaves the WRAM layout in place, so the
+/// serialized machine loads wholesale). Two halves are stale afterwards
+/// and get rebuilt here: the SA-1 (the saved PC pointed into whatever the
+/// old image carved, so it is re-booted from THIS image's CRV, exactly
+/// the writes the shim makes at reset) and the live relocated regions
+/// (the plan moved those bytes out of WRAM, so the state's WRAM copy is
+/// the truth and seeds their new homes).
+fn seedConverted(
+    con: anytype,
+    state: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+) !void {
+    try con.loadState(state);
+    const sa1 = &con.bus.sa1;
+    const clk = con.bus.clock;
+    sa1.mmioWrite(clk, 0x2200, 0x20); // hold RESB
+    sa1.mmioWrite(clk, 0x2229, 0xFF); // SIWP: S-CPU may write I-RAM
+    sa1.mmioWrite(clk, 0x2226, 0x80); // SWEN: S-CPU may write BW-RAM
+    sa1.mmioWrite(clk, 0x2203, @truncate(res.stats.crv));
+    sa1.mmioWrite(clk, 0x2204, @truncate(res.stats.crv >> 8));
+    sa1.mmioWrite(clk, 0x2200, 0x00); // release: boot from CRV
+    sa1.cmeg = 0; // drop a stale done echo from the old image's run
+    sa1.iram[0x38A] = 0; // async busy flag idle
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean) continue;
+        if (res.region_sites[ri] == 0 and !(r.dp and res.stats.d_moved)) continue;
+        const src = con.bus.wram.data[r.start .. r.start + r.len];
+        switch (r.dest) {
+            .iram => @memcpy(sa1.iram[r.dest_off..][0..r.len], src),
+            .bwram => @memcpy(sa1.bwram[r.dest_off..][0..r.len], src),
+        }
+    }
 }
 
 fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
@@ -1150,6 +1199,26 @@ fn runSa1Gen(
     else
         gen_frames_default;
     const total = args.skip + frames;
+    // State-anchored generation: profile AND verify from a gameplay save
+    // state instead of power-on, so the candidate set comes from a scene
+    // with real slowdown — code the attract demo never executes has no
+    // coverage and can never be offloaded. The state may be from an
+    // earlier conversion of this same game: nothing binds a state to an
+    // image, and the S3 stage leaves the WRAM layout in place.
+    const state_bytes: ?[]const u8 = if (args.state) |spath| blk: {
+        if (args.whole_game) {
+            try out.print("error: --state with --whole-game is not supported (the whole-game window shift is not applied to seeded states)\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+        const data = std.Io.Dir.cwd().readFileAlloc(io, spath, gpa, .limited(16 * 1024 * 1024)) catch {
+            try out.print("error: cannot read state '{s}'\n", .{spath});
+            try out.flush();
+            std.process.exit(1);
+        };
+        try out.print("anchored at state: {s}\n", .{spath});
+        break :blk data;
+    } else null;
     try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
     try out.flush();
 
@@ -1177,6 +1246,11 @@ fn runSa1Gen(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
+    if (state_bytes) |sb| con.loadState(sb) catch |e| {
+        try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
+        try out.flush();
+        std.process.exit(1);
+    };
     for (0..total) |i| {
         if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
         feedMovie(con, mov, i);
@@ -1203,6 +1277,21 @@ fn runSa1Gen(
     if (!args.whole_game) {
         conv = profile.assessConversion(&con.prof, sum.verdict);
         plan = profile.planRelocation(&con.prof, conv);
+        // Anchored runs hunt OFFLOADS, not relocations. Two reasons, one
+        // fundamental and one earned: the dp-window move happens in the
+        // boot shim, which a state seeded mid-game never executes (its
+        // live D and stacked D saves predate any move); and live-region
+        // moves from a gameplay profile are exactly the aggressive plans
+        // (34 KiB of shared WRAM on the first real cart tried) that no
+        // verification has ever passed — the attract-demo plans only ever
+        // moved dead regions. Offloads carry the plan's value anyway: the
+        // S3 stage exists to put compute on the SA-1, and candidates from
+        // a scene with real slowdown are the whole point of anchoring.
+        if (state_bytes != null and plan.n > 0) {
+            plan.n = 0;
+            plan.has_dp = false;
+            try out.print("  (anchored: relocation disabled — offload candidates only; a seeded state predates the boot shim's moves)\n", .{});
+        }
         for (conv.entries[0..conv.n], 0..) |e, i| {
             cands[i] = .{ .entry = e };
             if (con.prof.routineInfo(e)) |r| {
@@ -1324,6 +1413,7 @@ fn runSa1Gen(
             const cart2 = try core.Cartridge.load(gpa, res.image);
             const con2 = try gpa.create(core.ProfilingConsole);
             con2.init(cart2);
+            if (state_bytes) |sb| try seedConverted(con2, sb, &plan, &res);
             for (0..total) |i| {
                 feedMovie(con2, mov, i);
                 con2.runFrame();
@@ -1377,7 +1467,7 @@ fn runSa1Gen(
         if (passed == null and equiv == .divergent and args.verify_behavioral and !args.whole_game) {
             try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
             try out.flush();
-            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, total);
+            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, state_bytes, total);
             switch (bv.verdict) {
                 .pass => |kind| {
                     try out.print(

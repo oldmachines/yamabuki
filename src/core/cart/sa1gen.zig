@@ -151,6 +151,10 @@ pub const Stats = struct {
     /// 24-bit address of the shared fence routine (JSL target), for the
     /// NMI prologue convert() emits.
     async_fence: u24 = 0,
+    /// The SA-1 reset vector the shim programs (the dispatcher, or the
+    /// park stub when nothing offloaded) — what a state-seeded run needs
+    /// to re-boot the SA-1 without executing the shim.
+    crv: u16 = 0,
     /// `--wg-static` only: unprovable shapes found in statically
     /// discovered (never-executed) code and left as-is for S4 verification
     /// to arbitrate — D/S establishes, block moves, RMW MMIO.
@@ -315,6 +319,7 @@ pub fn convert(
     // — awaiting a handshake for a call that never happened.
     if (res.stats.async_entry != 0) n = emitStore(w, n, 0x378A, 0x00);
     const park_addr: u16 = shim_addr + @as(u16, @intCast(shim_len_max));
+    res.stats.crv = crv;
     n = emitStore(w, n, 0x2203, @truncate(crv)); // CRV low
     n = emitStore(w, n, 0x2204, @truncate(crv >> 8)); // CRV high
     w[n] = 0x9C; // STZ $2200: release the SA-1 from reset -> boots from CRV
