@@ -1255,7 +1255,7 @@ fn runSa1Gen(
     // earlier conversion of this same game: nothing binds a state to an
     // image, and the S3 stage leaves the WRAM layout in place.
     const state_bytes: ?[]const u8 = if (args.state) |spath| blk: {
-        if (args.whole_game) {
+        if (args.whole_game and !args.window) {
             try out.print("error: --state with --whole-game is not supported (the whole-game window shift is not applied to seeded states)\n", .{});
             try out.flush();
             std.process.exit(1);
@@ -1268,6 +1268,16 @@ fn runSa1Gen(
         try out.print("anchored at state: {s}\n", .{spath});
         break :blk data;
     } else null;
+    // WINDOW + state: EVIDENCE and TRUTH split. A window image cannot be
+    // seeded mid-game (the shim's D/S/window moves never ran for a saved
+    // state, and the stack carries pre-move D saves as data), so the
+    // state anchors an EVIDENCE pass only — profile, coverage, and the
+    // candidate set come from the anchored scene — while verification
+    // runs from power-on, where the shim makes everything consistent.
+    // The offloads still get exercised: hot gameplay routines run in the
+    // attract too.
+    const evidence_state: ?[]const u8 = if (args.window) state_bytes else null;
+    const verify_state: ?[]const u8 = if (args.window) null else state_bytes;
     try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
     try out.flush();
 
@@ -1291,11 +1301,42 @@ fn runSa1Gen(
     // capture might be too short" from a caveat into a number.
     var cov_early: u32 = 0;
     const cov_mark: usize = total - total / 10;
+    // The anchored EVIDENCE pass (window + --state): profile and coverage
+    // from the gameplay scene, into the same usage map the rewriter and
+    // the walks consume. Candidates come from THIS profile.
+    var evidence_conv: ?profile.Conversion = null;
+    if (evidence_state) |sb| {
+        const ecart = try core.Cartridge.load(gpa, image);
+        const econ = try gpa.create(core.ProfilingConsole);
+        econ.init(ecart);
+        econ.usage = &umap;
+        econ.loadState(sb) catch |e| {
+            try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
+            try out.flush();
+            std.process.exit(1);
+        };
+        var esamples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+        try esamples.ensureTotalCapacity(total);
+        for (0..total) |i| {
+            feedMovie(econ, mov, i);
+            econ.runFrame();
+            if (econ.takeProfile()) |smp| {
+                if (i >= args.skip) esamples.appendAssumeCapacity(smp);
+            }
+        }
+        const escratch = try gpa.alloc(f64, esamples.items.len);
+        const esum = profile.summarise(esamples.items, escratch);
+        evidence_conv = profile.assessConversion(&econ.prof, esum.verdict);
+        econ.cart.deinit(gpa);
+        gpa.destroy(econ);
+        try out.print("  (evidence pass: profile + coverage anchored at the state; verification stays power-on)\n", .{});
+        try out.flush();
+    }
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
-    if (state_bytes) |sb| con.loadState(sb) catch |e| {
+    if (verify_state) |sb| con.loadState(sb) catch |e| {
         try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
         try out.flush();
         std.process.exit(1);
@@ -1327,7 +1368,7 @@ fn runSa1Gen(
     // page machinery — a window image has no marshal to size, only trees
     // to walk. The bisect and mode ladder below drive them as usual.
     if (args.window) {
-        conv = profile.assessConversion(&con.prof, sum.verdict);
+        conv = evidence_conv orelse profile.assessConversion(&con.prof, sum.verdict);
         for (conv.entries[0..conv.n], 0..) |e, i| cands[i] = .{ .entry = e };
         n_cands = conv.n;
         if (!args.verify_behavioral) {
@@ -1500,7 +1541,7 @@ fn runSa1Gen(
             const cart2 = try core.Cartridge.load(gpa, res.image);
             const con2 = try gpa.create(core.ProfilingConsole);
             con2.init(cart2);
-            if (state_bytes) |sb| try seedConverted(con2, sb, &plan, &res);
+            if (verify_state) |sb| try seedConverted(con2, sb, &plan, &res);
             for (0..total) |i| {
                 feedMovie(con2, mov, i);
                 con2.runFrame();
@@ -1558,7 +1599,7 @@ fn runSa1Gen(
         {
             try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
             try out.flush();
-            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, state_bytes, args.window, total);
+            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, verify_state, args.window, total);
             switch (bv.verdict) {
                 .pass => |kind| {
                     try out.print(
@@ -1875,6 +1916,16 @@ fn reportSa1(
             res.stats.rewritten_abs,
             res.stats.dp_sites,
         });
+        if (res.stats.offload_count != 0) {
+            try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
+            for (res.stats.offload_entries[0..res.stats.offload_count], 0..) |e, i| {
+                try out.print("    $00:{x:0>4} ({} byte(s) of tree copied{s})\n", .{
+                    e,
+                    res.stats.offload_copy_len[i],
+                    if (res.stats.async_entry == e) @as([]const u8, ", ASYNC — fire-and-forget") else "",
+                });
+            }
+        }
     } else if (args.whole_game) {
         try out.print(
             \\whole-game migration (SA-1 Root):

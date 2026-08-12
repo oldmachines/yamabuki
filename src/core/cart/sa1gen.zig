@@ -1971,6 +1971,11 @@ fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) 
     const entry: u32 = spec.members[mi].entry;
     var pc: u32 = entry;
     var limit: u32 = entry;
+    // The data-bank pin, post-window flavor: the rewritten idiom loads
+    // $40/$41 now. Under a BW-RAM pin every absolute is data both CPUs
+    // read identically — including operands that happen to fall in the
+    // MMIO decode range ($8EF1 stores $3E00 under a pinned $40).
+    var db_pin: ?u8 = null;
     while (pc - entry < span_max) {
         if (pc > 0xFFFF) return false;
         if (usage[pc] & usage_map.flag_opcode == 0) {
@@ -2032,14 +2037,24 @@ fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) 
                 if (dst < entry or dst - entry >= span_max) return false;
                 limit = @max(limit, dst);
             },
+            0xA9 => if (m8 and file + 3 < out.len and out[file + 2] == 0x48 and out[file + 3] == 0xAB) {
+                db_pin = out[file + 1];
+            },
+            0xAB => {
+                if (file < 3 or out[file - 3] != 0xA9 or out[file - 1] != 0x48) db_pin = null;
+            },
             else => {},
         }
+        if (!dbrSurvives(out, usage, file, op)) db_pin = null;
         switch (usage_map.mode(op)) {
             .none, .dp, .dp_idx => {},
             .abs, .abs_x, .abs_y => {
                 const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                // MMIO through any system bank is S-CPU-only hardware.
-                if (v >= 0x2100 and v < 0x4380) return false;
+                // MMIO through a system bank is S-CPU-only hardware — but
+                // under a pinned BW-RAM bank the same operand is data both
+                // CPUs read identically.
+                const pinned_bw = db_pin != null and (db_pin.? == 0x40 or db_pin.? == 0x41);
+                if (!pinned_bw and v >= 0x2100 and v < 0x4380) return false;
             },
             .long, .long_x => {
                 const b = out[file + 3];
