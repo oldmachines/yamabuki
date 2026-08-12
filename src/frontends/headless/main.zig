@@ -102,6 +102,10 @@ const Args = struct {
     /// game executes on the SA-1 and the S-CPU becomes an MMIO service
     /// loop — instead of the routine-offload ladder.
     whole_game: bool = false,
+    /// With --whole-game: also rewrite code the profiled run never reached,
+    /// discovered by recursive-descent disassembly seeded from coverage.
+    /// Unprovable shapes in that code are counted, not refused over.
+    wg_static: bool = false,
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
@@ -162,6 +166,9 @@ pub fn main(init: std.process.Init) !void {
             \\                clean state moves), verified pixel- and audio-identical; the game
             \\                still runs on the S-CPU — execution migration is stage S3b
             \\                (default output: <rom>-sa1.bps)
+            \\  --wg-static   with --whole-game: also rewrite code the profiled run never reached
+            \\                (recursive-descent disassembly seeded from coverage); unprovable
+            \\                shapes there are counted, not refused over
             \\  --whole-game  with --gen-sa1-patch: whole-game migration (SA-1 Root) — the game
             \\                executes entirely on the SA-1, the S-CPU becomes an MMIO service
             \\                loop; needs the WRAM working set inside I-RAM's identity window
@@ -893,12 +900,31 @@ fn runSa1Gen(
 
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
             error.Refused => {
-                try out.print("refused: {s}\n", .{refusal.?.reason.describe()});
+                const r = refusal.?;
+                try out.print("refused: {s}\n", .{r.reason.describe()});
+                // Most whole-game refusals name the instruction that caused
+                // them; without the address the message is a dead end.
+                switch (r.reason) {
+                    .wg_wram_beyond_iram,
+                    .wg_wram_beyond_bwram,
+                    .wg_dp_dynamic,
+                    .wg_stack_dynamic,
+                    .wg_blockmove_source,
+                    .wg_mmio_shape,
+                    .wg_mmio_outside_bank0,
+                    .wg_unsupported_op,
+                    => if (r.detail != 0) try out.print(
+                        "  at ${x:0>2}:{x:0>4}\n",
+                        .{ r.detail >> 16, r.detail & 0xFFFF },
+                    ),
+                    .no_free_space => try out.print("  needs {} bytes\n", .{r.detail}),
+                    else => {},
+                }
                 try out.flush();
                 std.process.exit(1);
             },
@@ -2240,6 +2266,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.gen_sa1 = true;
         } else if (std.mem.eql(u8, a, "--whole-game")) {
             out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--wg-static")) {
+            out.wg_static = true;
         } else if (std.mem.eql(u8, a, "--out")) {
             out.gen_out = it.next() orelse return error.MissingValue;
         } else if (rom == null) {

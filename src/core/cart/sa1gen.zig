@@ -75,6 +75,10 @@ pub const Reason = enum {
     wg_uses_irq,
     wg_nmi_ambiguous,
     wg_unsupported_op,
+    wg_wram_beyond_bwram,
+    wg_dp_dynamic,
+    wg_stack_dynamic,
+    wg_blockmove_source,
 
     pub fn describe(self: Reason) []const u8 {
         return switch (self) {
@@ -86,6 +90,10 @@ pub const Reason = enum {
             .reset_vector_not_rom => "the reset vector does not point into ROM",
             .no_free_space => "no padding run in bank $00 is large enough for the boot shim",
             .wg_wram_beyond_iram => "whole-game migration needs the WRAM working set inside $0000-$07FF (the SA-1's identity-mapped I-RAM)",
+            .wg_wram_beyond_bwram => "the WRAM working set does not fit the BW-RAM window either: bank $7E/$7F beyond 128 KiB, or a low-bank address at or above $2000",
+            .wg_dp_dynamic => "the game loads the direct page from something other than an immediate; the BW-RAM window move needs every D provable at build time",
+            .wg_stack_dynamic => "the game loads the stack pointer from something other than an immediate; the BW-RAM window move needs every S provable at build time",
+            .wg_blockmove_source => "a block move reads bank $00, where WRAM and ROM share the map, and X is not provably a WRAM address here — re-banking a move that turns out to walk ROM would read BW-RAM garbage",
             .wg_mmio_shape => "an MMIO access is not a plain LDA/STA/STZ absolute — not proxyable in place",
             .wg_mmio_outside_bank0 => "an MMIO site executes outside bank $00 code; its in-place JSR can only reach helpers carved in its own bank",
             .wg_uses_irq => "the game takes IRQs; whole-game migration forwards only NMI so far",
@@ -136,6 +144,10 @@ pub const Stats = struct {
     /// Pointer offloads whose data is BW-RAM-RESIDENT: not marshalled at
     /// all, addressed in place by both CPUs.
     resident_offloads: u8 = 0,
+    /// `--wg-static` only: unprovable shapes found in statically
+    /// discovered (never-executed) code and left as-is for S4 verification
+    /// to arbitrate — D/S establishes, block moves, RMW MMIO.
+    static_skipped: u32 = 0,
     /// Where each offload's SA-1-side body copy landed (full 24-bit
     /// address), in message-id order; 0 for leaf offloads, which run the
     /// original body in place. Lets a diagnosis point the SA-1 execution
@@ -1400,11 +1412,31 @@ comptime {
 /// 4 read16 filed, $FE read served — >= 5 means busy, not a request.
 const wg_mailbox: u16 = 0x37F0;
 
-const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16 };
-const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16 };
-const wg_sites_max = 96;
+const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16, c8, c16, ry8, ry16, rx8, rx16, wx8, wx16, wy8, wy16 };
+/// Which index register the site's addressing mode adds, if any. An indexed
+/// site's helper computes base+index at run time — in the caller's own index
+/// width, since TXA/TYA zero-extend exactly when the hardware would — and
+/// files the *effective* register; the mailbox protocol never sees the
+/// difference.
+const WgIndex = enum { none, x, y };
+const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16, idx: WgIndex = .none };
+const wg_sites_max = 768;
+/// A helper is a pure function of (kind, reg, idx), so sites sharing all
+/// three share one helper — Gradius III alone has hundreds of MMIO sites
+/// but only a few dozen distinct shapes, and the carve is sized by the
+/// latter.
+const wg_uniq_max = 160;
+/// Executed TCD/TCS sites the BW-RAM window move can adjust.
+const wg_moves_max = 64;
+/// Where the BW-RAM window sits on both buses ($6000-$7FFF of every system
+/// bank). WRAM's low mirror $0000-$1FFF shifts here; $7E/$7F re-bank to
+/// $40/$41 instead, reaching the same bytes linearly.
+const wg_bw_window: u16 = 0x6000;
 
 const wg_prologue_len = 21;
+/// Extra prologue the BW-RAM window needs: select block 0, unprotect, and
+/// reproduce the power-on D and S inside the window (native mode first).
+const wg_prologue_bw_extra = 20;
 const wg_sa1_nmi_len = 18;
 const wg_scpu_nmi_len = 19;
 const wg_shim_len = 37;
@@ -1444,12 +1476,149 @@ comptime {
     std.debug.assert(wg_service.len == 89);
 }
 
+/// `--wg-static`: extend the S1 coverage map by recursive-descent
+/// disassembly. Every dynamically covered opcode is a PROVEN instruction
+/// start with proven M/X widths — the profiler recorded them — which
+/// sidesteps the classic 65816 static-disassembly trap: immediates change
+/// length with the width flags, so a cold disassembler cannot even take
+/// instruction boundaries for granted. Seeded from every covered opcode
+/// plus the reset vector, the walk decodes forward through code the
+/// profiled run never reached, following static control flow (branches both
+/// ways, JSR/JSL target and return, JMP/JML/BRA/BRL targets) and
+/// propagating widths through SEP/REP. A path stops wherever the widths
+/// stop being provable (PLP, XCE, RTI) or control goes somewhere static
+/// analysis cannot follow — indirect jumps, whose targets are usually
+/// covered seeds already, which is the point of seeding from coverage.
+/// Bytes never reached stay data and are never rewritten.
+fn extendCoverage(
+    gpa: std.mem.Allocator,
+    image: []const u8,
+    header: header_mod.Header,
+    usage: []const u8,
+) ![]u8 {
+    const ext = try gpa.dupe(u8, usage);
+    errdefer gpa.free(ext);
+    // File-offset-shaped visit marks; one decode per byte is enough because
+    // dynamic flags are already trusted and a width conflict is grounds to
+    // stop, not re-decode.
+    const seen = try gpa.alloc(bool, image.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+
+    const Item = struct { addr: u24, m8: bool, x8: bool };
+    var stack: std.array_list.Managed(Item) = .init(gpa);
+    defer stack.deinit();
+
+    if (header.reset_vector >= 0x8000)
+        try stack.append(.{ .addr = header.reset_vector, .m8 = true, .x8 = true });
+    var sbank: u32 = 0;
+    while (sbank < 0x40) : (sbank += 1) {
+        if (sbank * 0x8000 >= image.len) break;
+        var sa: u32 = 0x8000;
+        while (sa < 0x10000) : (sa += 1) {
+            const cpu = (sbank << 16) | sa;
+            for ([2]u32{ cpu, 0x80_0000 | cpu }) |c| {
+                const fl = usage[c];
+                if (fl & usage_map.flag_opcode != 0) try stack.append(.{
+                    .addr = @intCast(cpu),
+                    .m8 = fl & usage_map.flag_m != 0,
+                    .x8 = fl & usage_map.flag_x != 0,
+                });
+            }
+        }
+    }
+
+    while (stack.pop()) |item| {
+        var addr: u32 = item.addr;
+        var m8 = item.m8;
+        var x8 = item.x8;
+        walk: while (true) {
+            const wbank = addr >> 16;
+            const a16 = addr & 0xFFFF;
+            if (wbank >= 0x40 or a16 < 0x8000) break;
+            const file = wbank * 0x8000 + (a16 - 0x8000);
+            if (file >= image.len) break;
+            if (seen[file]) break;
+            seen[file] = true;
+            const op = image[file];
+            const len: u32 = usage_map.instrLen(op, m8, x8);
+            if (a16 + len > 0x10000) break;
+            if (ext[addr] & usage_map.flag_opcode == 0) {
+                ext[addr] &= ~(usage_map.flag_m | usage_map.flag_x);
+                ext[addr] |= usage_map.flag_opcode | usage_map.flag_exec |
+                    (if (m8) usage_map.flag_m else @as(u8, 0)) |
+                    (if (x8) usage_map.flag_x else @as(u8, 0));
+                var i: u32 = 1;
+                while (i < len) : (i += 1) ext[addr + i] |= usage_map.flag_exec;
+            }
+            switch (op) {
+                // Path enders: returns, software interrupts, STP — and the
+                // two instructions after which the widths are anyone's
+                // guess.
+                0x60, 0x6B, 0x40, 0x00, 0x02, 0xDB, 0x28, 0xFB => break,
+                0xE2 => { // SEP #imm
+                    const im = image[file + 1];
+                    if (im & 0x20 != 0) m8 = true;
+                    if (im & 0x10 != 0) x8 = true;
+                },
+                0xC2 => { // REP #imm
+                    const im = image[file + 1];
+                    if (im & 0x20 != 0) m8 = false;
+                    if (im & 0x10 != 0) x8 = false;
+                },
+                0x4C => { // JMP abs: bank-confined
+                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                    break;
+                },
+                0x5C, 0x22 => { // JML long / JSL long
+                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    const tb: u32 = image[file + 3] & 0x7F;
+                    try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
+                    if (op == 0x5C) break; // JSL falls through on return
+                },
+                0x20 => { // JSR abs: target plus fall-through
+                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                },
+                0x80, 0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
+                    const rel: i8 = @bitCast(image[file + 1]);
+                    const t = (a16 +% 2 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
+                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                    if (op == 0x80) break; // BRA is unconditional
+                },
+                0x82 => { // BRL
+                    const rel: i16 = @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little));
+                    const t = (a16 +% 3 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
+                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                    break;
+                },
+                // Indirect control transfers: statically opaque. (JSR
+                // (abs,X) does fall through on return, so it continues.)
+                0x6C, 0x7C, 0xDC => break,
+                else => {},
+            }
+            addr += len;
+            continue :walk;
+        }
+    }
+    return ext;
+}
+
 /// Convert for whole-game migration. Needs only the coverage map — no plan:
 /// state stays at its own addresses inside the identity window.
 pub fn convertWholeGame(
     gpa: std.mem.Allocator,
     image: []const u8,
     usage: []const u8,
+    /// `--wg-static`: also rewrite code the profiled run never executed,
+    /// discovered by `extendCoverage`. Statically discovered code gets the
+    /// window rewrites and (supported-shape) MMIO proxies but contributes
+    /// no proofs and no refusals — unprovable shapes there are counted in
+    /// `stats.static_skipped` and left for S4 verification to arbitrate,
+    /// because refusing a conversion over code that may never run would
+    /// bring back the old "no game qualifies" regime by another road.
+    static_walk: bool,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -1460,6 +1629,12 @@ pub fn convertWholeGame(
     if (image.len > 4 << 20) return refuse(refusal, .{ .reason = .rom_too_big });
     const reset = header.reset_vector;
     if (reset < 0x8000) return refuse(refusal, .{ .reason = .reset_vector_not_rom });
+
+    // The map both walks consume: dynamic coverage, statically extended
+    // when asked. `usage` stays the authority on what actually ran — the
+    // refusal policy keys on it.
+    const cov: []const u8 = if (static_walk) try extendCoverage(gpa, image, header, usage) else usage;
+    defer if (static_walk) gpa.free(@constCast(cov));
     // Executed flags are merged across the $80-$BF fast mirrors throughout:
     // the same ROM byte, the same file offset, possibly only ever executed
     // through the mirror.
@@ -1483,11 +1658,23 @@ pub fn convertWholeGame(
         return refuse(refusal, .{ .reason = .wg_nmi_ambiguous });
     const nmi_target: u16 = if (emu_used and !nat_used) nmi_emu else nmi_native;
 
-    // Every WRAM byte the game touched — by effective address, so dp,
-    // stack, and indirect accesses are all covered — must sit inside the
-    // identity window, clear of the mailbox tail this conversion reserves.
+    // Which identity window carries the game's WRAM?
+    //
+    // I-RAM first: the SA-1's 2 KiB sits at $0000-$07FF of its bus, exactly
+    // where the S-CPU sees WRAM's low mirror, so a set that fits needs NO
+    // WRAM rewriting at all — the cheapest and safest conversion, and the
+    // only one this generator used to attempt.
+    //
+    // Otherwise BW-RAM, which is what every shipped SA-1 Root conversion
+    // actually uses (checked against Vitor Vilela's Gradius III v17: it
+    // re-banks $7E:xxxx to $40:xxxx and adds $6000 to low-bank absolute
+    // addresses, nothing else). BW-RAM is 128 KiB+ against I-RAM's 2 KiB,
+    // so the sets that fit are a different order of game. The price is that
+    // every WRAM-naming operand must be rewritten, and D and S must move
+    // with them — see the walk below.
+    const touched = usage_map.flag_read | usage_map.flag_write | usage_map.flag_exec;
+    var wram_fits_iram = true;
     {
-        const touched = usage_map.flag_read | usage_map.flag_write | usage_map.flag_exec;
         var b: u32 = 0;
         while (b < 0x100) : (b += 1) {
             const sys = b < 0x40 or (b >= 0x80 and b < 0xC0);
@@ -1495,60 +1682,420 @@ pub fn convertWholeGame(
             var a: u32 = 0;
             while (a < top) : (a += 1) {
                 if (usage[(b << 16) | a] & touched == 0) continue;
-                if (b == 0x7F or a >= 0x7F0)
-                    return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = (b << 16) | a });
+                if (b == 0x7F or a >= 0x7F0) {
+                    wram_fits_iram = false;
+                    break;
+                }
             }
+            if (!wram_fits_iram) break;
         }
     }
+    // The BW-RAM window is uniform: WRAM $7E/$7F:xxxx -> BW-RAM $40/$41:xxxx
+    // and low-bank $0000-$1FFF -> $6000-$7FFF, the same byte reached either
+    // way. A low-bank address at or above $2000 is not WRAM at all, so
+    // nothing in that range can be carried by this move.
+    const bwram = !wram_fits_iram;
 
     // Eligibility walk + MMIO site collection over every executed opcode.
     var sites: [wg_sites_max]WgSite = undefined;
     var n_sites: usize = 0;
+    // File offsets of `LDA #imm` operands feeding a TCD/TCS (BW-RAM mode).
+    var moves: [wg_moves_max]u32 = undefined;
+    var n_moves: usize = 0;
+    // File offsets of bank-$00 block moves proved to walk WRAM.
+    var bm: [wg_moves_max]u32 = undefined;
+    var n_bm: usize = 0;
+    // File offsets of `LDA #$7E/$7F` immediates feeding a PLB.
+    var dbrs: [wg_moves_max]u32 = undefined;
+    var n_dbrs: usize = 0;
+    // Unprovable shapes in statically discovered code, left for S4.
+    var static_skipped: u32 = 0;
     var bank: u32 = 0;
+    // The most recent `LDX #imm` this walk passed, for the block-move source
+    // proof below. Reset at every bank and killed by anything that writes X
+    // or transfers control, so it only ever survives straight-line code.
+    var ldx_at: ?u32 = null;
+    var ldx_imm: u16 = 0;
+    var ldy_at: ?u32 = null;
+    var ldy_imm: u16 = 0;
+    var ldy_file: u32 = 0;
+    // Does the data bank register point at BW-RAM here? Absolute operands
+    // are DBR-relative, so the same instruction means different memory
+    // depending on it: with DBR a system bank, `LDA $0900` is WRAM's low
+    // mirror and must shift into the $6000 window; with DBR already $7E (or
+    // $40 after re-banking), it is that bank's own $0900 and must NOT shift.
+    // Gradius III relies on this — its `STZ $2000` at $00:8086 runs with DBR
+    // left at $7E by the preceding `MVN $7E,$7E`, which is why Vilela
+    // re-banks the move and leaves the store alone.
+    //
+    // DBR is $00 at reset and system-bank for the overwhelming majority of
+    // code, so "not provably BW-RAM" is treated as a system bank; a game
+    // that defeats that assumption fails S4 verification rather than
+    // shipping.
+    var dbr_bw = false;
     while (bank < 0x40) : (bank += 1) {
         const bank_file = bank * 0x8000;
         if (bank_file >= image.len) break;
         var a16: u32 = 0x8000;
+        ldx_at = null;
+        dbr_bw = false;
         while (a16 < 0x10000) : (a16 += 1) {
             const cpu_addr = (bank << 16) | a16;
-            const fl_lo = usage[cpu_addr];
-            const fl_hi = usage[0x80_0000 | cpu_addr];
+            const fl_lo = cov[cpu_addr];
+            const fl_hi = cov[0x80_0000 | cpu_addr];
             if ((fl_lo | fl_hi) & usage_map.flag_opcode == 0) continue;
             const file = bank_file + (a16 - 0x8000);
             const op = image[file];
             const fl = if (fl_lo & usage_map.flag_opcode != 0) fl_lo else fl_hi;
             const m8 = fl & usage_map.flag_m != 0;
+            // Did this instruction actually run? Statically discovered code
+            // is rewritten but never refused over (see `static_walk`).
+            const covered = (usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode != 0;
             // Executed in both mirrors with different M widths: the site
-            // has two shapes and a single helper cannot serve both.
+            // has two shapes and a single helper cannot serve both. Index-
+            // register loads (LDY/LDX) size by the X flag instead.
             const m_mixed = fl_lo & usage_map.flag_opcode != 0 and
                 fl_hi & usage_map.flag_opcode != 0 and
                 (fl_lo ^ fl_hi) & usage_map.flag_m != 0;
+            const x_mixed = fl_lo & usage_map.flag_opcode != 0 and
+                fl_hi & usage_map.flag_opcode != 0 and
+                (fl_lo ^ fl_hi) & usage_map.flag_x != 0;
+            const x8 = fl & usage_map.flag_x != 0;
+            if (!covered) {
+                // Statically discovered code: collect MMIO sites whose shape
+                // the proxy supports; count everything unprovable and leave
+                // it alone. No proofs are carried out of here, so the
+                // register/DBR knowledge dies conservatively.
+                ldx_at = null;
+                ldy_at = null;
+                dbr_bw = false;
+                switch (usage_map.mode(op)) {
+                    .abs, .abs_x, .abs_y => {
+                        const v = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                        if (v >= 0x2100 and v < 0x4380) {
+                            const kind: ?WgSiteKind = switch (op) {
+                                0xAD, 0xBD, 0xB9 => if (m8) WgSiteKind.r8 else .r16,
+                                0x8D, 0x9D, 0x99 => if (m8) WgSiteKind.w8 else .w16,
+                                0x9C => if (m8) WgSiteKind.stz8 else .stz16,
+                                0xCD => if (m8) WgSiteKind.c8 else .c16,
+                                0xBC => if (x8) WgSiteKind.ry8 else .ry16,
+                                0xBE => if (x8) WgSiteKind.rx8 else .rx16,
+                                0x8E => if (x8) WgSiteKind.wx8 else .wx16,
+                                0x8C => if (x8) WgSiteKind.wy8 else .wy16,
+                                else => null,
+                            };
+                            const idx: WgIndex = switch (op) {
+                                0xBD, 0x9D, 0xBC => .x,
+                                0xB9, 0x99, 0xBE => .y,
+                                else => .none,
+                            };
+                            if (kind != null and bank == 0 and !m_mixed and !x_mixed and n_sites < wg_sites_max) {
+                                sites[n_sites] = .{ .file = file, .kind = kind.?, .reg = v, .idx = idx };
+                                n_sites += 1;
+                            } else static_skipped += 1;
+                        }
+                    },
+                    else => switch (op) {
+                        // Shapes the dynamic walk would have refused over:
+                        // count them so `static_skipped` is an honest tally
+                        // of what verification is being trusted with.
+                        0x44, 0x54, 0x2B, 0x5B, 0x1B, 0x9A, 0x00, 0x02, 0xDB => static_skipped += 1,
+                        else => {},
+                    },
+                }
+                continue;
+            }
             switch (op) {
-                0x44, 0x54, 0x00, 0x02, 0xDB => return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr }),
+                // MVN/MVP name their banks in the operand, so a move between
+                // WRAM banks re-banks like any long access. A move naming
+                // bank $00 does not: bank $00 is WRAM below $2000 and ROM
+                // above $8000, and which one this move walks is in X/Y at
+                // run time. The destination alone would be decidable (ROM is
+                // not writable), but re-banking one side of a move and not
+                // the other is worse than refusing, so both stay refused.
+                0x44, 0x54 => blockmove: {
+                    if (!bwram) return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr });
+                    const dst = image[file + 1];
+                    const src = image[file + 2];
+                    // Destination first, and it is the easy half: bank $00's
+                    // only writable memory is WRAM below $2000, so a move
+                    // that writes bank $00 is writing WRAM whatever X and Y
+                    // hold. $7E/$7F are unambiguous either way.
+                    if (!(dst == 0x7E or dst == 0x7F or dst == 0x00))
+                        return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr });
+                    if (dst != 0x00) {
+                        // Destination $7E/$7F re-banks to $40/$41. The source
+                        // needs nothing: another WRAM bank re-banks the same
+                        // way, and any other bank is ROM whose mapping is
+                        // identical on the SA-1's bus (Gradius III unpacks
+                        // graphics with `MVN $7E,$04`, and v17 ships it as
+                        // `MVN $40,$04`). Bank $00 as source is the one
+                        // ambiguous case — accept it only when X provably
+                        // points at ROM, where the byte passes through
+                        // unchanged.
+                        if (src == 0x00) {
+                            const sx = ldx_at != null and cpu_addr - ldx_at.? <= 16;
+                            if (!sx or ldx_imm < 0x8000)
+                                return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                        }
+                        dbr_bw = true;
+                        break :blockmove;
+                    }
+                    // Bank $00 both sides, so the banks say nothing: X and Y
+                    // decide, and only an immediate that reaches here through
+                    // straight-line code proves either. Two shapes occur, and
+                    // v17 treats them differently because they ARE different:
+                    //
+                    //   WRAM <- WRAM   re-bank both to $40; the indices are
+                    //                  already the right offsets. (The boot
+                    //                  WRAM clear.)
+                    //   WRAM <- ROM    leave the banks alone — bank $00 still
+                    //                  holds the ROM — and shift the
+                    //                  destination index into the $6000
+                    //                  window instead.
+                    if (src != 0x00) return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                    const sx = ldx_at != null and cpu_addr - ldx_at.? <= 16;
+                    if (!sx or n_bm == wg_moves_max or n_moves == wg_moves_max)
+                        return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                    if (ldx_imm < 0x2000) {
+                        // WRAM <- WRAM. The destination needs no proof of
+                        // its own: bank $00's only writable memory is WRAM,
+                        // and re-banking keeps every index as it was — which
+                        // is just as well, since the clear idiom derives Y
+                        // from X (`TXY : INY`) rather than loading it.
+                        bm[n_bm] = file;
+                        n_bm += 1;
+                        dbr_bw = true;
+                    } else if (ldx_imm >= 0x8000) {
+                        // WRAM <- ROM. Here the destination index is the
+                        // thing that moves, so it does have to be provable.
+                        const dy = ldy_at != null and cpu_addr - ldy_at.? <= 16;
+                        if (!dy or ldy_imm >= 0x2000)
+                            return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                        moves[n_moves] = ldy_file + 1;
+                        n_moves += 1;
+                        dbr_bw = false; // DBR stays bank $00
+                    } else return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
+                },
+                0x00, 0x02, 0xDB => return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr }),
                 else => {},
             }
+            // Moving WRAM into the BW-RAM window moves the direct page and
+            // the stack with it: both live in bank $00's low half, which is
+            // exactly the range being displaced by $6000. Every D and S the
+            // game installs must therefore be adjustable at build time, so
+            // each executed TCD/TCS has to be fed by an adjacent 16-bit
+            // `LDA #imm` we can add $6000 to. Anything else — a D or S
+            // pulled from the stack or computed — cannot be proven and is
+            // refused by name rather than silently left pointing at WRAM
+            // that no longer exists on this bus.
+            if (bwram) switch (op) {
+                0x2B, 0x5B, 0x1B, 0x9A => dpmove: { // PLD, TCD, TCS, TXS
+                    const dyn: Reason = if (op == 0x2B or op == 0x5B) .wg_dp_dynamic else .wg_stack_dynamic;
+                    // A `PLD` that restores a D some `PHD` pushed — the tail
+                    // of every interrupt epilogue — is transparent to the
+                    // shift: whatever went on the stack was already shifted,
+                    // and comes back the same. Only a `PLD` fed by a pushed
+                    // *immediate* establishes a new D, and only that shape
+                    // needs rewriting. A PEA does it in one instruction.
+                    if (op == 0x2B) {
+                        if (file >= 3 and image[file - 3] == 0xF4) {
+                            const imm = std.mem.readInt(u16, image[file - 2 ..][0..2], .little);
+                            if (imm >= 0x2000) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                            if (n_moves == wg_moves_max) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                            moves[n_moves] = file - 2;
+                            n_moves += 1;
+                            break :dpmove;
+                        }
+                        const pushed = file >= 1 and
+                            (image[file - 1] == 0xDA or image[file - 1] == 0x5A or image[file - 1] == 0x48);
+                        const from_imm = pushed and file >= 4 and
+                            (image[file - 4] == 0xA2 or image[file - 4] == 0xA0 or image[file - 4] == 0xA9);
+                        if (!from_imm) break :dpmove; // restore shape: nothing to do
+                    }
+                    // Three shapes reach D or S from an immediate, and each
+                    // is fed by a register whose load carries its own width
+                    // flag: TCD/TCS take A (M), TXS takes X (X), and
+                    // `LDX/LDA #imm : PHX/PHA : PLD` — the idiom Gradius III
+                    // uses, and the very byte Vilela's v17 patches — reaches
+                    // D through the stack. Distance from the immediate's
+                    // operand back to this opcode is all that differs.
+                    var back: u32 = 3; // LD? #imm | this
+                    var want_ld: u8 = 0xA9;
+                    var want_w: u8 = usage_map.flag_m;
+                    if (op == 0x9A) {
+                        want_ld = 0xA2;
+                        want_w = usage_map.flag_x;
+                    } else if (op == 0x2B) {
+                        if (file < 1) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                        switch (image[file - 1]) { // the push feeding PLD
+                            0xDA => { // PHX
+                                want_ld = 0xA2;
+                                want_w = usage_map.flag_x;
+                            },
+                            0x5A => { // PHY — Gradius III's main-loop shape
+                                want_ld = 0xA0;
+                                want_w = usage_map.flag_x;
+                            },
+                            0x48 => {}, // PHA: defaults
+                            else => return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr }),
+                        }
+                        back = 4; // LD? #imm | PH? | this
+                    }
+                    if (file < back) return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    if (image[file - back] != want_ld)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    const ld = cpu_addr - back;
+                    const lf = cov[ld] | cov[0x80_0000 | ld];
+                    // The load must have executed, and in 16-bit width — an
+                    // 8-bit load leaves the high half of D/S carrying
+                    // whatever was there, which no static shift can follow.
+                    if (lf & usage_map.flag_opcode == 0 or lf & want_w != 0)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    const imm = std.mem.readInt(u16, image[file - back + 1 ..][0..2], .little);
+                    if (imm >= 0x2000 or n_moves == wg_moves_max)
+                        return refuse(refusal, .{ .reason = dyn, .detail = cpu_addr });
+                    // One immediate can feed two consumers (a TXS and a
+                    // later PHX/PLD); shifting it twice would land at
+                    // $C000. Record each operand once.
+                    const at = file - back + 1;
+                    for (moves[0..n_moves]) |m| {
+                        if (m == at) break;
+                    } else {
+                        moves[n_moves] = at;
+                        n_moves += 1;
+                    }
+                },
+                else => {},
+            };
+            // Track X for the block-move source proof. Updated after this
+            // instruction's own checks, and before the operand switch below,
+            // whose branches `continue`.
+            if (bwram) {
+                const x16 = fl & usage_map.flag_x == 0;
+                // A D argument passed through a call: `LDY/LDX #imm` still
+                // live at a `JSR f` where f opens `PHY/PHX : PLD` — the
+                // callee establishes D from the caller's immediate, which
+                // Gradius III does at every main-loop iteration
+                // (`LDY #$1F00 : ... : JSR $9857` / `$9857: PHY : PLD`).
+                // The adjacency matcher above cannot see across the call,
+                // but the carried immediate can, and v17 confirms the fix:
+                // it shifts exactly these immediates.
+                if (op == 0x20) jsr: {
+                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    if (t < 0x8000) break :jsr;
+                    const tf = bank_file + (t - 0x8000);
+                    if (tf + 1 >= image.len or image[tf + 1] != 0x2B) break :jsr;
+                    const imm_file: u32 = switch (image[tf]) {
+                        0x5A => blk: { // PHY : PLD — needs the Y carry
+                            const at = ldy_at orelse break :jsr;
+                            if (cpu_addr - at > 16 or ldy_imm >= 0x2000) break :jsr;
+                            break :blk ldy_file + 1;
+                        },
+                        0xDA => blk: { // PHX : PLD — the X carry
+                            const at = ldx_at orelse break :jsr;
+                            if (cpu_addr - at > 16 or ldx_imm >= 0x2000) break :jsr;
+                            break :blk bank_file + ((at & 0xFFFF) - 0x8000) + 1;
+                        },
+                        else => break :jsr,
+                    };
+                    if (n_moves == wg_moves_max)
+                        return refuse(refusal, .{ .reason = .wg_dp_dynamic, .detail = cpu_addr });
+                    for (moves[0..n_moves]) |m| {
+                        if (m == imm_file) break;
+                    } else {
+                        moves[n_moves] = imm_file;
+                        n_moves += 1;
+                    }
+                }
+                if (op == 0xA2) { // LDX #
+                    if (x16) {
+                        ldx_at = cpu_addr;
+                        ldx_imm = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    } else ldx_at = null;
+                } else if (writesXOrBranches(op)) ldx_at = null;
+                if (op == 0xA0) { // LDY #
+                    if (x16) {
+                        ldy_at = cpu_addr;
+                        ldy_file = file;
+                        ldy_imm = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                    } else ldy_at = null;
+                } else if (writesYOrBranches(op)) ldy_at = null;
+
+                // DBR: the `LDA #bank : PHA : PLB` idiom is the only shape
+                // that names a bank statically. A WRAM bank there re-banks
+                // like any other $7E/$7F reference; anything else leaves DBR
+                // system-bank as far as this walk can tell. Like the X/Y
+                // carries, the knowledge dies at any control transfer — the
+                // next linear instruction may be a different routine that
+                // arrives with a different DBR.
+                if (branches(op)) dbr_bw = false;
+                if (op == 0xAB) {
+                    dbr_bw = false;
+                    if (file >= 3 and image[file - 3] == 0xA9 and image[file - 1] == 0x48) {
+                        const b = image[file - 2];
+                        if (b == 0x7E or b == 0x7F) {
+                            if (n_dbrs == wg_moves_max)
+                                return refuse(refusal, .{ .reason = .wg_wram_beyond_bwram, .detail = cpu_addr });
+                            dbrs[n_dbrs] = file - 2;
+                            n_dbrs += 1;
+                            dbr_bw = true;
+                        }
+                    }
+                }
+            }
+
             switch (usage_map.mode(op)) {
                 .none, .dp => {},
                 .dp_idx => {},
                 .abs, .abs_x, .abs_y => {
                     const v = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                    if (v < 0x800 or v >= 0x8000) continue; // I-RAM window / ROM: fine as-is
+                    // With DBR on BW-RAM the operand already names the right
+                    // byte of it, whatever its value — no window, no MMIO,
+                    // nothing to check.
+                    if (bwram and dbr_bw) continue;
+                    if (v >= 0x8000) continue; // ROM: identical on both buses
+                    if (!bwram and v < 0x800) continue; // I-RAM window: fine as-is
+                    if (bwram and v < 0x2000) continue; // rewritten to the window below
                     if (v >= 0x2100 and v < 0x4380) {
                         if (bank != 0)
                             return refuse(refusal, .{ .reason = .wg_mmio_outside_bank0, .detail = cpu_addr });
-                        if (m_mixed)
+                        const mixed = switch (op) {
+                            0xBC, 0xBE, 0x8E, 0x8C => x_mixed,
+                            else => m_mixed,
+                        };
+                        if (mixed)
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         const kind: WgSiteKind = switch (op) {
-                            0xAD => if (m8) WgSiteKind.r8 else .r16,
-                            0x8D => if (m8) WgSiteKind.w8 else .w16,
+                            0xAD, 0xBD, 0xB9 => if (m8) WgSiteKind.r8 else .r16,
+                            0x8D, 0x9D, 0x99 => if (m8) WgSiteKind.w8 else .w16,
                             0x9C => if (m8) WgSiteKind.stz8 else .stz16,
+                            // CMP against an MMIO register: an APU-port
+                            // handshake spin, in every Konami boot.
+                            0xCD => if (m8) WgSiteKind.c8 else .c16,
+                            // Index-register loads size by the X flag: the
+                            // auto-joypad read loop is LDY $4218,X.
+                            0xBC => if (x8) WgSiteKind.ry8 else .ry16,
+                            0xBE => if (x8) WgSiteKind.rx8 else .rx16,
+                            // ...and index-register stores (STX $2116 sets
+                            // the VRAM address in Gradius III's NMI path).
+                            0x8E => if (x8) WgSiteKind.wx8 else .wx16,
+                            0x8C => if (x8) WgSiteKind.wy8 else .wy16,
                             else => return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr }),
+                        };
+                        const idx: WgIndex = switch (op) {
+                            0xBD, 0x9D, 0xBC => .x,
+                            0xB9, 0x99, 0xBE => .y,
+                            else => .none,
                         };
                         if (n_sites == wg_sites_max)
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
-                        sites[n_sites] = .{ .file = file, .kind = kind, .reg = v };
+                        sites[n_sites] = .{ .file = file, .kind = kind, .reg = v, .idx = idx };
                         n_sites += 1;
-                    } else return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = cpu_addr });
+                    } else return refuse(refusal, .{
+                        .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
+                        .detail = cpu_addr,
+                    });
                 },
                 .long, .long_x => {
                     const b = image[file + 3];
@@ -1556,7 +2103,9 @@ pub fn convertWholeGame(
                     if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380)
                         return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                     const wram = b == 0x7E or b == 0x7F or ((b & 0x7F) <= 0x3F and v < 0x2000);
-                    if (wram and (b == 0x7F or v >= 0x800))
+                    // BW-RAM carries all of WRAM: $7E/$7F re-bank to $40/$41
+                    // and low-bank forms shift into the window, both below.
+                    if (wram and !bwram and (b == 0x7F or v >= 0x800))
                         return refuse(refusal, .{ .reason = .wg_wram_beyond_iram, .detail = cpu_addr });
                     // $7E:0000-07FF long sites are re-banked to $00 below.
                 },
@@ -1565,15 +2114,92 @@ pub fn convertWholeGame(
     }
 
     var helper_len: u32 = 0;
-    for (sites[0..n_sites]) |site| helper_len += wgHelperLen(site.kind);
-    const need: u32 = wg_prologue_len + wg_sa1_nmi_len + wg_scpu_nmi_len +
-        @as(u32, wg_service.len) + wg_shim_len + helper_len;
-    const carve = patchgen.findFreeSpace(image[0..header.offset], need) orelse
-        return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
+    // Dedup: sites sharing (kind, reg, idx) share one emitted helper.
+    var uniq: [wg_uniq_max]WgSite = undefined;
+    var n_uniq: usize = 0;
+    for (sites[0..n_sites]) |site| {
+        const seen = for (uniq[0..n_uniq]) |u| {
+            if (u.kind == site.kind and u.reg == site.reg and u.idx == site.idx) break true;
+        } else false;
+        if (seen) continue;
+        if (n_uniq == wg_uniq_max)
+            return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = site.file });
+        uniq[n_uniq] = site;
+        n_uniq += 1;
+    }
+    for (uniq[0..n_uniq]) |u| helper_len += wgHelperLen(u);
+    // The scaffolding is bank-$00-only: the shim is the reset vector's
+    // target, the service loop is `JMP`ed from it, and CRV/CNV are 16-bit
+    // registers, so the SA-1 prologue and NMI shim must be reachable in
+    // bank $00 too. The helpers are not: they run on the SA-1, and every
+    // absolute they touch (the mailbox, CIE, CIC) mirrors across all system
+    // banks, so they can live in ANY bank's padding — which matters, because
+    // a real game's bank $00 is nearly full (Gradius III has 1.5 KiB of
+    // padding against ~3.6 KiB of helpers). Each unique helper gets a
+    // 4-byte `JML` trampoline in bank $00 for the sites' in-place `JSR` to
+    // land on; the helper ends with `JML` back to a shared bank-$00 `RTS`.
+    const scaffold: u32 = wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
+        wg_sa1_nmi_len + wg_scpu_nmi_len +
+        @as(u32, wg_service.len) + wg_shim_len;
+    var carve: u32 = undefined; // bank $00: scaffold (+ trampolines if split)
+    var split = false;
+    // Split mode: where each helper landed (file offset), first-fit across
+    // every bank's largest padding run — helpers are self-contained and the
+    // trampolines carry 24-bit targets, so they need not even share a bank.
+    var helper_at: [wg_uniq_max]u32 = undefined;
+    if (patchgen.findFreeSpace(image[0..header.offset], scaffold + helper_len)) |c| {
+        carve = c;
+    } else {
+        split = true;
+        const b0_need = scaffold + 4 * @as(u32, @intCast(n_uniq)) + 1;
+        carve = patchgen.findFreeSpace(image[0..header.offset], b0_need) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = b0_need });
+        // The largest padding run in each bank beyond $00, cursor at its
+        // start plus the same 8-byte margin findFreeSpace keeps.
+        const Run = struct { cur: u32, end: u32 };
+        var bank_runs: [0x40]Run = undefined;
+        var n_runs: usize = 0;
+        var hb: u32 = 1;
+        while (hb * 0x8000 < image.len) : (hb += 1) {
+            const base = hb * 0x8000;
+            const win = image[base..@min(base + 0x8000, image.len)];
+            var best_off: u32 = 0;
+            var best_len: u32 = 0;
+            var i: usize = 0;
+            while (i < win.len) {
+                const b = win[i];
+                if (b == 0x00 or b == 0xFF) {
+                    var j = i + 1;
+                    while (j < win.len and win[j] == b) j += 1;
+                    if (j - i >= best_len) {
+                        best_len = @intCast(j - i);
+                        best_off = @intCast(i);
+                    }
+                    i = j;
+                } else i += 1;
+            }
+            if (best_len > 72) { // margin + at least one helper
+                bank_runs[n_runs] = .{ .cur = base + best_off + 8, .end = base + best_off + best_len };
+                n_runs += 1;
+            }
+        }
+        // First-fit each helper (+3 for the JML that replaces its RTS).
+        for (uniq[0..n_uniq], 0..) |u, ui| {
+            const need_h = wgHelperLen(u) + 3;
+            helper_at[ui] = for (bank_runs[0..n_runs]) |*r| {
+                if (r.end - r.cur >= need_h) {
+                    const at = r.cur;
+                    r.cur += need_h;
+                    break at;
+                }
+            } else return refuse(refusal, .{ .reason = .no_free_space, .detail = need_h });
+        }
+    }
 
     const out = try gpa.dupe(u8, image);
     errdefer gpa.free(out);
     var res: Result = .{ .image = out, .stats = .{}, .fate = @splat(.not_attempted) };
+    res.stats.static_skipped = static_skipped;
 
     // Re-bank $7E long sites into the identity window (bank $7E does not
     // exist on the SA-1 bus; bank $00's low $0800 is the same I-RAM).
@@ -1582,32 +2208,175 @@ pub fn convertWholeGame(
         const bank_file = bank * 0x8000;
         if (bank_file >= out.len) break;
         var a16: u32 = 0x8000;
+        // Same DBR reasoning as the eligibility walk, replayed here because
+        // the shift an absolute site needs depends on it. Read before this
+        // pass mutates the site; the DBR immediates themselves are rewritten
+        // after the loop so the idiom is still recognisable while it runs.
+        dbr_bw = false;
         while (a16 < 0x10000) : (a16 += 1) {
             const cpu_addr = (bank << 16) | a16;
-            if ((usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
+            if ((cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
+            if (bwram) {
+                // A WRAM bank byte materialized by an immediate and stored —
+                // the bank slot of a long pointer the game will dereference
+                // at run time (`LDA #$7E : STA $05` builds [$03] = $7E:xxxx
+                // in Gradius III's decompressor). The pointer VALUE is
+                // runtime data no static rewrite can reach, but its bank
+                // byte comes from this immediate, and $40 names the same
+                // bytes. The store opcode is checked against the coverage
+                // map, so this never fires mid-instruction. v17 rewrites
+                // exactly these immediates (and none of the arithmetic uses
+                // of the constant $7E, which have no adjacent store).
+                if (op == 0xA9 and (out[file + 1] == 0x7E or out[file + 1] == 0x7F)) {
+                    const fl2 = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                    const next = cpu_addr + 2;
+                    const next_op = (cov[next] | cov[0x80_0000 | next]) & usage_map.flag_opcode != 0;
+                    if (fl2 & usage_map.flag_m != 0 and next_op and file + 2 < out.len and
+                        (out[file + 2] == 0x85 or out[file + 2] == 0x8D))
+                    {
+                        out[file + 1] -= 0x3E;
+                        res.stats.rewritten_long += 1;
+                    }
+                }
+                if (branches(op)) dbr_bw = false;
+                if (op == 0xAB) {
+                    dbr_bw = file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
+                        (out[file - 2] == 0x7E or out[file - 2] == 0x7F);
+                } else if (op == 0x44 or op == 0x54) {
+                    // Only a move whose destination becomes BW-RAM leaves
+                    // DBR there; the ROM-source shape keeps bank $00.
+                    const d0 = out[file + 1];
+                    dbr_bw = d0 == 0x7E or d0 == 0x7F or (d0 == 0x00 and for (bm[0..n_bm]) |f| {
+                        if (f == file) break true;
+                    } else false);
+                }
+            }
             switch (usage_map.mode(op)) {
                 .long, .long_x => {
-                    if (out[file + 3] == 0x7E and std.mem.readInt(u16, out[file + 1 ..][0..2], .little) < 0x800) {
+                    const b = out[file + 3];
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (bwram) {
+                        // $7E/$7F are not on the SA-1's bus; $40/$41 are the
+                        // same bytes of BW-RAM, at the same offsets.
+                        if (b == 0x7E or b == 0x7F) {
+                            out[file + 3] = b - 0x3E;
+                            res.stats.rewritten_long += 1;
+                        } else if ((b & 0x7F) <= 0x3F and v < 0x2000) {
+                            std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                            res.stats.rewritten_long += 1;
+                        }
+                    } else if (b == 0x7E and v < 0x800) {
                         out[file + 3] = 0x00;
                         res.stats.rewritten_long += 1;
                     }
+                },
+                .abs, .abs_x, .abs_y => if (bwram and !dbr_bw) {
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (v < 0x2000) {
+                        std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                        res.stats.rewritten_abs += 1;
+                    }
+                },
+                // Indirect control flow reads its *pointer* from bank $00:
+                // `JMP ($0000)` names a WRAM word that just moved into the
+                // window, and mode() files these as .none because the
+                // operand is not a data address the offload rewriter cares
+                // about. Here it is exactly a data address. JMP (abs) and
+                // JMP/JSR (abs,X) pointers under $2000 shift with their
+                // memory; [abs] (JML) reads 3 bytes but shifts the same way.
+                .none => if (bwram) switch (op) {
+                    0x6C, 0x7C, 0xFC, 0xDC => {
+                        const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                        if (v < 0x2000) {
+                            std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
+                            res.stats.rewritten_abs += 1;
+                        }
+                    },
+                    // MVN/MVP: $7E/$7F re-bank like any long access, and
+                    // bank $00 re-banks only where the walk proved both
+                    // halves (the sites it recorded in `bm`).
+                    0x44, 0x54 => {
+                        const proved = for (bm[0..n_bm]) |f| {
+                            if (f == file) break true;
+                        } else false;
+                        for (1..3) |k| {
+                            const b = out[file + k];
+                            if (b == 0x7E or b == 0x7F) {
+                                out[file + k] = b - 0x3E;
+                                res.stats.rewritten_long += 1;
+                            } else if (b == 0x00 and proved) {
+                                out[file + k] = 0x40;
+                                res.stats.rewritten_long += 1;
+                            }
+                        }
+                    },
+                    else => {},
                 },
                 else => {},
             }
         }
     }
+    // Data bank loads follow their memory too: a game that sets DBR to $7E
+    // is naming WRAM, which is now $40.
+    for (dbrs[0..n_dbrs]) |off| {
+        out[off] -= 0x3E;
+        res.stats.rewritten_long += 1;
+    }
+    // D and S follow their memory into the window.
+    for (moves[0..n_moves]) |off| {
+        const imm = std.mem.readInt(u16, out[off..][0..2], .little);
+        std.mem.writeInt(u16, out[off..][0..2], imm + wg_bw_window, .little);
+        res.stats.dp_sites += 1;
+    }
+    res.stats.d_moved = bwram;
 
     // Emit: helpers first (their addresses feed the site rewrites).
     var cur: usize = 0;
     const base16: u16 = 0x8000 + @as(u16, @intCast(carve));
     const d = out[carve..];
+    // Where each unique helper's JSR target lives in bank $00: the helper
+    // itself when everything fits, its trampoline when split.
+    var uniq_addr: [wg_uniq_max]u16 = undefined;
+    if (!split) {
+        for (uniq[0..n_uniq], 0..) |u, ui| {
+            uniq_addr[ui] = base16 + @as(u16, @intCast(cur));
+            const before = cur;
+            wgEmitHelper(d, &cur, u);
+            std.debug.assert(cur - before == wgHelperLen(u));
+        }
+    } else {
+        // Helpers wherever first-fit placed them, each ending in a JML back
+        // to the shared bank-$00 RTS stub instead of its own RTS (a JSR
+        // pushes 16 bits, so an RTS with PB stuck in the helper's bank would
+        // return into it).
+        const rts16: u16 = base16 + @as(u16, @intCast(scaffold)) + 4 * @as(u16, @intCast(n_uniq));
+        for (uniq[0..n_uniq], 0..) |u, ui| {
+            const hd = out[helper_at[ui]..];
+            var hcur: usize = 0;
+            wgEmitHelper(hd, &hcur, u);
+            std.debug.assert(hcur == wgHelperLen(u));
+            std.debug.assert(hd[hcur - 1] == 0x60); // every helper ends RTS
+            hcur -= 1;
+            put(hd, &hcur, &.{ 0x5C, @truncate(rts16), @truncate(rts16 >> 8), 0x00 });
+        }
+        // Bank $00: trampolines after the scaffold, then the RTS stub. The
+        // scaffold is emitted below at `cur`; reserve its span now.
+        var tcur: usize = scaffold;
+        for (uniq[0..n_uniq], 0..) |_, ui| {
+            uniq_addr[ui] = base16 + @as(u16, @intCast(tcur));
+            const h16: u16 = 0x8000 + @as(u16, @intCast(helper_at[ui] % 0x8000));
+            const hbank: u8 = @intCast(helper_at[ui] / 0x8000);
+            put(d, &tcur, &.{ 0x5C, @truncate(h16), @truncate(h16 >> 8), hbank });
+        }
+        d[tcur] = 0x60; // the shared RTS
+        std.debug.assert(base16 + @as(u16, @intCast(tcur)) == rts16);
+    }
     for (sites[0..n_sites]) |site| {
-        const haddr = base16 + @as(u16, @intCast(cur));
-        const before = cur;
-        wgEmitHelper(d, &cur, site);
-        std.debug.assert(cur - before == wgHelperLen(site.kind));
+        const haddr = for (uniq[0..n_uniq], 0..) |u, ui| {
+            if (u.kind == site.kind and u.reg == site.reg and u.idx == site.idx) break uniq_addr[ui];
+        } else unreachable;
         out[site.file] = 0x20; // JSR (same length as the LDA/STA/STZ it replaces)
         std.mem.writeInt(u16, out[site.file + 1 ..][0..2], haddr, .little);
         res.stats.offload_sites += 1;
@@ -1621,9 +2390,25 @@ pub fn convertWholeGame(
         0xA9, 0xFF, 0x8D, 0x2A, 0x22, // CIWP: all I-RAM blocks writable
         0xA9, 0x80, 0x8D, 0x27, 0x22, // CBWE
         0xA9, 0x10, 0x8D, 0x0B, 0x22, // CIC: NMI clear latch primed
-        0x8D, 0x0A,             0x22, // CIE: NMI from the SNES enabled (A still $10)
-        0x4C, @truncate(reset), @truncate(reset >> 8),
+        0x8D, 0x0A, 0x22, // CIE: NMI from the SNES enabled (A still $10)
     });
+    if (bwram) {
+        // Reproduce the power-on direct page and stack *inside the window*.
+        // The game's own TCD/TCS/TXS were shifted by $6000 with everything
+        // else, but a game that simply inherits D=$0000 / S=$01FF would
+        // otherwise land in I-RAM while its absolute accesses to the same
+        // variables went to BW-RAM — the two would silently disagree.
+        // Native mode first: emulation pins S to page 1.
+        put(d, &cur, &.{
+            0x9C, 0x25, 0x22, // STZ $2225 (CBM: BW-RAM block 0)
+            0x9C, 0x28, 0x22, // STZ $2228 (BWPA: unprotect)
+            0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+            0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, // LDA #$6000 / TCD
+            0xA9, 0xFF, 0x61, 0x1B, // LDA #$61FF / TCS
+            0xE2, 0x30, // SEP #$30
+        });
+    }
+    put(d, &cur, &.{ 0x4C, @truncate(reset), @truncate(reset >> 8) });
     // SA-1 NMI entry (CNV, native and emulation pulls alike): ack the
     // message via CIC — the game's handler has never heard of it, and a
     // stale flag would re-fire on every helper unmask — preserving A and
@@ -1666,7 +2451,7 @@ pub fn convertWholeGame(
     w2[n2 + 2] = @truncate(svc >> 8);
     n2 += 3;
     std.debug.assert(n2 == wg_shim_len);
-    std.debug.assert(cur + n2 == need);
+    std.debug.assert(cur + n2 == scaffold + if (split) @as(usize, 0) else helper_len);
 
     // Vectors: reset -> shim; NMI (native + emulation) -> the forward stub.
     std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], shim, .little);
@@ -1675,7 +2460,9 @@ pub fn convertWholeGame(
 
     out[header.offset + 0x15] = 0x23;
     out[header.offset + 0x16] = 0x35;
-    out[header.offset + 0x18] = 0x05;
+    // BW-RAM size: 32 KiB is plenty when the game's state stayed in I-RAM,
+    // but the window mode maps all 128 KiB of WRAM into it.
+    out[header.offset + 0x18] = if (bwram) 0x07 else 0x05;
     patchgen.recomputeChecksum(out, header.offset);
 
     res.stats.shim_addr = shim;
@@ -1685,13 +2472,58 @@ pub fn convertWholeGame(
     return res;
 }
 
-fn wgHelperLen(kind: WgSiteKind) u32 {
-    return switch (kind) {
+/// Does `op` put a new value in X, or hand control somewhere this linear
+/// walk cannot follow? Either kills the `LDX #imm` the block-move source
+/// proof is carrying — the walk only reasons about straight-line code, so
+/// anything that could arrive with a different X invalidates it.
+fn writesXOrBranches(op: u8) bool {
+    return switch (op) {
+        // Loads into X, transfers into X, pulls, inc/dec — and block moves,
+        // which leave X at the end of the run.
+        0xA2, 0xA6, 0xB6, 0xAE, 0xBE, 0xAA, 0xBA, 0xFA, 0xE8, 0xCA, 0x44, 0x54 => true,
+        else => branches(op),
+    };
+}
+
+/// The same, for Y — which the block-move destination proof rides on.
+fn writesYOrBranches(op: u8) bool {
+    return switch (op) {
+        // Loads into Y, transfers into Y, pull, inc/dec — and block moves.
+        0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xA8, 0x7A, 0xC8, 0x88, 0x9B, 0x44, 0x54 => true,
+        else => branches(op),
+    };
+}
+
+/// Hands control somewhere a linear walk cannot follow, so nothing it was
+/// carrying about register contents survives.
+fn branches(op: u8) bool {
+    return switch (op) {
+        0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82 => true,
+        0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x20, 0x22, 0xFC => true,
+        0x60, 0x6B, 0x40, 0x00, 0x02 => true,
+        else => false,
+    };
+}
+
+fn wgHelperLen(site: WgSite) u32 {
+    if (site.idx != .none) return switch (site.kind) {
+        .w8 => 40,
+        .w16 => 42,
+        .r8 => 48,
+        .r16 => 49,
+        .ry8, .ry16, .rx8, .rx16 => 49,
+        .stz8, .stz16, .c8, .c16, .wx8, .wx16, .wy8, .wy16 => unreachable,
+    };
+    return switch (site.kind) {
         .w8, .stz8 => 36,
         .w16 => 46,
         .r8 => 39,
         .r16 => 47,
         .stz16 => 43,
+        .c8 => 49,
+        .c16 => 55,
+        .wx8, .wx16, .wy8, .wy16 => 38,
+        .ry8, .ry16, .rx8, .rx16 => unreachable, // only collected indexed
     };
 }
 
@@ -1707,6 +2539,7 @@ fn wgHelperLen(kind: WgSiteKind) u32 {
 fn wgEmitHelper(d: []u8, cur: *usize, site: WgSite) void {
     const lo: u8 = @truncate(site.reg);
     const hi: u8 = @truncate(site.reg >> 8);
+    if (site.idx != .none) return wgEmitIndexedHelper(d, cur, site);
     switch (site.kind) {
         .w8 => put(d, cur, &.{
             0x9C, 0x0A, 0x22, // STZ CIE: mask (STZ leaves flags alone)
@@ -1788,6 +2621,186 @@ fn wgEmitHelper(d: []u8, cur: *usize, site: WgSite) void {
             0xA9, 0x04, 0x8D, 0xF0, 0x37,
             0xAD, 0xF0, 0x37, 0x10, 0xFB,
             0xC2, 0x20, // 16-bit again (the entry width)
+            0xAD, 0xF3, 0x37, // 16-bit result
+            0x9C, 0xF0, 0x37, // 16-bit release (also zeroes $37F1)
+            0x08, 0x48, 0xE2,
+            0x20, 0xA9, 0x10,
+            0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68,
+            0x28, 0x60,
+        }),
+        // CMP against an MMIO register: an r8/r16 read whose result is then
+        // compared against the caller's preserved A — N/Z/C land exactly as
+        // the original CMP left them, and V (which CMP never touches)
+        // survives inside the pushed P.
+        .c8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // mask
+            0x08, // PHP
+            0xC2, 0x20, 0x48, // REP / PHA: full C, the request loads clobber it
+            0xE2, 0x20, 0xA9,
+            lo,   0x8D, 0xF1,
+            0x37, 0xA9, hi,
+            0x8D, 0xF2, 0x37,
+            0xA9, 0x02, 0x8D, 0xF0, 0x37, // filed: r8
+            0xAD, 0xF0, 0x37, 0x10, 0xFB, // BPL: wait for the $FE marker
+            0xC2, 0x20, 0x68, // A back
+            0x28, // PLP: caller flags and widths (m8 by construction)
+            0xCD, 0xF3, 0x37, // CMP result: N/Z/C as the original
+            0x9C, 0xF0, 0x37, // release (no flags)
+            0x08, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask, flags kept
+            0x60,
+        }),
+        .c16 => put(d, cur, &.{
+            0x08, // PHP
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, 0x48, // REP / PHA
+            0xE2, 0x20, 0xA9,
+            lo,   0x8D, 0xF1,
+            0x37, 0xA9, hi,
+            0x8D, 0xF2, 0x37,
+            0xA9, 0x04, 0x8D, 0xF0, 0x37, // filed: r16
+            0xAD, 0xF0, 0x37, 0x10, 0xFB,
+            0xC2, 0x20, 0x68, // A back (16)
+            0x28, // PLP (m=16 by construction)
+            0xCD, 0xF3, 0x37, // 16-bit CMP
+            0x9C, 0xF0, 0x37, // 16-bit release
+            0x08, 0x48, 0xE2,
+            0x20, 0xA9, 0x10,
+            0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68,
+            0x28, 0x60,
+        }),
+        .ry8, .ry16, .rx8, .rx16 => unreachable, // only collected indexed
+        // STX/STY to MMIO: flag-neutral stores whose width follows X. The
+        // value store runs first, at the caller's own index width, before
+        // any P munging; the PLP restores every flag exactly as the
+        // original left them (STX/STY touch none).
+        .wx8, .wx16, .wy8, .wy16 => {
+            const st: u8 = if (site.kind == .wx8 or site.kind == .wx16) 0x8E else 0x8C;
+            const rk: u8 = if (site.kind == .wx8 or site.kind == .wy8) 0x01 else 0x03;
+            put(d, cur, &.{
+                0x9C, 0x0A, 0x22, // mask
+                0x08, // PHP
+                st, 0xF3, 0x37, // value, caller's X width
+                0xE2, 0x20, // m8 for the immediates below
+                0x48, // PHA (AL; B untouched by anything after)
+                0xA9,
+                lo,
+                0x8D,
+                0xF1,
+                0x37,
+                0xA9,
+                hi,
+                0x8D,
+                0xF2,
+                0x37,
+                0xA9, rk, 0x8D, 0xF0, 0x37, // filed
+                0xAD, 0xF0, 0x37, 0xD0, 0xFB, // until served
+                0xA9, 0x10, 0x8D, 0x0A, 0x22, // unmask
+                0x68, 0x28, 0x60, // PLA / PLP / RTS
+            });
+        },
+    }
+}
+
+/// An indexed MMIO helper: same mailbox, same mask protocol, but the
+/// register field is computed at run time — TXA/TYA into a 16-bit A, add
+/// the base, file the sum. TXA/TYA read the index in the *caller's* index
+/// width (x=1 zero-extends), which is exactly the address arithmetic the
+/// original `abs,X`/`abs,Y` performed, so no width case-split is needed.
+/// What IS needed is more preservation than the plain helpers: the 16-bit
+/// transfer clobbers B, and ADC clobbers C and V, all of which the original
+/// store/load left alone — hence the 16-bit PHA and the PLP placed after
+/// the arithmetic. An effective address that leaves the MMIO range would be
+/// performed verbatim on the S-CPU bus (where low addresses are WRAM the
+/// game no longer owns); no shipped game does that from a $21xx/$42xx base,
+/// and one that did would fail S4 verification, not ship wrong.
+fn wgEmitIndexedHelper(d: []u8, cur: *usize, site: WgSite) void {
+    const lo: u8 = @truncate(site.reg);
+    const hi: u8 = @truncate(site.reg >> 8);
+    const txa: u8 = if (site.idx == .x) 0x8A else 0x98; // TXA / TYA
+    switch (site.kind) {
+        .w8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // STZ CIE: mask
+            0x08, // PHP
+            0x8D, 0xF3, 0x37, // value (A is the caller's, 8-bit)
+            0xC2, 0x20, // REP #$20
+            0x48, // PHA: the full C=B:A, which the transfer clobbers
+            txa, 0x18, 0x69, lo, hi, // index + base, caller's index width
+            0x8D, 0xF1, 0x37, // effective reg
+            0xE2, 0x20, // SEP #$20
+            0xA9, 0x01, 0x8D, 0xF0, 0x37, // filed: w8
+            0xAD, 0xF0, 0x37, 0xD0, 0xFB, // until served
+            0xA9, 0x10, 0x8D, 0x0A, 0x22, // unmask
+            0xC2, 0x20, 0x68, // REP / PLA: B:A back
+            0x28, 0x60, // PLP / RTS
+        }),
+        .stz8, .stz16, .c8, .c16, .wx8, .wx16, .wy8, .wy16 => unreachable,
+        // Loads into an index register (LDY abs,X / LDX abs,Y): the result
+        // width is the caller's X width, which conveniently is also the
+        // request width. The unmask tail is width-agnostic — PHP right after
+        // the load captures its N/Z, SEP pins m for the immediate, and the
+        // final PLP restores both the caller's widths and the load's flags.
+        .ry8, .ry16, .rx8, .rx16 => {
+            const req: u8 = if (site.kind == .ry8 or site.kind == .rx8) 0x02 else 0x04;
+            const ld: u8 = if (site.kind == .ry8 or site.kind == .ry16) 0xAC else 0xAE; // LDY/LDX abs
+            put(d, cur, &.{
+                0x9C, 0x0A, 0x22, // mask
+                0x08, // PHP
+                0xC2, 0x20, 0x48, // REP / PHA: A survives (the original preserved it)
+                txa,  0x18, 0x69, lo,   hi, // effective reg, caller's index width
+                0x8D, 0xF1, 0x37, 0xE2, 0x20,
+                0xA9, req, 0x8D, 0xF0, 0x37, // filed
+                0xAD, 0xF0, 0x37, 0x10, 0xFB, // until the $FE marker
+                0xC2, 0x20, 0x68, // A back
+                0x28, // PLP: caller widths (X width sizes the load below)
+                ld, 0xF3, 0x37, // result -> Y or X, N/Z as the original
+                0x9C, 0xF0, 0x37, // release (no flags)
+                0x08, 0xE2, 0x20, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask
+                0x60,
+            });
+        },
+        .w16 => put(d, cur, &.{
+            0x08, 0x48, // PHP / PHA (16-bit)
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, // 16-bit again (A untouched by SEP/REP)
+            0x8D, 0xF3, 0x37, // 16-bit value
+            txa,  0x18, 0x69, lo,   hi, // effective reg
+            0x8D, 0xF1, 0x37, 0xE2, 0x20,
+            0xA9, 0x03, 0x8D, 0xF0, 0x37, // filed: w16
+            0xAD, 0xF0, 0x37, 0xD0, 0xFB,
+            0xA9, 0x10, 0x8D, 0x0A, 0x22,
+            0xC2, 0x20, 0x68, 0x28, 0x60,
+        }),
+        .r8 => put(d, cur, &.{
+            0x9C, 0x0A, 0x22, // mask
+            0x08, // PHP: C and V survive the ADC below
+            0xC2, 0x20, 0x48, // REP / PHA: B survives the transfer
+            txa,  0x18, 0x69,
+            lo,   hi,   0x8D,
+            0xF1, 0x37, 0xE2,
+            0x20,
+            0xA9, 0x02, 0x8D, 0xF0, 0x37, // filed: r8
+            0xAD, 0xF0, 0x37, 0x10, 0xFB, // BPL: wait for the $FE marker
+            0xC2, 0x20, 0x68, 0xE2, 0x20, // B back (old AL too — about to be replaced)
+            0x28, // PLP: caller's flags and widths
+            0xAD, 0xF3, 0x37, // result — N/Z now match the original LDA
+            0x9C, 0xF0, 0x37, // release the mailbox (no flags)
+            0x08, 0x48, 0xA9, 0x10, 0x8D, 0x0A, 0x22, 0x68, 0x28, // unmask, flags kept
+            0x60,
+        }),
+        .r16 => put(d, cur, &.{
+            0x08, // PHP
+            0xE2, 0x20, 0x9C, 0x0A, 0x22, // 8-bit: mask
+            0xC2, 0x20, // A is dead (16-bit load overwrites all of it)
+            txa,  0x18,
+            0x69, lo,
+            hi,   0x8D,
+            0xF1, 0x37,
+            0xE2, 0x20,
+            0xA9, 0x04, 0x8D, 0xF0, 0x37, // filed: r16
+            0xAD, 0xF0, 0x37, 0x10, 0xFB,
+            0x28, // PLP: caller widths back (m=16 for r16 by construction)
             0xAD, 0xF3, 0x37, // 16-bit result
             0x9C, 0xF0, 0x37, // 16-bit release (also zeroes $37F1)
             0x08, 0x48, 0xE2,
@@ -2575,7 +3588,7 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, false, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.offload_sites >= 14);
 
@@ -2605,6 +3618,103 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     try testing.expect(con.bus.wram.data[0x2100] >= frames - 2);
 }
 
+test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // The same shape as the I-RAM test, but the game's state sits at $0900
+    // and $7E:4000 — one beyond I-RAM's 2 KiB, one in a bank that is not on
+    // the SA-1's bus at all. Both are ordinary BW-RAM once the window moves
+    // them, and the two must land on the SAME byte from either form: $0900
+    // absolute and $7E:0900 long are one variable to the game.
+    @memcpy(rom[0x0000..0x001C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x5A, 0x8D, 0x00, 0x09, // LDA #$5A / STA $0900
+        0xAF, 0x00, 0x40, 0x7E, // LDA $7E:4000  (reads the long form)
+        0xA9, 0xC3, 0x8F, 0x00, 0x40, 0x7E, // LDA #$C3 / STA $7E:4000
+        0xAD, 0x00, 0x09, 0x8F, 0x01, 0x40, 0x7E, // LDA $0900 / STA $7E:4001
+        0x80, 0xFE, // spin
+    });
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800D, 0x800F, 0x8013, 0x8016, 0x801A }) |a| markOp(usage, a);
+    usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
+
+    var ref: ?Refusal = null;
+    const res = convertWholeGame(gpa, rom, usage, false, &ref) catch |e| {
+        std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
+        return e;
+    };
+    defer gpa.free(res.image);
+    try testing.expect(res.stats.d_moved);
+    try testing.expect(res.stats.rewritten_abs >= 2);
+    try testing.expect(res.stats.rewritten_long >= 3);
+    // The operands really moved: $0900 -> $6900, and $7E -> $40.
+    try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, res.image[0x0007..0x0009], .little));
+    try testing.expectEqual(@as(u8, 0x40), res.image[0x000C]);
+    // BW-RAM, not 32 KiB of it: the window maps all of WRAM.
+    try testing.expectEqual(@as(u8, 0x07), res.image[0x7FC0 + 0x18]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..8) |_| con.runFrame();
+
+    // State lives in BW-RAM at its own offsets, reached identically by the
+    // absolute-window and long-rebanked forms.
+    try testing.expectEqual(@as(u8, 0x5A), con.cart.sram[0x0900]);
+    try testing.expectEqual(@as(u8, 0xC3), con.cart.sram[0x4000]);
+    try testing.expectEqual(@as(u8, 0x5A), con.cart.sram[0x4001]);
+    // ...and nothing was left behind in the WRAM the game no longer owns.
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0900]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x4000]);
+}
+
+test "whole-game: --wg-static rewrites code the profiled run never reached" {
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // Covered code: go native 8-bit, load A (Z clear), take a BEQ that
+    // dynamically never falls... never branches — the taken side is the
+    // covered spin, the NOT-taken side is a block the profiler never saw.
+    @memcpy(rom[0x0000..0x000D], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x5A, // LDA #$5A (Z clear: BEQ never taken)
+        0xF0, 0x05, // BEQ $800D — the statically-discovered side
+        0x8D, 0x00, 0x09, // STA $0900 (covered; selects the BW-RAM window)
+        0x80, 0xFE, // BRA * (covered spin)
+    });
+    // The uncovered block the static walk must find through the BEQ.
+    @memcpy(rom[0x000D..0x0011], &[_]u8{ 0x8D, 0x02, 0x09, 0x60 }); // STA $0902 / RTS
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8008, 0x800B }) |a| markOp(usage, a);
+    usage[0x00_0900] = usage_map.flag_write;
+
+    var ref: ?Refusal = null;
+    // Without the static walk the uncovered store keeps its WRAM operand...
+    {
+        const r = try convertWholeGame(gpa, rom, usage, false, &ref);
+        defer gpa.free(r.image);
+        try testing.expectEqual(@as(u16, 0x0902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
+    }
+    // ...with it, the operand moves into the window like the covered one.
+    {
+        const r = try convertWholeGame(gpa, rom, usage, true, &ref);
+        defer gpa.free(r.image);
+        try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, r.image[0x0009..0x000B], .little));
+        try testing.expectEqual(@as(u16, 0x6902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
+    }
+}
+
 test "whole-game: refusals name their reasons" {
     const gpa = testing.allocator;
     const rom = try makeWgRom(gpa);
@@ -2613,23 +3723,76 @@ test "whole-game: refusals name their reasons" {
     defer gpa.free(usage);
     var ref: ?Refusal = null;
 
-    // WRAM touched beyond the identity window.
+    // WRAM beyond the I-RAM window — and the reserved mailbox tail inside
+    // it — no longer refuse: they select the BW-RAM window instead, which
+    // carries all 128 KiB of WRAM. (`wg_wram_beyond_iram` now only reports
+    // an operand no window can carry; the beyond-BW-RAM case is below.)
+    for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
+        @memset(usage, 0);
+        usage[a] = usage_map.flag_write;
+        const r = try convertWholeGame(gpa, rom, usage, false, &ref);
+        defer gpa.free(r.image);
+        try testing.expect(r.stats.d_moved);
+    }
+
+    // An executed absolute operand that is neither WRAM, MMIO, nor ROM has
+    // no home on the SA-1's bus in either window.
+    @memset(usage, 0);
+    usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
+    markOp(usage, 0x00_8100);
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
+    try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
+    try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
+
+    // D and S must be provable at build time once the window moves them.
+    // `PLD` fed by a push of an immediate is fine; fed by anything else is
+    // not, and neither is a computed stack pointer.
     @memset(usage, 0);
     usage[0x00_0900] = usage_map.flag_write;
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
-    try testing.expectEqual(Reason.wg_wram_beyond_iram, ref.?.reason);
-
-    // The reserved mailbox tail, even inside the window.
+    @memcpy(rom[0x0100..0x0106], &[_]u8{ 0xA2, 0x00, 0x00, 0xDA, 0x2B, 0x60 }); // LDX #0 / PHX / PLD
+    markOp(usage, 0x00_8100);
+    markOp(usage, 0x00_8103);
+    markOp(usage, 0x00_8104);
+    usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
+    {
+        const r = try convertWholeGame(gpa, rom, usage, false, &ref);
+        defer gpa.free(r.image);
+        // The immediate moved into the window with everything else.
+        try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
+    }
+    // A bare PLD is the tail of an interrupt epilogue restoring a D that
+    // was already shifted when it was pushed: allowed, and left alone.
+    rom[0x0103] = 0xEA; // NOP where the push was
+    {
+        const r = try convertWholeGame(gpa, rom, usage, false, &ref);
+        defer gpa.free(r.image);
+        try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
+    }
+    // A TCD fed by something that is not an immediate is a genuine
+    // establish this walk cannot follow.
     @memset(usage, 0);
-    usage[0x7E_07F4] = usage_map.flag_read;
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
-    try testing.expectEqual(Reason.wg_wram_beyond_iram, ref.?.reason);
+    usage[0x00_0900] = usage_map.flag_write;
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x7B, 0x5B, 0x60 }); // TDC / TCD
+    markOp(usage, 0x00_8100);
+    markOp(usage, 0x00_8101);
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
+    try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
+
+    @memset(usage, 0);
+    usage[0x00_0900] = usage_map.flag_write;
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
+    markOp(usage, 0x00_8100);
+    markOp(usage, 0x00_8101);
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
+    try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
     // An executed IRQ handler.
     @memset(usage, 0);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0x8100, .little);
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_uses_irq, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0, .little);
 
@@ -2641,23 +3804,25 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0060..0x0062], &[_]u8{ 0x68, 0x40 });
     markOp(usage, 0x00_8050);
     markOp(usage, 0x00_8060);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_nmi_ambiguous, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
 
-    // An indexed MMIO store: not proxyable in place.
+    // A read-modify-write on MMIO: not proxyable in place. (Plain indexed
+    // stores and loads ARE, since the helper computes the effective
+    // register at run time — Gradius III's `STA $210D,Y`, `LDY $4218,X`.)
     @memset(usage, 0);
-    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x9D, 0x00, 0x21 });
+    @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // A long MMIO store: no room for the in-place JSR either.
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x8F, 0x00, 0x21, 0x00 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // An MMIO site executing outside bank $00 (this 64K image's bank $01).
@@ -2666,13 +3831,13 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     @memcpy(rom[0xFF00..0xFF03], &[_]u8{ 0x8D, 0x00, 0x21 });
     markOp(usage, 0x01_FF00);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_outside_bank0, ref.?.reason);
     @memset(usage, 0);
 
     // A block move.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x54, 0x00, 0x7E });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
 }
