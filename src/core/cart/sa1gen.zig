@@ -532,6 +532,11 @@ const shadow_linear: u32 = 0x1_0000;
 const shadow_bank: u8 = 0x41;
 const ptr_slot_cap = 6;
 const ptr_db_cap = 4;
+const ptr_tree_cap = 8;
+const ptr_wram_long_cap = 16;
+/// Sum-of-spans budget for one tree's copies (overlapping members each
+/// carry their own copy of any shared tail, so this bounds the carve).
+const ptr_tree_span_max: u32 = 4096;
 const ptr_run_cap = 8;
 const ptr_pages_cap = 32;
 
@@ -564,6 +569,32 @@ const PtrSpec = struct {
     n_db: usize = 0,
     /// Bytes from entry to the closing RTL: the span copied for the SA-1.
     span: u32 = 0,
+    /// The CALL TREE: members[0] is the root; the rest are bank-$00
+    /// JSL/RTL helpers the tree JSLs, each walked by the same rules and
+    /// copied alongside the root (JSL operands in the copies are rebased
+    /// member-to-member). Only the ROOT's call sites are re-pointed at a
+    /// stub — a helper's outside callers keep running the original, which
+    /// is safe for a synchronous offload because the S-CPU spins in the
+    /// stub for the whole SA-1 run. `pin` is the data bank the member
+    /// INHERITS at entry — the caller's pin at every tree JSL that
+    /// reaches it (the copy is only ever entered through those JSLs); a
+    /// disagreement between call sites sets `conflict` and refuses the
+    /// tree.
+    members: [ptr_tree_cap]struct { entry: u16, span: u32, pin: ?u8, conflict: bool } = undefined,
+    n_members: usize = 0,
+    /// Sum of the members' spans: the carve the copies need.
+    total_span: u32 = 0,
+    /// File offsets of the BANK byte of long WRAM operands ($7E:xxxx, or
+    /// the $00-$3F low mirror of it) — rewritten to the shadow bank in
+    /// the copy (identity offsets make the 16 bits carry over; a $00-$3F
+    /// mirror's low half IS $7E:0000-1FFF). On the SA-1 those addresses
+    /// are I-RAM or nothing, so without the rewrite the body reads noise.
+    wram_long_sites: [ptr_wram_long_cap]u32 = undefined,
+    n_wram_long: usize = 0,
+    /// Every helper's executed JSL sites lie inside the tree: nothing
+    /// outside can run a helper WHILE the SA-1 does — the gate async
+    /// needs (sync never overlaps, so it never cares).
+    helpers_private: bool = true,
 };
 
 /// The routine's profiled WRAM pages coalesced into marshal runs (split at
@@ -689,7 +720,13 @@ fn tryOffload(
         for ([_][]const Candidate{ candidates, neighbours }) |list| {
             for (list) |o| {
                 if (o.entry == c.entry) continue;
-                if (o.entry < c.entry or o.entry - c.entry >= spec.span) continue;
+                // Inside ANY tree member: alternate entry points into the
+                // root, and the helpers themselves — the SA-1 runs their
+                // code, so their working sets ride along.
+                const in_tree = for (spec.members[0..spec.n_members]) |m| {
+                    if (o.entry >= m.entry and o.entry - m.entry < m.span) break true;
+                } else false;
+                if (!in_tree) continue;
                 for (&marshal_pages, o.pages) |*p, op| p.* |= op;
                 siblings += 1;
             }
@@ -725,26 +762,29 @@ fn tryOffload(
             while (p < 512) : (p += 1) {
                 if (!profile.getPage(marshal_pages, p) or p == dp_page) continue;
                 if (profile.getPage(dma_pages, p)) {
+                    if (dbg_walk_root != 0 and e == dbg_walk_root)
+                        std.debug.print("[walk] {x:0>4}: page {x:0>2} feeds DMA — not resident\n", .{ e, p });
                     resident = false;
                     break;
                 }
-                for (neighbours) |o| {
-                    // Siblings share the body and get the same rewrite,
-                    // so their traffic is this routine's traffic.
-                    if (o.entry >= c.entry and o.entry - c.entry < spec.span) continue;
-                    if (profile.getPage(o.pages, p)) {
-                        resident = false;
-                        break;
+                for ([_][]const Candidate{ neighbours, candidates }) |list| {
+                    for (list) |o| {
+                        if (o.entry == c.entry) continue;
+                        // Tree members and the siblings inside them share
+                        // the body and get the same rewrite, so their
+                        // traffic is this routine's traffic.
+                        const in_tree = for (spec.members[0..spec.n_members]) |m| {
+                            if (o.entry >= m.entry and o.entry - m.entry < m.span) break true;
+                        } else false;
+                        if (in_tree) continue;
+                        if (profile.getPage(o.pages, p)) {
+                            if (dbg_walk_root != 0 and e == dbg_walk_root)
+                                std.debug.print("[walk] {x:0>4}: page {x:0>2} shared with ${x:0>6} — not resident\n", .{ e, p, o.entry });
+                            resident = false;
+                            break;
+                        }
                     }
-                }
-                if (!resident) break;
-                for (candidates) |o| {
-                    if (o.entry == c.entry) continue;
-                    if (o.entry >= c.entry and o.entry - c.entry < spec.span) continue;
-                    if (profile.getPage(o.pages, p)) {
-                        resident = false;
-                        break;
-                    }
+                    if (!resident) break;
                 }
                 if (!resident) break;
             }
@@ -754,7 +794,7 @@ fn tryOffload(
             // a long operand, still breaks if the bytes move. So refuse
             // residency when any executed instruction outside this
             // routine's own span statically names a page we would move.
-            if (resident and namedOutside(out, usage, e, spec.span, marshal_pages, dp_page))
+            if (resident and namedOutside(out, usage, &spec, marshal_pages, dp_page))
                 resident = false;
         }
         // Resident pages are not copied: only the direct page is, and
@@ -770,9 +810,17 @@ fn tryOffload(
             for (0..runs.n) |r| bytes += @as(u64, runs.len[r]) * 256;
             const marshal_cost = bytes * 2 * mvn_cycles_per_byte;
             const per_call = c.self_cycles / c.calls;
-            if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) continue;
+            if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) {
+                if (dbg_walk_root != 0 and e == dbg_walk_root)
+                    std.debug.print("[walk] {x:0>4}: UNECONOMIC — marshal {} bytes ({} cycles) vs {} cycles/call\n", .{ e, bytes, marshal_cost, per_call });
+                continue;
+            }
         }
-        if (countCallSites(out, usage, e, 0x22) == 0) continue;
+        if (countCallSites(out, usage, e, 0x22) == 0) {
+            if (dbg_walk_root != 0 and e == dbg_walk_root)
+                std.debug.print("[walk] {x:0>4}: no executed JSL call sites\n", .{e});
+            continue;
+        }
         // Fire-and-forget: RESIDENT routines only — an async call keeps no
         // write-back at all (register results and dp writes are both
         // dropped; see emitFence), so only effects on BW-RAM-resident
@@ -784,7 +832,12 @@ fn tryOffload(
         // needed the dropped effects is exactly what verification
         // arbitrates, and the mode ladder retries synchronously when it
         // says so.
-        const is_async = allow_async and resident and !c.no_async and spec.n_slots <= 2 and n == 0;
+        // A tree with a SHARED helper additionally rules out async: an
+        // outside caller would run the helper's original on the S-CPU
+        // while the SA-1 runs the copy — sync never overlaps, async is
+        // nothing but overlap.
+        const is_async = allow_async and resident and !c.no_async and spec.n_slots <= 2 and n == 0 and
+            (spec.n_members == 1 or spec.helpers_private);
         chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings, .resident = resident, .is_async = is_async };
         n += 1;
     }
@@ -814,9 +867,9 @@ fn tryOffload(
             .ptr => {
                 blocks_len += 33;
                 ptr_stub_len += if (c.is_async)
-                    fenceLen(c.spec) + asyncStubLen(c.spec) + c.spec.span
+                    fenceLen(c.spec) + asyncStubLen(c.spec) + c.spec.total_span
                 else
-                    ptrStubLen(c.spec, c.runs) + c.spec.span;
+                    ptrStubLen(c.spec, c.runs) + c.spec.total_span;
             },
         };
         const dl: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
@@ -876,33 +929,50 @@ fn tryOffload(
                     emitPtrStub(out[stub_file..], id, c.entry, c.spec, c.runs);
                 std.debug.assert(emitted == if (c.is_async) asyncStubLen(c.spec) else ptrStubLen(c.spec, c.runs));
                 ptr_cur += emitted;
-                // The SA-1's copy of the body, immediately after the stub:
-                // the DB idiom's bank immediates become the shadow bank,
-                // and intra-span JMP targets are re-based. The ORIGINAL
-                // body stays untouched for unseen S-CPU callers.
+                // The SA-1's copies of the TREE, immediately after the
+                // stub — the root first, so the dispatcher's JSL lands on
+                // it. In each copy the DB idiom's and the long-WRAM
+                // operands' bank bytes become the shadow bank, intra-
+                // member JMP targets are re-based, and member-to-member
+                // JSLs are re-pointed at the copies. The ORIGINAL bodies
+                // stay untouched for unseen S-CPU callers.
                 const copy_file = ptr_cur;
-                const entry_file: u32 = c.entry - 0x8000;
-                @memcpy(out[copy_file..][0..c.spec.span], out[entry_file..][0..c.spec.span]);
-                for (c.spec.db_sites[0..c.spec.n_db]) |site| {
-                    std.debug.assert(out[copy_file + (site - entry_file)] == 0x7E);
-                    out[copy_file + (site - entry_file)] = shadow_bank;
-                    // Residency: the ORIGINAL body's data bank moves too,
-                    // so the S-CPU's own calls — including the sibling
-                    // entry points that were never re-pointed — address
-                    // the one BW-RAM copy rather than a stale WRAM one.
-                    // This is the whole difference between residency and
-                    // marshalling: one copy, no synchronisation, no
-                    // window for an NMI to write the side we then
-                    // overwrite.
-                    if (c.resident) out[site] = shadow_bank;
+                var member_copy: [ptr_tree_cap]u32 = undefined;
+                for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
+                    member_copy[mi] = ptr_cur;
+                    @memcpy(out[ptr_cur..][0..m.span], out[m.entry - 0x8000 ..][0..m.span]);
+                    ptr_cur += m.span;
+                }
+                for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
+                    const m_file: u32 = m.entry - 0x8000;
+                    for (c.spec.db_sites[0..c.spec.n_db]) |site| {
+                        if (site < m_file or site - m_file >= m.span) continue;
+                        std.debug.assert(out[member_copy[mi] + (site - m_file)] == 0x7E);
+                        out[member_copy[mi] + (site - m_file)] = shadow_bank;
+                        // Residency: the ORIGINAL body's data bank moves
+                        // too, so the S-CPU's own calls — including the
+                        // sibling entry points that were never re-pointed
+                        // — address the one BW-RAM copy rather than a
+                        // stale WRAM one. That is the whole difference
+                        // between residency and marshalling: one copy,
+                        // nothing to synchronise. (Idempotent: a site
+                        // shared by overlapping members rewrites once.)
+                        if (c.resident and out[site] == 0x7E) out[site] = shadow_bank;
+                    }
+                    for (c.spec.wram_long_sites[0..c.spec.n_wram_long]) |site| {
+                        if (site < m_file or site - m_file >= m.span) continue;
+                        out[member_copy[mi] + (site - m_file)] = shadow_bank;
+                        if (c.resident and (out[site] == 0x7E or (out[site] & 0x7F) <= 0x3F))
+                            out[site] = shadow_bank;
+                    }
+                    fixupJmps(out, usage, m.entry, m.span, member_copy[mi], @intCast(0x8000 + (member_copy[mi] % 0x8000)));
+                    rebaseTreeJsls(out, usage, &c.spec, m.entry, m.span, member_copy[mi], &member_copy);
                 }
                 if (c.resident) res.stats.resident_offloads += 1;
                 c.copy_bank = @intCast(copy_file / 0x8000);
                 c.copy_addr = @intCast(0x8000 + (copy_file % 0x8000));
                 res.stats.offload_copy[i] = @as(u24, c.copy_bank) << 16 | c.copy_addr;
-                res.stats.offload_copy_len[i] = c.spec.span;
-                fixupJmps(out, usage, c.entry, c.spec.span, copy_file, c.copy_addr);
-                ptr_cur += c.spec.span;
+                res.stats.offload_copy_len[i] = c.spec.total_span;
                 const stub_bank: u8 = @intCast(stub_file / 0x8000);
                 const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
                 res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
@@ -1003,8 +1073,7 @@ fn bwramLive(plan: *const profile.Plan, res: *const Result) u32 {
 fn namedOutside(
     out: []const u8,
     usage: []const u8,
-    entry: u16,
-    span: u32,
+    spec: *const PtrSpec,
     pages: profile.WramPages,
     dp_page: u16,
 ) bool {
@@ -1017,9 +1086,14 @@ fn namedOutside(
             const cpu_addr = (bank << 16) | a16;
             const fl = usage[cpu_addr] | usage[0x80_0000 | cpu_addr];
             if (fl & usage_map.flag_opcode == 0) continue;
-            // Inside the routine's own body: its accesses are the ones
+            // Inside the tree's own bodies: their accesses are the ones
             // the data-bank rewrite re-points.
-            if (bank == 0 and a16 >= entry and a16 - entry < span) continue;
+            if (bank == 0) {
+                const in_tree = for (spec.members[0..spec.n_members]) |m| {
+                    if (a16 >= m.entry and a16 - m.entry < m.span) break true;
+                } else false;
+                if (in_tree) continue;
+            }
             const file = bank_file + (a16 - 0x8000);
             if (file + 4 > out.len) continue;
             const op = out[file];
@@ -1064,6 +1138,42 @@ fn fixupJmps(out: []u8, usage: []const u8, entry: u16, span: u32, copy_file: u32
             const t = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
             const rebased: u16 = copy_addr + (t - entry);
             std.mem.writeInt(u16, out[copy_file + (pc - entry) + 1 ..][0..2], rebased, .little);
+        }
+        pc += usage_map.instrLen(op, m8, x8);
+    }
+}
+
+/// Re-point member-to-member JSLs inside one member's COPY at the other
+/// members' copies. The eligibility walk proved every JSL in the span
+/// targets a tree member, so this scan is exhaustive by construction.
+fn rebaseTreeJsls(
+    out: []u8,
+    usage: []const u8,
+    spec: *const PtrSpec,
+    entry: u16,
+    span: u32,
+    copy_file: u32,
+    member_copy: *const [ptr_tree_cap]u32,
+) void {
+    var pc: u32 = entry;
+    while (pc - entry < span) {
+        if (usage[pc] & usage_map.flag_opcode == 0) {
+            pc += 1;
+            continue;
+        }
+        const file = pc - 0x8000;
+        const op = out[file];
+        const m8 = usage[pc] & usage_map.flag_m != 0;
+        const x8 = usage[pc] & usage_map.flag_x != 0;
+        if (op == 0x22 and out[file + 3] == 0x00) {
+            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            for (spec.members[0..spec.n_members], 0..) |m, mj| {
+                if (m.entry != tgt) continue;
+                const dst = copy_file + (pc - entry);
+                std.mem.writeInt(u16, out[dst + 1 ..][0..2], @intCast(0x8000 + (member_copy[mj] % 0x8000)), .little);
+                out[dst + 3] = @intCast(member_copy[mj] / 0x8000);
+                break;
+            }
         }
         pc += usage_map.instrLen(op, m8, x8);
     }
@@ -1132,23 +1242,73 @@ fn callSites(ro: []const u8, rw: ?[]u8, usage: []const u8, entry: u16, op: u8, s
 /// Static pointer-eligibility walk: a JSL/RTL routine whose data flows
 /// through dp cells and runtime pointers, offloadable as COMPUTE against
 /// the BW-RAM shadow of its profiled working set. The walk proves what it
-/// can (return shape, span containment, no MMIO/abs/stack-relative sites,
-/// the DB idiom, the long-pointer bank slots); the pointer VALUES are
-/// dynamic evidence — anything they reach outside the marshalled shadow
-/// diverges in S4 verification and no patch ships. Refusal here is a skip,
-/// not an error: the routine simply stays on the S-CPU.
+/// can (return shape, span containment, no MMIO/stack-relative sites, the
+/// DB idiom, the long-pointer bank slots); the pointer VALUES are dynamic
+/// evidence — anything they reach outside the marshalled shadow diverges
+/// in S4 verification and no patch ships. Refusal here is a skip, not an
+/// error: the routine simply stays on the S-CPU.
+///
+/// The walk covers a CALL TREE: a JSL to a bank-$00 target makes that
+/// target a member, walked by the same rules and copied alongside the
+/// root. Absolute (DB-relative) operands are allowed while the data bank
+/// is PINNED by an immediate LDA #bank / PHA / PLB — tracked linearly,
+/// which matches the idiom's real use (pin once up front, restore at the
+/// end); a backward branch across a re-pin is dynamic evidence like the
+/// rest. Long WRAM operands are recorded as bank-byte rewrite sites: the
+/// shadow is identity-offset, so only the bank byte changes in the copy.
 fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
-    const span_max: u32 = 1024;
     var spec: PtrSpec = .{};
     var has_idp = false;
+    spec.members[0] = .{ .entry = entry, .span = 0, .pin = null, .conflict = false };
+    spec.n_members = 1;
+    var walked: usize = 0;
+    while (walked < spec.n_members) : (walked += 1) {
+        if (!walkMember(out, usage, &spec, walked, &has_idp)) {
+            if (dbg_walk_root != 0 and entry == dbg_walk_root)
+                std.debug.print("[walk] root {x:0>4}: member {} (${x:0>4}) refused\n", .{ entry, walked, spec.members[walked].entry });
+            return null;
+        }
+    }
+    // A member validated under an inherited pin that a LATER call site
+    // contradicts was validated on a false premise.
+    for (spec.members[0..spec.n_members]) |m| if (m.conflict) return null;
+    if (has_idp and spec.n_db == 0) return null;
+    spec.span = spec.members[0].span;
+    spec.total_span = 0;
+    for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
+    if (spec.total_span > ptr_tree_span_max) return null;
+    // Helper privacy (an ASYNC-only requirement, recorded for the gate):
+    // every executed JSL site of every helper lies inside the tree.
+    for (spec.members[1..spec.n_members]) |m| {
+        if (!jslSitesInsideTree(out, usage, &spec, m.entry)) {
+            spec.helpers_private = false;
+            break;
+        }
+    }
+    return spec;
+}
+
+/// Walk diagnostics: set to a root entry to print why the offload gates
+/// skip it (walk refusal per member, residency's shared/DMA page, the
+/// marshal economics). Zero compiles every print away.
+const dbg_walk_root: u16 = 0;
+
+fn walkMember(out: []const u8, usage: []const u8, spec: *PtrSpec, mi: usize, has_idp: *bool) bool {
+    const span_max: u32 = 1024;
+    const entry: u32 = spec.members[mi].entry;
+    const dbg = dbg_walk_root != 0 and spec.members[0].entry == dbg_walk_root;
     var pc: u32 = entry;
     var limit: u32 = entry;
+    // The pinned data bank, if an LDA #imm / PHA / PLB executed and no
+    // later PLB unpinned it. Tracked linearly. A helper starts with the
+    // pin it INHERITS from its tree call sites (see PtrSpec.members).
+    var db_pin: ?u8 = spec.members[mi].pin;
     while (pc - entry < span_max) {
-        if (pc > 0xFFFF) return null;
+        if (pc > 0xFFFF) return false;
         if (usage[pc] & usage_map.flag_opcode == 0) {
             // A gap (data or never-taken padding) is fine while pending
             // flow still reaches past it; a gap at the frontier is not.
-            if (pc >= limit) return null;
+            if (pc >= limit) return false;
             pc += 1;
             continue;
         }
@@ -1157,42 +1317,85 @@ fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
         const m8 = usage[pc] & usage_map.flag_m != 0;
         const x8 = usage[pc] & usage_map.flag_x != 0;
         const len = usage_map.instrLen(op, m8, x8);
+        if (dbg) std.debug.print("  [walk] {x:0>4}: {x:0>2} pin={?x}\n", .{ pc, op, db_pin });
         switch (op) {
             0x6B => { // RTL: done once every pending path has closed
                 if (pc >= limit) {
-                    if (has_idp and spec.n_db == 0) return null;
-                    spec.span = pc + 1 - entry;
-                    return spec;
+                    spec.members[mi].span = pc + 1 - entry;
+                    return true;
                 }
             },
-            // Wrong return shape, calls, far jumps, block moves,
+            0x22 => { // JSL: a bank-$00 target joins the tree
+                if (out[file + 3] != 0x00) return false;
+                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                if (tgt < 0x8000) return false;
+                const existing: ?usize = for (spec.members[0..spec.n_members], 0..) |m, j| {
+                    if (m.entry == tgt) break j;
+                } else null;
+                if (existing) |j| {
+                    // A second call site with a different pin invalidates
+                    // whatever the member's walk assumed.
+                    if (!std.meta.eql(spec.members[j].pin, db_pin)) spec.members[j].conflict = true;
+                } else {
+                    if (spec.n_members == ptr_tree_cap) return false;
+                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .pin = db_pin, .conflict = false };
+                    spec.n_members += 1;
+                }
+            },
+            // Wrong return shape, near calls, far jumps, block moves,
             // interrupt-adjacent, D/S relocation: not this routine.
-            0x60, 0x40, 0x20, 0x22, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return null,
-            0x00, 0x02, 0xCB, 0xDB, 0x44, 0x54 => return null,
-            0x2B, 0x5B, 0x1B, 0x9A, 0xFB, 0x58 => return null,
-            0x4C => { // JMP abs: intra-span only
-                const dst: u32 = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if (dst < entry or dst - entry >= span_max) return null;
+            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return false,
+            0x00, 0x02, 0xCB, 0xDB, 0x44, 0x54 => return false,
+            0x2B, 0x5B, 0x1B, 0x9A, 0xFB, 0x58 => return false,
+            0x4C, 0x82, 0x80 => { // JMP abs / BRL / BRA: intra-member only
+                const dst: u32 = switch (op) {
+                    0x4C => std.mem.readInt(u16, out[file + 1 ..][0..2], .little),
+                    0x82 => pc + 3 +% @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little)))))),
+                    else => pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1]))))),
+                };
+                if (dst < entry or dst - entry >= span_max) return false;
                 limit = @max(limit, dst);
+                // An unconditional BACKWARD transfer at the frontier
+                // closes the member like an RTL: no pending path reaches
+                // past it, and the loop it forms stays inside the span.
+                if (dst <= pc and pc >= limit) {
+                    spec.members[mi].span = pc + len - entry;
+                    return true;
+                }
             },
-            0x82 => { // BRL
-                const disp: i16 = @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little));
-                const dst = pc + 3 +% @as(u32, @bitCast(@as(i32, disp)));
-                if (dst < entry or dst - entry >= span_max) return null;
-                limit = @max(limit, dst);
-            },
-            0x10, 0x30, 0x50, 0x70, 0x80, 0x90, 0xB0, 0xD0, 0xF0 => {
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
                 const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
-                if (dst < entry or dst - entry >= span_max) return null;
+                if (dst < entry or dst - entry >= span_max) return false;
                 limit = @max(limit, dst);
             },
-            0xA9 => if (m8 and out[file + 1] == 0x7E) {
-                // LDA #$7E / PHA / PLB is the shadow's rewrite point; a
-                // bare #$7E has an unknowable purpose — refuse.
-                if (file + 3 >= out.len or out[file + 2] != 0x48 or out[file + 3] != 0xAB) return null;
-                if (spec.n_db == ptr_db_cap) return null;
-                spec.db_sites[spec.n_db] = file + 1;
-                spec.n_db += 1;
+            0xA9 => if (m8) {
+                const imm = out[file + 1];
+                if (file + 3 < out.len and out[file + 2] == 0x48 and out[file + 3] == 0xAB) {
+                    // LDA #imm / PHA / PLB pins the data bank. #$7E is
+                    // the shadow's rewrite point and gets recorded; any
+                    // other immediate is a pin the walk merely tracks.
+                    db_pin = imm;
+                    if (imm == 0x7E) {
+                        // Overlapping members walk shared tails twice;
+                        // record each site once.
+                        const dup = for (spec.db_sites[0..spec.n_db]) |s| {
+                            if (s == file + 1) break true;
+                        } else false;
+                        if (!dup) {
+                            if (spec.n_db == ptr_db_cap) return false;
+                            spec.db_sites[spec.n_db] = file + 1;
+                            spec.n_db += 1;
+                        }
+                    }
+                } else if (imm == 0x7E) {
+                    // A bare #$7E has an unknowable purpose — refuse.
+                    return false;
+                }
+            },
+            0xAB => {
+                // A PLB outside the idiom restores a pushed bank the walk
+                // cannot see: unpinned from here on.
+                if (file < 3 or out[file - 3] != 0xA9 or out[file - 1] != 0x48) db_pin = null;
             },
             else => {},
         }
@@ -1200,12 +1403,12 @@ fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
         // byte at dp+2 is a translation slot ($7E/$7F -> shadow).
         if (op & 0x0F == 0x07) {
             const slot: u16 = @as(u16, out[file + 1]) + 2;
-            if (slot > 0xFF) return null; // bank byte past the dp window
+            if (slot > 0xFF) return false; // bank byte past the dp window
             const dup = for (spec.slots[0..spec.n_slots]) |s| {
                 if (s == slot) break true;
             } else false;
             if (!dup) {
-                if (spec.n_slots == ptr_slot_cap) return null;
+                if (spec.n_slots == ptr_slot_cap) return false;
                 spec.slots[spec.n_slots] = @intCast(slot);
                 spec.n_slots += 1;
             }
@@ -1214,8 +1417,8 @@ fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
         // sound once the DB idiom pins it to the shadow. (dp,x) hides the
         // pointer cell behind a runtime index; stack-relative reads the
         // S-CPU stack the SA-1 does not have.
-        if (op & 0x1F == 0x11 or op & 0x1F == 0x12) has_idp = true;
-        if (op & 0x1F == 0x01 or op & 0x0F == 0x03) return null;
+        if (op & 0x1F == 0x11 or op & 0x1F == 0x12) has_idp.* = true;
+        if (op & 0x1F == 0x01 or op & 0x0F == 0x03) return false;
         switch (usage_map.mode(op)) {
             .none, .dp => {},
             // dp,X/dp,Y: a runtime index that can leave the shadow's dp
@@ -1224,18 +1427,71 @@ fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
             // actually left the marshalled shadow reads ROM instead of
             // state, diverges in S4 verification, and no patch ships.
             .dp_idx => {},
-            .abs, .abs_x, .abs_y => return null, // DB-relative: unprovable under a rewritten DB
+            // DB-relative: allowed exactly while the idiom pins the bank.
+            // Pinned $7E is WRAM top to bottom — the rewritten idiom
+            // re-points every one of these at the shadow. A pinned ROM
+            // bank reads identically on both CPUs above $8000; below it
+            // the banks diverge (S-CPU mirrors, SA-1 I-RAM), so refuse.
+            .abs, .abs_x, .abs_y => {
+                const b = db_pin orelse return false;
+                if (b == 0x7E) {
+                    // follows the rewritten DB into the shadow
+                } else if ((b <= 0x3F or (b >= 0x80 and b != 0x7F)) and
+                    std.mem.readInt(u16, out[file + 1 ..][0..2], .little) >= 0x8000)
+                {
+                    // ROM through a pinned bank: same bytes on both CPUs
+                } else return false;
+            },
             .long, .long_x => {
                 const b = out[file + 3];
-                // ROM and BW-RAM read identically on the SA-1; long WRAM
-                // or MMIO cannot follow execution across.
-                const ok = (b >= 0x40 and b <= 0x4F) or b >= 0xC0 or (b & 0x7F) <= 0x3F;
-                if (!ok) return null;
+                const a16 = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                // ROM and BW-RAM read identically on the SA-1. Long WRAM
+                // becomes a bank-byte rewrite to the identity-offset
+                // shadow: $7E:xxxx directly, and a $00-$3F bank's low 8K
+                // is the same bytes through the mirror. $7F and MMIO
+                // cannot follow execution across.
+                if (b == 0x7E or ((b & 0x7F) <= 0x3F and a16 < 0x2000)) {
+                    const dup = for (spec.wram_long_sites[0..spec.n_wram_long]) |s| {
+                        if (s == file + 3) break true;
+                    } else false;
+                    if (!dup) {
+                        if (spec.n_wram_long == ptr_wram_long_cap) return false;
+                        spec.wram_long_sites[spec.n_wram_long] = file + 3;
+                        spec.n_wram_long += 1;
+                    }
+                } else if ((b >= 0x40 and b <= 0x4F) or b >= 0xC0 or
+                    ((b & 0x7F) <= 0x3F and a16 >= 0x8000))
+                {
+                    // ROM / BW-RAM: fine as-is
+                } else return false;
             },
         }
         pc += len;
     }
-    return null;
+    return false;
+}
+
+/// Are all executed JSL call sites of `entry` inside the tree's spans?
+fn jslSitesInsideTree(out: []const u8, usage: []const u8, spec: *const PtrSpec, entry: u16) bool {
+    var bank: u32 = 0;
+    while (bank < 0x40) : (bank += 1) {
+        const bank_file = bank * 0x8000;
+        if (bank_file >= out.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu_addr = (bank << 16) | a16;
+            if ((usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
+            const file = bank_file + (a16 - 0x8000);
+            if (out[file] != 0x22) continue;
+            if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) != entry) continue;
+            if (out[file + 3] != 0x00) continue;
+            const inside = bank == 0 and for (spec.members[0..spec.n_members]) |m| {
+                if (a16 >= m.entry and a16 - m.entry < m.span) break true;
+            } else false;
+            if (!inside) return false;
+        }
+    }
+    return true;
 }
 
 /// Byte-exact length of a pointer stub (the emitter asserts against it).
@@ -3646,6 +3902,81 @@ test "async: a fire-and-forget resident offload runs, and the fence collects it"
     try testing.expectEqual(@as(u8, 0), con.bus.sa1.iram[0x38A]);
     try testing.expectEqual(@as(u4, 0), con.bus.sa1.smeg);
     try testing.expectEqual(@as(u4, 0), con.bus.sa1.cmeg);
+}
+
+test "tree offload: a root with a JSL helper, DB-pinned abs, and long-WRAM rewrites round-trips" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0xE000..0x10000], 0xFF);
+
+    // Caller: seed WRAM $1234, JSL the root, spin. The caller's own
+    // absolute store also makes page $12 "named outside", so the tree is
+    // NOT resident — the marshalled path is what this test exercises.
+    @memcpy(rom[0x0000..0x000F], &[_]u8{
+        0x18, 0xFB, // CLC / XCE
+        0xE2, 0x30, // SEP #$30
+        0xA9, 0x77, // LDA #$77
+        0x8D, 0x34, 0x12, // STA $1234 (WRAM low mirror, DB=0)
+        0x22, 0x40, 0x80, 0x00, // JSL $00:8040
+        0x80, 0xFE, // BRA *
+    });
+    // Root: pin DB=$7E by the idiom, write $1F00 through the pinned
+    // bank (an ABSOLUTE store — refused before DB tracking), JSL the
+    // helper, restore, RTL.
+    @memcpy(rom[0x0040..0x0050], &[_]u8{
+        0x8B, // PHB
+        0xA9, 0x7E, 0x48, 0xAB, // LDA #$7E / PHA / PLB (pin + rewrite site)
+        0xA9, 0x55, // LDA #$55
+        0x8D, 0x00, 0x1F, // STA $1F00 (abs under the pin)
+        0x22, 0x60, 0x80, 0x00, // JSL $00:8060 — a tree member
+        0xAB, // PLB (unpin)
+        0x6B, // RTL
+    });
+    // Helper: long-WRAM read-modify-write through the $00 low mirror —
+    // both bank bytes become the shadow bank in the SA-1's copy.
+    @memcpy(rom[0x0060..0x006C], &[_]u8{
+        0xAF, 0x34, 0x12, 0x00, // LDA $00:1234
+        0x18, 0x69, 0x01, // CLC / ADC #$01
+        0x8F, 0x35, 0x12, 0x00, // STA $00:1235
+        0x6B, // RTL
+    });
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800D }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8043, 0x8044, 0x8045, 0x8047, 0x804A, 0x804E, 0x804F }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8060, 0x8064, 0x8065, 0x8067, 0x806B }) |a| markOp(usage, a);
+
+    var plan = onePlan(0x0F00, 0x10, .iram, 0x80, false);
+    var pages: profile.WramPages = @splat(0);
+    pages[0] |= 1 << 0; // dp page
+    pages[0] |= 1 << 0x12; // the helper's long-WRAM cells
+    pages[0] |= 1 << 0x1F; // the root's pinned-abs target
+    var ref: ?Refusal = null;
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, @splat(0), &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 1), res.stats.pointer_offloads);
+    try testing.expectEqual(@as(u8, 0), res.stats.resident_offloads);
+    // Both members copied: 16 (root) + 12 (helper).
+    try testing.expectEqual(@as(u32, 28), res.stats.offload_copy_len[0]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame();
+    // The root's pinned-abs store and the helper's long RMW both ran on
+    // the SA-1 against the shadow and marshalled home.
+    try testing.expectEqual(@as(u8, 0x55), con.bus.wram.data[0x1F00]);
+    try testing.expectEqual(@as(u8, 0x77), con.bus.wram.data[0x1234]);
+    try testing.expectEqual(@as(u8, 0x78), con.bus.wram.data[0x1235]);
 }
 
 test "sa1 trace: the SA-1's path through an offloaded body is observable" {
