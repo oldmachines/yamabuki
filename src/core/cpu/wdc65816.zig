@@ -192,6 +192,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// round, and a loop that is computing something walks memory.
         pub inline fn read8(self: *Self, addr: u24) u8 {
             if (@hasField(BusT, "last_data_read")) self.bus.last_data_read = addr;
+            if (@hasDecl(BusT, "noteTickRead")) self.bus.noteTickRead(addr);
             return self.bus.read8(addr);
         }
 
@@ -200,6 +201,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// the machine's state, never call/return bookkeeping.
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
+            if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);
         }
 

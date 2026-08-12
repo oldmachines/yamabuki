@@ -94,6 +94,10 @@ const Args = struct {
     /// Resume from an SDL-player save state instead of power-on (plain runs
     /// and --sa1-report). Same-image, same-core states only.
     state: ?[]const u8 = null,
+    /// Diagnostic for the behavioral verifier's design: write every logic
+    /// tick's phase-aligned WRAM snapshot (u32 wall frame + 128 KiB raw,
+    /// repeated) to this file. Fast core only.
+    tick_dump: ?[]const u8 = null,
     /// Generate a FastROM patch for this ROM, verified in-emulator before
     /// anything is written (see `util.generateFastromVerified`).
     gen_fastrom: bool = false,
@@ -252,6 +256,10 @@ pub fn main(init: std.process.Init) !void {
         try runReport(io, gpa, out, args, cart, mov);
         return;
     }
+    if (args.tick_dump) |path| {
+        try runTickDump(io, gpa, out, args, cart, mov, path);
+        return;
+    }
 
     const con = try gpa.create(core.AnyConsole);
     con.init(args.accuracy, cart);
@@ -408,6 +416,107 @@ fn loadMovie(
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
 /// movie's end. A no-op without a movie.
+/// `--tick-dump`: one record per logic tick — u32 wall frame (little-endian)
+/// followed by the phase-aligned snapshot the bus captured at that tick's
+/// controller poll: 128 KiB WRAM, 128 KiB cartridge RAM (BW-RAM), 2 KiB SA-1
+/// I-RAM — the relocated homes too, because a conversion moves state and a
+/// WRAM-only view is blind exactly where a broken offload does its damage. The offline analysis behind the behavioral
+/// verifier's design; not part of any verification path itself.
+fn runTickDump(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    cart: core.Cartridge,
+    mov: ?util.movie.Movie,
+    path: []const u8,
+) !void {
+    const con = try gpa.create(core.FastConsole);
+    con.init(cart);
+    if (args.auto_fastrom) con.bus.enableAutoFastrom();
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+
+    const snap = try gpa.create(core.bus.Bus.TickSnap);
+    snap.* = .{};
+    @memset(&snap.live, 0);
+    @memset(&snap.written, 0);
+    con.bus.tick_snap = snap;
+
+    const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch {
+        try out.print("error: cannot create '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    defer file.close(io);
+    var fbuf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &fbuf);
+
+    // Lag-frame mask: bytes that change across a LAG frame were written by
+    // the NMI side (or by the main loop's stalled mid-computation) — the
+    // candidate set for "legitimately wall-coupled". Lag means genuine
+    // slowdown: a SHORT no-poll blip amid live gameplay. Long no-poll runs
+    // are loads and transitions, where the game legitimately rewrites great
+    // swaths of WRAM — learning from those buries real corruption inside
+    // the mask (a 23% blind spot on Gradius III), so runs longer than
+    // `lag_run_max` teach nothing.
+    const lag_run_max = 3;
+    const prev = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len);
+    const lagbuf = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len * lag_run_max);
+    const mask = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len);
+    @memset(mask, 0);
+    @memcpy(prev, &con.bus.wram.data);
+
+    const frames = args.frames orelse 600;
+    var ticks: u32 = 0;
+    var lag_run: u32 = 0;
+    var drain: [4096]i16 = undefined;
+    for (0..frames) |i| {
+        con.bus.input_polled = false;
+        snap.captured = false;
+        feedMovie(con, mov, i);
+        con.runFrame();
+        while (con.readAudio(&drain) != 0) {}
+        if (snap.captured) {
+            var hdr: [4]u8 = undefined;
+            std.mem.writeInt(u32, &hdr, @intCast(i), .little);
+            try fw.interface.writeAll(&hdr);
+            // The liveness accumulated since the LAST poll: which bytes of
+            // the previous tick's state this interval actually consumed.
+            try fw.interface.writeAll(&snap.live);
+            try fw.interface.writeAll(&snap.wram);
+            try fw.interface.writeAll(&snap.sram);
+            try fw.interface.writeAll(&snap.iram);
+            @memset(&snap.live, 0);
+            @memset(&snap.written, 0);
+            ticks += 1;
+            // The no-poll run just ended: it was lag (not a load) only if
+            // it stayed short, and only then does it teach the mask.
+            if (lag_run > 0 and lag_run <= lag_run_max and ticks > 1) {
+                for (0..lag_run) |r| {
+                    const before = if (r == 0) prev else lagbuf[(r - 1) * core.bus.Bus.TickSnap.wram_len ..];
+                    const after = lagbuf[r * core.bus.Bus.TickSnap.wram_len ..];
+                    for (0..core.bus.Bus.TickSnap.wram_len) |x| {
+                        if (before[x] != after[x]) mask[x] = 1;
+                    }
+                }
+            }
+            lag_run = 0;
+            @memcpy(prev, &con.bus.wram.data);
+        } else {
+            if (lag_run < lag_run_max)
+                @memcpy(lagbuf[lag_run * core.bus.Bus.TickSnap.wram_len ..][0..core.bus.Bus.TickSnap.wram_len], &con.bus.wram.data);
+            lag_run += 1;
+        }
+    }
+    // The mask rides at the tail: 128 KiB of 0/1 after the tick records.
+    try fw.interface.writeAll(mask);
+    try fw.interface.flush();
+    var masked: u32 = 0;
+    for (mask) |m| masked += m;
+    try out.print("{s}: {} ticks in {} frames, {} lag-touched bytes -> {s}\n", .{ args.rom, ticks, frames, masked, path });
+    try out.flush();
+}
+
 /// `--state`: resume from an SDL-player save state instead of power-on —
 /// which lets the profiler measure a scene the attract demo never reaches
 /// (a slowdown-heavy stage the player save-stated, say) without replaying
@@ -962,6 +1071,13 @@ fn runSa1Gen(
             },
             else => return e,
         };
+
+        // TEMPORARY: keep each attempt's image for the behavioral experiment.
+        {
+            var namebuf: [32]u8 = undefined;
+            const nm = std.fmt.bufPrint(&namebuf, "wg-attempt{d}.sfc", .{n_dropped}) catch unreachable;
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nm, .data = res.image }) catch {};
+        }
 
         // The verify run for this attempt.
         @memset(env_conv, 0);
@@ -2295,6 +2411,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.movie = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--state")) {
             out.state = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--tick-dump")) {
+            out.tick_dump = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
