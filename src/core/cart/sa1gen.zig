@@ -2531,11 +2531,12 @@ pub fn convertWholeGame(
                 // DBR: the `LDA #bank : PHA : PLB` idiom is the only shape
                 // that names a bank statically. A WRAM bank there re-banks
                 // like any other $7E/$7F reference; anything else leaves DBR
-                // system-bank as far as this walk can tell. Like the X/Y
-                // carries, the knowledge dies at any control transfer — the
-                // next linear instruction may be a different routine that
-                // arrives with a different DBR.
-                if (branches(op)) dbr_bw = false;
+                // system-bank as far as this walk can tell. The knowledge
+                // survives conditional branches and DBR-transparent calls
+                // (the pin at a routine's head dominates its body); it dies
+                // at unconditional transfers — join points another DBR may
+                // reach.
+                if (!dbrSurvives(image, cov, file, op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = false;
                     if (file >= 3 and image[file - 3] == 0xA9 and image[file - 1] == 0x48) {
@@ -2771,7 +2772,7 @@ pub fn convertWholeGame(
                         }
                     }
                 }
-                if (branches(op)) dbr_bw = false;
+                if (!dbrSurvives(out, cov, file, op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
                         (out[file - 2] == 0x7E or out[file - 2] == 0x7F);
@@ -3075,6 +3076,75 @@ fn branches(op: u8) bool {
         0x60, 0x6B, 0x40, 0x00, 0x02 => true,
         else => false,
     };
+}
+
+/// Does the DBR knowledge survive `op` at `file`? A CONDITIONAL branch
+/// does not change DBR — the pin at a routine's head dominates its whole
+/// straight-line body, branches included (killing it there is what made
+/// the window rewriter shift `STA $0000,Y` sites that run under a pinned
+/// $7E and corrupt BW-RAM $9C00 with the bubble tables). A JSR/JSL
+/// survives when the callee provably never touches DBR. Everything else
+/// unconditional (JMP/BRA/returns/interrupts) is a join point another
+/// DBR may reach — the knowledge dies.
+fn dbrSurvives(image: []const u8, cov: []const u8, file: u32, op: u8) bool {
+    switch (op) {
+        // Conditional branches and short unconditional skips (BRA/BRL):
+        // neither touches DBR, and the next LINEAR instruction is the
+        // same routine's alternate path, under the same pin.
+        0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82 => return true,
+        0x20, 0x22 => {
+            if (op == 0x22 and image[file + 3] != 0x00) return false;
+            const tgt = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+            if (tgt < 0x8000) return false;
+            return dbrTransparent(image, cov, tgt, 2);
+        },
+        else => return !branches(op),
+    }
+}
+
+/// Linear scan of a callee: true when every covered instruction to its
+/// return leaves DBR alone (no PLB, no block move, no interrupt-adjacent
+/// op), recursing through nested bank-$00 calls. Anything the scan cannot
+/// follow — an uncovered byte, a jump, depth exhausted — is a no.
+fn dbrTransparent(image: []const u8, cov: []const u8, entry: u16, depth: u8) bool {
+    if (depth == 0) return false;
+    var pc: u32 = entry;
+    while (pc - entry < 768) {
+        if (pc > 0xFFFF) return false;
+        const fl = cov[pc] | cov[0x80_0000 | pc];
+        if (fl & usage_map.flag_opcode == 0) return false;
+        const file = pc - 0x8000;
+        const op = image[file];
+        switch (op) {
+            0x60, 0x6B => return true, // RTS/RTL: clean exit
+            0xAB, 0x44, 0x54, 0x40, 0x00, 0x02, 0xDB => return false,
+            // An intra-span JMP/BRA/BRL changes nothing about DBR; the
+            // scan keeps walking linearly (the return is still ahead of
+            // it). A jump that leaves the span is a path it cannot judge.
+            0x4C => {
+                const dst = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                if (dst < entry or dst - entry >= 768) return false;
+            },
+            0x80, 0x82 => {
+                const dst = if (op == 0x80)
+                    pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(image[file + 1])))))
+                else
+                    pc + 3 +% @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little))))));
+                if (dst < entry or dst - entry >= 768) return false;
+            },
+            0x5C, 0x6C, 0x7C, 0xDC, 0xFC => return false,
+            0x20, 0x22 => {
+                if (op == 0x22 and image[file + 3] != 0x00) return false;
+                const tgt = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                if (tgt < 0x8000 or !dbrTransparent(image, cov, tgt, depth - 1)) return false;
+            },
+            else => {},
+        }
+        const m8 = fl & usage_map.flag_m != 0;
+        const x8 = fl & usage_map.flag_x != 0;
+        pc += usage_map.instrLen(op, m8, x8);
+    }
+    return false;
 }
 
 fn wgHelperLen(site: WgSite) u32 {

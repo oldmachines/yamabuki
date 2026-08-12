@@ -582,6 +582,10 @@ fn verifyBehavioral(
     res: *const core.sa1gen.Result,
     mov: ?util.movie.Movie,
     state: ?[]const u8,
+    /// Uniform window image: every WRAM byte's home is BW-RAM at the
+    /// identity offset (`plan`/`res` are not consulted — the whole-game
+    /// pipeline never builds a plan).
+    window: bool,
     total: u32,
 ) !Behavioral {
     const wram_len = core.bus.Bus.TickSnap.wram_len;
@@ -668,7 +672,15 @@ fn verifyBehavioral(
             if (live[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) == 0) continue;
             if (mask[i] != 0) continue;
             const bb = base.prev.wram[i];
-            const cb = switch (convHome(plan, res, @intCast(i))) {
+            const cb = if (window) blk: {
+                // A window image moves every code-path WRAM reference to
+                // BW-RAM at the identity offset — but WMDATA-port traffic
+                // still lands in real WRAM, and nothing records which
+                // path wrote a given byte last. A byte matching EITHER
+                // home passes; matching neither is a real divergence.
+                const via_bw = conv.prev.sram[i];
+                break :blk if (bb == via_bw) via_bw else conv.prev.wram[i];
+            } else switch (convHome(plan, res, @intCast(i))) {
                 .wram => conv.prev.wram[i],
                 .sram => |off| conv.prev.sram[off],
                 .iram => |off| conv.prev.iram[off & 0x7FF],
@@ -1517,13 +1529,17 @@ fn runSa1Gen(
 
         // The behavioral tier: a slowdown-removing conversion cannot be
         // frame-identical to a slowed-down baseline, so `divergent` from
-        // the pixel gate is where working offloads go to die. Opt-in, and
-        // never for whole-game images (their state relocation is the
-        // window shift, which convHome does not model).
-        if (passed == null and equiv == .divergent and args.verify_behavioral and !args.whole_game) {
+        // the pixel gate is where working offloads go to die. Opt-in.
+        // Whole-game (SA-1-execution) images stay excluded — their state
+        // relocation is not modelled — but WINDOW images are in: their
+        // homes are identity offsets in BW-RAM, and wall-timing drift
+        // from the moved memory is exactly what this tier absorbs.
+        if (passed == null and equiv == .divergent and args.verify_behavioral and
+            (!args.whole_game or args.window))
+        {
             try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
             try out.flush();
-            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, state_bytes, total);
+            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, state_bytes, args.window, total);
             switch (bv.verdict) {
                 .pass => |kind| {
                     try out.print(
