@@ -47,7 +47,16 @@ pub const Config = struct {
 
     pub const Audio = struct {
         enabled: bool = true,
+        /// Output volume percent, 0..200 (100 = the stream as mixed; above
+        /// it is SDL gain and can clip). Applied at stream creation when
+        /// this SDL3 exports SDL_SetAudioStreamGain; hand-editable.
+        volume: u32 = 100,
     };
+
+    /// `audio.volume` with hand-edit protection.
+    pub fn effectiveVolume(self: Config) u32 {
+        return @min(self.audio.volume, 200);
+    }
 
     pub const RewindCfg = struct {
         enabled: bool = true,

@@ -240,6 +240,7 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .patch_name = booted.patch_name,
     };
 }
 
@@ -366,6 +367,9 @@ const Booted = struct {
     rom_crc: u32,
     /// The core the console was built on (movies replay only on their own).
     accuracy: core.Accuracy,
+    /// Basename of the soft-patch applied at load, null when the image is
+    /// as dumped — the info palette's PATCH row.
+    patch_name: ?[]const u8,
 };
 
 /// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
@@ -406,8 +410,10 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         try err.flush();
         return error.BootFailed;
     };
+    var patch_name: ?[]const u8 = null;
     if (args.patch) |patch_path| {
         image = try applySoftPatch(io, gpa, image, patch_path, err);
+        patch_name = std.fs.path.basename(patch_path);
     } else if (args.frames == 0) {
         // Launch discovery: a same-basename softpatch, a patch-folder match,
         // or a registry entry. Whether it is used is the per-game choice the
@@ -422,6 +428,7 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
                 if (pref) |choice| switch (choice) {
                     .patched => {
                         image = try applySoftPatch(io, gpa, image, found.path, err);
+                        patch_name = std.fs.path.basename(found.path);
                         try err.print("patch applied: {s}\n", .{found.path});
                         try err.flush();
                     },
@@ -496,6 +503,7 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         .rewind = if (pg) |p| p.rewind else null,
         .rom_crc = util.movie.imageCrc(core.header.stripCopierHeader(image)),
         .accuracy = accuracy,
+        .patch_name = patch_name,
     };
 }
 

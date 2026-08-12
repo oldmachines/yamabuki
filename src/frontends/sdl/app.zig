@@ -20,6 +20,7 @@ const menu = @import("menu.zig");
 const ui = @import("ui.zig");
 const config = @import("config.zig");
 const saves = @import("saves.zig");
+const infopanel = @import("infopanel.zig");
 const png = @import("png.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
@@ -71,6 +72,8 @@ pub const Options = struct {
     /// `--movie`: a validated recorded playthrough to replay from power-on.
     /// Live input takes over when it ends.
     movie: ?util.movie.Movie,
+    /// Basename of the soft-patch applied at load; null = playing as dumped.
+    patch_name: ?[]const u8,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -275,6 +278,18 @@ pub fn run(
         if (sdl.SDL_OpenAudioDeviceStream(sdl3.audio_device_default_playback, &spec, null, null)) |stream| {
             audio = stream;
             _ = sdl.SDL_ResumeAudioStreamDevice(stream);
+            // Volume, best-effort: gain is a newer stream property, its own
+            // symbol group so an SDL3 without it costs the setting and
+            // nothing else. 100% skips the call entirely.
+            const vol = opts.cfg.effectiveVolume();
+            if (vol != 100) {
+                if (sdl3.loadGain()) |g| {
+                    _ = g.SDL_SetAudioStreamGain(stream, @as(f32, @floatFromInt(vol)) / 100.0);
+                } else |_| {
+                    try err.print("warning: this SDL3 has no SDL_SetAudioStreamGain — volume stays 100%\n", .{});
+                    try err.flush();
+                }
+            }
         } else {
             try err.print("warning: no audio device ({s}), running silent\n", .{sdl.SDL_GetError()});
             try err.flush();
@@ -329,6 +344,11 @@ pub fn run(
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
+    // The info palette (I): an overlay HUD, not a pause — the game keeps
+    // running under it. Slot facts are gathered when it opens and after
+    // saves/loads while it is up, never per frame.
+    var info_open = false;
+    var slot_infos: [9]infopanel.SlotInfo = @splat(.{});
     // Hold-to-scroll for the menu's Up/Down; reset whenever the menu isn't
     // open so a key held from before it opened (or from gameplay) can never
     // carry a repeat in.
@@ -450,6 +470,7 @@ pub fn run(
                     },
                     .save_state => {
                         saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
+                        if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
                         mnu = null;
                     },
                     .load_state => {
@@ -516,7 +537,10 @@ pub fn run(
                     if (rw) |*r| r.clear();
                     discardMovieModes(&rec, &play_movie, "reset", err);
                 },
-                .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
+                .save_state => {
+                    saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
+                    if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                },
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
@@ -570,6 +594,10 @@ pub fn run(
                         try err.print("screenshot unavailable: no per-user data directory\n", .{});
                         try err.flush();
                     }
+                },
+                .info => {
+                    info_open = !info_open;
+                    if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
                 },
                 // Hotplug actions can only come from pad_added/removed,
                 // which the branch above consumed.
@@ -643,6 +671,26 @@ pub fn run(
                 .game_id = opts.game_id,
                 .shader_name = if (glv) |g| g.names[g.index] else null,
             }, slot);
+            break :blk compose[0..fb.len];
+        } else if (info_open) blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            // game_id is `<sha16>-<title-slug>`; the slug half is the human
+            // name. A bare-hash id (blank title) shows as itself.
+            const title = if (opts.game_id.len > 17) opts.game_id[17..] else opts.game_id;
+            const inf: infopanel.Info = .{
+                .title = title,
+                .rom_name = std.fs.path.basename(opts.rom),
+                .patch_name = opts.patch_name,
+                .core = @tagName(opts.accuracy),
+                .region = @tagName(con.region()),
+                .shader = if (glv) |g| g.names[g.index] else null,
+                .audio_on = audio_on and audio != null,
+                .volume = opts.cfg.effectiveVolume(),
+                .slot = slot,
+                .slots = slot_infos,
+            };
+            infopanel.draw(&surf, &inf);
             break :blk compose[0..fb.len];
         } else if (rewinding) blk: {
             @memcpy(compose[0..fb.len], fb);
@@ -1699,10 +1747,46 @@ fn saveStateTo(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, b
     if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
     if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf })) {
         err.print("state saved: slot {d} ({s})\n", .{ slot, path }) catch {};
+        // The info palette's screenshot sidecar, from the frame on screen
+        // right now. Best-effort on purpose: a thumbnail must never fail
+        // (or slow) the save it decorates, and states saved before this
+        // existed simply have none.
+        var tp_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&tp_buf, "{s}.thumb", .{path})) |tp| {
+            var tf: [infopanel.Thumb.file_len]u8 = undefined;
+            infopanel.Thumb.encode(con.framebuffer(), con.frameWidth(), &tf);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tp, .data = &tf }) catch {};
+        } else |_| {}
     } else |e| {
         err.print("state save failed: {s}\n", .{@errorName(e)}) catch {};
     }
     err.flush() catch {};
+}
+
+/// Re-gather what the info palette shows about the slots: which exist, and
+/// their thumbnails. Eight stats and at most eight 7-KiB reads — palette-open
+/// cost, never frame cost.
+fn refreshSlots(
+    io: std.Io,
+    slot_paths: *const [9]?[]const u8,
+    legacy_state_path: []const u8,
+    infos: *[9]infopanel.SlotInfo,
+) void {
+    for (1..9) |n| {
+        const path = slot_paths[n] orelse legacy_state_path;
+        var inf: infopanel.SlotInfo = .{};
+        inf.exists = if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| true else |_| false;
+        if (inf.exists) {
+            var tp_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&tp_buf, "{s}.thumb", .{path})) |tp| {
+                var tf: [infopanel.Thumb.file_len]u8 = undefined;
+                if (std.Io.Dir.cwd().readFile(io, tp, &tf)) |data| {
+                    inf.thumb = infopanel.Thumb.decode(data);
+                } else |_| {}
+            } else |_| {}
+        }
+        infos[n] = inf;
+    }
 }
 
 fn loadStateFrom(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, buf: []u8, err: *std.Io.Writer) bool {
