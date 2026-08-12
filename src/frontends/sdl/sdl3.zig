@@ -317,3 +317,15 @@ pub fn loadExt() LoadError!ExtApi {
 pub fn loadPad() LoadError!PadApi {
     return resolve(PadApi, try open());
 }
+
+/// Stream gain, its own tiny group so an SDL3 build that predates it costs
+/// the volume setting and nothing else. Gain is linear: 1.0 is unity.
+pub const GainApi = struct {
+    SDL_SetAudioStreamGain: *const fn (s: *AudioStream, gain: f32) callconv(.c) bool,
+};
+
+/// Resolve the gain entry point. Callers treat any error as "volume fixed
+/// at 100%".
+pub fn loadGain() LoadError!GainApi {
+    return resolve(GainApi, try open());
+}

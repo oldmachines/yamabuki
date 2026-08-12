@@ -259,6 +259,7 @@ pub const Hotkey = enum(u4) {
     screenshot,
     reset,
     record_movie,
+    info,
 };
 
 pub const n_hotkeys = @typeInfo(Hotkey).@"enum".fields.len;
@@ -338,6 +339,10 @@ pub const HotkeyStrings = struct {
     /// Toggle input-movie recording: starts with a repower (movies replay
     /// from power-on), stops by writing the .ymv into the movies directory.
     record_movie: []const u8 = "key:f10",
+    /// Toggle the session info palette: game, patch, volume, save states.
+    /// `i` is free in the historical keyboard layout (the SNES buttons sit
+    /// on z/x/a/s/q/w and the hotkeys on F-keys, Tab, and P).
+    info: []const u8 = "key:i",
 
     pub fn get(self: *const HotkeyStrings, hk: Hotkey) []const u8 {
         return switch (hk) {
@@ -454,6 +459,7 @@ pub const Action = union(enum) {
     screenshot,
     reset,
     record_movie,
+    info,
     /// A pad was assigned to a player slot — open it and keep the handle.
     pad_opened: struct { pad: u32, slot: u1 },
     /// A pad left its slot — close the handle.
@@ -641,6 +647,7 @@ fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
                 .screenshot => .screenshot,
                 .reset => .reset,
                 .record_movie => .record_movie,
+                .info => .info,
                 .fast_forward, .rewind => unreachable,
             };
         }
