@@ -423,6 +423,26 @@ fn rewrite(
                     },
                 };
 
+                // Indexed sites: the index carries the access anywhere
+                // ABOVE the base — 255 bytes for an 8-bit index, the rest
+                // of the bank for 16. Every region the reach touches is
+                // compromised, not merely the one holding the base: the
+                // site that sank the first live relocation ever verified
+                // (`INC $10B9,X` on a real cart) had its base two pages
+                // BELOW the region it scribbled into, so a base-only rule
+                // rewrites the exact stores and leaves the indexed ones
+                // splitting the structure between WRAM and the new home.
+                if (md == .abs_x or md == .abs_y or md == .long_x or md == .dp_idx) {
+                    if (pass == 0) {
+                        const reach: u32 = if (x8) 255 else 0xFFFF;
+                        for (plan.regions[0..plan.n], 0..) |rg, rgi| {
+                            if (wram_off < rg.start + rg.len and wram_off + reach >= rg.start)
+                                res.fate[rgi] = .blocked_indexed;
+                        }
+                    }
+                    continue;
+                }
+
                 const region: u8 = for (plan.regions[0..plan.n], 0..) |r, ri| {
                     if (wram_off >= r.start and wram_off < r.start + r.len)
                         break @intCast(ri);
@@ -432,10 +452,6 @@ fn rewrite(
                 if (pass == 0) {
                     // Judgement pass: what would sink this region's move?
                     switch (md) {
-                        // An index can carry the access past the region
-                        // edge; inside the dp window, dp,X is the same
-                        // hazard. Refuse, per the ladder's contract.
-                        .abs_x, .abs_y, .long_x, .dp_idx => res.fate[region] = .blocked_indexed,
                         .abs => if (r.dest == .bwram) {
                             res.fate[region] = .blocked_abs_to_bwram;
                         },

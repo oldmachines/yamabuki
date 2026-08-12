@@ -91,6 +91,10 @@ const Args = struct {
     /// generator/report modes it drives the profiled runs, so coverage and
     /// verification come from real gameplay instead of the attract mode.
     movie: ?[]const u8 = null,
+    /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
+    /// comma-separated plan-region indices to KEEP as live relocations
+    /// (offloads disabled for the run). Bisects the relocation plan.
+    s2_keep: ?[]const u8 = null,
     /// Resume from an SDL-player save state instead of power-on (plain runs
     /// and --sa1-report). Same-image, same-core states only.
     state: ?[]const u8 = null,
@@ -1288,9 +1292,32 @@ fn runSa1Gen(
         // S3 stage exists to put compute on the SA-1, and candidates from
         // a scene with real slowdown are the whole point of anchoring.
         if (state_bytes != null and plan.n > 0) {
-            plan.n = 0;
-            plan.has_dp = false;
-            try out.print("  (anchored: relocation disabled — offload candidates only; a seeded state predates the boot shim's moves)\n", .{});
+            // TEMP S2 debugging: YAMABUKI_S2_KEEP="1,3" keeps only those
+            // region indices (dp always dropped — unseedable); unset
+            // keeps the production behavior (all relocation disabled).
+            const keep_env: ?[]const u8 = args.s2_keep;
+            if (keep_env) |ke| {
+                var w: usize = 0;
+                for (plan.regions[0..plan.n], 0..) |r, ri| {
+                    if (r.dp) continue;
+                    var it = std.mem.splitScalar(u8, ke, ',');
+                    const keep = while (it.next()) |tok| {
+                        const idx = std.fmt.parseInt(usize, std.mem.trim(u8, tok, " "), 10) catch continue;
+                        if (idx == ri) break true;
+                    } else false;
+                    if (!keep) continue;
+                    plan.regions[w] = r;
+                    w += 1;
+                }
+                plan.n = w;
+                plan.has_dp = false;
+                try out.print("  (anchored: TEMP S2 debug — keeping {} region(s) of the plan: {s})\n", .{ w, ke });
+                for (plan.regions[0..plan.n]) |r| try out.print("    keeping $7e:{x:0>4}+{} -> {s} ${x:0>4}\n", .{ r.start, r.len, @tagName(r.dest), r.dest_off });
+            } else {
+                plan.n = 0;
+                plan.has_dp = false;
+                try out.print("  (anchored: relocation disabled — offload candidates only; a seeded state predates the boot shim's moves)\n", .{});
+            }
         }
         for (conv.entries[0..conv.n], 0..) |e, i| {
             cands[i] = .{ .entry = e };
@@ -1303,6 +1330,8 @@ fn runSa1Gen(
             }
         }
         n_cands = conv.n;
+        // TEMP S2 debugging: relocation-only attempts, no offloads.
+        if (state_bytes != null and args.s2_keep != null) n_cands = 0;
         // Fire-and-forget offloads reorder execution by design: only the
         // behavioral tier can ever verify one, so without it every
         // candidate is demoted to synchronous up front.
@@ -2810,6 +2839,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.movie = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--state")) {
             out.state = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--s2-keep")) {
+            out.s2_keep = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {
             out.tick_dump = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--verify-behavioral")) {
