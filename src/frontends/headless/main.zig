@@ -310,13 +310,16 @@ pub fn main(init: std.process.Init) !void {
     // place. The tool that found every window-mode blocker so far.
     defer if (args.dump_ram) |dpath| {
         const fc = &con.fast;
-        const buf = gpa.alloc(u8, 0x20000 + 0x10000 + 0x10000) catch unreachable;
+        const buf = gpa.alloc(u8, 0x20000 + 0x10000 + 0x10000 + 0x800) catch unreachable;
         @memset(buf, 0);
         @memcpy(buf[0..0x20000], &fc.bus.wram.data);
         if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x10000], fc.bus.sa1.bwram[0..0x10000]);
         @memcpy(buf[0x30000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x40000..][0..0x800], &fc.bus.sa1.iram);
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
         std.debug.print("[dump] pc={x:0>2}:{x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p });
+        if (fc.bus.cart.chip == .sa1)
+            std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
     };
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
@@ -1320,6 +1323,17 @@ fn runSa1Gen(
     var n_cands: usize = 0;
     var neighbours: []const core.sa1gen.Candidate = &.{};
     var dma_pages: profile.WramPages = @splat(0);
+    // WINDOW offload candidates: the profile's hot entries, no plan or
+    // page machinery — a window image has no marshal to size, only trees
+    // to walk. The bisect and mode ladder below drive them as usual.
+    if (args.window) {
+        conv = profile.assessConversion(&con.prof, sum.verdict);
+        for (conv.entries[0..conv.n], 0..) |e, i| cands[i] = .{ .entry = e };
+        n_cands = conv.n;
+        if (!args.verify_behavioral) {
+            for (cands[0..n_cands]) |*c| c.no_async = true;
+        }
+    }
     if (!args.whole_game) {
         conv = profile.assessConversion(&con.prof, sum.verdict);
         plan = profile.planRelocation(&con.prof, conv);
@@ -1445,7 +1459,7 @@ fn runSa1Gen(
 
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, args.window, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -1585,8 +1599,11 @@ fn runSa1Gen(
             return;
         }
 
-        // Failure. Terminal when no offloaded routine could explain it.
-        if (args.whole_game or res.stats.offload_count == 0) {
+        // Failure. Terminal when no offloaded routine could explain it —
+        // window images bisect their offloads like the S3 path (a failed
+        // window attempt with none left is what proves the RELOCATION
+        // itself, which the seventh commit already did).
+        if ((args.whole_game and !args.window) or res.stats.offload_count == 0) {
             try out.print("verification FAILED: {s}", .{fail_why});
             if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
             try out.print(".\n  No patch written.\n", .{});

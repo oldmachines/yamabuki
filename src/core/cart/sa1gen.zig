@@ -1923,10 +1923,393 @@ const wg_moves_max = 64;
 /// $40/$41 instead, reaching the same bytes linearly.
 const wg_bw_window: u16 = 0x6000;
 
+// --- window offloads --------------------------------------------------
+//
+// On a WINDOW image the composition that took the S3 path a shadow, a
+// marshal, slot translation, and a D-swap costs NOTHING: the game's whole
+// working set already lives in BW-RAM at identity offsets, and the SA-1's
+// own $6000-$7FFF window (CBM block 0) shows the same bytes at the same
+// addresses as the S-CPU's (SBM block 0). A window-rewritten routine
+// therefore runs VERBATIM on the SA-1 — the stub passes registers, D, and
+// DBR through the mailbox and nothing else. Every offload is resident by
+// construction, which is exactly the shape the async contract wants:
+// there is nothing to write back, because there is no second copy.
+
+/// A window-offload call tree: members[0] is the root.
+const WinSpec = struct {
+    members: [ptr_tree_cap]struct { entry: u16, span: u32 } = undefined,
+    n_members: usize = 0,
+    total_span: u32 = 0,
+};
+
+/// Window-tree eligibility: JSL/RTL shape over covered code, members via
+/// bank-$00 JSLs, closure at RTL or an unconditional backward transfer at
+/// the frontier. The rules ask one question — does the instruction mean
+/// the same thing on both CPUs' buses? Window/bank-$40 data, ROM, dp
+/// under a window-shifted D, and the tree's own control flow all do.
+/// MMIO and the stack-swap ops do not. Low-mirror absolutes ($0000-$1FFF,
+/// which the window rewrite left only as pointer-walkers and DBR-followers)
+/// are dynamic evidence: under a marshalled game DBR they read the same
+/// BW-RAM or ROM on both CPUs; under a system DBR they differ (WRAM vs
+/// I-RAM) and S4 verification is the judge.
+fn windowEligible(out: []const u8, usage: []const u8, entry: u16) ?WinSpec {
+    var spec: WinSpec = .{};
+    spec.members[0] = .{ .entry = entry, .span = 0 };
+    spec.n_members = 1;
+    var walked: usize = 0;
+    while (walked < spec.n_members) : (walked += 1) {
+        if (!winWalkMember(out, usage, &spec, walked)) return null;
+    }
+    spec.total_span = 0;
+    for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
+    if (spec.total_span > ptr_tree_span_max) return null;
+    return spec;
+}
+
+fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) bool {
+    const span_max: u32 = 1024;
+    const entry: u32 = spec.members[mi].entry;
+    var pc: u32 = entry;
+    var limit: u32 = entry;
+    while (pc - entry < span_max) {
+        if (pc > 0xFFFF) return false;
+        if (usage[pc] & usage_map.flag_opcode == 0) {
+            if (pc >= limit) return false;
+            pc += 1;
+            continue;
+        }
+        const file = pc - 0x8000;
+        const op = out[file];
+        const m8 = usage[pc] & usage_map.flag_m != 0;
+        const x8 = usage[pc] & usage_map.flag_x != 0;
+        const len = usage_map.instrLen(op, m8, x8);
+        switch (op) {
+            0x6B => if (pc >= limit) {
+                spec.members[mi].span = pc + 1 - entry;
+                return true;
+            },
+            0x22 => {
+                if (out[file + 3] != 0x00) return false;
+                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                if (tgt < 0x8000) return false;
+                const dup = for (spec.members[0..spec.n_members]) |m| {
+                    if (m.entry == tgt) break true;
+                } else false;
+                if (!dup) {
+                    if (spec.n_members == ptr_tree_cap) return false;
+                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0 };
+                    spec.n_members += 1;
+                }
+            },
+            // Wrong return shape, near calls, far jumps, interrupt ops,
+            // and the ops that would swap the SA-1's stack from under it.
+            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return false,
+            0x00, 0x02, 0xCB, 0xDB => return false,
+            0x1B, 0x9A => return false, // TCS / TXS
+            0x44, 0x54 => {
+                // Block moves only between the BW-RAM banks, where both
+                // CPUs see the same bytes.
+                const d0 = out[file + 1];
+                const s0 = out[file + 2];
+                if (!((d0 == 0x40 or d0 == 0x41) and (s0 == 0x40 or s0 == 0x41 or s0 >= 0x80 or (s0 >= 0x02 and s0 <= 0x3F))))
+                    return false;
+            },
+            0x4C, 0x82, 0x80 => {
+                const dst: u32 = switch (op) {
+                    0x4C => std.mem.readInt(u16, out[file + 1 ..][0..2], .little),
+                    0x82 => pc + 3 +% @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little)))))),
+                    else => pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1]))))),
+                };
+                if (dst < entry or dst - entry >= span_max) return false;
+                limit = @max(limit, dst);
+                if (dst <= pc and pc >= limit) {
+                    spec.members[mi].span = pc + len - entry;
+                    return true;
+                }
+            },
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
+                const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
+                if (dst < entry or dst - entry >= span_max) return false;
+                limit = @max(limit, dst);
+            },
+            else => {},
+        }
+        switch (usage_map.mode(op)) {
+            .none, .dp, .dp_idx => {},
+            .abs, .abs_x, .abs_y => {
+                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                // MMIO through any system bank is S-CPU-only hardware.
+                if (v >= 0x2100 and v < 0x4380) return false;
+            },
+            .long, .long_x => {
+                const b = out[file + 3];
+                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380) return false;
+                // $7E/$7F would be real WRAM — the window rewrite
+                // re-banked every covered site, so seeing one here means
+                // the walk wandered into unrewritten territory.
+                if (b == 0x7E or b == 0x7F) return false;
+            },
+        }
+        pc += len;
+    }
+    return false;
+}
+
+/// Window sync stub: caller D ($3788), registers, caller P, and caller
+/// DBR ($378B) into the mailbox; send; double handshake; exit registers
+/// back out. No guard (every D is valid — the SA-1 runs the same D over
+/// its own identity window), no shadow, no slots, no page copies.
+const win_stub_len: u32 = 112;
+fn emitWinStub(d: []u8, id: u8) u32 {
+    var cur: usize = 0;
+    // Caller D, with A saved around the grab.
+    put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00, 0x68, 0x28 });
+    // Register marshal (the sync-ptr stub's, verbatim).
+    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
+    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
+    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
+    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 });
+    // Caller DBR: the PHB byte, at the stack top now the PHP is pulled.
+    put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 });
+    // Send + double handshake.
+    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 });
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 });
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
+    // Exit registers from the mailbox; caller DBR back.
+    put(d, &cur, &.{0xAB});
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 });
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 });
+    put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 });
+    put(d, &cur, &.{ 0x28, 0x6B });
+    return @intCast(cur);
+}
+
+/// Window async stub: fence first (drain any in-flight call), marshal
+/// registers + D + DBR, send, mark busy, return AT ONCE with the
+/// caller's own registers. Nothing to write back — the routine's effects
+/// land in the shared BW-RAM both CPUs address.
+const win_async_stub_len: u32 = 93;
+fn emitWinAsyncStub(d: []u8, fence: u24, id: u8) u32 {
+    var cur: usize = 0;
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save caller
+    put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
+    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore (REP first)
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // re-save P,A,X,Y
+    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
+    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
+    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
+    // Caller P is the re-save's PHP byte: B(1)+Y(2)+X(2)+A(2) above it
+    // once our own PHP is pulled.
+    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0xA3, 0x08, 0x8F, 0x86, 0x37, 0x00 });
+    put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 }); // DBR (PHB byte)
+    // D last — the PLA clobbers A, which the mailbox already holds.
+    put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00 });
+    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, id, 0x8F, 0x00, 0x22, 0x00, 0x8F, 0x8A, 0x37, 0x00 });
+    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, 0x6B });
+    return @intCast(cur);
+}
+
+/// One dispatcher block for a window offload: game D as-is, game DBR
+/// from the mailbox, the shared unmarshal, the copy, dispatcher DBR back
+/// (mar's absolute mailbox stores need a system bank), the shared
+/// marshal, dispatcher D back, signal.
+const win_block_len: u32 = 36;
+fn emitWinBlock(d: []u8, cur: *usize, id: u8, copy_addr: u16, copy_bank: u8, unm_addr: u16, mar_addr: u16, sig_addr: u16, dp_base: u16) void {
+    put(d, cur, &.{ 0xC9, id, 0xD0, 0x20 });
+    put(d, cur, &.{0x8B}); // dispatcher DBR
+    put(d, cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x5B }); // game D
+    put(d, cur, &.{ 0xE2, 0x20, 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
+    putJsr(d, cur, unm_addr);
+    put(d, cur, &.{ 0x22, @truncate(copy_addr), @truncate(copy_addr >> 8), copy_bank });
+    put(d, cur, &.{0xAB}); // dispatcher DBR back
+    putJsr(d, cur, mar_addr);
+    put(d, cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
+    put(d, cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
+}
+
 const wg_prologue_len = 21;
-/// Window mode's whole scaffold: SEI + 3 stores + XCE/REP + D + S + SEP +
-/// JMP = 1 + 15 + 4 + 4 + 4 + 2 + 3.
+/// Window mode's shim: SEI + 3 stores + XCE/REP + D + S + SEP + JMP =
+/// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
+/// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
+const wg_window_shim_max = 33 + 23;
+/// Bank-0 reservation for the window dispatcher: prologue + message loop
+/// + JMP + sig + unm + mar + blocks + NMI prologue.
+const win_disp_max: u32 = 26 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + nmi_prologue_len;
+
+const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool };
+
+/// Choose and emit window offloads onto the REWRITTEN image. The
+/// dispatcher (CRV is 16-bit) and the NMI prologue (a 16-bit vector)
+/// live in the bank-0 carve after the shim; stubs, copies, and the fence
+/// are long-addressed and carve from any bank's padding. Returns the CRV
+/// for the shim to program, or null when nothing offloaded.
+fn emitWindowOffloads(
+    out: []u8,
+    usage: []const u8,
+    header_off: u32,
+    candidates: []const Candidate,
+    allow_async_in: bool,
+    bank0_at: u32,
+    res: *Result,
+) ?u16 {
+    const nmi_native = std.mem.readInt(u16, out[header_off + 0x2A ..][0..2], .little);
+    const nmi_emu = std.mem.readInt(u16, out[header_off + 0x3A ..][0..2], .little);
+    const nmi_ok = nmi_native >= 0x8000 and
+        (nmi_emu == nmi_native or nmi_emu < 0x8000 or nmi_emu == 0xFFFF);
+    const allow_async = allow_async_in and nmi_ok;
+
+    var chosen: [offload_max]WinChosen = undefined;
+    var n: usize = 0;
+    for (candidates) |c| {
+        if (n == offload_max) break;
+        if (c.entry >> 16 != 0 or (c.entry & 0xFFFF) < 0x8000) continue;
+        const e: u16 = @truncate(c.entry);
+        const dup = for (chosen[0..n]) |x| {
+            if (x.entry == e) break true;
+        } else false;
+        if (dup) continue;
+        // The async monopoly, as in the S3 path: a sibling's un-fenced
+        // send mid-flight deadlocks the dispatcher.
+        if (n > 0 and chosen[0].is_async) break;
+        const spec = windowEligible(out, usage, e) orelse continue;
+        if (countCallSites(out, usage, e, 0x22) == 0) continue;
+        chosen[n] = .{ .entry = e, .spec = spec, .is_async = allow_async and !c.no_async and n == 0 };
+        n += 1;
+    }
+    if (n == 0) return null;
+
+    // Any-bank sizes.
+    var any_len: u32 = 0;
+    var has_async = false;
+    for (chosen[0..n]) |c| {
+        any_len += c.spec.total_span;
+        if (c.is_async) {
+            has_async = true;
+            any_len += fenceLen(.{}) + win_async_stub_len;
+        } else any_len += win_stub_len;
+    }
+    const any_at = 0x8000 + (patchgen.findFreeSpace(out[0x8000 .. out.len - 1], any_len) orelse return null);
+    var cur: u32 = any_at;
+
+    // Copies first (their addresses feed the blocks and stubs).
+    var copy_at: [offload_max]u32 = undefined;
+    for (chosen[0..n], 0..) |c, i| {
+        var member_copy: [ptr_tree_cap]u32 = undefined;
+        copy_at[i] = cur;
+        for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
+            member_copy[mi] = cur;
+            @memcpy(out[cur..][0..m.span], out[m.entry - 0x8000 ..][0..m.span]);
+            cur += m.span;
+        }
+        for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
+            fixupJmps(out, usage, m.entry, m.span, member_copy[mi], @intCast(0x8000 + (member_copy[mi] % 0x8000)));
+            // Member-to-member JSLs re-point at the copies.
+            var pc: u32 = m.entry;
+            while (pc - m.entry < m.span) {
+                if (usage[pc] & usage_map.flag_opcode == 0) {
+                    pc += 1;
+                    continue;
+                }
+                const mf = pc - 0x8000;
+                const op = out[mf];
+                if (op == 0x22 and out[mf + 3] == 0x00) {
+                    const tgt = std.mem.readInt(u16, out[mf + 1 ..][0..2], .little);
+                    for (c.spec.members[0..c.spec.n_members], 0..) |m2, mj| {
+                        if (m2.entry != tgt) continue;
+                        const dst = member_copy[mi] + (pc - m.entry);
+                        std.mem.writeInt(u16, out[dst + 1 ..][0..2], @intCast(0x8000 + (member_copy[mj] % 0x8000)), .little);
+                        out[dst + 3] = @intCast(member_copy[mj] / 0x8000);
+                        break;
+                    }
+                }
+                const m8 = usage[pc] & usage_map.flag_m != 0;
+                const x8 = usage[pc] & usage_map.flag_x != 0;
+                pc += usage_map.instrLen(op, m8, x8);
+            }
+        }
+        res.stats.offload_copy[i] = @as(u24, @intCast(copy_at[i] / 0x8000)) << 16 |
+            @as(u24, @intCast(0x8000 + (copy_at[i] % 0x8000)));
+        res.stats.offload_copy_len[i] = c.spec.total_span;
+    }
+
+    // Fence for the async offload, then the stubs; re-point call sites.
+    var fence24: u24 = 0;
+    for (chosen[0..n], 0..) |c, i| {
+        const id: u8 = @intCast(i + 1);
+        if (c.is_async) {
+            const flen = emitFence(out[cur..], .{});
+            std.debug.assert(flen == fenceLen(.{}));
+            fence24 = @as(u24, @intCast(cur / 0x8000)) << 16 |
+                @as(u24, @intCast(0x8000 + (cur % 0x8000)));
+            res.stats.async_entry = c.entry;
+            res.stats.async_fence = fence24;
+            cur += flen;
+        }
+        const stub_file = cur;
+        const slen = if (c.is_async)
+            emitWinAsyncStub(out[cur..], fence24, id)
+        else
+            emitWinStub(out[cur..], id);
+        std.debug.assert(slen == if (c.is_async) win_async_stub_len else win_stub_len);
+        cur += slen;
+        const stub_bank: u8 = @intCast(stub_file / 0x8000);
+        const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
+        res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
+        res.stats.offload_entries[i] = c.entry;
+        res.stats.offload_ptr_mask |= @as(u8, 1) << @intCast(i);
+    }
+    std.debug.assert(cur - any_at == any_len);
+
+    // The dispatcher, in the bank-0 carve after the shim.
+    const d = out[bank0_at..];
+    var dc: usize = 0;
+    const dp_base: u16 = 0x3700;
+    const base16: u16 = @intCast(0x8000 + (bank0_at % 0x8000));
+    // Prologue: I-RAM/BW-RAM gates, CBM block 0 (the identity window!),
+    // native mode, 16-bit X, stack under the mailbox, D.
+    put(d, &dc, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x9C, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
+    std.debug.assert(dc == 26);
+    const loop_addr: u16 = base16 + @as(u16, @intCast(dc));
+    put(d, &dc, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
+    const blocks_at = dc;
+    dc += n * win_block_len; // blocks emitted below, once sig/unm/mar addresses exist
+    put(d, &dc, &.{ 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
+    const sig_addr: u16 = base16 + @as(u16, @intCast(dc));
+    put(d, &dc, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x09, 0x22, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xD0, 0xF9, 0x9C, 0x09, 0x22, 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
+    const unm_addr: u16 = base16 + @as(u16, @intCast(dc));
+    put(d, &dc, &.{ 0xAD, 0x86, 0x37, 0x48, 0xAD, 0x81, 0x37, 0xEB, 0xAD, 0x80, 0x37, 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37, 0x28, 0x60 });
+    const mar_addr: u16 = base16 + @as(u16, @intCast(dc));
+    put(d, &dc, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
+    const nmi_at = dc;
+    var bc = blocks_at;
+    for (chosen[0..n], 0..) |_, i| {
+        const id: u8 = @intCast(i + 1);
+        emitWinBlock(d, &bc, id, @intCast(0x8000 + (copy_at[i] % 0x8000)), @intCast(copy_at[i] / 0x8000), unm_addr, mar_addr, sig_addr, dp_base);
+    }
+    std.debug.assert(bc == blocks_at + n * win_block_len);
+
+    // Async: the NMI prologue (bank 0 — the vector is 16-bit), vectors.
+    if (has_async) {
+        var nc = nmi_at;
+        put(d, &nc, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B });
+        put(d, &nc, &.{ 0x22, @truncate(fence24), @truncate(fence24 >> 8), @truncate(fence24 >> 16) });
+        put(d, &nc, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 });
+        put(d, &nc, &.{ 0x4C, @truncate(nmi_native), @truncate(nmi_native >> 8) });
+        std.debug.assert(nc - nmi_at == nmi_prologue_len);
+        const nmi_addr: u16 = base16 + @as(u16, @intCast(nmi_at));
+        std.mem.writeInt(u16, out[header_off + 0x2A ..][0..2], nmi_addr, .little);
+        std.mem.writeInt(u16, out[header_off + 0x3A ..][0..2], nmi_addr, .little);
+    }
+
+    res.stats.offload_count = @intCast(n);
+    res.stats.offloaded = chosen[0].entry;
+    res.stats.pointer_offloads = @intCast(n);
+    res.stats.resident_offloads = @intCast(n); // by construction
+    return base16;
+}
 /// Extra prologue the BW-RAM window needs: select block 0, unprotect, and
 /// reproduce the power-on D and S inside the window (native mode first).
 const wg_prologue_bw_extra = 20;
@@ -2123,6 +2506,12 @@ pub fn convertWholeGame(
     /// This is the enabler for resident offloads over the whole working
     /// set: once state lives in BW-RAM, both CPUs address it in place.
     window: bool,
+    /// Window offload candidates (profile entries; empty = relocation
+    /// only). Ignored outside window mode.
+    win_candidates: []const Candidate,
+    /// Allow the fire-and-forget flavor (gated on the behavioral tier by
+    /// the caller, as in the S3 path).
+    win_allow_async: bool,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -2668,7 +3057,7 @@ pub fn convertWholeGame(
     // 4-byte `JML` trampoline in bank $00 for the sites' in-place `JSR` to
     // land on; the helper ends with `JML` back to a shared bank-$00 `RTS`.
     const scaffold: u32 = if (window)
-        wg_window_shim_len
+        wg_window_shim_max + (if (win_candidates.len != 0) win_disp_max else 0)
     else
         wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
             wg_sa1_nmi_len + wg_scpu_nmi_len +
@@ -2935,26 +3324,46 @@ pub fn convertWholeGame(
     const base16: u16 = 0x8000 + @as(u16, @intCast(carve));
     const d = out[carve..];
     if (window) {
+        // Offloads first: eligibility walks the REWRITTEN image, and the
+        // dispatcher's CRV feeds the shim below. The dispatcher and NMI
+        // prologue live in this same bank-0 carve, after the shim slot.
+        const crv: ?u16 = if (win_candidates.len != 0)
+            emitWindowOffloads(out, cov, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, &res)
+        else
+            null;
+
         var wn: usize = 0;
         d[wn] = 0x78; // SEI
         wn += 1;
         wn = emitStore(d, wn, 0x2224, 0x00); // SBM: S-CPU window = block 0
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
+        if (crv) |v| {
+            // Boot the SA-1 into the window dispatcher; the async busy
+            // flag starts idle (I-RAM is garbage at power-on, and SIWP
+            // must open before the S-CPU can zero it).
+            wn = emitStore(d, wn, 0x2229, 0xFF);
+            wn = emitStore(d, wn, 0x2203, @truncate(v));
+            wn = emitStore(d, wn, 0x2204, @truncate(v >> 8));
+            if (res.stats.async_entry != 0) wn = emitStore(d, wn, 0x378A, 0x00);
+            put(d, &wn, &.{ 0x9C, 0x00, 0x22 }); // release reset
+        }
         put(d, &wn, &.{ 0x18, 0xFB, 0xC2, 0x30 }); // CLC / XCE / REP #$30
         put(d, &wn, &.{ 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // LDA #$6000 / TCD
         put(d, &wn, &.{ 0xA9, 0xFF, 0x61, 0x1B }); // LDA #$61FF / TCS
         put(d, &wn, &.{ 0xE2, 0x30 }); // SEP #$30
         put(d, &wn, &.{ 0x4C, @truncate(reset), @truncate(reset >> 8) });
-        std.debug.assert(wn == wg_window_shim_len);
-        // Reset -> shim; every other vector stays the game's own.
+        std.debug.assert(wn <= wg_window_shim_max);
+        // Reset -> shim; the other vectors stay the game's own unless an
+        // async offload injected its NMI prologue above.
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x35;
         out[header.offset + 0x18] = 0x07; // 128 KiB BW-RAM: all of WRAM
         patchgen.recomputeChecksum(out, header.offset);
         res.stats.shim_addr = base16;
-        res.stats.offloaded = reset;
+        res.stats.park_addr = crv orelse 0;
+        res.stats.offloaded = if (crv == null) reset else res.stats.offloaded;
         return res;
     }
     // Where each unique helper's JSR target lives in bank $00: the helper
@@ -4421,7 +4830,7 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, false, true, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, false, true, &.{}, false, &ref);
     defer gpa.free(res.image);
     // Two plain abs, one indexed abs, one INC in the NMI handler; one long.
     try testing.expect(res.stats.rewritten_abs >= 3);
@@ -4453,6 +4862,82 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     // ports never moved — the cart is carried for its RAM.
     try testing.expectEqual(@as(u4, 0), con.bus.sa1.smeg);
     try testing.expectEqual(@as(u4, 0), con.bus.sa1.cmeg);
+}
+
+test "window offload: a tree runs on the SA-1 against the shared window, sync and async" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF); // bank 1: the any-bank carve
+    // Caller: NMI on, then JSL the tree forever. Tree root stores a
+    // marker and JSLs a helper that increments a counter — both through
+    // absolute addresses the window rewrite moves to $65xx, which is
+    // BW-RAM $05xx for BOTH CPUs.
+    @memcpy(rom[0x0000..0x000F], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMITIMEN: NMI on
+        0x22, 0x80, 0x80, 0x00, // JSL $00:8080
+        0x80, 0xFA, // BRA back to the JSL
+    });
+    @memcpy(rom[0x0040..0x0046], &[_]u8{ 0x48, 0xEE, 0x40, 0x00, 0x68, 0x40 }); // NMI: INC $0040
+    std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0x8040, .little);
+    @memcpy(rom[0x0080..0x008A], &[_]u8{
+        0xA9, 0x11, 0x8D, 0x00, 0x05, // LDA #$11 / STA $0500
+        0x22, 0xA0, 0x80, 0x00, // JSL $00:80A0
+        0x6B, // RTL
+    });
+    @memcpy(rom[0x00A0..0x00A4], &[_]u8{ 0xEE, 0x01, 0x05, 0x6B }); // INC $0501 / RTL
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800D }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8044, 0x8045 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8080, 0x8082, 0x8085, 0x8089 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x80A0, 0x80A3 }) |a| markOp(bytes, a);
+
+    const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
+    for ([_]bool{ false, true }) |go_async| {
+        var ref: ?Refusal = null;
+        const res = try convertWholeGame(gpa, rom, bytes, false, true, &cand, go_async, &ref);
+        defer gpa.free(res.image);
+        try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
+        try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
+        if (go_async) {
+            try testing.expectEqual(@as(u24, 0x00_8080), res.stats.async_entry);
+            try testing.expect(res.stats.async_fence != 0);
+        } else {
+            try testing.expectEqual(@as(u24, 0), res.stats.async_entry);
+        }
+
+        const cart = try cartridge.Cartridge.load(gpa, res.image);
+        const con = try gpa.create(console.FastConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        // Watch the copy execute on the SA-1.
+        const trace = try gpa.create(sa1_trace.Trace);
+        defer gpa.destroy(trace);
+        const copy24 = res.stats.offload_copy[0];
+        trace.* = sa1_trace.Trace.init(copy24);
+        con.bus.sa1.trace = trace;
+        for (0..5) |_| con.runFrame();
+        // The tree's effects land in the shared BW-RAM, computed by the
+        // SA-1 (the trace watched the copy), visible untranslated to the
+        // S-CPU. Real WRAM saw none of it.
+        try testing.expectEqual(@as(u8, 0x11), con.bus.sa1.bwram[0x0500]);
+        try testing.expect(con.bus.sa1.bwram[0x0501] > 10);
+        try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0500]);
+        try testing.expect(con.bus.sa1.bwram[0x0040] >= 3); // NMI counter
+        try testing.expect(trace.total > 0);
+        // (No port-idle assert: the caller loops hot, so a sampled
+        // instant is legitimately mid-handshake.)
+    }
 }
 
 test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, NMI round-trips" {
@@ -4523,7 +5008,7 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, false, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, false, false, &.{}, false, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.offload_sites >= 14);
 
@@ -4579,7 +5064,7 @@ test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
     usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
 
     var ref: ?Refusal = null;
-    const res = convertWholeGame(gpa, rom, usage, false, false, &ref) catch |e| {
+    const res = convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref) catch |e| {
         std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
         return e;
     };
@@ -4637,13 +5122,13 @@ test "whole-game: --wg-static rewrites code the profiled run never reached" {
     var ref: ?Refusal = null;
     // Without the static walk the uncovered store keeps its WRAM operand...
     {
-        const r = try convertWholeGame(gpa, rom, usage, false, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x0902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
     }
     // ...with it, the operand moves into the window like the covered one.
     {
-        const r = try convertWholeGame(gpa, rom, usage, true, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, true, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, r.image[0x0009..0x000B], .little));
         try testing.expectEqual(@as(u16, 0x6902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
@@ -4665,7 +5150,7 @@ test "whole-game: refusals name their reasons" {
     for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
         @memset(usage, 0);
         usage[a] = usage_map.flag_write;
-        const r = try convertWholeGame(gpa, rom, usage, false, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expect(r.stats.d_moved);
     }
@@ -4676,7 +5161,7 @@ test "whole-game: refusals name their reasons" {
     usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
     try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
 
@@ -4691,7 +5176,7 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8104);
     usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
     {
-        const r = try convertWholeGame(gpa, rom, usage, false, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         // The immediate moved into the window with everything else.
         try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
@@ -4700,7 +5185,7 @@ test "whole-game: refusals name their reasons" {
     // was already shifted when it was pushed: allowed, and left alone.
     rom[0x0103] = 0xEA; // NOP where the push was
     {
-        const r = try convertWholeGame(gpa, rom, usage, false, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
     }
@@ -4711,7 +5196,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x7B, 0x5B, 0x60 }); // TDC / TCD
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
 
     @memset(usage, 0);
@@ -4719,7 +5204,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
@@ -4727,7 +5212,7 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0x8100, .little);
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_uses_irq, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0, .little);
 
@@ -4739,7 +5224,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0060..0x0062], &[_]u8{ 0x68, 0x40 });
     markOp(usage, 0x00_8050);
     markOp(usage, 0x00_8060);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_nmi_ambiguous, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
@@ -4750,14 +5235,14 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // A long MMIO store: no room for the in-place JSR either.
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x8F, 0x00, 0x21, 0x00 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // An MMIO site executing outside bank $00 (this 64K image's bank $01).
@@ -4766,13 +5251,13 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     @memcpy(rom[0xFF00..0xFF03], &[_]u8{ 0x8D, 0x00, 0x21 });
     markOp(usage, 0x01_FF00);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_outside_bank0, ref.?.reason);
     @memset(usage, 0);
 
     // A block move.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x54, 0x00, 0x7E });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
 }
