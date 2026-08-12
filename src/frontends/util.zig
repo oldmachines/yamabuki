@@ -610,3 +610,126 @@ pub fn maybeShot(
     };
     try err.flush();
 }
+
+/// The behavioral tier's verdict machine: fed the diverging live-state
+/// addresses of each compared tick, it decides whether the divergence
+/// pattern is a wall-time echo or corruption.
+///
+/// The distinction, validated on Gradius III's own conversions: values the
+/// main loop DERIVES from wall-coupled state (an animation phase computed
+/// from an NMI frame counter, say) sit one taint hop past anything the
+/// lag-learned mask can identify, so they leak through — but they echo the
+/// lag delta and SELF-HEAL within a handful of ticks, over a small fixed
+/// set of addresses. Corruption is the opposite in every axis: it persists
+/// (the game trusts its state), spreads (wrong state begets wrong state),
+/// or floods (a clobbered buffer diverges wholesale). Hence three limits,
+/// each with real headroom over the measured echoes (worst observed: run
+/// 17, 18 addresses, 1.4% of ticks).
+pub const Persistence = struct {
+    /// Distinct diverging addresses tolerated before the verdict is
+    /// corruption-by-spread.
+    pub const max_addrs = 64;
+    /// Consecutive diverging ticks tolerated before the verdict is
+    /// corruption-by-persistence.
+    pub const max_run = 30;
+    /// Diverging ticks per thousand tolerated before the verdict is
+    /// corruption-by-flood.
+    pub const max_bad_per_mille = 50;
+
+    addrs: [max_addrs]u32 = undefined,
+    n_addrs: usize = 0,
+    addr_overflow: bool = false,
+    ticks: u32 = 0,
+    bad_ticks: u32 = 0,
+    run: u32 = 0,
+    worst_run: u32 = 0,
+    first_bad: ?u32 = null,
+
+    /// One compared tick: `bad` is the diverging live addresses (empty =
+    /// clean). Order and duplicates don't matter.
+    pub fn feed(self: *Persistence, tick: u32, bad: []const u32) void {
+        self.ticks += 1;
+        if (bad.len == 0) {
+            self.run = 0;
+            return;
+        }
+        self.bad_ticks += 1;
+        self.run += 1;
+        self.worst_run = @max(self.worst_run, self.run);
+        if (self.first_bad == null) self.first_bad = tick;
+        for (bad) |a| {
+            const seen = for (self.addrs[0..self.n_addrs]) |x| {
+                if (x == a) break true;
+            } else false;
+            if (seen) continue;
+            if (self.n_addrs == max_addrs) {
+                self.addr_overflow = true;
+                return;
+            }
+            self.addrs[self.n_addrs] = a;
+            self.n_addrs += 1;
+        }
+    }
+
+    pub const Verdict = union(enum) {
+        /// No divergence at all, or only transient bounded echoes.
+        pass: enum { clean, echoes },
+        /// Named so the gate's output explains itself.
+        fail: enum { persistence, spread, flood },
+    };
+
+    pub fn verdict(self: *const Persistence) Verdict {
+        if (self.addr_overflow) return .{ .fail = .spread };
+        if (self.worst_run > max_run) return .{ .fail = .persistence };
+        if (self.ticks > 0 and
+            @as(u64, self.bad_ticks) * 1000 > @as(u64, self.ticks) * max_bad_per_mille)
+            return .{ .fail = .flood };
+        return .{ .pass = if (self.bad_ticks == 0) .clean else .echoes };
+    }
+};
+
+test "persistence: clean and transient-echo runs pass" {
+    var p: Persistence = .{};
+    for (0..1000) |t| p.feed(@intCast(t), &.{});
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .clean }, p.verdict());
+
+    // Gradius III's measured shape: short scattered runs over 3 addresses,
+    // ~1.2% of ticks (40 of 3202 in the 3600-frame capture).
+    p = .{};
+    for (0..1000) |t| {
+        const in_echo = (t % 250) < 8;
+        if (in_echo) p.feed(@intCast(t), &.{ 0x1F20, 0x1F28, 0x1F29 }) else p.feed(@intCast(t), &.{});
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+}
+
+test "persistence: a divergence that never heals is corruption" {
+    var p: Persistence = .{};
+    for (0..100) |t| p.feed(@intCast(t), &.{});
+    for (100..200) |t| p.feed(@intCast(t), &.{0x0042}); // sticks forever
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
+    try std.testing.expectEqual(@as(?u32, 100), p.first_bad);
+}
+
+test "persistence: spreading addresses are corruption even when transient" {
+    var p: Persistence = .{};
+    var t: u32 = 0;
+    var a: u32 = 0x1000;
+    while (t < 900) : (t += 1) {
+        // A new address every bad tick, each healing immediately.
+        if (t % 10 == 0) {
+            p.feed(t, &.{a});
+            a += 1;
+        } else p.feed(t, &.{});
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, p.verdict());
+}
+
+test "persistence: too many bad ticks are corruption even when bounded" {
+    var p: Persistence = .{};
+    for (0..1000) |t| {
+        // 10% bad, always the same byte, runs of 5 — flood without spread.
+        if (t % 50 < 5) p.feed(@intCast(t), &.{0x0042}) else p.feed(@intCast(t), &.{});
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .flood }, p.verdict());
+}

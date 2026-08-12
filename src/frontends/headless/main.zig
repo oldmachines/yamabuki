@@ -94,6 +94,10 @@ const Args = struct {
     /// Resume from an SDL-player save state instead of power-on (plain runs
     /// and --sa1-report). Same-image, same-core states only.
     state: ?[]const u8 = null,
+    /// S4: when the pixel gate says divergent, also run the behavioral
+    /// tier — logic-state equality at every logic tick — and accept a
+    /// conversion whose divergence is only wall-time echoes.
+    verify_behavioral: bool = false,
     /// Diagnostic for the behavioral verifier's design: write every logic
     /// tick's phase-aligned WRAM snapshot (u32 wall frame + 128 KiB raw,
     /// repeated) to this file. Fast core only.
@@ -160,6 +164,8 @@ pub fn main(init: std.process.Init) !void {
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
             \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\  --verify-behavioral  S4: on pixel divergence, accept a conversion whose logic
+            \\                state matches at every tick (for timing-changing offloads)
             \\  --state f     resume from an SDL-player save state instead of power-on
             \\                (plain runs and --sa1-report; same image and core only)
             \\                from power-on, verifying its end hashes; with --sa1-report or a
@@ -416,6 +422,238 @@ fn loadMovie(
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
 /// movie's end. A no-op without a movie.
+/// One frame of a behavioral replay: clear the poll flags, run, drain.
+/// Returns true when the frame completed a logic tick (the snapshot is
+/// filled and `snap.live` holds the interval's consumption since the
+/// caller last cleared it).
+fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
+    con.bus.input_polled = false;
+    snap.captured = false;
+    feedMovie(con, mov, frame);
+    con.runFrame();
+    var drain: [4096]i16 = undefined;
+    while (con.readAudio(&drain) != 0) {}
+    return snap.captured;
+}
+
+/// Learn the wall-coupled byte mask from the baseline: bytes that change
+/// across a LAG frame (a short no-poll blip amid live gameplay) were
+/// written by the NMI side. Long no-poll runs are loads and transitions,
+/// where the game legitimately rewrites great swaths of WRAM — learning
+/// from them buries real corruption inside the mask (a 23%-of-WRAM blind
+/// spot on Gradius III; short-run learning masks ~500 bytes).
+fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Movie, total: u32) ![]u8 {
+    const wram_len = core.bus.Bus.TickSnap.wram_len;
+    const lag_run_max = 3;
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    const snap = try gpa.create(core.bus.Bus.TickSnap);
+    defer gpa.destroy(snap);
+    snap.* = .{};
+    @memset(&snap.live, 0);
+    @memset(&snap.written, 0);
+    con.bus.tick_snap = snap;
+
+    const mask = try gpa.alloc(u8, wram_len);
+    @memset(mask, 0);
+    const prev = try gpa.alloc(u8, wram_len);
+    defer gpa.free(prev);
+    const lagbuf = try gpa.alloc(u8, wram_len * lag_run_max);
+    defer gpa.free(lagbuf);
+    @memcpy(prev, &con.bus.wram.data);
+
+    var ticks: u32 = 0;
+    var lag_run: u32 = 0;
+    for (0..total) |i| {
+        if (stepBehavioralFrame(con, snap, mov, @intCast(i))) {
+            if (lag_run > 0 and lag_run <= lag_run_max and ticks > 0) {
+                for (0..lag_run) |r| {
+                    const before = if (r == 0) prev else lagbuf[(r - 1) * wram_len ..];
+                    const after = lagbuf[r * wram_len ..];
+                    for (0..wram_len) |x| {
+                        if (before[x] != after[x]) mask[x] = 1;
+                    }
+                }
+            }
+            lag_run = 0;
+            ticks += 1;
+            @memcpy(prev, &con.bus.wram.data);
+        } else {
+            if (lag_run < lag_run_max)
+                @memcpy(lagbuf[lag_run * wram_len ..][0..wram_len], &con.bus.wram.data);
+            lag_run += 1;
+        }
+    }
+    return mask;
+}
+
+/// Where a logical WRAM byte lives in the CONVERTED image: unmoved bytes in
+/// WRAM, relocated regions wherever the plan put them — but only regions
+/// that actually moved (`region_sites` > 0; a "clean" region with zero
+/// re-pointed sites moved vacuously and WRAM stays canonical).
+const ConvHome = union(enum) { wram, sram: u32, iram: u32 };
+
+fn convHome(plan: *const profile.Plan, res: *const core.sa1gen.Result, i: u32) ConvHome {
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean or res.region_sites[ri] == 0) continue;
+        if (i < r.start or i >= r.start + r.len) continue;
+        return switch (r.dest) {
+            .iram => .{ .iram = r.dest_off + (i - r.start) },
+            .bwram => .{ .sram = r.dest_off + (i - r.start) },
+        };
+    }
+    return .wram;
+}
+
+const Behavioral = struct {
+    verdict: util.Persistence.Verdict,
+    stats: util.Persistence,
+    ticks_base: u32,
+    ticks_conv: u32,
+    /// Baseline wall frame of the first diverging tick (forensics anchor).
+    first_bad_frame: u32,
+    /// Sample of diverging addresses for the report.
+    sample: [6]u32,
+    n_sample: usize,
+};
+
+/// The behavioral tier (`--verify-behavioral`): a conversion that removes
+/// slowdown CANNOT be frame-identical to a slowed-down baseline — different
+/// lag means different pictures, and the pixel gate rightly calls that
+/// divergent. What lag cannot legitimately change is the game's LOGIC
+/// state at each logic tick. So: run both images tick-locked (a tick = the
+/// frame's first controller poll, the one phase-aligned moment two runs
+/// with different lag share), and at every tick compare the bytes the
+/// baseline's NEXT tick actually consumes (read-before-write liveness —
+/// dead residue and stack slime never qualify), each read from wherever
+/// the conversion relocated it, excluding the lag-learned wall-coupled
+/// mask. Wall-DERIVED values leak through all of that (one taint hop past
+/// the mask), so the verdict keys on persistence: echoes self-heal within
+/// ticks over a bounded address set; corruption persists, spreads, or
+/// floods.
+fn verifyBehavioral(
+    gpa: std.mem.Allocator,
+    base_image: []const u8,
+    conv_image: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+    mov: ?util.movie.Movie,
+    total: u32,
+) !Behavioral {
+    const wram_len = core.bus.Bus.TickSnap.wram_len;
+    const mask = try learnWallMask(gpa, base_image, mov, total);
+    defer gpa.free(mask);
+
+    const Side = struct {
+        con: *core.FastConsole,
+        snap: *core.bus.Bus.TickSnap,
+        prev: *core.bus.Bus.TickSnap,
+        frame: u32 = 0,
+
+        fn init(al: std.mem.Allocator, image: []const u8) !@This() {
+            const cart = try core.Cartridge.load(al, image);
+            const con = try al.create(core.FastConsole);
+            con.init(cart);
+            const snap = try al.create(core.bus.Bus.TickSnap);
+            snap.* = .{};
+            @memset(&snap.live, 0);
+            @memset(&snap.written, 0);
+            con.bus.tick_snap = snap;
+            return .{ .con = con, .snap = snap, .prev = try al.create(core.bus.Bus.TickSnap) };
+        }
+
+        fn advance(self: *@This(), m: ?util.movie.Movie, budget: u32) bool {
+            while (self.frame < budget) {
+                const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame);
+                self.frame += 1;
+                if (ticked) return true;
+            }
+            return false;
+        }
+    };
+
+    var base = try Side.init(gpa, base_image);
+    var conv = try Side.init(gpa, conv_image);
+
+    var out: Behavioral = .{
+        .verdict = .{ .pass = .clean },
+        .stats = .{},
+        .ticks_base = 0,
+        .ticks_conv = 0,
+        .first_bad_frame = 0,
+        .sample = @splat(0),
+        .n_sample = 0,
+    };
+
+    // Tick 0 on both sides.
+    if (!base.advance(mov, total)) return out; // no ticks at all: vacuous
+    if (!conv.advance(mov, total)) {
+        // The baseline reached gameplay and the conversion never did.
+        out.verdict = .{ .fail = .persistence };
+        return out;
+    }
+    out.ticks_base = 1;
+    out.ticks_conv = 1;
+    base.prev.* = base.snap.*;
+    conv.prev.* = conv.snap.*;
+    @memset(&base.snap.live, 0);
+    @memset(&base.snap.written, 0);
+    var prev_frame: u32 = base.frame;
+
+    var bad: [util.Persistence.max_addrs + 1]u32 = undefined;
+    while (true) {
+        if (!base.advance(mov, total)) break;
+        out.ticks_base += 1;
+        if (!conv.advance(mov, total)) {
+            // The conversion fell behind for the rest of the budget while
+            // the baseline kept ticking: it hung or slowed catastrophically.
+            out.verdict = .{ .fail = .persistence };
+            return out;
+        }
+        out.ticks_conv += 1;
+
+        // Compare the PREVIOUS tick pair on the bytes this baseline
+        // interval consumed.
+        var n_bad: usize = 0;
+        const live = &base.snap.live;
+        for (0..wram_len) |i| {
+            if (live[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) == 0) continue;
+            if (mask[i] != 0) continue;
+            const bb = base.prev.wram[i];
+            const cb = switch (convHome(plan, res, @intCast(i))) {
+                .wram => conv.prev.wram[i],
+                .sram => |off| conv.prev.sram[off],
+                .iram => |off| conv.prev.iram[off & 0x7FF],
+            };
+            if (bb == cb) continue;
+            if (n_bad < bad.len) {
+                bad[n_bad] = @intCast(i);
+                n_bad += 1;
+            }
+        }
+        if (n_bad > 0 and out.stats.first_bad == null) {
+            out.first_bad_frame = prev_frame;
+            out.n_sample = @min(out.sample.len, n_bad);
+            @memcpy(out.sample[0..out.n_sample], bad[0..out.n_sample]);
+        }
+        out.stats.feed(out.ticks_base - 2, bad[0..n_bad]);
+
+        base.prev.* = base.snap.*;
+        conv.prev.* = conv.snap.*;
+        @memset(&base.snap.live, 0);
+        @memset(&base.snap.written, 0);
+        prev_frame = base.frame;
+    }
+
+    out.verdict = out.stats.verdict();
+    return out;
+}
+
 /// `--tick-dump`: one record per logic tick — u32 wall frame (little-endian)
 /// followed by the phase-aligned snapshot the bus captured at that tick's
 /// controller poll: 128 KiB WRAM, 128 KiB cartridge RAM (BW-RAM), 2 KiB SA-1
@@ -1072,13 +1310,6 @@ fn runSa1Gen(
             else => return e,
         };
 
-        // TEMPORARY: keep each attempt's image for the behavioral experiment.
-        {
-            var namebuf: [32]u8 = undefined;
-            const nm = std.fmt.bufPrint(&namebuf, "wg-attempt{d}.sfc", .{n_dropped}) catch unreachable;
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nm, .data = res.image }) catch {};
-        }
-
         // The verify run for this attempt.
         @memset(env_conv, 0);
         var fast_audio = core.console.audio_hash_init;
@@ -1108,7 +1339,7 @@ fn runSa1Gen(
         const equiv = util.framesEquivalent(hashes, conv_hashes);
         var fail_why: []const u8 = "";
         var fail_frame: u32 = 0;
-        const passed: ?SaTier = switch (equiv) {
+        var passed: ?SaTier = switch (equiv) {
             .identical => blk: {
                 if (fast_audio == base_audio) break :blk .strict;
                 if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
@@ -1131,6 +1362,49 @@ fn runSa1Gen(
                 break :blk null;
             },
         };
+
+        // The behavioral tier: a slowdown-removing conversion cannot be
+        // frame-identical to a slowed-down baseline, so `divergent` from
+        // the pixel gate is where working offloads go to die. Opt-in, and
+        // never for whole-game images (their state relocation is the
+        // window shift, which convHome does not model).
+        if (passed == null and equiv == .divergent and args.verify_behavioral and !args.whole_game) {
+            try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
+            try out.flush();
+            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, total);
+            switch (bv.verdict) {
+                .pass => |kind| {
+                    try out.print(
+                        "  behavioral: {s} — {} ticks compared, {} diverging ({} address(es), worst run {})\n",
+                        .{
+                            if (kind == .clean) @as([]const u8, "logic state IDENTICAL at every tick") else "wall-time echoes only",
+                            bv.ticks_base,
+                            bv.stats.bad_ticks,
+                            bv.stats.n_addrs,
+                            bv.stats.worst_run,
+                        },
+                    );
+                    passed = .behavioral;
+                },
+                .fail => |why| {
+                    fail_why = switch (why) {
+                        .persistence => "live state diverges and never heals (or the conversion stopped ticking)",
+                        .spread => "live-state divergence keeps reaching new addresses",
+                        .flood => "live state diverges on too many ticks",
+                    };
+                    fail_frame = bv.first_bad_frame;
+                    try out.print("  behavioral: FAIL — {s}\n", .{fail_why});
+                    if (bv.n_sample > 0) {
+                        try out.print("    first at baseline frame {}, e.g.:", .{bv.first_bad_frame});
+                        for (bv.sample[0..bv.n_sample]) |adr| {
+                            try out.print(" ${X:0>2}:{X:0>4}", .{ @as(u32, 0x7E) + (adr >> 16), adr & 0xFFFF });
+                        }
+                        try out.print("\n", .{});
+                    }
+                    try out.flush();
+                },
+            }
+        }
 
         if (passed) |tier| {
             // Success: write the patch and the report.
@@ -1168,7 +1442,7 @@ fn runSa1Gen(
 }
 
 /// Which S4 tier a successful SA-1 conversion verified under.
-const SaTier = enum { strict, envelope, equivalent };
+const SaTier = enum { strict, envelope, equivalent, behavioral };
 
 /// First index where the two per-frame hash streams differ (streams are
 /// equal length by construction). Only meaningful for the divergent case,
@@ -1452,6 +1726,14 @@ fn reportSa1(
             \\  verified: EQUIVALENT MODULO TIMING — the same distinct pictures in the same
             \\  order, redistributed across {} frames (a speedup's exact signature); audio
             \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
+            \\
+        , .{total}),
+        .behavioral => try out.print(
+            \\  verified: BEHAVIORALLY EQUIVALENT — the game's logic state matches at every
+            \\  logic tick over {} frames (compared on the bytes the original actually
+            \\  consumes, wherever the conversion relocated them; residual divergence was
+            \\  wall-time echoes that self-heal). Pixels, audio, and wall timing change BY
+            \\  DESIGN in a slowdown-removing conversion and go UNVERIFIED — eyeball a run.
             \\
         , .{total}),
     }
@@ -2413,6 +2695,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {
             out.tick_dump = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--verify-behavioral")) {
+            out.verify_behavioral = true;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
