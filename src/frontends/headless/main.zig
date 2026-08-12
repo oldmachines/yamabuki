@@ -94,6 +94,9 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// Window debugging (undocumented): write each verification attempt's
+    /// converted image to this path (last attempt wins).
+    save_attempt: ?[]const u8 = null,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1473,6 +1476,8 @@ fn runSa1Gen(
             else => return e,
         };
 
+        if (args.save_attempt) |ap|
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
         // The verify run for this attempt.
         @memset(env_conv, 0);
         var fast_audio = core.console.audio_hash_init;
@@ -2904,6 +2909,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.s2_keep = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--save-attempt")) {
+            out.save_attempt = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {
             out.tick_dump = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--verify-behavioral")) {

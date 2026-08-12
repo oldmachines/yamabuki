@@ -2364,14 +2364,31 @@ pub fn convertWholeGame(
                     if (!sx or n_bm == wg_moves_max or n_moves == wg_moves_max)
                         return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
                     if (ldx_imm < 0x2000) {
-                        // WRAM <- WRAM. The destination needs no proof of
-                        // its own: bank $00's only writable memory is WRAM,
-                        // and re-banking keeps every index as it was — which
-                        // is just as well, since the clear idiom derives Y
-                        // from X (`TXY : INY`) rather than loading it.
-                        bm[n_bm] = file;
-                        n_bm += 1;
-                        dbr_bw = true;
+                        // WRAM <- WRAM. In window mode the banks STAY $00
+                        // and the X immediate shifts into the $6000 window
+                        // instead (Y derives from X in the clear idiom, so
+                        // it follows): re-banking to $40,$40 would leave
+                        // DBR=$40 where stock leaves $00 — and $00 is a
+                        // SYSTEM bank, so any MMIO the game does under the
+                        // inherited DBR (or any comparison of a saved copy)
+                        // forks. Measured on the real cart: a $40 sat on
+                        // the stack where stock saved $00, and the title
+                        // transition read it back. The SA-1-execution mode
+                        // keeps the re-bank (its MMIO is proxied anyway).
+                        if (window) {
+                            const at = bank_file + ((ldx_at.? & 0xFFFF) - 0x8000) + 1;
+                            for (moves[0..n_moves]) |m| {
+                                if (m == at) break;
+                            } else {
+                                moves[n_moves] = at;
+                                n_moves += 1;
+                            }
+                            dbr_bw = false;
+                        } else {
+                            bm[n_bm] = file;
+                            n_bm += 1;
+                            dbr_bw = true;
+                        }
                     } else if (ldx_imm >= 0x8000) {
                         // WRAM <- ROM. Here the destination index is the
                         // thing that moves, so it does have to be provable.
@@ -2749,24 +2766,37 @@ pub fn convertWholeGame(
                     const next = cpu_addr + 2;
                     const next_op = (cov[next] | cov[0x80_0000 | next]) & usage_map.flag_opcode != 0;
                     if (fl2 & usage_map.flag_m != 0 and next_op and file + 2 < out.len and
-                        (out[file + 2] == 0x85 or out[file + 2] == 0x8D))
+                        (out[file + 2] == 0x85 or out[file + 2] == 0x8D or
+                            out[file + 2] == 0x8F or out[file + 2] == 0x9F))
                     {
                         out[file + 1] -= 0x3E;
                         res.stats.rewritten_long += 1;
                     }
-                    // The 16-BIT form of the same idiom, aimed at a bank
-                    // register: `LDA #$007E : STA $43x4` (a DMA source
-                    // bank — Gradius III's boot loads the Konami logo
-                    // this way) or `STA $2183` (WMDATA's bank). The store
-                    // target names the semantics, so only those targets
-                    // rewrite; a random 16-bit $007E is a coordinate.
+                    // The 16-BIT form of the same idiom. Two shapes carry
+                    // a bank in a 16-bit immediate: `LDA #$007E : STA
+                    // $43x4` (a DMA source bank — the boot logo) and
+                    // `LDA #$007E : STA $7E:xxxx,X` (the bank WORD of a
+                    // far-pointer queue entry — the title's DMA queue
+                    // builder at $00:8EBB). The store's shape names the
+                    // semantics; a random 16-bit $007E is a coordinate
+                    // and stays.
                     const fl16 = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
                     if (fl16 & usage_map.flag_m == 0 and out[file + 2] == 0x00 and
-                        file + 5 < out.len and out[file + 3] == 0x8D)
+                        file + 6 < out.len)
                     {
-                        const tgt = std.mem.readInt(u16, out[file + 4 ..][0..2], .little);
-                        const dma_bank = tgt >= 0x4304 and tgt <= 0x4374 and (tgt & 0xF) == 4;
-                        if (dma_bank) {
+                        const st = out[file + 3];
+                        const bank_word = switch (st) {
+                            0x8D => blk: {
+                                const tgt = std.mem.readInt(u16, out[file + 4 ..][0..2], .little);
+                                break :blk tgt >= 0x4304 and tgt <= 0x4374 and (tgt & 0xF) == 4;
+                            },
+                            // A long store into WRAM ($7E/$7F pre-rewrite):
+                            // the immediate is the bank word of whatever
+                            // entry is being built there.
+                            0x8F, 0x9F => out[file + 6] == 0x7E or out[file + 6] == 0x7F,
+                            else => false,
+                        };
+                        if (bank_word) {
                             out[file + 1] -= 0x3E;
                             res.stats.rewritten_long += 1;
                         }
@@ -2796,6 +2826,15 @@ pub fn convertWholeGame(
                         if (b == 0x7E or b == 0x7F) {
                             out[file + 3] = b - 0x3E;
                             res.stats.rewritten_long += 1;
+                        } else if (b == 0x7D and v >= 0xFF00) {
+                            // The NEGATIVE-OFFSET idiom: `SBC $7D:FFFB,X`
+                            // wraps through the bank boundary into
+                            // $7E:0000+X-5 — entry-relative backward reach
+                            // into a WRAM queue (the title's DMA queue
+                            // reads its previous entry this way). $3F
+                            // wraps into $40 the same distance.
+                            out[file + 3] = 0x3F;
+                            res.stats.rewritten_long += 1;
                         } else if ((b & 0x7F) <= 0x3F and v < 0x2000 and usage_map.mode(op) == .long) {
                             // The low mirror through a system bank — but
                             // only UNINDEXED: `LDA $01:0000,X` with a big X
@@ -2818,6 +2857,15 @@ pub fn convertWholeGame(
                 },
                 .abs, .abs_x, .abs_y => if (bwram and !dbr_bw) {
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    // A TINY base under an index is the "X is the pointer"
+                    // idiom — the register carries the real address, which
+                    // can as legitimately be ROM through the ambient bank
+                    // (the title's display-list walker reads $01:8000+X
+                    // via `LDY $0000,X` with DBR=$01) as low WRAM.
+                    // Shifting the base breaks the ROM walks; leaving it
+                    // breaks a true low-WRAM walk softly (stale reads S4
+                    // catches). Real table bases keep the shift.
+                    if (usage_map.mode(op) != .abs and v < 0x100) continue;
                     if (v < 0x2000) {
                         std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
                         res.stats.rewritten_abs += 1;
