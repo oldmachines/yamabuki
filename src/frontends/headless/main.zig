@@ -91,6 +91,9 @@ const Args = struct {
     /// generator/report modes it drives the profiled runs, so coverage and
     /// verification come from real gameplay instead of the attract mode.
     movie: ?[]const u8 = null,
+    /// Resume from an SDL-player save state instead of power-on (plain runs
+    /// and --sa1-report). Same-image, same-core states only.
+    state: ?[]const u8 = null,
     /// Generate a FastROM patch for this ROM, verified in-emulator before
     /// anything is written (see `util.generateFastromVerified`).
     gen_fastrom: bool = false,
@@ -153,6 +156,8 @@ pub fn main(init: std.process.Init) !void {
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
             \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\  --state f     resume from an SDL-player save state instead of power-on
+            \\                (plain runs and --sa1-report; same image and core only)
             \\                from power-on, verifying its end hashes; with --sa1-report or a
             \\                --gen-* mode the movie drives the profiled runs instead, so
             \\                coverage and verification come from real gameplay
@@ -261,6 +266,7 @@ pub fn main(init: std.process.Init) !void {
     if (mov) |m| con.setRegion(if (m.region == 1) .pal else .ntsc);
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -402,6 +408,32 @@ fn loadMovie(
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
 /// movie's end. A no-op without a movie.
+/// `--state`: resume from an SDL-player save state instead of power-on —
+/// which lets the profiler measure a scene the attract demo never reaches
+/// (a slowdown-heavy stage the player save-stated, say) without replaying
+/// a movie to get there. The state must be from the same image and core;
+/// the serializer's own container checks refuse anything else.
+fn loadStateInto(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    con: anytype,
+    path: []const u8,
+) !void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try out.print("error: cannot read state '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    con.loadState(data) catch |e| {
+        try out.print("error: state '{s}' does not load into this console: {s}\n", .{ path, @errorName(e) });
+        try out.flush();
+        std.process.exit(1);
+    };
+    try out.print("state loaded: {s}\n", .{path});
+    try out.flush();
+}
+
 fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
     const m = mov orelse return;
     const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
@@ -1371,6 +1403,7 @@ fn runReport(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
 
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.
@@ -2260,6 +2293,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--movie")) {
             out.movie = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--state")) {
+            out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
