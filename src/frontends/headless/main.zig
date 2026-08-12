@@ -1214,6 +1214,12 @@ fn runSa1Gen(
             }
         }
         n_cands = conv.n;
+        // Fire-and-forget offloads reorder execution by design: only the
+        // behavioral tier can ever verify one, so without it every
+        // candidate is demoted to synchronous up front.
+        if (!args.verify_behavioral) {
+            for (cands[0..n_cands]) |*c| c.no_async = true;
+        }
         // Sibling evidence: every other profiled routine, so an alternate
         // entry point into an offloaded body folds its working set into
         // the marshal even though it is far too cold to be a candidate.
@@ -1433,6 +1439,18 @@ fn runSa1Gen(
 
         // Diagnose and drop a culprit, then go around again.
         const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
+        // The mode ladder: an ASYNC culprit is demoted to synchronous
+        // before it is dropped — a caller that needed the routine's
+        // register results, or a read racing the in-flight window, is
+        // cured by waiting. Only a sync culprit is dropped outright.
+        if (res.stats.async_entry == culprit) {
+            for (cands[0..n_cands]) |*c| {
+                if (c.entry == culprit) c.no_async = true;
+            }
+            try out.print("  auto-bisect: offload $00:{x:0>4} was ASYNC — retrying it synchronously ({} attempt(s) so far)\n", .{ culprit, n_dropped + 1 });
+            try out.flush();
+            continue;
+        }
         dropped[n_dropped] = culprit;
         dropped_why[n_dropped] = fail_why;
         n_dropped += 1;
@@ -1701,6 +1719,15 @@ fn reportSa1(
                         "  original body's data bank is rewritten too, so both CPUs address one copy\n" ++
                         "  in BW-RAM (only the direct page is still copied, per call)\n",
                     .{res.stats.resident_offloads},
+                );
+                if (res.stats.async_entry != 0) try out.print(
+                    "  $00:{x:0>4} runs ASYNCHRONOUSLY: its stub fires the SA-1 and returns at\n" ++
+                        "  once with the caller's own registers; a fence (at the next call and in\n" ++
+                        "  an injected NMI prologue) completes the handshake. Nothing is copied\n" ++
+                        "  back — only its BW-RAM-resident effects survive, by contract. The\n" ++
+                        "  S-CPU and SA-1 genuinely overlap — this is where the conversion stops\n" ++
+                        "  paying for its offloads and starts profiting from them\n",
+                    .{res.stats.async_entry},
                 );
             }
         } else {

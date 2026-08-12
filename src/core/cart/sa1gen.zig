@@ -144,6 +144,13 @@ pub const Stats = struct {
     /// Pointer offloads whose data is BW-RAM-RESIDENT: not marshalled at
     /// all, addressed in place by both CPUs.
     resident_offloads: u8 = 0,
+    /// The ASYNCHRONOUS offload's entry (0 = none): its stub returns
+    /// without waiting and completion is collected by the fence. At most
+    /// one per conversion — the fence hard-codes its slot set.
+    async_entry: u24 = 0,
+    /// 24-bit address of the shared fence routine (JSL target), for the
+    /// NMI prologue convert() emits.
+    async_fence: u24 = 0,
     /// `--wg-static` only: unprovable shapes found in statically
     /// discovered (never-executed) code and left as-is for S4 verification
     /// to arbitrate — D/S establishes, block moves, RMW MMIO.
@@ -186,6 +193,12 @@ pub const Candidate = struct {
     /// residency test cannot exclude one and residency is refused.
     entry_d: u16 = 0,
     d_varies: bool = false,
+    /// The auto-bisect's mode ladder: an ASYNCHRONOUS offload that fails
+    /// verification retries synchronously before being dropped. Also set
+    /// up front for every candidate when the behavioral tier is off —
+    /// async reorders execution by design, so only that tier can ever
+    /// accept it.
+    no_async: bool = false,
 };
 
 /// Convert a plain LoROM image into an SA-1 cart per `plan`. `usage` is the
@@ -226,8 +239,8 @@ pub fn convert(
     const reset = header.reset_vector;
     if (reset < 0x8000) return refuse(refusal, .{ .reason = .reset_vector_not_rom });
 
-    const carve = patchgen.findFreeSpace(image[0..header.offset], shim_len_max + park_len) orelse
-        return refuse(refusal, .{ .reason = .no_free_space, .detail = shim_len_max + park_len });
+    const carve = patchgen.findFreeSpace(image[0..header.offset], shim_len_max + park_len + nmi_prologue_len) orelse
+        return refuse(refusal, .{ .reason = .no_free_space, .detail = shim_len_max + park_len + nmi_prologue_len });
 
     const out = try gpa.dupe(u8, image);
     errdefer gpa.free(out);
@@ -247,13 +260,39 @@ pub fn convert(
     // BW-RAM: at least the SA-1-standard 32 KiB, more if the plan spilled.
     out[header.offset + 0x18] = if (plan.viable and plan.bwram_used > 32 * 1024) 0x07 else 0x05;
 
+    // Async needs the NMI vectors: the fence prologue takes them over, so
+    // the native target must be real code, and the emulation vector must
+    // agree (or be unused) — the prologue can only forward to one handler.
+    const nmi_native = std.mem.readInt(u16, image[header.offset + 0x2A ..][0..2], .little);
+    const nmi_emu = std.mem.readInt(u16, image[header.offset + 0x3A ..][0..2], .little);
+    const nmi_ok = nmi_native >= 0x8000 and
+        (nmi_emu == nmi_native or nmi_emu < 0x8000 or nmi_emu == 0xFFFF);
+
     // --- S3b: execution offload, before the shim (it decides CRV) ---------
     var crv: u16 = 0x8000 + @as(u16, @intCast(carve)) + @as(u16, @intCast(shim_len_max));
-    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, neighbours, dma_pages, carve, &res, &crv);
+    if (usage != null and plan.viable) tryOffload(out, plan, usage.?, candidates, neighbours, dma_pages, carve, nmi_ok, &res, &crv);
     // The pointer-offload shadow lives at BW-RAM linear $10000+ (bank
     // $41): the cart must carry the full 128 KiB.
     if (res.stats.pointer_offloads > 0 and out[header.offset + 0x18] < 0x07)
         out[header.offset + 0x18] = 0x07;
+
+    // The async fence's NMI prologue: every frame boundary collects a
+    // still-in-flight call before the game's own handler (whose DMA may
+    // read what the routine computes) runs.
+    if (res.stats.async_entry != 0) {
+        const nmi_file = carve + shim_len_max + park_len;
+        const f = res.stats.async_fence;
+        const wn = out[nmi_file..];
+        var m: usize = 0;
+        put(wn, &m, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save
+        put(wn, &m, &.{ 0x22, @truncate(f), @truncate(f >> 8), @truncate(f >> 16) });
+        put(wn, &m, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore
+        put(wn, &m, &.{ 0x4C, @truncate(nmi_native), @truncate(nmi_native >> 8) });
+        std.debug.assert(m == nmi_prologue_len);
+        const nmi_addr: u16 = 0x8000 + @as(u16, @intCast(nmi_file));
+        std.mem.writeInt(u16, out[header.offset + 0x2A ..][0..2], nmi_addr, .little);
+        std.mem.writeInt(u16, out[header.offset + 0x3A ..][0..2], nmi_addr, .little);
+    }
 
     // --- the S-CPU boot shim and the SA-1 park stub -----------------------
     const shim_addr: u16 = 0x8000 + @as(u16, @intCast(carve));
@@ -271,6 +310,10 @@ pub fn convert(
     }
     n = emitStore(w, n, 0x2229, 0xFF); // SIWP: allow S-CPU I-RAM writes
     n = emitStore(w, n, 0x2226, 0x80); // SWEN: allow S-CPU BW-RAM writes
+    // Async busy flag ($378A) starts idle: I-RAM is uninitialised at boot,
+    // and the NMI fence deadlocks on garbage that reads as an in-flight id
+    // — awaiting a handshake for a call that never happened.
+    if (res.stats.async_entry != 0) n = emitStore(w, n, 0x378A, 0x00);
     const park_addr: u16 = shim_addr + @as(u16, @intCast(shim_len_max));
     n = emitStore(w, n, 0x2203, @truncate(crv)); // CRV low
     n = emitStore(w, n, 0x2204, @truncate(crv >> 8)); // CRV high
@@ -295,8 +338,11 @@ pub fn convert(
 
 /// Worst-case shim size (with the D move): SEI + PEA/PLD + 4 stores + STZ +
 /// JMP = 1 + 4 + 20 + 3 + 3 = 31; rounded up for slack.
-const shim_len_max: u32 = 32;
+const shim_len_max: u32 = 40;
 const park_len: u32 = 2;
+/// The async offload's NMI prologue: save context, JSL the fence, restore,
+/// JMP the game's own handler. Carved after the park stub.
+const nmi_prologue_len: u32 = 21;
 
 fn emitStore(w: []u8, n: usize, reg: u16, value: u8) usize {
     w[n] = 0xA9; // LDA #value
@@ -558,6 +604,12 @@ const Chosen = struct {
     /// marshalled: the original body's data-bank idiom is rewritten too,
     /// so the S-CPU's own calls address the same single copy.
     resident: bool = false,
+    /// Fire-and-forget: the S-CPU stub sends the message and returns
+    /// immediately with the caller's own registers; a fence (at the next
+    /// call, and each NMI) completes the handshake. NOTHING is copied
+    /// back — register results and dp writes are dropped; only effects on
+    /// BW-RAM-resident state survive, so resident routines only.
+    is_async: bool = false,
     /// Where the SA-1's rewritten copy of a pointer routine landed (the
     /// dispatcher JSLs it; the original body is never modified).
     copy_addr: u16 = 0,
@@ -572,6 +624,7 @@ fn tryOffload(
     neighbours: []const Candidate,
     dma_pages: profile.WramPages,
     shim_carve: u32,
+    allow_async: bool,
     res: *Result,
     crv: *u16,
 ) void {
@@ -591,6 +644,13 @@ fn tryOffload(
             if (x.entry == e) break true;
         } else false;
         if (dup) continue;
+        // An async offload monopolizes the mailbox: a sibling stub that
+        // sends its message while the fire-and-forget call is still in
+        // flight deadlocks the dispatcher (it holds the async done echo,
+        // awaiting an ack; the sibling overwrites the message port and
+        // spins on an echo the dispatcher will never send). Until sync
+        // stubs learn to fence first, async rides alone.
+        if (n > 0 and chosen[0].is_async) break;
         if (eligibleLeaf(out, usage, plan, res, e)) {
             if (countCallSites(out, usage, e, 0x20) == 0) continue;
             chosen[n] = .{ .entry = e, .kind = .leaf };
@@ -708,7 +768,19 @@ fn tryOffload(
             if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) continue;
         }
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
-        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings, .resident = resident };
+        // Fire-and-forget: RESIDENT routines only — an async call keeps no
+        // write-back at all (register results and dp writes are both
+        // dropped; see emitFence), so only effects on BW-RAM-resident
+        // state can survive, and a routine without any has nothing async
+        // could deliver. FIRST and therefore alone (the monopoly guard
+        // above stops the choosing once an async is in — a sibling's
+        // un-fenced send would deadlock the dispatcher), few slots, and
+        // never when the ladder already demoted it. Whether any caller
+        // needed the dropped effects is exactly what verification
+        // arbitrates, and the mode ladder retries synchronously when it
+        // says so.
+        const is_async = allow_async and resident and !c.no_async and spec.n_slots <= 2 and n == 0;
+        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings, .resident = resident, .is_async = is_async };
         n += 1;
     }
     if (n == 0) return;
@@ -736,7 +808,10 @@ fn tryOffload(
             },
             .ptr => {
                 blocks_len += 33;
-                ptr_stub_len += ptrStubLen(c.spec, c.runs) + c.spec.span;
+                ptr_stub_len += if (c.is_async)
+                    fenceLen(c.spec) + asyncStubLen(c.spec) + c.spec.span
+                else
+                    ptrStubLen(c.spec, c.runs) + c.spec.span;
             },
         };
         const dl: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
@@ -778,9 +853,23 @@ fn tryOffload(
                 res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x20, stub_addr, 0);
             },
             .ptr => {
+                // The async variant carves its fence first, so the stub can
+                // JSL it by the address just decided.
+                if (c.is_async) {
+                    const fence_file = ptr_cur;
+                    const flen = emitFence(out[fence_file..], c.spec);
+                    std.debug.assert(flen == fenceLen(c.spec));
+                    ptr_cur += flen;
+                    res.stats.async_entry = c.entry;
+                    res.stats.async_fence = @as(u24, @intCast(fence_file / 0x8000)) << 16 |
+                        @as(u24, @intCast(0x8000 + (fence_file % 0x8000)));
+                }
                 const stub_file = ptr_cur;
-                const emitted = emitPtrStub(out[stub_file..], id, c.entry, c.spec, c.runs);
-                std.debug.assert(emitted == ptrStubLen(c.spec, c.runs));
+                const emitted = if (c.is_async)
+                    emitAsyncStub(out[stub_file..], res.stats.async_fence, id, c.entry, c.spec)
+                else
+                    emitPtrStub(out[stub_file..], id, c.entry, c.spec, c.runs);
+                std.debug.assert(emitted == if (c.is_async) asyncStubLen(c.spec) else ptrStubLen(c.spec, c.runs));
                 ptr_cur += emitted;
                 // The SA-1's copy of the body, immediately after the stub:
                 // the DB idiom's bank immediates become the shadow bank,
@@ -1243,6 +1332,125 @@ fn emitPtrStub(d: []u8, id: u8, entry: u16, spec: PtrSpec, runs: Runs) u32 {
     put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 }); // exit P staged
     put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 }); // B, A low
     put(d, &cur, &.{ 0x28, 0x6B }); // PLP (exit flags/widths) / RTL
+    return @intCast(cur);
+}
+
+/// Byte-exact length of the shared async fence (the emitter asserts).
+fn fenceLen(spec: PtrSpec) u32 {
+    _ = spec;
+    return 41;
+}
+
+/// The asynchronous offload's fence: complete the handshake of a
+/// fire-and-forget call so the mailbox and message ports free up. Nothing
+/// is copied back — that is the async CONTRACT, not a shortcut: the
+/// routine's register results are dropped, and so are its direct-page
+/// writes. A deferred whole-page copy-back is unsound against ANY S-CPU
+/// dp write between send and fence (measured on a real cart: the NMI
+/// fence reverting the APU upload counter mid-handshake wedged the boot).
+/// Only effects on BW-RAM-RESIDENT state survive an async call, because
+/// both CPUs address that state directly and no copy exists to disagree.
+/// Whether any caller needed the dropped effects is exactly what
+/// behavioral verification arbitrates.
+///
+/// JSL-reached and long-addressed, so it works from any bank; the caller
+/// has already saved every register it cares about. Idempotent: an NMI
+/// can interrupt a fence mid-handshake and run the fence again — the
+/// inner call either sees busy already cleared or completes the same
+/// handshake, and the outer's remaining reads find the ports quiet.
+fn emitFence(d: []u8, spec: PtrSpec) u32 {
+    _ = spec;
+    var cur: usize = 0;
+    const body: u32 = 32;
+    put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
+    put(d, &cur, &.{ 0xAF, 0x8A, 0x37, 0x00 }); // busy id, 0 = idle
+    put(d, &cur, &.{ 0xF0, @intCast(body) }); // BEQ done
+    // Await the SA-1's done echo of exactly the in-flight id, ack it, and
+    // wait for the port to clear — the back half of the handshake the
+    // async stub deliberately left unfinished.
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xCF, 0x8A, 0x37, 0x00, 0xD0, 0xF4 });
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8A, 0x37, 0x00 }); // busy = idle
+    put(d, &cur, &.{0x6B}); // done: RTL
+    return @intCast(cur);
+}
+
+/// Byte-exact length of an async stub (the emitter asserts).
+fn asyncStubLen(spec: PtrSpec) u32 {
+    return 122 + 27 * @as(u32, @intCast(spec.n_slots));
+}
+
+/// The fire-and-forget S-CPU stub for THE async offload: fence first (a
+/// previous call may still be in flight — and the D-guard's bail path runs
+/// the original body on the S-CPU, which must never race the SA-1 over the
+/// resident data), then the synchronous stub's whole front half, then send
+/// the message, mark busy, and return with the CALLER's registers — the
+/// routine's register results are dropped, which is the async contract;
+/// verification arbitrates whether any caller actually needed them.
+fn emitAsyncStub(d: []u8, fence: u24, id: u8, entry: u16, spec: PtrSpec) u32 {
+    var cur: usize = 0;
+    // Save the caller's context across the fence, which clobbers freely.
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // PHP REP PHA PHX PHY PHB
+    put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
+    // REP #$30 before the pulls: the fence returns with M narrowed (its
+    // final SEP #$20), and an 8-bit PLA against the 16-bit PHA above
+    // leaves a stray byte that shears the stack — the RTL at the tail
+    // would return into hyperspace.
+    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // PLB REP PLY PLX PLA PLP
+    // Re-save what the marshal below consumes (its own PHB balances the
+    // tail's PLB).
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // PHP REP PHA PHX PHY
+    // D guard, exactly as the sync stub: a caller whose direct page cannot
+    // mirror into the shadow window is handed the original body — safe on
+    // the S-CPU now, because the fence above drained the SA-1.
+    put(d, &cur, &.{
+        0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68,
+        0xC9, 0x01, 0x1F, // CMP #$1F01
+        0x90, 0x0C, // BCC ok
+        0x68, 0x28, // PLA / PLP
+        0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, // unwind the re-save
+        0x5C, @truncate(entry), @truncate(entry >> 8), 0x00, // JML original
+        // ok:
+        0x8F, 0x88, 0x37, 0x00, // caller D -> mailbox
+        0x68, 0x28, // PLA / PLP
+    });
+    // Register marshal into the mailbox (the SA-1's unmarshal input),
+    // identical to the sync stub's.
+    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
+    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
+    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
+    // Caller P: NOT the live P (the re-save REP'd it — the sync stub can
+    // read its own PHP because nothing widened P before its marshal). The
+    // true caller P is the re-save's PHP byte, at a fixed stack depth
+    // once our own PHP is pulled: B(1) + Y(2) + X(2) + A(2) above it.
+    // Marshalling the REP'd P hands the SA-1 16-bit index width for an
+    // 8-bit caller — its immediates then swallow the following opcode.
+    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0xA3, 0x08, 0x8F, 0x86, 0x37, 0x00 });
+    // dp page into the shadow (resident routines marshal nothing else).
+    put(d, &cur, &.{ 0xC2, 0x30 });
+    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, shadow_bank, 0x7E });
+    // Slot translate-in, as sync.
+    for (spec.slots[0..spec.n_slots]) |s| {
+        put(d, &cur, &.{
+            0xAF,        0x88, 0x37,        0x00,
+            0x18,        0x69, s,           0x00,
+            0xAA,        0xE2, 0x20,        0xBF,
+            0x00,        0x00, shadow_bank, 0xC9,
+            0x7E,        0xD0, 0x06,        0xA9,
+            shadow_bank, 0x9F, 0x00,        0x00,
+            shadow_bank, 0xC2, 0x20,
+        });
+    }
+    put(d, &cur, &.{ 0xE2, 0x20 });
+    // Send, mark busy, and DO NOT WAIT — the SA-1's signal loop holds the
+    // done echo until the fence acks it. The busy flag lives at $378A,
+    // OUTSIDE the caller-D slot ($3788-$3789, which the dispatcher reads
+    // 16-bit): a busy byte at $3789 is a +$0100 bias on the SA-1's D.
+    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00, 0x8F, 0x8A, 0x37, 0x00 });
+    // Caller context back (mirrors the re-save; the marshal's PHB pairs
+    // with this PLB), and out.
+    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, 0x6B });
     return @intCast(cur);
 }
 
@@ -3346,6 +3554,93 @@ test "residency: private data lives in BW-RAM, is never marshalled, and both CPU
     // The routine still ran and returned: its last loaded byte reached
     // the caller through the register marshal.
     try testing.expectEqual(@as(u8, 0xEF), con.bus.wram.data[0x0100]);
+}
+
+test "async: a fire-and-forget resident offload runs, and the fence collects it" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0xE000..0x10000], 0xFF);
+
+    // The residency test's shape, made async-VALID by removing the one
+    // thing that broke it on Gradius III: the caller never consumes the
+    // routine's result. It sets the pointers, JSLs the routine (whose only
+    // effect is writing the resident buffer), and spins. So the SA-1 may
+    // run it in the background — the buffer write is the whole point, and
+    // nothing reads it back synchronously.
+    @memcpy(rom[0x0000..0x0021], &[_]u8{
+        0x18, 0xFB, // CLC / XCE
+        0xE2, 0x30, // SEP #$30
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // LDA #$80 / STA $4200 (NMI on)
+        0x64, 0x00, // STZ $00
+        0xA9, 0x90, 0x85, 0x01, // ptr lo = $90
+        0x64, 0x02, 0x64, 0x03, // ptr hi/bank = 0
+        0xA9, 0x1F, 0x85, 0x04, // dest hi = $1F
+        0xA9, 0x7E, 0x85, 0x05, // dest bank = $7E (rewritten resident)
+        0x22, 0x40, 0x80, 0x00, // JSL $00:8040
+        0x80, 0xFE, // BRA * (never reads the buffer)
+    });
+    @memcpy(rom[0x0040..0x0052], &[_]u8{
+        0x8B, 0xA9, 0x7E, 0x48, 0xAB, // PHB / LDA #$7E / PHA / PLB
+        0xA0, 0x00, // LDY #0
+        0xB7, 0x00, // LDA [$00],Y
+        0x91, 0x03, // STA ($03),Y
+        0xC8, // INY
+        0xC0, 0x04, // CPY #4
+        0xD0, 0xF7, // BNE
+        0xAB, 0x6B, // PLB / RTL
+    });
+    @memcpy(rom[0x1000..0x1004], &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+    // A real NMI handler (just RTI): the async conversion needs the vector
+    // to point at code so its fence prologue can forward to it.
+    rom[0x0060] = 0x40; // RTI at $00:8060
+    std.mem.writeInt(u16, rom[0x7FEA..][0..2], 0x8060, .little); // native NMI
+
+    const usage = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800B, 0x800D, 0x800F, 0x8011, 0x8013, 0x8015, 0x8017, 0x8019, 0x801B, 0x801F }) |a| markOp(usage, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8043, 0x8044, 0x8045, 0x8047, 0x8049, 0x804B, 0x804C, 0x804E, 0x8050, 0x8051 }) |a| markOp(usage, a);
+    markOp(usage, 0x8060);
+
+    var plan = onePlan(0x0F00, 0x10, .iram, 0x80, false);
+    var pages: profile.WramPages = @splat(0);
+    pages[0] |= 1 << 0;
+    pages[0] |= 1 << 0x1F;
+    var ref: ?Refusal = null;
+    // no_async defaults false: the gate must pick async when it qualifies.
+    const res = try convert(gpa, rom, &plan, usage, &.{.{ .entry = 0x00_8040, .pages = pages }}, &.{}, @splat(0), &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u24, 0x00_8040), res.stats.async_entry);
+    try testing.expect(res.stats.async_fence != 0);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    const sa1_trace = @import("../sa1_trace.zig");
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x01_F800);
+    con.bus.sa1.trace = trace;
+    // A few frames: the async stub fires the SA-1 and the S-CPU spins; the
+    // NMI fence at each frame boundary drains any in-flight call, so the
+    // resident buffer holds the copy — computed on the SA-1, collected by
+    // the fence, never marshalled to WRAM.
+    for (0..3) |_| con.runFrame();
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, con.bus.sa1.bwram[0x11F00..0x11F04]);
+    // The SA-1 did the work (the trace watched the body copy execute),
+    // and the handshake fully drained: busy idle, both message ports
+    // clear — the fence collected the call, nothing is left in flight.
+    try testing.expect(trace.total > 0);
+    try testing.expectEqual(@as(u8, 0), con.bus.sa1.iram[0x38A]);
+    try testing.expectEqual(@as(u4, 0), con.bus.sa1.smeg);
+    try testing.expectEqual(@as(u4, 0), con.bus.sa1.cmeg);
 }
 
 test "sa1 trace: the SA-1's path through an offloaded body is observable" {
