@@ -91,6 +91,9 @@ const Args = struct {
     /// generator/report modes it drives the profiled runs, so coverage and
     /// verification come from real gameplay instead of the attract mode.
     movie: ?[]const u8 = null,
+    /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
+    /// file after the run.
+    dump_ram: ?[]const u8 = null,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -117,6 +120,10 @@ const Args = struct {
     /// game executes on the SA-1 and the S-CPU becomes an MMIO service
     /// loop — instead of the routine-offload ladder.
     whole_game: bool = false,
+    /// Uniform window relocation: the game keeps running on the S-CPU and
+    /// only its memory moves (WRAM low 8K -> the S-CPU BW-RAM window,
+    /// $7E/$7F longs -> $40/$41). Implies the whole-game pipeline shape.
+    window: bool = false,
     /// With --whole-game: also rewrite code the profiled run never reached,
     /// discovered by recursive-descent disassembly seeded from coverage.
     /// Unprovable shapes in that code are counted, not refused over.
@@ -195,6 +202,12 @@ pub fn main(init: std.process.Init) !void {
             \\                executes entirely on the SA-1, the S-CPU becomes an MMIO service
             \\                loop; needs the WRAM working set inside I-RAM's identity window
             \\                and refuses by name when it cannot prove the move
+            \\  --window      with --gen-sa1-patch: uniform window relocation — the game KEEPS
+            \\                RUNNING ON THE S-CPU; WRAM's low 8 KiB moves into the S-CPU's
+            \\                BW-RAM window (+$6000, distances preserved so indexed bases
+            \\                rewrite soundly) and $7E/$7F longs re-bank to $40/$41. MMIO stays
+            \\                native; the SA-1 never leaves reset. The enabler for resident
+            \\                offloads over the whole working set (composes with --wg-static)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -288,6 +301,20 @@ pub fn main(init: std.process.Init) !void {
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+
+    // Window debugging (undocumented --dump-ram): dump memories after the
+    // run — WRAM (128K), BW-RAM's first 64K, VRAM — plus the CPU's resting
+    // place. The tool that found every window-mode blocker so far.
+    defer if (args.dump_ram) |dpath| {
+        const fc = &con.fast;
+        const buf = gpa.alloc(u8, 0x20000 + 0x10000 + 0x10000) catch unreachable;
+        @memset(buf, 0);
+        @memcpy(buf[0..0x20000], &fc.bus.wram.data);
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x10000], fc.bus.sa1.bwram[0..0x10000]);
+        @memcpy(buf[0x30000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
+        std.debug.print("[dump] pc={x:0>2}:{x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p });
+    };
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -1403,7 +1430,7 @@ fn runSa1Gen(
 
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, args.window, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -1792,7 +1819,25 @@ fn reportSa1(
     };
 
     try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
-    if (args.whole_game) {
+    if (args.window) {
+        try out.print(
+            \\uniform window relocation (v17's architecture):
+            \\  boot shim at $00:{x:0>4}; the game KEEPS RUNNING ON THE S-CPU
+            \\  its WRAM moved wholesale — low 8 KiB into the S-CPU's BW-RAM window
+            \\  ($6000-$7FFF, every relative distance preserved, so indexed bases
+            \\  rewrite soundly), $7E/$7F long references re-banked to $40/$41
+            \\  {d} long site(s) and {d} absolute site(s) rewritten; {d} D/S/DBR move(s)
+            \\  MMIO stays native; the SA-1 never leaves reset — the cart is carried
+            \\  for its RAM. This is the enabler for resident offloads over the whole
+            \\  working set.
+            \\
+        , .{
+            res.stats.shim_addr,
+            res.stats.rewritten_long,
+            res.stats.rewritten_abs,
+            res.stats.dp_sites,
+        });
+    } else if (args.whole_game) {
         try out.print(
             \\whole-game migration (SA-1 Root):
             \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
@@ -2841,6 +2886,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--s2-keep")) {
             out.s2_keep = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--dump-ram")) {
+            out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {
             out.tick_dump = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--verify-behavioral")) {
@@ -2850,6 +2897,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
             out.gen_sa1 = true;
         } else if (std.mem.eql(u8, a, "--whole-game")) {
+            out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--window")) {
+            // Window mode rides the whole-game pipeline (all-or-nothing,
+            // no candidates, no plan) with execution left on the S-CPU.
+            out.window = true;
             out.whole_game = true;
         } else if (std.mem.eql(u8, a, "--wg-static")) {
             out.wg_static = true;
