@@ -187,7 +187,25 @@ Layered gates, strictest verdict that applies:
 - **I-RAM-hazard tree refusal**: an *unshifted* low-mirror site (mixed or
   absent evidence) is correct on the S-CPU but addresses the SA-1's own
   I-RAM in the copy. `windowEligible` refuses trees containing one unless
-  the site's measured traffic was pure ROM.
+  the site's measured traffic was pure ROM — or the site is reached under
+  a proven BW-RAM DBR pin (below), where the operand is data both CPUs
+  read identically.
+- **DBR pins travel through in-tree JSLs.** A copy's members are called
+  only from other copies in the same tree (the member-to-member JSLs are
+  re-pointed), so a pin proven at every in-tree call site genuinely holds
+  for the copy at runtime. The eligibility walk runs in two phases:
+  SURVEY passes collect members, spans, and per-member DBR-cleanliness
+  (no PLB or block move in the span, transitively through in-tree
+  callees; optimistic, iterated downward), then one JUDGE pass computes
+  entry pins as the meet over call sites — and inside a DBR-clean member
+  entered under a pin, the pin holds at *every* instruction, so the
+  per-op survival approximation (which a mid-span RTL would needlessly
+  kill) is not consulted. This is what earned Gradius III's physics tree:
+  its one refusal was an uncovered `ASL $0000,X` on a rare branch of a
+  shared helper — unshiftable, no evidence, the SA-1's own I-RAM if run
+  unpinned — but every in-tree path to it runs under the root's `$40`
+  pin, where a tiny-base indexed absolute is BW-RAM data on both buses
+  whatever the index holds.
 - **Async monopoly**: one fire-and-forget offload per conversion, first
   chosen; a sibling's un-fenced send mid-flight deadlocks the dispatcher.
 - **The async contract**: no write-back at all — register results and dp
@@ -219,35 +237,39 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**The single patch exists.** `--state <bubble> --movie <menu movie>` produces
-one 2.7 KB patch: window relocation + `$9BCD` (397 B sound-streamer tree) +
-`$8C95` on the SA-1, **BEHAVIORALLY EQUIVALENT over 900 frames of real input
-including the menu** — dropped frames 287→186, mean utilisation 53%→40% on
-that movie. The "menu-beep semantic divergence" that blocked it dissolved
-under the tick-level dive: it was never the offload. It was three verifier
-artifacts deep — wall-anchored input pairing, drifting dead-home deltas, and
-home-poisoning by coincidental zeros (section 5's last three equivalences).
-The offloads had been correct the whole time; the harness's demand
-(tick-identical wall-time counters) was one no speedup — v17 included —
-could meet.
+**The single patch exists, with the physics tree in it.**
+`--state <bubble> --movie <menu movie>` produces one 4.2 KB patch: window
+relocation + all three trees — `$9BCD` (397 B sound streamer), **`$8EF1`
+(1,324 B, the bubble physics tree)**, `$8C95` — on the SA-1,
+**BEHAVIORALLY EQUIVALENT over 900 frames of real input including the
+menu**: dropped frames 287→186, mean utilisation **53%→23%** on that movie.
+
+Two walls fell to get here, and neither was the offload:
+
+1. The "menu-beep semantic divergence" was three verifier artifacts deep —
+   wall-anchored input pairing, drifting dead-home deltas, and
+   home-poisoning by coincidental zeros (section 5's last three
+   equivalences). The offloads had been correct the whole time; the
+   harness's demand (tick-identical wall-time counters) was one no
+   speedup — v17 included — could meet.
+2. `$8EF1`'s I-RAM-hazard refusal came down to ONE instruction — an
+   uncovered `ASL $0000,X` on a rare branch of the shared slot-walker —
+   and pin propagation (section 6) proved it BW-RAM data on every in-tree
+   path. No per-copy byte was rewritten; the tree ships verbatim.
 
 **Superseded research builds** (both still true to their labels):
 
 - *Relocation-only*: FRAMES IDENTICAL over the same 900 frames;
   speed-neutral. (~1.8 KB)
-- *Bubble build*: window + 3 trees including the 1,324-byte `$8EF1` physics
-  tree — **dropped frames 343→200, utilisation 58%→17%** at the bubble
-  stage (v17: ~12%), menu garbled. (~4.2 KB)
+- *Bubble build*: same three trees, bubble-only evidence — **dropped
+  frames 343→200, utilisation 58%→17%** at the bubble stage (v17: ~12%),
+  menu garbled by the unshifted-idiom rewrites its coverage never tested.
+  The single patch is its strict successor.
 
-**What keeps the single patch above 17%**: `$8EF1` is refused under menu
-coverage by the I-RAM-hazard rule — its tree contains unshifted low-mirror
-sites with mixed or absent evidence, which can be neither shifted (their
-measured S-CPU traffic includes other classes) nor left (an unshifted
-low-mirror address is the SA-1's own I-RAM in the copy). A genuinely mixed
-site is an architectural limit of verbatim copies — more evidence cannot
-unmix it. Candidate paths if it ever matters enough: a per-copy site rewrite
-proven safe under the tree's own DBR pins, or a narrower tree that excludes
-the hazard branch.
+Still open: a bubble-stage measurement of the single patch itself (the
+17% figure belongs to the bubble build; the menu movie idles at the
+title). States are image-keyed, so the honest instrument is a recorded
+playthrough (F10) reaching stage 2, replayed over the patch.
 
 **Known hard limits** (dynamic evidence forever): pointer *values* in data;
 WMDATA-port traffic (real WRAM always — GIII has exactly one port site);

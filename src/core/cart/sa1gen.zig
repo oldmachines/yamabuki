@@ -1937,7 +1937,25 @@ const wg_bw_window: u16 = 0x6000;
 
 /// A window-offload call tree: members[0] is the root.
 const WinSpec = struct {
-    members: [ptr_tree_cap]struct { entry: u16, span: u32 } = undefined,
+    /// entry_pin: the DBR pin every in-tree call site carries into this
+    /// member (null = at least one call site is unpinned, or the root,
+    /// whose callers come through the stub with arbitrary DBR). A copy's
+    /// members are called ONLY from other copies in the same tree — the
+    /// member-to-member JSLs are re-pointed — so a pin proven at every
+    /// in-tree call site genuinely holds for the copy at runtime.
+    /// dbr_clean: the member's walked span — and, transitively, every
+    /// in-tree member it calls — contains no DBR-changing op (PLB, block
+    /// move), so a caller's pin survives calling it. Optimistic default;
+    /// the survey passes iterate it downward to the fixpoint.
+    /// pin_seen: a call site contributed this member's pin during the
+    /// current eligibility pass (the meet needs a first-write marker).
+    members: [ptr_tree_cap]struct {
+        entry: u16,
+        span: u32,
+        entry_pin: ?u8 = null,
+        pin_seen: bool = false,
+        dbr_clean: bool = true,
+    } = undefined,
     n_members: usize = 0,
     total_span: u32 = 0,
 };
@@ -1954,11 +1972,35 @@ const WinSpec = struct {
 /// I-RAM) and S4 verification is the judge.
 fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, entry: u16) ?WinSpec {
     var spec: WinSpec = .{};
-    spec.members[0] = .{ .entry = entry, .span = 0 };
+    spec.members[0] = .{ .entry = entry, .span = 0, .entry_pin = null, .pin_seen = true };
     spec.n_members = 1;
+    // Two phases. SURVEY walks flow only — members, spans, and each
+    // member's DBR-cleanliness — repeating while new members appear
+    // (bounded by the member cap), with the pin- and evidence-gated
+    // refusals disarmed: they depend on entry pins, which depend on
+    // cleanliness, which the survey exists to compute. JUDGE then runs
+    // once with everything armed; entry pins computed in that pass are a
+    // pure function of the surveyed facts, so one pass is the fixpoint.
+    var pass: usize = 0;
+    while (pass <= 2 * ptr_tree_cap + 1) : (pass += 1) {
+        const n_before = spec.n_members;
+        var clean_before: [ptr_tree_cap]bool = undefined;
+        for (spec.members[0..n_before], 0..) |m, i| clean_before[i] = m.dbr_clean;
+        for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
+        var walked: usize = 0;
+        while (walked < spec.n_members) : (walked += 1) {
+            if (!winWalkMember(out, usage, evidence, &spec, walked, false)) return null;
+        }
+        var stable = spec.n_members == n_before;
+        if (stable) for (spec.members[0..n_before], 0..) |m, i| {
+            if (m.dbr_clean != clean_before[i]) stable = false;
+        };
+        if (stable) break;
+    }
+    for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
     var walked: usize = 0;
     while (walked < spec.n_members) : (walked += 1) {
-        if (!winWalkMember(out, usage, evidence, &spec, walked)) return null;
+        if (!winWalkMember(out, usage, evidence, &spec, walked, true)) return null;
     }
     spec.total_span = 0;
     for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
@@ -1966,7 +2008,13 @@ fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, ent
     return spec;
 }
 
-fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec: *WinSpec, mi: usize) bool {
+/// Walk diagnostics, window flavor: set to a tree root to print every
+/// winWalkMember refusal for it (member, pc, opcode, operand, evidence
+/// class) plus each in-tree JSL's pin. Zero compiles every print away.
+const dbg_win_root: u16 = 0;
+
+fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec: *WinSpec, mi: usize, judge: bool) bool {
+    const dbg = dbg_win_root != 0 and spec.members[0].entry == dbg_win_root and judge;
     const span_max: u32 = 1024;
     const entry: u32 = spec.members[mi].entry;
     var pc: u32 = entry;
@@ -1975,11 +2023,31 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
     // $40/$41 now. Under a BW-RAM pin every absolute is data both CPUs
     // read identically — including operands that happen to fall in the
     // MMIO decode range ($8EF1 stores $3E00 under a pinned $40).
-    var db_pin: ?u8 = null;
+    // A member starts with the pin every in-tree call site proved
+    // (entry_pin) — the pin the root's own PLB idiom establishes travels
+    // through the tree's JSLs, which is what admits an UNCOVERED site in
+    // a shared helper: $8EF1's walker branch `ASL $0000,X` never executed
+    // under any coverage, but every path to it inside the tree runs under
+    // the root's $40 pin, where a tiny-base indexed absolute is BW-RAM
+    // data on both buses whatever the index holds.
+    var db_pin: ?u8 = spec.members[mi].entry_pin;
+    // No DBR-changing op seen in this member's span so far (see WinSpec).
+    var dbr_clean = true;
+    // A DBR-clean member entered under a pin holds it at EVERY
+    // instruction: nothing in its span (or, transitively, its in-tree
+    // callees) can change DBR, so the per-op survival approximation —
+    // which a mid-span RTL would needlessly kill — is not consulted.
+    const pin_locked = judge and spec.members[mi].dbr_clean and spec.members[mi].entry_pin != null;
     while (pc - entry < span_max) {
-        if (pc > 0xFFFF) return false;
+        if (pc > 0xFFFF) {
+            if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: ran past $FFFF\n", .{entry});
+            return false;
+        }
         if (usage[pc] & usage_map.flag_opcode == 0) {
-            if (pc >= limit) return false;
+            if (pc >= limit) {
+                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: uncovered byte at ${x:0>4} past frontier\n", .{ entry, pc });
+                return false;
+            }
             pc += 1;
             continue;
         }
@@ -1991,33 +2059,69 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
         switch (op) {
             0x6B => if (pc >= limit) {
                 spec.members[mi].span = pc + 1 - entry;
+                spec.members[mi].dbr_clean = dbr_clean;
                 return true;
             },
             0x22 => {
-                if (out[file + 3] != 0x00) return false;
-                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if (tgt < 0x8000) return false;
-                const dup = for (spec.members[0..spec.n_members]) |m| {
-                    if (m.entry == tgt) break true;
-                } else false;
-                if (!dup) {
-                    if (spec.n_members == ptr_tree_cap) return false;
-                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0 };
-                    spec.n_members += 1;
+                if (out[file + 3] != 0x00) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: far JSL to bank {x:0>2} at ${x:0>4}\n", .{ entry, out[file + 3], pc });
+                    return false;
                 }
+                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                if (tgt < 0x8000) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: JSL below ROM (${x:0>4}) at ${x:0>4}\n", .{ entry, tgt, pc });
+                    return false;
+                }
+                const dup_at: ?usize = for (spec.members[0..spec.n_members], 0..) |m, di| {
+                    if (m.entry == tgt) break di;
+                } else null;
+                const ci: usize = dup_at orelse blk: {
+                    if (spec.n_members == ptr_tree_cap) {
+                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: member cap at JSL ${x:0>4}\n", .{ entry, tgt });
+                        return false;
+                    }
+                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .entry_pin = db_pin, .pin_seen = true };
+                    spec.n_members += 1;
+                    break :blk spec.n_members - 1;
+                };
+                if (dup_at != null) {
+                    // Meet of the call sites' pins: the first site this
+                    // pass contributes its pin, every further site must
+                    // agree or the member weakens to unpinned.
+                    if (!spec.members[ci].pin_seen) {
+                        spec.members[ci].entry_pin = db_pin;
+                        spec.members[ci].pin_seen = true;
+                    } else if (!std.meta.eql(spec.members[ci].entry_pin, db_pin)) {
+                        spec.members[ci].entry_pin = null;
+                    }
+                }
+                // Transitive cleanliness: calling a dirty member dirties
+                // this one.
+                if (!spec.members[ci].dbr_clean) dbr_clean = false;
             },
             // Wrong return shape, near calls, far jumps, interrupt ops,
             // and the ops that would swap the SA-1's stack from under it.
-            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return false,
-            0x00, 0x02, 0xCB, 0xDB => return false,
-            0x1B, 0x9A => return false, // TCS / TXS
+            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => {
+                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: flow op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
+                return false;
+            },
+            0x00, 0x02, 0xCB, 0xDB => {
+                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: interrupt op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
+                return false;
+            },
+            0x1B, 0x9A => {
+                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: stack-swap op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
+                return false;
+            }, // TCS / TXS
             0x44, 0x54 => {
                 // Block moves only between the BW-RAM banks, where both
-                // CPUs see the same bytes.
+                // CPUs see the same bytes. (They also load DBR with the
+                // destination bank: not DBR-clean.)
                 const d0 = out[file + 1];
                 const s0 = out[file + 2];
                 if (!((d0 == 0x40 or d0 == 0x41) and (s0 == 0x40 or s0 == 0x41 or s0 >= 0x80 or (s0 >= 0x02 and s0 <= 0x3F))))
                     return false;
+                dbr_clean = false;
             },
             0x4C, 0x82, 0x80 => {
                 const dst: u32 = switch (op) {
@@ -2029,6 +2133,7 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
                 limit = @max(limit, dst);
                 if (dst <= pc and pc >= limit) {
                     spec.members[mi].span = pc + len - entry;
+                    spec.members[mi].dbr_clean = dbr_clean;
                     return true;
                 }
             },
@@ -2042,10 +2147,25 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
             },
             0xAB => {
                 if (file < 3 or out[file - 3] != 0xA9 or out[file - 1] != 0x48) db_pin = null;
+                dbr_clean = false;
             },
             else => {},
         }
-        if (!dbrSurvives(out, usage, file, op)) db_pin = null;
+        // A pin survives a call to an in-tree member whose own walked
+        // span is DBR-clean — the walk sees the callee's whole reachable
+        // body, which is a proof dbrTransparent's bounded scan cannot
+        // always deliver. (Cleanliness comes from the survey passes;
+        // in-tree callees of callees are members too, so the meet over
+        // every member's flag makes the property transitive.)
+        const in_tree_clean = op == 0x22 and out[file + 3] == 0x00 and blk: {
+            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            for (spec.members[0..spec.n_members]) |m| {
+                if (m.entry == tgt) break :blk m.dbr_clean;
+            }
+            break :blk false;
+        };
+        if (dbg and op == 0x22) std.debug.print("[win $8ef1] member ${x:0>4}: JSL ${x:0>4} at ${x:0>4} pin {?x} in_tree_clean {}\n", .{ entry, std.mem.readInt(u16, out[file + 1 ..][0..2], .little), pc, db_pin, in_tree_clean });
+        if (!pin_locked and !in_tree_clean and !dbrSurvives(out, usage, file, op)) db_pin = null;
         switch (usage_map.mode(op)) {
             .none, .dp, .dp_idx => {},
             .abs, .abs_x, .abs_y => {
@@ -2054,7 +2174,10 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
                 // under a pinned BW-RAM bank the same operand is data both
                 // CPUs read identically.
                 const pinned_bw = db_pin != null and (db_pin.? == 0x40 or db_pin.? == 0x41);
-                if (!pinned_bw and v >= 0x2100 and v < 0x4380) return false;
+                if (judge and !pinned_bw and v >= 0x2100 and v < 0x4380) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: MMIO abs ${x:0>4} at ${x:0>4} (op {x:0>2}, pin {?x})\n", .{ entry, v, pc, op, db_pin });
+                    return false;
+                }
                 // An UNSHIFTED low-mirror site (mixed or absent evidence
                 // keeps the rewriter's hands off it) means WRAM on the
                 // S-CPU but the SA-1's OWN I-RAM in the copy — a tree
@@ -2063,30 +2186,42 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
                 // branch at the START beep and the menu never reset its
                 // frame counter). Pure-ROM evidence is fine: same bytes
                 // on both buses.
-                if (!pinned_bw and v < 0x2000) {
+                if (judge and !pinned_bw and v < 0x2000) {
                     const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
                     const shifted = if (e != 0)
                         e == usage_map.site_wram_low
                     else
                         usage_map.mode(op) == .abs or v >= 0x100;
-                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) return false;
+                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) {
+                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: I-RAM hazard abs op {x:0>2} ${x:0>4} at ${x:0>4} evidence {x:0>2} pin {?x}\n", .{ entry, op, v, pc, e, db_pin });
+                        return false;
+                    }
                 }
             },
             .long, .long_x => {
                 const b = out[file + 3];
                 const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380) return false;
+                if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: MMIO long ${x:0>2}:{x:0>4} at ${x:0>4}\n", .{ entry, b, v, pc });
+                    return false;
+                }
                 // $7E/$7F would be real WRAM — the window rewrite
                 // re-banked every covered site, so seeing one here means
                 // the walk wandered into unrewritten territory.
-                if (b == 0x7E or b == 0x7F) return false;
+                if (b == 0x7E or b == 0x7F) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: unrewritten WRAM long ${x:0>2}:{x:0>4} at ${x:0>4}\n", .{ entry, b, v, pc });
+                    return false;
+                }
                 // Same I-RAM hazard as the absolute arm: an unshifted
                 // indexed-long low-mirror site diverges on the SA-1
                 // unless its measured traffic was pure ROM.
-                if (usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and v < 0x2000) {
+                if (judge and usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and v < 0x2000) {
                     const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
                     const shifted = e != 0 and e == usage_map.site_wram_low;
-                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) return false;
+                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) {
+                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: I-RAM hazard long_x ${x:0>2}:{x:0>4} at ${x:0>4} evidence {x:0>2}\n", .{ entry, b, v, pc, e });
+                        return false;
+                    }
                 }
             },
         }
@@ -5008,6 +5143,99 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
         try testing.expect(trace.total > 0);
         // (No port-idle assert: the caller loops hot, so a sampled
         // instant is legitimately mid-handshake.)
+    }
+}
+
+test "window offload: the root's DBR pin travels through in-tree JSLs and admits an uncovered site" {
+    // The $8EF1 shape in miniature: the root pins the WRAM bank (the
+    // window rewrite re-banks the idiom to $40), then JSLs a helper whose
+    // never-executed branch holds a tiny-base indexed absolute — no
+    // evidence, unshiftable, the SA-1's own I-RAM if the copy ran it
+    // unpinned. Every in-tree path to it carries the root's pin, under
+    // which it is BW-RAM data on both buses whatever X holds — so the
+    // tree is eligible. Without the pin idiom the same tree must refuse.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    for ([_]bool{ true, false }) |pinned| {
+        const rom = try makeWgRom(gpa);
+        defer gpa.free(rom);
+        @memset(rom[0x8000..0x10000], 0xFF); // bank 1: the any-bank carve
+        @memcpy(rom[0x0000..0x000A], &[_]u8{
+            0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+            0x22, 0x80, 0x80, 0x00, // JSL $00:8080
+            0x80, 0xFA, // BRA back to the JSL
+        });
+        // Root: pin the WRAM bank (or NOPs for the control), store a
+        // marker, call the helper.
+        @memcpy(rom[0x0080..0x008E], if (pinned) &[_]u8{
+            0xA9, 0x7E, 0x48, 0xAB, // LDA #$7E / PHA / PLB (re-banked to $40)
+            0xA9, 0x11, 0x8D, 0x00, 0x05, // LDA #$11 / STA $0500
+            0x22, 0xA0, 0x80, 0x00, // JSL $00:80A0
+            0x6B, // RTL
+        } else &[_]u8{
+            0xEA, 0xEA, 0xEA, 0xEA,
+            0xA9, 0x11, 0x8D, 0x00,
+            0x05, 0x22, 0xA0, 0x80,
+            0x00, 0x6B,
+        });
+        // Helper: a live counter, then a never-taken branch guarding the
+        // hazard-shaped site (statically discovered code, zero evidence).
+        @memcpy(rom[0x00A0..0x00AB], &[_]u8{
+            0xEE, 0x01, 0x05, // INC $0501
+            0xA9, 0x01, // LDA #$01
+            0xD0, 0x03, // BNE +3 (always taken)
+            0x1E, 0x00, 0x00, // ASL $0000,X — never executes
+            0x6B, // RTL
+        });
+
+        const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+        defer gpa.free(bytes);
+        @memset(bytes, 0);
+        for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8008 }) |a| markOp(bytes, a);
+        if (pinned) {
+            for ([_]u32{ 0x8080, 0x8082, 0x8083 }) |a| markOp(bytes, a);
+        } else {
+            for ([_]u32{ 0x8080, 0x8081, 0x8082, 0x8083 }) |a| markOp(bytes, a);
+        }
+        for ([_]u32{ 0x8084, 0x8086, 0x8089, 0x808D }) |a| markOp(bytes, a);
+        for ([_]u32{ 0x80A0, 0x80A3, 0x80A5, 0x80A7, 0x80AA }) |a| markOp(bytes, a);
+        // The helper's live sites measured as $7E-mediated traffic (the
+        // real trees' shape) so the rewriter leaves their operands to the
+        // pin; the guarded ASL keeps ZERO evidence — the hazard shape.
+        const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+        defer gpa.free(sites);
+        @memset(sites, 0);
+        sites[0x80A0] = usage_map.site_wram_bank;
+        sites[0x8086] = usage_map.site_wram_bank;
+
+        const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
+        var ref: ?Refusal = null;
+        const res = try convertWholeGame(gpa, rom, bytes, sites, false, true, &cand, false, &ref);
+        defer gpa.free(res.image);
+        if (!pinned) {
+            // Control: the uncovered site with no pin is the I-RAM hazard.
+            try testing.expectEqual(@as(u8, 0), res.stats.offload_count);
+            continue;
+        }
+        try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
+        try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
+
+        const cart = try cartridge.Cartridge.load(gpa, res.image);
+        const con = try gpa.create(console.FastConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        for (0..5) |_| con.runFrame();
+        // The tree ran on the SA-1 against the shared window: marker and
+        // counter in BW-RAM (the pinned bank IS the relocated home), real
+        // WRAM untouched.
+        try testing.expectEqual(@as(u8, 0x11), con.bus.sa1.bwram[0x0500]);
+        try testing.expect(con.bus.sa1.bwram[0x0501] > 2);
+        try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0500]);
+        try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0501]);
     }
 }
 
