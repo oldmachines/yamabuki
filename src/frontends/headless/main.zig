@@ -1291,7 +1291,13 @@ fn runSa1Gen(
     const conv_hashes = try gpa.alloc(u64, total);
     const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(ub, 0);
-    const umap: core.usage_map.UsageMap = .{ .bytes = ub };
+    // Per-site effective-address evidence: the dynamic answer to the
+    // statically undecidable idioms (is $0000,X a ROM table walk or a
+    // low-WRAM walk? measure it). Both the evidence pass and the main
+    // baseline accumulate into the same map.
+    const site_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    @memset(site_ev, 0);
+    const umap: core.usage_map.UsageMap = .{ .bytes = ub, .sites = site_ev };
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
     var base_audio = core.console.audio_hash_init;
@@ -1500,7 +1506,7 @@ fn runSa1Gen(
 
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {

@@ -343,8 +343,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (self.usage) |u| {
                 if (op) |o| u.noteInstr(pc, o, m8, x8);
                 const width: u8 = if (op) |o| @max(1, usage_map.dataWidth(o, m8, x8)) else 1;
-                if (dataAddr(self.bus.last_data_read)) |a| u.noteRead(a, width);
-                if (dataAddr(self.bus.last_data_write)) |a| u.noteWrite(a, width);
+                if (dataAddr(self.bus.last_data_read)) |a| {
+                    u.noteRead(a, width);
+                    if (op != null) u.noteSite(pc, a);
+                }
+                if (dataAddr(self.bus.last_data_write)) |a| {
+                    u.noteWrite(a, width);
+                    if (op != null) u.noteSite(pc, a);
+                }
             }
         }
 

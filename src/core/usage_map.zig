@@ -59,11 +59,44 @@ pub const cpu_map_len: usize = 1 << 24;
 /// The (zero-filled here) SMP block that follows it in the exported file.
 pub const smp_map_len: usize = 1 << 16;
 
+/// Per-SITE effective-address evidence: what memory an instruction's data
+/// accesses actually reached, recorded on the INSTRUCTION's address. This
+/// is the dynamic answer to the statically undecidable idioms — the same
+/// operand bytes mean "walk a ROM table" or "walk low WRAM" depending on
+/// runtime register values, and a rewriter that measured them does not
+/// have to guess.
+pub const site_wram_low: u8 = 0x01; // system-bank access below $2000 (the WRAM mirror)
+pub const site_rom: u8 = 0x02; // ROM, through any bank
+pub const site_wram_bank: u8 = 0x04; // through bank $7E/$7F (DBR- or long-mediated)
+pub const site_other: u8 = 0x08; // MMIO, cart space, open bus
+
+/// Classify one effective 24-bit data address into a site-evidence bit.
+pub fn siteClass(addr: u24) u8 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (bank == 0x7E or bank == 0x7F) return site_wram_bank;
+    if ((bank & 0x7F) <= 0x3F) {
+        if (a16 < 0x2000) return site_wram_low;
+        if (a16 >= 0x8000) return site_rom;
+        return site_other;
+    }
+    return if (bank >= 0xC0 or (bank & 0x7F) >= 0x40) site_rom else site_other;
+}
+
 pub const UsageMap = struct {
     /// Caller-allocated, `cpu_map_len` bytes, zeroed before the run. Kept
     /// out of every core struct on purpose — 16 MiB belongs on the heap of
     /// whoever asked for coverage, not inside a Console or Profiler.
     bytes: []u8,
+    /// Optional per-site evidence map, same length, indexed by the
+    /// INSTRUCTION address (`site_*` bits). Null when nobody asked.
+    sites: ?[]u8 = null,
+
+    /// Record where an instruction's data access actually landed.
+    pub fn noteSite(self: *const UsageMap, pc: u24, addr: u24) void {
+        const s = self.sites orelse return;
+        s[pc] |= siteClass(addr);
+    }
 
     /// One executed instruction: opcode byte and its operand bytes.
     pub fn noteInstr(self: *const UsageMap, pc: u24, op: u8, m8: bool, x8: bool) void {
