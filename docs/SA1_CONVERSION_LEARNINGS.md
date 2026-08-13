@@ -294,14 +294,37 @@ three equivalences) — no speedup, v17 included, can hold tick-identical
 wall-time counters; and `$8EF1`'s I-RAM refusal was ONE uncovered
 instruction, admitted by DBR-pin propagation with no byte rewritten.
 
-**The open chase**: why the offloaded copies diverge on the title-music
-path under full-cycle evidence — the rewrite decisions changed with the
-wider coverage (405 vs 370 shifted absolute sites), and one of the
-title-path decisions feeds a walker cursor the copies read differently.
-Same method as every blocker before it: dump-diff the failing rung at
-f830, disassemble the first diverging cell's writer, fix the rule.
-After that: the bubble-stage measurement over a recorded playthrough
-(F10) reaching stage 2.
+**The wall the arc ends against — context-split sites.** The first
+input surface that actually STARTS A GAME (menu → 1 player → weapon
+select → stage 1 → death → continue, all scripted and validated) proved
+that ~100 sites in the shared mode-handler region (`$A2E0-$A4xx`,
+unindexed absolutes on `$02xx/$12xx/$1Cxx` cells) are executed by TWO
+caller classes: system-DBR callers (title/attract paths) that need the
+`+$6000` shift, and `$7E`-pinned callers (gameplay, pin re-banked to
+`$40`) that need the operand untouched. The evidence honestly measures
+them mixed; either single decision breaks one class — SHIFTED broke
+stage-1 loading (black screen with music at 1-player start, found by
+play), UNSHIFTED broke the title path at f833 (found by the tier). One
+operand byte cannot serve both worlds. Diffing the two relocations
+byte-for-byte is what named the cluster: 286 bytes, 222 runs, every one
+a `$1x`↔`$7x` operand high byte.
+
+The candidate mechanisms, both real engineering: per-site DBR-dispatch
+thunks (a 3-byte `JSR` fits over the site, but the thunk must exit with
+the OP's own flag semantics — `CMP / STA / BEQ` callers make a naive
+save/restore wrong), or duplicating the shared helpers per caller class
+and re-pointing the pinned callers. Until one is built, offloads AND
+the full-game relocation are blocked on this game; the attract-cycle
+relocation remains the widest verified build.
+
+A phase-dependence note from the same run: the sound pump measures
+MAINLINE context in attract and INTERRUPT context in gameplay — the
+single-context rule fired for the first time (and kept the interrupt
+class, which under gameplay carries the larger slow work). Context is a
+property of a surface, not of a routine.
+
+After the split-site mechanism: the bubble-stage measurement over a
+recorded playthrough (F10) reaching stage 2.
 
 **Known hard limits** (dynamic evidence forever): pointer *values* in data;
 WMDATA-port traffic (real WRAM always — GIII has exactly one port site);
