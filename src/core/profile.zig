@@ -457,6 +457,11 @@ pub const Routine = struct {
     kind: RoutineKind,
     /// Times it was entered (calls + interrupt dispatches).
     calls: u64,
+    /// Entries made while an interrupt frame was on the stack (the handler's
+    /// own dispatch included). `int_entries * 2 > calls` reads as "this
+    /// routine lives in interrupt context" — the offload machinery's single
+    /// mailbox cannot serve two contexts, so context decides coexistence.
+    int_entries: u64,
     /// Master cycles attributed while it was on top of the stack, waits
     /// excluded — the ranking number.
     self_cycles: u64,
@@ -647,6 +652,8 @@ pub const Profiler = struct {
     /// the call, and the observed-cycle counter at entry (for inclusive time).
     stack: [call_stack_max]StackFrame,
     depth: u16,
+    /// Interrupt frames currently on the stack (nonzero = interrupt context).
+    int_depth: u16,
     stack_resets: u64,
     /// Every cycle the profiler has seen, work or idle — the wall clock that
     /// inclusive time is measured on.
@@ -691,6 +698,9 @@ pub const Profiler = struct {
         slot: u16,
         sp_pre: u16,
         observed_at: u64,
+        /// This frame was pushed by an interrupt dispatch — everything above
+        /// it runs in interrupt context.
+        is_int: bool = false,
     };
 
     pub const LedgerEntry = struct {
@@ -728,6 +738,7 @@ pub const Profiler = struct {
             .entry = Routine.empty,
             .kind = .code,
             .calls = 0,
+            .int_entries = 0,
             .self_cycles = 0,
             .incl_cycles = 0,
             .slow_cycles = 0,
@@ -749,8 +760,9 @@ pub const Profiler = struct {
             .dma_overflow = false,
         }),
         .routines_dropped = 0,
-        .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0 }),
+        .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0, .is_int = false }),
         .depth = 0,
+        .int_depth = 0,
         .stack_resets = 0,
         .observed = 0,
         .ledger = @splat(.{ .slot = 0, .pure = 0, .iter = 0 }),
@@ -976,9 +988,9 @@ pub const Profiler = struct {
     fn applyEvent(self: *Profiler, ev: Event) void {
         switch (ev.kind) {
             .none => {},
-            .call => self.pushFrame(ev.target, ev.sp_before, ev.d),
+            .call => self.pushFrame(ev.target, ev.sp_before, ev.d, false),
             .nmi, .irq => {
-                self.pushFrame(ev.target, ev.sp_before, ev.d);
+                self.pushFrame(ev.target, ev.sp_before, ev.d, true);
                 // Tag the handler. First insert wins; a routine both called
                 // and interrupted into keeps whichever it was seen as first.
                 if (self.depth > 0) {
@@ -1000,7 +1012,7 @@ pub const Profiler = struct {
         }
     }
 
-    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16) void {
+    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16, is_int: bool) void {
         if (self.depth == call_stack_max) {
             // Deeper than the model follows — recursion, or a game using the
             // stack in ways no model survives. Start over and count it rather
@@ -1018,16 +1030,19 @@ pub const Profiler = struct {
                 r.d_seen = true;
             } else if (r.entry_d != d) r.d_varies = true;
         }
+        if (is_int) self.int_depth += 1;
         const r = &self.routines[slot];
         r.calls += 1;
+        if (self.int_depth > 0) r.int_entries += 1;
         r.on_stack += 1;
-        self.stack[self.depth] = .{ .slot = slot, .sp_pre = sp_pre, .observed_at = self.observed };
+        self.stack[self.depth] = .{ .slot = slot, .sp_pre = sp_pre, .observed_at = self.observed, .is_int = is_int };
         self.depth += 1;
     }
 
     fn popFrame(self: *Profiler) void {
         self.depth -= 1;
         const f = self.stack[self.depth];
+        if (f.is_int) self.int_depth -|= 1;
         const r = &self.routines[f.slot];
         r.on_stack -|= 1;
         // Inclusive time is charged once per outermost instance, so recursion
@@ -1375,6 +1390,16 @@ pub const Conversion = struct {
     concentrated: bool = false,
     n: usize = 0,
     entries: [conversion_set_max]u24 = @splat(0),
+    /// Per entry: the routine runs mostly in interrupt context (more than
+    /// half its entries under an interrupt frame). The offload mailbox is
+    /// single-channel, so interrupt- and mainline-context offloads cannot
+    /// coexist — an interrupting stub call mid-handshake deadlocks both
+    /// CPUs (measured: Gradius III's attract demo, NMI-side sound pump vs
+    /// mainline physics).
+    entry_int: [conversion_set_max]bool = @splat(false),
+    /// Per entry: its slow cycles — the weight the coexistence rule uses
+    /// to keep the more valuable context class.
+    entry_slow: [conversion_set_max]u64 = @splat(0),
     /// Fraction of slow work the set covers, and the denominator itself.
     covered: f64 = 0,
     slow_work: u64 = 0,
@@ -1446,6 +1471,8 @@ pub fn assessConversion(prof: *const Profiler, verdict: Verdict) Conversion {
         if (out.n == conversion_set_max) break;
         set[out.n] = slot;
         out.entries[out.n] = @intCast(prof.routines[slot].entry);
+        out.entry_int[out.n] = prof.routines[slot].int_entries * 2 > prof.routines[slot].calls;
+        out.entry_slow[out.n] = prof.routines[slot].slow_cycles;
         out.n += 1;
         cum += prof.routines[slot].slow_cycles;
         if (@as(f64, @floatFromInt(cum)) >= target) break;
@@ -2437,6 +2464,31 @@ test "recursion counts inclusive time once" {
     // Pushed (outer) at observed 6, popped at 42: one span, not two.
     try std.testing.expectEqual(@as(u64, 36), a.incl_cycles);
     try std.testing.expect(t.p.attributionBalanced());
+}
+
+test "interrupt context marks every entry made under the handler" {
+    var p: Profiler = .init;
+    const cyc: u64 = 6;
+    // main -> A (mainline).
+    p.step(0x00_9000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_A000, cyc, false, null, null, .{});
+    // NMI dispatches on top; the handler calls A too.
+    p.step(0x00_A003, cyc, false, null, null, .{ .kind = .nmi, .target = 0x00_F000, .sp_before = 0x1FD, .sp_after = 0x1F9 });
+    p.step(0x00_F000, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1F9, .sp_after = 0x1F7 });
+    p.step(0x00_A000, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1F7, .sp_after = 0x1F9 });
+    p.step(0x00_F003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1F9, .sp_after = 0x1FD });
+    // Back under main: A again, mainline.
+    p.step(0x00_A003, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+    p.step(0x00_9004, cyc, false, null, null, .{ .kind = .call, .target = 0x00_A000, .sp_before = 0x1FF, .sp_after = 0x1FD });
+    p.step(0x00_A000, cyc, false, null, null, .{ .kind = .ret, .target = 0, .sp_before = 0x1FD, .sp_after = 0x1FF });
+
+    const a = p.routineInfo(0x00_A000).?;
+    try std.testing.expectEqual(@as(u64, 3), a.calls);
+    try std.testing.expectEqual(@as(u64, 1), a.int_entries); // only the call under the NMI frame
+    const h = p.routineInfo(0x00_F000).?;
+    try std.testing.expectEqual(@as(u64, 1), h.calls);
+    try std.testing.expectEqual(@as(u64, 1), h.int_entries); // the handler itself runs in interrupt context
+    try std.testing.expectEqual(@as(u16, 0), p.int_depth); // fully unwound
 }
 
 test "an interrupt pushes a tagged handler frame" {

@@ -1484,10 +1484,36 @@ fn runSa1Gen(
     // WINDOW offload candidates: the profile's hot entries, no plan or
     // page machinery — a window image has no marshal to size, only trees
     // to walk. The bisect and mode ladder below drive them as usual.
+    //
+    // ONE CONTEXT ONLY: the offload mailbox is single-channel, so a stub
+    // call from interrupt context landing inside a mainline handshake
+    // deadlocks both CPUs (measured on Gradius III's attract demo — the
+    // NMI-side sound pump stomped the physics tree's smeg mid-flight and
+    // both ends waited forever). Candidates partition by measured
+    // context and the class with less slow work is refused by name.
     if (args.window) {
         conv = evidence_conv orelse profile.assessConversion(&con.prof, sum.verdict);
-        for (conv.entries[0..conv.n], 0..) |e, i| cands[i] = .{ .entry = e };
-        n_cands = conv.n;
+        var int_slow: u64 = 0;
+        var main_slow: u64 = 0;
+        for (conv.entry_int[0..conv.n], conv.entry_slow[0..conv.n]) |is_int, slow| {
+            if (is_int) int_slow += slow else main_slow += slow;
+        }
+        const keep_int = int_slow > main_slow;
+        for (conv.entries[0..conv.n], 0..) |e, i| {
+            if (conv.entry_int[i] != keep_int) {
+                try out.print(
+                    "  window: ${x:0>2}:{x:0>4} runs in {s} context — refused (offloads share one mailbox; keeping the {s} class, {d} vs {d} slow cycles)\n",
+                    .{
+                        e >> 16,                                                             e & 0xFFFF,
+                        if (conv.entry_int[i]) @as([]const u8, "interrupt") else "mainline", if (keep_int) @as([]const u8, "interrupt") else "mainline",
+                        if (keep_int) int_slow else main_slow,                               if (keep_int) main_slow else int_slow,
+                    },
+                );
+                continue;
+            }
+            cands[n_cands] = .{ .entry = e };
+            n_cands += 1;
+        }
         if (!args.verify_behavioral) {
             for (cands[0..n_cands]) |*c| c.no_async = true;
         }

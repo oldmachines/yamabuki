@@ -220,6 +220,24 @@ Layered gates, strictest verdict that applies:
   whatever the index holds.
 - **Async monopoly**: one fire-and-forget offload per conversion, first
   chosen; a sibling's un-fenced send mid-flight deadlocks the dispatcher.
+- **One context only**: the mailbox is single-channel, so a stub call from
+  interrupt context landing inside a mainline handshake would stomp `smeg`
+  before the SA-1 consumes it and park both CPUs. The profiler now counts
+  each routine's entries made under an interrupt frame, and window
+  candidates partition by majority context — the class with less measured
+  slow work is refused by name. Honest footnote: this guard was built for
+  a Gradius III wedge that turned out to be something else (all three
+  trees measured mainline; the wedge was a diverging copy spinning
+  forever, below) — it stands as a cheap defensive contract for games
+  whose sound engines really do run under NMI.
+- **A diverging copy is a hung machine, not just a wrong answer.** The
+  wedge signature — S-CPU parked in the stub bank, SA-1 mid-copy, `smeg`
+  pending unconsumed — means the copy entered a loop its S-CPU original
+  never does (Gradius III: the slot walker's cursor marching past `$A000`
+  with a limit compare that can never catch it). The behavioral tier sees
+  it as spreading divergence; the player sees a freeze. Bounds on scan
+  loops in copies are not verifiable statically — coverage and the tier
+  are the net.
 - **The async contract**: no write-back at all — register results and dp
   writes dropped; only shared-BW-RAM effects survive. (Earned when a fence's
   dp-page copy-back reverted the APU upload counter mid-handshake.)
@@ -249,39 +267,41 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**The single patch exists, with the physics tree in it.**
-`--state <bubble> --movie <menu movie>` produces one 4.2 KB patch: window
-relocation + all three trees — `$9BCD` (397 B sound streamer), **`$8EF1`
-(1,324 B, the bubble physics tree)**, `$8C95` — on the SA-1,
-**BEHAVIORALLY EQUIVALENT over 900 frames of real input including the
-menu**: dropped frames 287→186, mean utilisation **53%→23%** on that movie.
+**The shipping patch is the full-cycle relocation.** Under the widest
+surface yet — 4,800 frames covering the logo auto-advance, title with
+music, menu, and the attract gameplay demo — the relocation-only patch is
+BEHAVIORALLY EQUIVALENT (worst active run 3) and cycles the whole attract
+sequence untouched. Speed-neutral, but correct everywhere a player can
+reach without a controller.
 
-Two walls fell to get here, and neither was the offload:
+**The offloaded builds are honest speedups on narrower surfaces, and the
+widest surface caught them.** The three-tree build (`$9BCD` + the
+1,324-byte `$8EF1` physics tree + `$8C95`) verified BEHAVIORALLY
+EQUIVALENT over 1,800 frames including the menu — dropped frames
+287→186, utilisation **53%→23%** — and its earning history is real: the
+wall-time verdict work and the pin propagation (sections 5 and 6) were
+both required and both stand. But the 4,800-frame surface added the
+title-music phase, and there every offload build diverges at ~f830: the
+copies enter states their S-CPU originals never do (the slot walker's
+runaway cursor), the divergence spreads, and live play freezes — the
+attract-demo wedge a play session found first. The auto-bisect dropped
+all three and shipped the relocation, which is the system working as
+designed: the widest coverage wins the argument.
 
-1. The "menu-beep semantic divergence" was three verifier artifacts deep —
-   wall-anchored input pairing, drifting dead-home deltas, and
-   home-poisoning by coincidental zeros (section 5's last three
-   equivalences). The offloads had been correct the whole time; the
-   harness's demand (tick-identical wall-time counters) was one no
-   speedup — v17 included — could meet.
-2. `$8EF1`'s I-RAM-hazard refusal came down to ONE instruction — an
-   uncovered `ASL $0000,X` on a rare branch of the shared slot-walker —
-   and pin propagation (section 6) proved it BW-RAM data on every in-tree
-   path. No per-copy byte was rewritten; the tree ships verbatim.
+Two walls that fell along the way, for the record: the "menu-beep
+semantic divergence" was three verifier artifacts (section 5's last
+three equivalences) — no speedup, v17 included, can hold tick-identical
+wall-time counters; and `$8EF1`'s I-RAM refusal was ONE uncovered
+instruction, admitted by DBR-pin propagation with no byte rewritten.
 
-**Superseded research builds** (both still true to their labels):
-
-- *Relocation-only*: FRAMES IDENTICAL over the same 900 frames;
-  speed-neutral. (~1.8 KB)
-- *Bubble build*: same three trees, bubble-only evidence — **dropped
-  frames 343→200, utilisation 58%→17%** at the bubble stage (v17: ~12%),
-  menu garbled by the unshifted-idiom rewrites its coverage never tested.
-  The single patch is its strict successor.
-
-Still open: a bubble-stage measurement of the single patch itself (the
-17% figure belongs to the bubble build; the menu movie idles at the
-title). States are image-keyed, so the honest instrument is a recorded
-playthrough (F10) reaching stage 2, replayed over the patch.
+**The open chase**: why the offloaded copies diverge on the title-music
+path under full-cycle evidence — the rewrite decisions changed with the
+wider coverage (405 vs 370 shifted absolute sites), and one of the
+title-path decisions feeds a walker cursor the copies read differently.
+Same method as every blocker before it: dump-diff the failing rung at
+f830, disassemble the first diverging cell's writer, fix the rule.
+After that: the bubble-stage measurement over a recorded playthrough
+(F10) reaching stage 2.
 
 **Known hard limits** (dynamic evidence forever): pointer *values* in data;
 WMDATA-port traffic (real WRAM always — GIII has exactly one port site);
