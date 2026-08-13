@@ -3343,6 +3343,54 @@ pub fn convertWholeGame(
     // patched after the pass, once the bank-0 carve is paintable.
     var thunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
     var n_thunks: usize = 0;
+    // CELL COHERENCE (window mode): per-site evidence decisions can split
+    // one cell's accessor population — gameplay evidence shifted a sound
+    // cell's readers while its pinned writers stayed, and the two homes
+    // diverged at the title-music handoff. The invariant is per CELL, not
+    // per site: collect, for every unindexed absolute operand below
+    // $2000, the union of its sites' evidence classes plus whether any
+    // site reaches it under a re-banked WRAM pin. A pinned accessor is
+    // STUCK at the BW-RAM home (its unshifted operand under DBR $40/$41
+    // is bwram[v]), so a {low, bank} cell's home is forced there and the
+    // unpinned sites SHIFT to follow, whatever their own class mix.
+    var cell_ev: [0x2000]u8 = @splat(0);
+    var cell_pinned: [0x2000]bool = @splat(false);
+    if (bwram and window) {
+        var pbank: u32 = 0;
+        while (pbank < 0x40) : (pbank += 1) {
+            const pbf = pbank * 0x8000;
+            if (pbf >= out.len) break;
+            var pa: u32 = 0x8000;
+            var p_dbr_bw = false;
+            while (pa < 0x10000) : (pa += 1) {
+                const pca = (pbank << 16) | pa;
+                if ((cov[pca] | cov[0x80_0000 | pca]) & usage_map.flag_opcode == 0) continue;
+                const pf = pbf + (pa - 0x8000);
+                const pop = out[pf];
+                if (usage_map.mode(pop) == .abs) {
+                    const pv = std.mem.readInt(u16, out[pf + 1 ..][0..2], .little);
+                    if (pv < 0x2000) {
+                        if (p_dbr_bw) {
+                            cell_pinned[pv] = true;
+                        } else {
+                            const pe: u8 = if (site_evidence) |s| s[pca] | s[0x80_0000 | pca] else 0;
+                            cell_ev[pv] |= pe;
+                        }
+                    }
+                }
+                if (!dbrSurvives(out, cov, pf, pop)) p_dbr_bw = false;
+                if (pop == 0xAB) {
+                    p_dbr_bw = pf >= 3 and out[pf - 3] == 0xA9 and out[pf - 1] == 0x48 and
+                        (out[pf - 2] == 0x7E or out[pf - 2] == 0x7F);
+                } else if (pop == 0x44 or pop == 0x54) {
+                    const d0 = out[pf + 1];
+                    p_dbr_bw = d0 == 0x7E or d0 == 0x7F or (d0 == 0x00 and for (bm[0..n_bm]) |f| {
+                        if (f == pf) break true;
+                    } else false);
+                }
+            }
+        }
+    }
     while (bank < 0x40) : (bank += 1) {
         const bank_file = bank * 0x8000;
         if (bank_file >= out.len) break;
@@ -3475,14 +3523,11 @@ pub fn convertWholeGame(
                     // reads $01:8000+X via `LDY $0000,X`) and stays; real
                     // table bases shift.
                     const e: u8 = if (site_evidence) |s| s[cpu_addr] | s[0x80_0000 | cpu_addr] else 0;
-                    // A CONTEXT-SPLIT site: measured under BOTH a system
-                    // DBR (the mirror — needs the shift) and a WRAM pin
-                    // (re-banked to $40/$41 — needs the operand as-is).
-                    // The same cell, two idioms, opposite rewrites: no
-                    // single operand serves both callers (measured on
-                    // Gradius III's mode helpers — shifted broke stage-1
-                    // loading, unshifted broke the title path). The site
-                    // becomes a JSR to a DBR-dispatching thunk instead.
+                    // A CONTEXT-SPLIT single site: THIS instruction was
+                    // measured under both a system DBR and a WRAM pin, so
+                    // no single operand serves its two callers and no
+                    // per-cell home argument applies either — the site
+                    // becomes a JSR to a DBR-dispatching thunk.
                     if (window and v < 0x2000 and
                         e == usage_map.site_wram_low | usage_map.site_wram_bank)
                     {
@@ -3492,7 +3537,20 @@ pub fn convertWholeGame(
                         n_thunks += 1;
                         continue;
                     }
-                    const shift_it = if (e != 0)
+                    // Cell coherence (unindexed, single-context site): a
+                    // {low, bank} CELL's home is BW-RAM — its pinned
+                    // accessors are stuck there — so this unpinned site
+                    // shifts to follow even when its own measured class
+                    // says "stay" (distinct sites carried the two
+                    // classes; the collection pass above unioned them).
+                    const cell_move = window and usage_map.mode(op) == .abs and v < 0x2000 and blk: {
+                        const ce = cell_ev[v] | e;
+                        const has_low = ce & usage_map.site_wram_low != 0;
+                        const has_bank = ce & usage_map.site_wram_bank != 0 or cell_pinned[v];
+                        const has_other = ce & (usage_map.site_rom | usage_map.site_other) != 0;
+                        break :blk !has_other and has_low and has_bank;
+                    };
+                    const shift_it = cell_move or if (e != 0)
                         e == usage_map.site_wram_low
                     else
                         usage_map.mode(op) == .abs or v >= 0x100;

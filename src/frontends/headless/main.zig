@@ -702,7 +702,7 @@ fn verifyBehavioral(
 
     var out: Behavioral = .{
         .verdict = .{ .pass = .clean },
-        .stats = .{},
+        .stats = .{ .epoch_budget = @intCast(edges.len + 1) },
         .ticks_base = 0,
         .ticks_conv = 0,
         .first_bad_frame = 0,
@@ -1484,7 +1484,13 @@ fn runSa1Gen(
         var esamples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
         try esamples.ensureTotalCapacity(total);
         for (0..total) |i| {
-            feedMovie(econ, movAt(movs, 0), i);
+            // NO input: a movie is a power-on script, and pressing its
+            // buttons into a mid-game scene means something else entirely
+            // (START pauses gameplay — one press froze an anchored
+            // evidence pass for 3,200 frames and silently changed a
+            // hundred rewrite decisions between two otherwise-identical
+            // runs). The anchored scene plays itself; evidence becomes
+            // independent of which surfaces drive verification.
             econ.runFrame();
             if (econ.takeProfile()) |smp| {
                 if (i >= args.skip) esamples.appendAssumeCapacity(smp);

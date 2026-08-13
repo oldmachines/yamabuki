@@ -645,8 +645,11 @@ pub const Persistence = struct {
     pub const max_addrs = 64;
     /// Dedup capacity past the threshold: novelty tracking needs to keep
     /// telling new addresses from seen ones after max_addrs, or a single
-    /// busy burst would blind it. Exceeding THIS is spread outright.
-    pub const addr_buf = 512;
+    /// busy burst would blind it. Exceeding THIS is spread outright —
+    /// sized for a multi-transition gameplay surface (menu, weapon
+    /// select, stage load, deaths, continue: each reseeds a screen's
+    /// worth of scratch, and 512 was exceeded by legitimate echoes).
+    pub const addr_buf = 4096;
     /// Ticks-with-new-addresses tolerated. This is what separates
     /// WANDERING corruption (novelty sustained across the run — each cell
     /// heals but the damage keeps finding fresh ones) from a PHASE BURST
@@ -669,6 +672,12 @@ pub const Persistence = struct {
     /// wall-time origin (holds) from active divergence (changes).
     pub const Bad = struct { addr: u32, delta: u8 };
 
+    /// Input epochs the compared run spans (edges consumed + 1). Every
+    /// consumed edge starts a transition that legitimately reseeds a
+    /// screen's worth of wall-derived scratch, so the novelty and breadth
+    /// budgets scale with it — a five-transition gameplay surface is not
+    /// "spreading" for paying five transitions' worth of echoes.
+    epoch_budget: u32 = 1,
     addrs: [addr_buf]u32 = undefined,
     deltas: [addr_buf]u8 = undefined,
     /// Addresses that re-diverged at their established offset at least
@@ -744,7 +753,8 @@ pub const Persistence = struct {
 
     pub fn verdict(self: *const Persistence) Verdict {
         if (self.addr_overflow) return .{ .fail = .spread };
-        if (self.n_addrs > max_addrs and self.novelty_ticks > max_novelty_ticks)
+        if (self.n_addrs > max_addrs * self.epoch_budget and
+            self.novelty_ticks > max_novelty_ticks * self.epoch_budget)
             return .{ .fail = .spread };
         if (self.worst_run > max_run) return .{ .fail = .persistence };
         if (self.ticks > 0 and
@@ -803,6 +813,30 @@ test "persistence: a constant offset held forever is a wall-time origin, not cor
     // actively computing wrong — the excusal must not survive the change.
     for (1000..1040) |t| p.feed(@intCast(t), &.{.{ .addr = 0x003A, .delta = @truncate(t) }});
     try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
+}
+
+test "persistence: the novelty budget scales with input epochs" {
+    // A five-epoch surface pays five transitions' worth of fresh scratch:
+    // the same shape that fails a one-epoch run passes with the budget,
+    // and sustained wandering beyond it still fails.
+    var p: Persistence = .{ .epoch_budget = 5 };
+    var t: u32 = 0;
+    var a: u32 = 0x1000;
+    // 40 bursts of 4 new addrs: 160 addrs over 40 novelty ticks — over a
+    // single-epoch budget (64/30), inside a five-epoch one (320/150).
+    while (t < 800) : (t += 1) {
+        if (t % 20 == 0) {
+            p.feed(t, &.{ .{ .addr = a, .delta = 1 }, .{ .addr = a + 1, .delta = 1 }, .{ .addr = a + 2, .delta = 1 }, .{ .addr = a + 3, .delta = 1 } });
+            a += 4;
+        } else p.feed(t, &.{});
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+    var single: Persistence = .{};
+    single.n_addrs = p.n_addrs;
+    single.novelty_ticks = p.novelty_ticks;
+    single.ticks = p.ticks;
+    single.bad_ticks = 1;
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, single.verdict());
 }
 
 test "persistence: spreading addresses are corruption even when transient" {
