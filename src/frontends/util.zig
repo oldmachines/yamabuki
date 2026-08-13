@@ -690,6 +690,10 @@ pub const Persistence = struct {
     bad_ticks: u32 = 0,
     run: u32 = 0,
     worst_run: u32 = 0,
+    /// Tick where the worst run began — the forensics anchor for a
+    /// persistence verdict (first_bad routinely misleads: it names the
+    /// first active tick of the whole run, not the killer stretch).
+    worst_start: u32 = 0,
     first_bad: ?u32 = null,
 
     /// One compared tick: `bad` is the diverging live cells (empty =
@@ -732,7 +736,10 @@ pub const Persistence = struct {
         }
         self.bad_ticks += 1;
         self.run += 1;
-        self.worst_run = @max(self.worst_run, self.run);
+        if (self.run > self.worst_run) {
+            self.worst_run = self.run;
+            self.worst_start = tick + 1 - self.run;
+        }
         if (self.first_bad == null) self.first_bad = tick;
     }
 

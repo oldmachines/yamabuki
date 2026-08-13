@@ -83,6 +83,76 @@ pub fn siteClass(addr: u24) u8 {
     return if (bank >= 0xC0 or (bank & 0x7F) >= 0x40) site_rom else site_other;
 }
 
+/// Pointer-bank PROVENANCE — the dynamic answer to the one idiom the
+/// operand rewriter cannot reach: a [dp] long-indirect access whose pointer
+/// bank byte is DATA. `LDA $01:0000,X / STA $22 / ... / STA [$20]` writes
+/// real $7E whatever the code rewrite did, because the $7E travelled as a
+/// value (from a ROM table entry, or an immediate operand). Measured here:
+/// every low-8K write remembers which ROM byte sourced the value it stored
+/// (a plain A-load's read, or its immediate operand, on the immediately
+/// preceding step); every [dp]/[dp],Y access that resolves into bank
+/// $7E/$7F then PROVES its pointer's bank-byte cell's remembered source —
+/// a ROM byte the window conversion re-banks like any long operand, which
+/// is what keeps value-mediated traffic in the same home as the rewritten
+/// world (measured: Gradius III's stage loader builds its decompression
+/// target pointers from a bank-$01 table; the un-re-banked table tore the
+/// $A000+/$E000+/$7F buffers out of BW-RAM and every gameplay sprite
+/// vanished).
+pub const PtrBankEvidence = struct {
+    /// Per low-8K WRAM byte (dp slots live there): the ROM CPU address of
+    /// the byte that sourced the $7E/$7F value currently stored in it, or
+    /// `none`. Refreshed on every tracked write.
+    src: [0x2000]u32,
+    /// Deduped ROM bytes proven to feed pointer bank bytes (or DMA A-bus
+    /// bank registers) that carried $7E/$7F into an actual access.
+    proven: [max_proven]u32,
+    n_proven: usize,
+    /// Accesses whose bank byte had no attributable source — torn traffic
+    /// the conversion cannot repair; a verdict input, not just a counter.
+    unresolved: u32,
+
+    pub const none: u32 = 0xFFFF_FFFF;
+    pub const max_proven = 256;
+    pub const init: PtrBankEvidence = .{
+        .src = @splat(none),
+        .proven = undefined,
+        .n_proven = 0,
+        .unresolved = 0,
+    };
+
+    pub fn addProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF; // fast mirrors carry the same byte
+        for (self.proven[0..self.n_proven]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_proven == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.proven[self.n_proven] = a;
+        self.n_proven += 1;
+    }
+};
+
+/// Low-8K WRAM offset of a CPU address, if it names one: bank $7E's first
+/// 8 KiB or the system-bank mirror — the same cells either way.
+pub fn wramLowOffset(addr: u24) ?u16 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (a16 >= 0x2000) return null;
+    if (bank == 0x7E or (bank & 0x7F) <= 0x3F) return a16;
+    return null;
+}
+
+/// Plain loads of A whose read bytes (or immediate operand bytes) are a
+/// byte-for-byte SOURCE of what an immediately following store writes.
+pub fn loadASource(op: u8) bool {
+    return switch (op) {
+        0xA1, 0xA3, 0xA5, 0xA7, 0xA9, 0xAD, 0xAF, 0xB1, 0xB2, 0xB3, 0xB5, 0xB7, 0xB9, 0xBD, 0xBF => true,
+        else => false,
+    };
+}
+
 pub const UsageMap = struct {
     /// Caller-allocated, `cpu_map_len` bytes, zeroed before the run. Kept
     /// out of every core struct on purpose — 16 MiB belongs on the heap of
@@ -91,6 +161,8 @@ pub const UsageMap = struct {
     /// Optional per-site evidence map, same length, indexed by the
     /// INSTRUCTION address (`site_*` bits). Null when nobody asked.
     sites: ?[]u8 = null,
+    /// Optional pointer-bank provenance tracking. Null when nobody asked.
+    ptr_banks: ?*PtrBankEvidence = null,
 
     /// Record where an instruction's data access actually landed.
     pub fn noteSite(self: *const UsageMap, pc: u24, addr: u24) void {

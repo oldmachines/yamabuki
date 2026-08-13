@@ -118,6 +118,9 @@ pub const Stats = struct {
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
     rewritten_abs: u32 = 0,
+    /// Measured pointer-bank source bytes re-banked (window mode): ROM
+    /// bytes proven to feed [dp] pointer bank bytes / DMA bank registers.
+    rewritten_ptr_banks: u32 = 0,
     /// Context-split sites (window mode): absolutes below $2000 whose
     /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
     /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
@@ -2708,6 +2711,16 @@ pub fn convertWholeGame(
     /// absolute whose observed traffic was all ROM stays put; one whose
     /// traffic was all low WRAM shifts into the window.
     site_evidence: ?[]const u8,
+    /// Pointer-bank provenance (window mode): ROM bytes a profiled run
+    /// PROVED to feed [dp] long-indirect pointer bank bytes or DMA A-bus
+    /// bank registers with $7E/$7F. Bank bytes that travel as DATA are the
+    /// one $7E-naming idiom the operand rewrite cannot reach — these bytes
+    /// re-bank with the world so value-mediated traffic lands in BW-RAM
+    /// like everything else (measured: Gradius III's stage loader builds
+    /// its buffer pointers from a bank-$01 ROM table; without this the
+    /// $A000+/$E000+/$7F buffers tear out of the relocation and gameplay
+    /// sprites never render).
+    ptr_bank_srcs: ?[]const u32,
     static_walk: bool,
     /// UNIFORM WINDOW MODE (v17's actual architecture): the game KEEPS
     /// RUNNING ON THE S-CPU and only its memory moves — WRAM's low 8 KiB
@@ -3605,6 +3618,22 @@ pub fn convertWholeGame(
         out[off] -= 0x3E;
         res.stats.rewritten_long += 1;
     }
+    // Measured pointer-bank sources: table bytes (and immediate operands
+    // the shape pass above didn't already reach) that carry $7E/$7F into
+    // runtime pointers. The byte may sit anywhere in ROM; the proof it is
+    // a bank byte is dynamic, so the only static check left is that it
+    // still holds $7E/$7F (the shape pass may have re-banked it first).
+    if (bwram) if (ptr_bank_srcs) |srcs| for (srcs) |ca| {
+        const src_bank: u32 = (ca >> 16) & 0x7F;
+        const a16: u32 = ca & 0xFFFF;
+        if (a16 < 0x8000) continue;
+        const f = src_bank * 0x8000 + (a16 - 0x8000);
+        if (f >= out.len) continue;
+        if (out[f] == 0x7E or out[f] == 0x7F) {
+            out[f] -= 0x3E;
+            res.stats.rewritten_ptr_banks += 1;
+        }
+    };
     // D and S follow their memory into the window.
     for (moves[0..n_moves]) |off| {
         const imm = std.mem.readInt(u16, out[off..][0..2], .little);
@@ -5181,7 +5210,7 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, &ref);
     defer gpa.free(res.image);
     // Two plain abs, one indexed abs, one INC in the NMI handler; one long.
     try testing.expect(res.stats.rewritten_abs >= 3);
@@ -5253,7 +5282,7 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
     const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
     for ([_]bool{ false, true }) |go_async| {
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, null, false, true, &cand, go_async, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, &ref);
         defer gpa.free(res.image);
         try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
         try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
@@ -5356,7 +5385,7 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
 
         const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, sites, false, true, &cand, false, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &cand, false, &ref);
         defer gpa.free(res.image);
         if (!pinned) {
             // Control: the uncovered site with no pin is the I-RAM hazard.
@@ -5436,7 +5465,7 @@ test "window: a context-split site serves both caller classes through its thunk"
     sites[0x8103] = usage_map.site_wram_low | usage_map.site_wram_bank;
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the site
@@ -5532,7 +5561,7 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, false, false, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.offload_sites >= 14);
 
@@ -5588,7 +5617,7 @@ test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
     usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
 
     var ref: ?Refusal = null;
-    const res = convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref) catch |e| {
+    const res = convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref) catch |e| {
         std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
         return e;
     };
@@ -5646,13 +5675,13 @@ test "whole-game: --wg-static rewrites code the profiled run never reached" {
     var ref: ?Refusal = null;
     // Without the static walk the uncovered store keeps its WRAM operand...
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x0902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
     }
     // ...with it, the operand moves into the window like the covered one.
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, true, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, true, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, r.image[0x0009..0x000B], .little));
         try testing.expectEqual(@as(u16, 0x6902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
@@ -5674,7 +5703,7 @@ test "whole-game: refusals name their reasons" {
     for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
         @memset(usage, 0);
         usage[a] = usage_map.flag_write;
-        const r = try convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expect(r.stats.d_moved);
     }
@@ -5685,7 +5714,7 @@ test "whole-game: refusals name their reasons" {
     usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
     try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
 
@@ -5700,7 +5729,7 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8104);
     usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         // The immediate moved into the window with everything else.
         try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
@@ -5709,7 +5738,7 @@ test "whole-game: refusals name their reasons" {
     // was already shifted when it was pushed: allowed, and left alone.
     rom[0x0103] = 0xEA; // NOP where the push was
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
     }
@@ -5720,7 +5749,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x7B, 0x5B, 0x60 }); // TDC / TCD
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
 
     @memset(usage, 0);
@@ -5728,7 +5757,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
@@ -5736,7 +5765,7 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0x8100, .little);
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_uses_irq, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0, .little);
 
@@ -5748,7 +5777,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0060..0x0062], &[_]u8{ 0x68, 0x40 });
     markOp(usage, 0x00_8050);
     markOp(usage, 0x00_8060);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_nmi_ambiguous, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
@@ -5759,14 +5788,14 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // A long MMIO store: no room for the in-place JSR either.
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x8F, 0x00, 0x21, 0x00 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // An MMIO site executing outside bank $00 (this 64K image's bank $01).
@@ -5775,13 +5804,13 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     @memcpy(rom[0xFF00..0xFF03], &[_]u8{ 0x8D, 0x00, 0x21 });
     markOp(usage, 0x01_FF00);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_mmio_outside_bank0, ref.?.reason);
     @memset(usage, 0);
 
     // A block move.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x54, 0x00, 0x7E });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
 }

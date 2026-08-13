@@ -101,6 +101,12 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// Verifier debugging (undocumented): run ONLY the behavioral tier —
+    /// stock ROM as baseline, this converted image, the given movies —
+    /// and print the verdict with its full accounting. Iterating the
+    /// tier's rules against a preserved failing rung in minutes instead
+    /// of re-running the whole generation ladder.
+    behavioral_probe: ?[]const u8 = null,
     /// Window debugging (undocumented): write each verification attempt's
     /// converted image to this path (last attempt wins).
     save_attempt: ?[]const u8 = null,
@@ -282,6 +288,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
+        return;
+    }
+    if (args.behavioral_probe) |cpath| {
+        try runBehavioralProbe(io, gpa, out, args, core.header.stripCopierHeader(image), cpath, movs);
         return;
     }
     if (args.gen_sa1) {
@@ -1492,7 +1502,12 @@ fn runSa1Gen(
     // baseline accumulate into the same map.
     const site_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(site_ev, 0);
-    const umap: core.usage_map.UsageMap = .{ .bytes = ub, .sites = site_ev };
+    // Pointer-bank provenance: which ROM bytes feed $7E/$7F into runtime
+    // pointers ([dp] bank bytes, DMA bank registers). Accumulates across
+    // every profiled surface like the rest of the evidence.
+    const ptr_ev = try gpa.create(core.usage_map.PtrBankEvidence);
+    ptr_ev.* = .init;
+    const umap: core.usage_map.UsageMap = .{ .bytes = ub, .sites = site_ev, .ptr_banks = ptr_ev };
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
     // Coverage growth: how much code the profile was STILL discovering in
@@ -1762,9 +1777,13 @@ fn runSa1Gen(
             }
         }
 
+        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0) {
+            try out.print("  pointer-bank provenance: {} proven ROM source byte(s), {} access(es) unresolved\n", .{ ptr_ev.n_proven, ptr_ev.unresolved });
+            try out.flush();
+        }
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev.proven[0..ptr_ev.n_proven], args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -1950,6 +1969,61 @@ const SaTier = enum { strict, envelope, equivalent, behavioral };
 /// Surface `s`'s movie — null for the legacy no-movie (attract) surface.
 fn movAt(movs: []const util.movie.Movie, s: usize) ?util.movie.Movie {
     return if (movs.len == 0) null else movs[s];
+}
+
+/// `--behavioral-probe` (undocumented): the behavioral tier alone, stock
+/// baseline vs a saved rung image, full verdict accounting printed —
+/// iterating the tier's rules in minutes instead of ladder-hours.
+fn runBehavioralProbe(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    base_image: []const u8,
+    conv_path: []const u8,
+    movs: []const util.movie.Movie,
+) !void {
+    const conv_raw = std.Io.Dir.cwd().readFileAlloc(io, conv_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try out.print("error: cannot read '{s}'\n", .{conv_path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    const conv_image = core.header.stripCopierHeader(conv_raw);
+    var plan: profile.Plan = .{};
+    var res: core.sa1gen.Result = .{ .image = @constCast(conv_image), .stats = .{}, .fate = @splat(.not_attempted) };
+    const n = @max(1, movs.len);
+    for (0..n) |s| {
+        const m = movAt(movs, s);
+        const frames = args.frames orelse if (m) |mm|
+            @max(1, @as(u32, @intCast(mm.frames.len)) -| args.skip)
+        else
+            gen_frames_default;
+        const total = args.skip + frames;
+        const bv = try verifyBehavioral(gpa, base_image, conv_image, &plan, &res, m, null, true, total);
+        const verdict_name: []const u8 = switch (bv.verdict) {
+            .pass => |k| if (k == .clean) "PASS clean" else "PASS echoes",
+            .fail => |w| switch (w) {
+                .persistence => "FAIL persistence",
+                .spread => "FAIL spread",
+                .flood => "FAIL flood",
+            },
+        };
+        try out.print(
+            "surface {}: {s} — ticks {}, bad {}, addrs {}, novelty {}, worst_run {} (from tick {}), held {}, overflow {}, epochs {}, first_bad_frame {}\n",
+            .{
+                s + 1,                  verdict_name,          bv.ticks_base,
+                bv.stats.bad_ticks,     bv.stats.n_addrs,      bv.stats.novelty_ticks,
+                bv.stats.worst_run,     bv.stats.worst_start,  bv.stats.heldCount(),
+                bv.stats.addr_overflow, bv.stats.epoch_budget, bv.first_bad_frame,
+            },
+        );
+        if (bv.n_sample > 0) {
+            try out.print("  first-bad sample:", .{});
+            for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}", .{adr & 0xFFFF});
+            try out.print("\n", .{});
+        }
+        try out.flush();
+    }
 }
 
 /// The behavioral tier for one surface: returns `.behavioral` on pass,
@@ -2244,6 +2318,11 @@ fn reportSa1(
             try out.print(
                 "  {} context-split site(s) dispatch on the runtime data bank through a\n  thunk (measured under both a system DBR and a WRAM pin — no single\n  operand serves both callers)\n",
                 .{res.stats.split_sites},
+            );
+        if (res.stats.rewritten_ptr_banks != 0)
+            try out.print(
+                "  {} measured pointer-bank ROM source byte(s) re-banked ([dp]/DMA bank\n  bytes that travel as data — the idiom operand rewrites cannot reach)\n",
+                .{res.stats.rewritten_ptr_banks},
             );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
@@ -3309,6 +3388,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.s2_keep = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
+            out.behavioral_probe = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--save-attempt")) {
             out.save_attempt = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {

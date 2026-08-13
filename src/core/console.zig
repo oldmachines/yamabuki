@@ -62,7 +62,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w" };
 
         cart: Cartridge,
         bus: Bus,
@@ -75,6 +75,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// on purpose — the 16 MiB map lives on the frontend's heap, never
         /// inside the console. Zero-sized unless `cfg.profile`.
         usage: if (cfg.profile) ?*const usage_map.UsageMap else void,
+        /// Pointer-bank provenance scratch (see `usage_map.PtrBankEvidence`):
+        /// the ROM address of the previous step's plain A-load source (its
+        /// read's last byte, or its immediate's last operand byte) and that
+        /// load's width — what a store on THIS step is presumed to be
+        /// storing. Zero-sized unless `cfg.profile`.
+        prev_load_end: if (cfg.profile) u32 else void,
+        prev_load_w: if (cfg.profile) u8 else void,
 
         region: timing.Region,
         /// Current scanline within the frame (0-based).
@@ -118,6 +125,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (cfg.profile) {
                 self.prof = .init;
                 self.usage = null;
+                self.prev_load_end = usage_map.PtrBankEvidence.none;
+                self.prev_load_w = 0;
             }
         }
 
@@ -351,11 +360,94 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     u.noteWrite(a, width);
                     if (op != null) u.noteSite(pc, a);
                 }
+                if (u.ptr_banks) |pb| self.trackPtrBanks(pb, pc, op, m8, width);
             }
         }
 
         fn dataAddr(v: u32) ?u24 {
             return if (v == Bus.no_data_access) null else @intCast(v);
+        }
+
+        /// Pointer-bank provenance (see `usage_map.PtrBankEvidence`): runs
+        /// once per profiled step, after the usage map has recorded the
+        /// step's accesses.
+        fn trackPtrBanks(self: *Self, pb: *usage_map.PtrBankEvidence, pc: u24, op_o: ?u8, m8: bool, width: u8) void {
+            const none = usage_map.PtrBankEvidence.none;
+            const op = op_o orelse {
+                // Interrupt dispatch between the load and the store would
+                // clobber A anyway only via the handler's own tracked
+                // steps; the dispatch itself proves nothing — drop the
+                // pending source.
+                self.prev_load_end = none;
+                self.prev_load_w = 0;
+                return;
+            };
+            // 1. Every write refreshes the touched low-8K cells' source
+            //    attribution: a $7E/$7F byte just stored there is presumed
+            //    to be the previous step's load, byte for byte, when the
+            //    widths agree; anything else clears the cell.
+            if (dataAddr(self.bus.last_data_write)) |a| {
+                var i: u8 = 0;
+                while (i < width) : (i += 1) {
+                    const ad = a -% i;
+                    if (usage_map.wramLowOffset(ad)) |off| {
+                        const val = self.bus.wram.data[off];
+                        pb.src[off] = if ((val == 0x7E or val == 0x7F) and
+                            self.prev_load_end != none and self.prev_load_w == width)
+                            self.prev_load_end -% i
+                        else
+                            none;
+                    }
+                }
+                // DMA A-bus bank registers ($43x4): a $7E/$7F written there
+                // is a bank VALUE naming WRAM for the hardware — same
+                // provenance, proven directly.
+                const a16: u16 = @truncate(a);
+                if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4304 and a16 <= 0x4374 and
+                    (a16 & 0xF) == 4 and width == 1)
+                {
+                    if (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F) {
+                        if (self.prev_load_end != none and self.prev_load_w == 1)
+                            pb.addProven(self.prev_load_end)
+                        else
+                            pb.unresolved += 1;
+                    }
+                }
+            }
+            // 2. A [dp]/[dp],Y data access that resolved into bank $7E/$7F:
+            //    prove the pointer's bank-byte cell's remembered source.
+            if (op & 0x0F == 0x07) {
+                const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
+                if (tgt) |t| {
+                    const tb: u8 = @truncate(t >> 16);
+                    if (tb == 0x7E or tb == 0x7F) {
+                        const src: u32 = blk: {
+                            const operand = self.bus.peek8(pc +% 1) orelse break :blk none;
+                            const slot = self.cpu.regs.d +% operand +% 2;
+                            if (slot >= 0x2000) break :blk none;
+                            break :blk pb.src[slot];
+                        };
+                        if (src != none) pb.addProven(src) else pb.unresolved += 1;
+                    }
+                }
+            }
+            // 3. Remember THIS step if it was a plain A-load from ROM (or
+            //    an immediate — its operand bytes are ROM): the candidate
+            //    source for the next step's store.
+            self.prev_load_end = none;
+            self.prev_load_w = 0;
+            if (usage_map.loadASource(op)) {
+                const w: u8 = if (m8) 1 else 2;
+                if (op == 0xA9) {
+                    self.prev_load_end = (pc +% w) & 0x7F_FFFF;
+                    self.prev_load_w = w;
+                } else if (dataAddr(self.bus.last_data_read)) |r| {
+                    if (usage_map.siteClass(r) == usage_map.site_rom) {
+                        self.prev_load_end = r & 0x7F_FFFF;
+                        self.prev_load_w = w;
+                    }
+                }
+            }
         }
 
         /// Collect the frame the profiler closed at the last vblank, if any.
