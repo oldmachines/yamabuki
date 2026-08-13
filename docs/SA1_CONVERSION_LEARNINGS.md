@@ -106,12 +106,24 @@ Two mechanisms feed coverage, and they answer different questions:
   coverage *and* verification input. Real recorded playthroughs (F10 in the
   SDL player) are the scaling path.
 
-Standing law, demonstrated twice: **the verified surface is exactly the
+Standing law, demonstrated three times: **the verified surface is exactly the
 covered surface.** Two minutes of human play found two defects that 4,000
 frames of automated verification could not, because nothing had ever pressed
 START. And widening coverage *retroactively strengthens* old verdicts: the
 bubble build's offloads were correct on their verified surface and hostile on
 the menu path that surface never included.
+
+A corollary that cost a shipped patch: **input coverage is not monotonic.**
+The menu movie that ADDED the START path silently REMOVED the no-input path —
+its f500 press skips the logo's auto-advance, so the `$9980` sound-status
+routine (polled only in the exit phase, behind a mode dispatch the static
+walk cannot pierce) fell out of coverage entirely, went un-rewritten, read
+dead real-WRAM, and every menu-era build froze on the Konami logo for any
+player who didn't press START. FRAMES IDENTICAL was truthfully reported —
+over the movie's frames, where the press masks the breakage. A movie is not
+"the old coverage plus a button": every path that only runs *un-pressed*
+needs frames where nothing is pressed. The standing GIII movie now waits
+through the auto-advance (~f750) and presses START at f1200.
 
 ## 5. The verification stack
 
