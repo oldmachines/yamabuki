@@ -360,13 +360,47 @@ single-context rule fired for the first time (and kept the interrupt
 class, which under gameplay carries the larger slow work). Context is a
 property of a surface, not of a routine.
 
+**The stream mask landed (multi-write-per-tick cells wall-derived by
+construction) and halved the damage — and the remainder was not stream
+noise at all.** A `--behavioral-probe` CLI (behavioral tier alone
+against a preserved failing rung — minutes, not 75-minute ladders) plus
+`worst_start` in the persistence verdict (first_bad names the run's
+first ACTIVE tick, which misled a whole night; the killer stretch
+starts elsewhere) located the real failure: rendering the two sides at
+the worst run showed the converted game playing stage 1 WITH NO
+SPRITES. RAM dumps told the story exactly: object tables live and
+correct in BW-RAM (down to the bank-value map in the entries), but the
+VRAM upload buffers — `$7E:A000+`, `$7E:E000+`, most of `$7F` — TORN:
+written to real WRAM, read as BW-RAM zeros. The writer is a `STA [$20]`
+loader loop whose pointer bank bytes come from a bank-$01 ROM TABLE.
+
+**Bank bytes travelling as DATA are the one $7E-naming idiom no operand
+rewrite can reach — and provenance is measurable.** The profiler now
+remembers, for every low-8K write, which ROM byte sourced the stored
+value (the preceding plain A-load's read bytes or immediate operand,
+widths agreeing); a `[dp]`/`[dp],Y` access resolving into $7E/$7F
+proves its pointer's bank-byte cell's remembered source, and $7E/$7F
+stored to a DMA A-bus bank register proves its source directly. The
+conversion re-banks the proven ROM bytes like any long operand, so
+value-mediated traffic lands in BW-RAM with the rest of the world and
+the whole-bank invariant survives. On GIII the entire value-mediated
+surface over the full game is ONE loader loop plus a small decompressor
+cluster (whose pointer banks come from immediates the shape pass
+already re-banked — which is why `$3000-$3800` was coherent all along
+and the tear stayed invisible until a per-home comparison of the
+`$A000` buffers). Unattributable accesses are counted and disclosed;
+the behavioral tier arbitrates them.
+
 After the split-site mechanism: the bubble-stage measurement over a
 recorded playthrough (F10) reaching stage 2.
 
-**Known hard limits** (dynamic evidence forever): pointer *values* in data;
-WMDATA-port traffic (real WRAM always — GIII has exactly one port site);
-per-site evidence that is genuinely mixed (same instruction, both worlds);
-emulation-mode S pinning to page 1; and the coverage boundary itself.
+**Known hard limits** (dynamic evidence forever): pointer *values* in
+data beyond the tracked one-step load→store attribution (a bank byte
+that transits arithmetic, XBA, or a WRAM staging cell is unresolved);
+WMDATA-port traffic (real WRAM always — GIII has exactly one port
+site); per-site evidence that is genuinely mixed (same instruction,
+both worlds); emulation-mode S pinning to page 1; and the coverage
+boundary itself.
 
 ## 9. The comparison that frames everything
 
