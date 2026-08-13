@@ -98,6 +98,17 @@ const Args = struct {
     /// the attract demo, and demo-only code fell out of the rewrite).
     movies: [max_movies][]const u8 = undefined,
     n_movies: usize = 0,
+    /// Per-movie: does this movie VERIFY (a surface every attempt must
+    /// pass) or only contribute evidence/coverage? `--evidence-movie`
+    /// adds the latter kind — a playthrough whose later stretch is
+    /// UNVERIFIABLE by construction rather than broken: gameplay forks at
+    /// the first RNG-divergent event (enemy RNG seeds from wall-origin
+    /// counters the conversion legitimately offsets; measured: stock's
+    /// ship exploded at wall 3100 while the byte-equivalent conversion's
+    /// ship flew on — every later tick compares two different games). The
+    /// code such a stretch covers (death sequence, continue screen) still
+    /// runs in real play and still needs its rewrites.
+    movie_verify: [max_movies]bool = @splat(true),
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
@@ -1832,6 +1843,10 @@ fn runSa1Gen(
         var fail_mov: ?util.movie.Movie = null;
         var conv_sum: @TypeOf(sum) = undefined;
         for (0..n_surf) |s| {
+            // Evidence-only movie: it profiled into the union above; its
+            // gameplay forks at the first RNG-divergent event, so a
+            // tick-locked verdict over it compares two different games.
+            if (!args.movie_verify[s]) continue;
             const s_total = totals[s];
             const s_hashes = hashes_s[s];
             const s_conv_hashes = conv_hashes_s[s];
@@ -3381,6 +3396,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             if (out.n_movies == max_movies) return error.TooManyMovies;
             out.movies[out.n_movies] = v;
+            out.n_movies += 1;
+        } else if (std.mem.eql(u8, a, "--evidence-movie")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_movies == max_movies) return error.TooManyMovies;
+            out.movies[out.n_movies] = v;
+            out.movie_verify[out.n_movies] = false;
             out.n_movies += 1;
         } else if (std.mem.eql(u8, a, "--state")) {
             out.state = it.next() orelse return error.MissingValue;
