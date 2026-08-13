@@ -684,8 +684,17 @@ fn verifyBehavioral(
                 // still lands in real WRAM, and nothing records which
                 // path wrote a given byte last. A byte matching EITHER
                 // home passes; matching neither is a real divergence.
+                // One more equivalence: the relocation maps WRAM bank
+                // VALUES, so data holding $7E/$7F (a pointer's bank byte)
+                // legitimately holds $40/$41 in the image — permanently,
+                // which the persistence verdict would otherwise read as
+                // immortal corruption.
                 const via_bw = conv.prev.sram[i];
-                break :blk if (bb == via_bw) via_bw else conv.prev.wram[i];
+                if (bb == via_bw) break :blk via_bw;
+                if ((bb == 0x7E and via_bw == 0x40) or (bb == 0x7F and via_bw == 0x41)) break :blk bb;
+                const via_wram = conv.prev.wram[i];
+                if ((bb == 0x7E and via_wram == 0x40) or (bb == 0x7F and via_wram == 0x41)) break :blk bb;
+                break :blk via_wram;
             } else switch (convHome(plan, res, @intCast(i))) {
                 .wram => conv.prev.wram[i],
                 .sram => |off| conv.prev.sram[off],
@@ -1537,8 +1546,14 @@ fn runSa1Gen(
             else => return e,
         };
 
-        if (args.save_attempt) |ap|
+        if (args.save_attempt) |ap| {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
+            // Every rung, numbered — the bisect overwrites the plain name,
+            // and the failing rung is usually the interesting one.
+            var nbuf: [256]u8 = undefined;
+            const numbered = std.fmt.bufPrint(&nbuf, "{s}.{d}", .{ ap, n_dropped }) catch ap;
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = numbered, .data = res.image });
+        }
         // The verify run for this attempt.
         @memset(env_conv, 0);
         var fast_audio = core.console.audio_hash_init;
