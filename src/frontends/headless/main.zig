@@ -86,11 +86,18 @@ const Args = struct {
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
-    /// A recorded playthrough (.ymv) driving both pads from power-on. In a
-    /// normal run it replays and verifies the movie's end hashes; in the
-    /// generator/report modes it drives the profiled runs, so coverage and
-    /// verification come from real gameplay instead of the attract mode.
-    movie: ?[]const u8 = null,
+    /// Recorded playthroughs (.ymv) driving both pads from power-on. In a
+    /// normal run one movie replays and verifies its end hashes; in the
+    /// generator/report modes movies drive the profiled runs, so coverage
+    /// and verification come from real gameplay instead of the attract
+    /// mode. The generator accepts SEVERAL `--movie` flags: each is an
+    /// input SURFACE, all of them feed one evidence/coverage union, and
+    /// every one must verify — because each movie is a different world,
+    /// and a surface one movie covers can be exactly the surface another
+    /// displaces (measured: the movie that added stage-1 gameplay lost
+    /// the attract demo, and demo-only code fell out of the rewrite).
+    movies: [max_movies][]const u8 = undefined,
+    n_movies: usize = 0,
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
@@ -139,6 +146,9 @@ const Args = struct {
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
 const report_frames_default: u32 = 3600;
 
+/// Input surfaces one generator run accepts (each `--movie` is one).
+const max_movies: usize = 4;
+
 /// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
 /// same standard patches/fastrom-compat.zon entries are verified to.
 const gen_frames_default: u32 = 1800;
@@ -177,7 +187,10 @@ pub fn main(init: std.process.Init) !void {
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
-            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player);
+            \\                --gen-sa1-patch accepts SEVERAL --movie flags — each is a
+            \\                verification SURFACE, evidence/coverage is their union, and
+            \\                every surface must verify
             \\  --verify-behavioral  S4: on pixel divergence, accept a conversion whose logic
             \\                state matches at every tick (for timing-changing offloads)
             \\  --state f     resume from an SDL-player save state instead of power-on;
@@ -258,19 +271,29 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // The movie identifies itself against the image AS PLAYED (post
+    // Movies identify themselves against the image AS PLAYED (post
     // soft-patching): loaded here, after the patch stage, and checked
     // against the same stripped image the run will use.
-    var mov: ?util.movie.Movie = null;
-    if (args.movie) |mpath| mov = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+    var movs_buf: [max_movies]util.movie.Movie = undefined;
+    for (args.movies[0..args.n_movies], 0..) |mpath, i|
+        movs_buf[i] = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+    const movs: []const util.movie.Movie = movs_buf[0..args.n_movies];
+    const mov: ?util.movie.Movie = if (movs.len != 0) movs[0] else null;
 
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
     }
     if (args.gen_sa1) {
-        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
+        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), movs);
         return;
+    }
+    // Outside the generator, several surfaces have no meaning: one run
+    // replays one movie.
+    if (movs.len > 1) {
+        try out.print("error: multiple --movie flags are a generator feature (each is a verification surface)\n", .{});
+        try out.flush();
+        std.process.exit(2);
     }
 
     if (args.auto_fastrom) checkFastromCompat(out, core.header.stripCopierHeader(image)) catch std.process.exit(1);
@@ -1352,13 +1375,23 @@ fn runSa1Gen(
     out: *std.Io.Writer,
     args: Args,
     image: []const u8,
-    mov: ?util.movie.Movie,
+    movs: []const util.movie.Movie,
 ) !void {
-    const frames = args.frames orelse if (mov) |m|
-        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
-    else
-        gen_frames_default;
-    const total = args.skip + frames;
+    // Each movie is one verification SURFACE. Evidence and coverage are
+    // the UNION over all of them — because each movie is a different
+    // world, and the surface one covers can be exactly the surface
+    // another displaces — while verification runs per surface and every
+    // one must pass. Zero movies = the one legacy surface (attract).
+    const n_surf: usize = @max(1, movs.len);
+    var totals: [max_movies]u32 = undefined;
+    for (0..n_surf) |s| {
+        const frames = args.frames orelse if (movs.len != 0)
+            @max(1, @as(u32, @intCast(movs[s].frames.len)) -| args.skip)
+        else
+            gen_frames_default;
+        totals[s] = args.skip + frames;
+    }
+    const total = totals[0];
     // State-anchored generation: profile AND verify from a gameplay save
     // state instead of power-on, so the candidate set comes from a scene
     // with real slowdown — code the attract demo never executes has no
@@ -1389,17 +1422,34 @@ fn runSa1Gen(
     // attract too.
     const evidence_state: ?[]const u8 = if (args.window) state_bytes else null;
     const verify_state: ?[]const u8 = if (args.window) null else state_bytes;
-    try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    if (n_surf > 1) {
+        try out.print("baseline (profiled) + verify runs over {} surfaces:", .{n_surf});
+        for (totals[0..n_surf]) |t| try out.print(" {}f", .{t});
+        try out.print("...\n", .{});
+    } else {
+        try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    }
     try out.flush();
 
-    // Baseline ONCE: per-frame hashes, audio (hash + per-frame energy
-    // envelope), the profile, and the coverage map the rewriter walks.
-    // Every verification attempt below replays against this.
-    const env_base = try gpa.alloc(u64, total);
-    @memset(env_base, 0);
-    const env_conv = try gpa.alloc(u64, total);
-    const hashes = try gpa.alloc(u64, total);
-    const conv_hashes = try gpa.alloc(u64, total);
+    // Baselines, one per surface: per-frame hashes, audio (hash +
+    // per-frame energy envelope), the profile, and the coverage map the
+    // rewriter walks — coverage and site evidence accumulate into ONE
+    // union across all surfaces. Every verification attempt below
+    // replays against these.
+    var env_base_s: [max_movies][]u64 = undefined;
+    var env_conv_s: [max_movies][]u64 = undefined;
+    var hashes_s: [max_movies][]u64 = undefined;
+    var conv_hashes_s: [max_movies][]u64 = undefined;
+    var base_audio_s: [max_movies]u64 = undefined;
+    for (0..n_surf) |s| {
+        env_base_s[s] = try gpa.alloc(u64, totals[s]);
+        @memset(env_base_s[s], 0);
+        env_conv_s[s] = try gpa.alloc(u64, totals[s]);
+        hashes_s[s] = try gpa.alloc(u64, totals[s]);
+        conv_hashes_s[s] = try gpa.alloc(u64, totals[s]);
+    }
+    const env_base = env_base_s[0];
+    const hashes = hashes_s[0];
     const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(ub, 0);
     // Per-site effective-address evidence: the dynamic answer to the
@@ -1411,7 +1461,6 @@ fn runSa1Gen(
     const umap: core.usage_map.UsageMap = .{ .bytes = ub, .sites = site_ev };
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
-    var base_audio = core.console.audio_hash_init;
     // Coverage growth: how much code the profile was STILL discovering in
     // the last tenth of the capture. Every conversion failure measured so
     // far traces back to code the rewriter never saw, so this turns "the
@@ -1435,7 +1484,7 @@ fn runSa1Gen(
         var esamples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
         try esamples.ensureTotalCapacity(total);
         for (0..total) |i| {
-            feedMovie(econ, mov, i);
+            feedMovie(econ, movAt(movs, 0), i);
             econ.runFrame();
             if (econ.takeProfile()) |smp| {
                 if (i >= args.skip) esamples.appendAssumeCapacity(smp);
@@ -1458,9 +1507,10 @@ fn runSa1Gen(
         try out.flush();
         std.process.exit(1);
     };
+    var base_audio = core.console.audio_hash_init;
     for (0..total) |i| {
         if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
-        feedMovie(con, mov, i);
+        feedMovie(con, movAt(movs, 0), i);
         con.runFrame();
         try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
         hashes[i] = core.console.hashFrame(con.framebuffer());
@@ -1468,8 +1518,37 @@ fn runSa1Gen(
             if (i >= args.skip) samples.appendAssumeCapacity(smp);
         }
     }
+    base_audio_s[0] = base_audio;
     const scratch = try gpa.alloc(f64, samples.items.len);
     const sum = profile.summarise(samples.items, scratch);
+    // Surfaces beyond the first: fresh consoles into the SAME coverage
+    // and evidence union, their own hashes/audio and their own profile
+    // summary (the lag comparison is per surface).
+    var sum_s: [max_movies]@TypeOf(sum) = undefined;
+    sum_s[0] = sum;
+    for (1..n_surf) |s| {
+        const cart_s = try core.Cartridge.load(gpa, image);
+        const con_s = try gpa.create(core.ProfilingConsole);
+        con_s.init(cart_s);
+        con_s.usage = &umap;
+        var audio_s = core.console.audio_hash_init;
+        var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+        try samples_s.ensureTotalCapacity(totals[s]);
+        for (0..totals[s]) |i| {
+            feedMovie(con_s, movAt(movs, s), i);
+            con_s.runFrame();
+            try util.drainAudio(con_s, &audio_s, EnergySink{ .cell = &env_base_s[s][i] }, EnergySink.add);
+            hashes_s[s][i] = core.console.hashFrame(con_s.framebuffer());
+            if (con_s.takeProfile()) |smp| {
+                if (i >= args.skip) samples_s.appendAssumeCapacity(smp);
+            }
+        }
+        base_audio_s[s] = audio_s;
+        const scratch_s = try gpa.alloc(f64, samples_s.items.len);
+        sum_s[s] = profile.summarise(samples_s.items, scratch_s);
+        con_s.cart.deinit(gpa);
+        gpa.destroy(con_s);
+    }
     const cov_total = core.usage_map.countOpcodes(ub);
     const cov_late = cov_total - cov_early;
 
@@ -1624,8 +1703,10 @@ fn runSa1Gen(
     var dropped: [profile.conversion_set_max]u24 = undefined;
     var dropped_why: [profile.conversion_set_max][]const u8 = undefined;
     var n_dropped: usize = 0;
+    var total_max: u32 = 0;
+    for (totals[0..n_surf]) |t| total_max = @max(total_max, t);
     var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
-    try conv_samples.ensureTotalCapacity(total);
+    try conv_samples.ensureTotalCapacity(total_max);
 
     while (true) {
         // Candidates minus the dropped culprits.
@@ -1682,109 +1763,93 @@ fn runSa1Gen(
             const numbered = std.fmt.bufPrint(&nbuf, "{s}.{d}", .{ ap, n_dropped }) catch ap;
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = numbered, .data = res.image });
         }
-        // The verify run for this attempt.
-        @memset(env_conv, 0);
-        var fast_audio = core.console.audio_hash_init;
-        conv_samples.clearRetainingCapacity();
-        {
-            const cart2 = try core.Cartridge.load(gpa, res.image);
-            const con2 = try gpa.create(core.ProfilingConsole);
-            con2.init(cart2);
-            if (verify_state) |sb| try seedConverted(con2, sb, &plan, &res);
-            for (0..total) |i| {
-                feedMovie(con2, mov, i);
-                con2.runFrame();
-                try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
-                conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
-                if (con2.takeProfile()) |smp| {
-                    if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
-                }
-            }
-            con2.cart.deinit(gpa);
-            gpa.destroy(con2);
-        }
-        const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
-        const conv_sum = profile.summarise(conv_samples.items, conv_scratch);
-
-        // Stage-S4 gate, three tiers: strict identity; frames identical
-        // with envelope-equivalent audio; equivalent modulo timing with a
-        // non-negative lag improvement.
-        const equiv = util.framesEquivalent(hashes, conv_hashes);
+        // The verify runs for this attempt, one per surface. Every
+        // surface must pass; the attempt's tier is the WEAKEST across
+        // them, and the first failing surface drives the bisect.
+        var passed: ?SaTier = .strict;
         var fail_why: []const u8 = "";
         var fail_frame: u32 = 0;
-        var passed: ?SaTier = switch (equiv) {
-            .identical => blk: {
-                if (fast_audio == base_audio) break :blk .strict;
-                if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
-                    fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
-                    fail_frame = bad;
-                    break :blk null;
-                }
-                break :blk .envelope;
-            },
-            .equivalent => blk: {
-                if (conv_sum.lag_frames > sum.lag_frames) {
-                    fail_why = "same pictures but MORE dropped frames — a regression";
-                    break :blk null;
-                }
-                break :blk .equivalent;
-            },
-            .divergent => blk: {
-                fail_why = "renders pictures the original never showed";
-                fail_frame = firstDiff(hashes, conv_hashes);
-                break :blk null;
-            },
-        };
-
-        // The behavioral tier: a slowdown-removing conversion cannot be
-        // frame-identical to a slowed-down baseline, so `divergent` from
-        // the pixel gate is where working offloads go to die. Opt-in.
-        // Whole-game (SA-1-execution) images stay excluded — their state
-        // relocation is not modelled — but WINDOW images are in: their
-        // homes are identity offsets in BW-RAM, and wall-timing drift
-        // from the moved memory is exactly what this tier absorbs.
-        if (passed == null and equiv == .divergent and args.verify_behavioral and
-            (!args.whole_game or args.window))
-        {
-            try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
-            try out.flush();
-            const bv = try verifyBehavioral(gpa, image, res.image, &plan, &res, mov, verify_state, args.window, total);
-            switch (bv.verdict) {
-                .pass => |kind| {
-                    try out.print(
-                        "  behavioral: {s} — {} ticks compared, {} diverging ({} address(es), worst run {})\n",
-                        .{
-                            if (kind == .clean) @as([]const u8, "logic state IDENTICAL at every tick") else "wall-time echoes only",
-                            bv.ticks_base,
-                            bv.stats.bad_ticks,
-                            bv.stats.n_addrs,
-                            bv.stats.worst_run,
-                        },
-                    );
-                    if (bv.stats.heldCount() > 0)
-                        try out.print(
-                            "    {} cell(s) hold a constant offset (wall-time origins: pass counters and state seeded from them)\n",
-                            .{bv.stats.heldCount()},
-                        );
-                    passed = .behavioral;
-                },
-                .fail => |why| {
-                    fail_why = switch (why) {
-                        .persistence => "live state diverges and never heals (or the conversion stopped ticking)",
-                        .spread => "live-state divergence keeps reaching new addresses",
-                        .flood => "live state diverges on too many ticks",
-                    };
-                    fail_frame = bv.first_bad_frame;
-                    try out.print("  behavioral: FAIL — {s}\n", .{fail_why});
-                    if (bv.n_sample > 0) {
-                        try out.print("    first at baseline frame {}, e.g.:", .{bv.first_bad_frame});
-                        for (bv.sample[0..bv.n_sample]) |adr| {
-                            try out.print(" ${X:0>2}:{X:0>4}", .{ @as(u32, 0x7E) + (adr >> 16), adr & 0xFFFF });
-                        }
-                        try out.print("\n", .{});
+        var equiv: util.Equivalence = .identical;
+        var fail_mov: ?util.movie.Movie = null;
+        var conv_sum: @TypeOf(sum) = undefined;
+        for (0..n_surf) |s| {
+            const s_total = totals[s];
+            const s_hashes = hashes_s[s];
+            const s_conv_hashes = conv_hashes_s[s];
+            const s_env_base = env_base_s[s];
+            const s_env_conv = env_conv_s[s];
+            @memset(s_env_conv, 0);
+            var fast_audio = core.console.audio_hash_init;
+            conv_samples.clearRetainingCapacity();
+            {
+                const cart2 = try core.Cartridge.load(gpa, res.image);
+                const con2 = try gpa.create(core.ProfilingConsole);
+                con2.init(cart2);
+                if (verify_state) |sb| try seedConverted(con2, sb, &plan, &res);
+                for (0..s_total) |i| {
+                    feedMovie(con2, movAt(movs, s), i);
+                    con2.runFrame();
+                    try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &s_env_conv[i] }, EnergySink.add);
+                    s_conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
+                    if (con2.takeProfile()) |smp| {
+                        if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
                     }
-                    try out.flush();
+                }
+                con2.cart.deinit(gpa);
+                gpa.destroy(con2);
+            }
+            const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
+            const s_conv_sum = profile.summarise(conv_samples.items, conv_scratch);
+            if (s == 0) conv_sum = s_conv_sum;
+
+            // Stage-S4 gate, three tiers: strict identity; frames
+            // identical with envelope-equivalent audio; equivalent modulo
+            // timing with a non-negative lag improvement.
+            const s_equiv = util.framesEquivalent(s_hashes, s_conv_hashes);
+            var s_tier: ?SaTier = switch (s_equiv) {
+                .identical => blk: {
+                    if (fast_audio == base_audio_s[s]) break :blk .strict;
+                    if (util.audioEnvelopeMismatch(s_env_base, s_env_conv)) |bad| {
+                        fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
+                        fail_frame = bad;
+                        break :blk null;
+                    }
+                    break :blk .envelope;
                 },
+                .equivalent => blk: {
+                    if (s_conv_sum.lag_frames > sum_s[s].lag_frames) {
+                        fail_why = "same pictures but MORE dropped frames — a regression";
+                        break :blk null;
+                    }
+                    break :blk .equivalent;
+                },
+                .divergent => blk: {
+                    fail_why = "renders pictures the original never showed";
+                    fail_frame = firstDiff(s_hashes, s_conv_hashes);
+                    break :blk null;
+                },
+            };
+
+            // The behavioral tier: a slowdown-removing conversion cannot
+            // be frame-identical to a slowed-down baseline, so
+            // `divergent` from the pixel gate is where working offloads
+            // go to die. Opt-in. Whole-game (SA-1-execution) images stay
+            // excluded — their state relocation is not modelled — but
+            // WINDOW images are in.
+            if (s_tier == null and s_equiv == .divergent and args.verify_behavioral and
+                (!args.whole_game or args.window))
+            {
+                if (n_surf > 1) try out.print("  surface {} of {}:\n", .{ s + 1, n_surf });
+                s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), verify_state, args.window, s_total, &fail_why, &fail_frame);
+            }
+            if (s_tier) |t| {
+                if (@intFromEnum(t) > @intFromEnum(passed.?)) passed = t;
+            } else {
+                passed = null;
+                equiv = s_equiv;
+                fail_mov = movAt(movs, s);
+                if (n_surf > 1) try out.print("  surface {} of {} FAILED: {s}\n", .{ s + 1, n_surf, fail_why });
+                break;
             }
         }
 
@@ -1802,7 +1867,7 @@ fn runSa1Gen(
             try out.print("verification FAILED: {s}", .{fail_why});
             if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
             try out.print(".\n  No patch written.\n", .{});
-            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv, fail_frame, total);
+            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv_s[0], fail_frame, total);
             if (equiv == .divergent) {
                 try out.print(
                     \\  Either uncovered code touches moved state, or the game animates through
@@ -1816,8 +1881,9 @@ fn runSa1Gen(
             std.process.exit(1);
         }
 
-        // Diagnose and drop a culprit, then go around again.
-        const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
+        // Diagnose and drop a culprit, then go around again — against the
+        // surface that failed.
+        const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], fail_mov, equiv, fail_frame, fail_why, ub);
         // The mode ladder: an ASYNC culprit is demoted to synchronous
         // before it is dropped — a caller that needed the routine's
         // register results, or a read racing the in-flight window, is
@@ -1840,6 +1906,70 @@ fn runSa1Gen(
 
 /// Which S4 tier a successful SA-1 conversion verified under.
 const SaTier = enum { strict, envelope, equivalent, behavioral };
+
+/// Surface `s`'s movie — null for the legacy no-movie (attract) surface.
+fn movAt(movs: []const util.movie.Movie, s: usize) ?util.movie.Movie {
+    return if (movs.len == 0) null else movs[s];
+}
+
+/// The behavioral tier for one surface: returns `.behavioral` on pass,
+/// null on fail with `fail_why`/`fail_frame` filled for the bisect.
+fn runBehavioralTier(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    base_image: []const u8,
+    conv_image: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+    mov: ?util.movie.Movie,
+    verify_state: ?[]const u8,
+    window: bool,
+    total: u32,
+    fail_why: *[]const u8,
+    fail_frame: *u32,
+) !?SaTier {
+    try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
+    try out.flush();
+    const bv = try verifyBehavioral(gpa, base_image, conv_image, plan, res, mov, verify_state, window, total);
+    switch (bv.verdict) {
+        .pass => |kind| {
+            try out.print(
+                "  behavioral: {s} — {} ticks compared, {} diverging ({} address(es), worst run {})\n",
+                .{
+                    if (kind == .clean) @as([]const u8, "logic state IDENTICAL at every tick") else "wall-time echoes only",
+                    bv.ticks_base,
+                    bv.stats.bad_ticks,
+                    bv.stats.n_addrs,
+                    bv.stats.worst_run,
+                },
+            );
+            if (bv.stats.heldCount() > 0)
+                try out.print(
+                    "    {} cell(s) hold a constant offset (wall-time origins: pass counters and state seeded from them)\n",
+                    .{bv.stats.heldCount()},
+                );
+            return .behavioral;
+        },
+        .fail => |why| {
+            fail_why.* = switch (why) {
+                .persistence => "live state diverges and never heals (or the conversion stopped ticking)",
+                .spread => "live-state divergence keeps reaching new addresses",
+                .flood => "live state diverges on too many ticks",
+            };
+            fail_frame.* = bv.first_bad_frame;
+            try out.print("  behavioral: FAIL — {s}\n", .{fail_why.*});
+            if (bv.n_sample > 0) {
+                try out.print("    first at baseline frame {}, e.g.:", .{bv.first_bad_frame});
+                for (bv.sample[0..bv.n_sample]) |adr| {
+                    try out.print(" ${X:0>2}:{X:0>4}", .{ @as(u32, 0x7E) + (adr >> 16), adr & 0xFFFF });
+                }
+                try out.print("\n", .{});
+            }
+            try out.flush();
+            return null;
+        },
+    }
+}
 
 /// First index where the two per-frame hash streams differ (streams are
 /// equal length by construction). Only meaningful for the divergent case,
@@ -2626,12 +2756,12 @@ fn runReport(
     // is the first thing a reader needs, because every number below is a
     // number *about that run* — a demo loop, a chosen moment, and a recorded
     // playthrough are three different games as far as the frame budget cares.
-    if (args.movie) |path| {
+    if (args.n_movies != 0) {
         try out.print(
             \\
             \\  Replayed {s} — real recorded input, so this is gameplay rather than a demo.
             \\
-        , .{path});
+        , .{args.movies[0]});
     } else {
         try out.print(
             \\
@@ -3129,7 +3259,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--movie")) {
-            out.movie = it.next() orelse return error.MissingValue;
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_movies == max_movies) return error.TooManyMovies;
+            out.movies[out.n_movies] = v;
+            out.n_movies += 1;
         } else if (std.mem.eql(u8, a, "--state")) {
             out.state = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--s2-keep")) {
