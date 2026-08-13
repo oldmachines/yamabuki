@@ -524,6 +524,7 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
     snap.* = .{};
     @memset(&snap.live, 0);
     @memset(&snap.written, 0);
+    @memset(&snap.multi, 0);
     con.bus.tick_snap = snap;
 
     const mask = try gpa.alloc(u8, wram_len);
@@ -668,6 +669,7 @@ fn verifyBehavioral(
             snap.* = .{};
             @memset(&snap.live, 0);
             @memset(&snap.written, 0);
+            @memset(&snap.multi, 0);
             con.bus.tick_snap = snap;
             return .{ .con = con, .snap = snap, .prev = try al.create(core.bus.Bus.TickSnap) };
         }
@@ -723,7 +725,21 @@ fn verifyBehavioral(
     conv.prev.* = conv.snap.*;
     @memset(&base.snap.live, 0);
     @memset(&base.snap.written, 0);
+    @memset(&base.snap.multi, 0);
     var prev_frame: u32 = base.frame;
+
+    // Intra-frame stream detection: a byte the BASELINE writes more than
+    // once inside one tick interval is mid-stream at every snapshot
+    // instant (an APU pump's cursor, its data buffers, a handshake cell)
+    // — its value at the poll is phase, not logic, and a timing-shifted
+    // conversion can never match it at the same tick. A cell that
+    // streams in eight intervals joins the wall mask by CONSTRUCTION —
+    // previously this class was absorbed only when a surface's
+    // lag-learned mask happened to cover it, which is why one surface
+    // passed and another failed on identical input.
+    const stream_ticks = try gpa.alloc(u8, wram_len);
+    defer gpa.free(stream_ticks);
+    @memset(stream_ticks, 0);
 
     // Which home each WRAM cell actually lives in on the conversion,
     // learned from the ticks where it AGREED with the baseline (0 unknown,
@@ -773,8 +789,23 @@ fn verifyBehavioral(
             conv.prev.* = conv.snap.*;
             @memset(&base.snap.live, 0);
             @memset(&base.snap.written, 0);
+            @memset(&base.snap.multi, 0);
             prev_frame = base.frame;
             continue;
+        }
+
+        // Streams first: cells the baseline multi-wrote this interval.
+        for (0..wram_len / 8) |bi| {
+            var mm = base.snap.multi[bi];
+            while (mm != 0) {
+                const bit: u3 = @intCast(@ctz(mm));
+                mm &= mm - 1;
+                const i = bi * 8 + @as(usize, bit);
+                if (stream_ticks[i] < 8) {
+                    stream_ticks[i] += 1;
+                    if (stream_ticks[i] == 8) mask[i] = 1;
+                }
+            }
         }
 
         // Compare the PREVIOUS tick pair on the bytes this baseline
@@ -842,6 +873,7 @@ fn verifyBehavioral(
         conv.prev.* = conv.snap.*;
         @memset(&base.snap.live, 0);
         @memset(&base.snap.written, 0);
+        @memset(&base.snap.multi, 0);
         prev_frame = base.frame;
     }
 
@@ -873,6 +905,7 @@ fn runTickDump(
     snap.* = .{};
     @memset(&snap.live, 0);
     @memset(&snap.written, 0);
+    @memset(&snap.multi, 0);
     con.bus.tick_snap = snap;
 
     const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch {
@@ -921,6 +954,7 @@ fn runTickDump(
             try fw.interface.writeAll(&snap.iram);
             @memset(&snap.live, 0);
             @memset(&snap.written, 0);
+            @memset(&snap.multi, 0);
             ticks += 1;
             // The no-poll run just ended: it was lag (not a load) only if
             // it stayed short, and only then does it teach the mask.

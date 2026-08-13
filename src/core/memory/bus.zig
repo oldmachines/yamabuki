@@ -70,6 +70,12 @@ pub const Bus = struct {
         /// comparator ignore it without knowing what any byte means.
         live: [wram_len / 8]u8 = undefined,
         written: [wram_len / 8]u8 = undefined,
+        /// Bytes written MORE THAN ONCE this tick: intra-frame streams
+        /// (an APU pump's cursor and buffers, a handshake cell). Their
+        /// instantaneous value at any single snapshot instant is phase,
+        /// not logic — a timing-shifted twin can never match them at the
+        /// same tick, and no state comparison should ask it to.
+        multi: [wram_len / 8]u8 = undefined,
         wram: [wram_len]u8 = undefined,
         /// Cartridge RAM (BW-RAM on an SA-1 cart) and SA-1 I-RAM, captured
         /// at the same instant: a conversion RELOCATES state into these, so
@@ -377,7 +383,9 @@ pub const Bus = struct {
     pub fn noteTickWrite(self: *Bus, addr: u24) void {
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
-        t.written[off >> 3] |= @as(u8, 1) << @intCast(off & 7);
+        const bit = @as(u8, 1) << @intCast(off & 7);
+        if (t.written[off >> 3] & bit != 0) t.multi[off >> 3] |= bit;
+        t.written[off >> 3] |= bit;
     }
 
     /// A controller poll: the lag-detection flag, and — under the
