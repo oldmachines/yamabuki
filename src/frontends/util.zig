@@ -626,9 +626,23 @@ pub fn maybeShot(
 /// each with real headroom over the measured echoes (worst observed: run
 /// 17, 18 addresses, 1.4% of ticks).
 pub const Persistence = struct {
-    /// Distinct diverging addresses tolerated before the verdict is
-    /// corruption-by-spread.
+    /// Distinct diverging addresses tolerated before spread is even a
+    /// question.
     pub const max_addrs = 64;
+    /// Dedup capacity past the threshold: novelty tracking needs to keep
+    /// telling new addresses from seen ones after max_addrs, or a single
+    /// busy burst would blind it. Exceeding THIS is spread outright.
+    pub const addr_buf = 512;
+    /// Ticks-with-new-addresses tolerated. This is what separates
+    /// WANDERING corruption (novelty sustained across the run — each cell
+    /// heals but the damage keeps finding fresh ones) from a PHASE BURST
+    /// (an offload's latency shifts the poll instant through a busy
+    /// transition: dozens of scratch cells differ at the sampled moment,
+    /// re-converge by the next frame, and novelty stops when the
+    /// transition does). Measured on the menu transition: the burst's
+    /// novelty spans a handful of ticks; the classifier's own wandering
+    /// test spans ninety.
+    pub const max_novelty_ticks = 30;
     /// Consecutive diverging ticks tolerated before the verdict is
     /// corruption-by-persistence.
     pub const max_run = 30;
@@ -636,9 +650,10 @@ pub const Persistence = struct {
     /// corruption-by-flood.
     pub const max_bad_per_mille = 50;
 
-    addrs: [max_addrs]u32 = undefined,
+    addrs: [addr_buf]u32 = undefined,
     n_addrs: usize = 0,
     addr_overflow: bool = false,
+    novelty_ticks: u32 = 0,
     ticks: u32 = 0,
     bad_ticks: u32 = 0,
     run: u32 = 0,
@@ -657,18 +672,21 @@ pub const Persistence = struct {
         self.run += 1;
         self.worst_run = @max(self.worst_run, self.run);
         if (self.first_bad == null) self.first_bad = tick;
+        var any_new = false;
         for (bad) |a| {
             const seen = for (self.addrs[0..self.n_addrs]) |x| {
                 if (x == a) break true;
             } else false;
             if (seen) continue;
-            if (self.n_addrs == max_addrs) {
+            any_new = true;
+            if (self.n_addrs == addr_buf) {
                 self.addr_overflow = true;
-                return;
+                break;
             }
             self.addrs[self.n_addrs] = a;
             self.n_addrs += 1;
         }
+        if (any_new) self.novelty_ticks += 1;
     }
 
     pub const Verdict = union(enum) {
@@ -680,6 +698,8 @@ pub const Persistence = struct {
 
     pub fn verdict(self: *const Persistence) Verdict {
         if (self.addr_overflow) return .{ .fail = .spread };
+        if (self.n_addrs > max_addrs and self.novelty_ticks > max_novelty_ticks)
+            return .{ .fail = .spread };
         if (self.worst_run > max_run) return .{ .fail = .persistence };
         if (self.ticks > 0 and
             @as(u64, self.bad_ticks) * 1000 > @as(u64, self.ticks) * max_bad_per_mille)
@@ -721,6 +741,33 @@ test "persistence: spreading addresses are corruption even when transient" {
             p.feed(t, &.{a});
             a += 1;
         } else p.feed(t, &.{});
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, p.verdict());
+}
+
+test "persistence: a phase burst — many addresses, few novelty ticks — is an echo" {
+    // The menu-transition shape: an offload's latency shifts the poll
+    // instant through a busy transition, dozens of scratch cells differ
+    // for a handful of ticks, everything re-converges, and novelty stops
+    // when the transition does.
+    var p: Persistence = .{};
+    for (0..500) |t| p.feed(@intCast(t), &.{});
+    var burst: [40]u32 = undefined;
+    for (500..506) |t| {
+        for (&burst, 0..) |*a, i| a.* = @intCast(0x0020 + (t - 500) * 40 + i);
+        p.feed(@intCast(t), &burst);
+    }
+    for (506..1000) |t| p.feed(@intCast(t), &.{});
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+
+    // The same breadth arriving as a sustained trickle stays corruption.
+    p = .{};
+    var a: u32 = 0x1000;
+    for (0..1000) |t| {
+        if (t % 10 == 0) {
+            p.feed(@intCast(t), &.{a});
+            a += 1;
+        } else p.feed(@intCast(t), &.{});
     }
     try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, p.verdict());
 }

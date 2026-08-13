@@ -1952,13 +1952,13 @@ const WinSpec = struct {
 /// are dynamic evidence: under a marshalled game DBR they read the same
 /// BW-RAM or ROM on both CPUs; under a system DBR they differ (WRAM vs
 /// I-RAM) and S4 verification is the judge.
-fn windowEligible(out: []const u8, usage: []const u8, entry: u16) ?WinSpec {
+fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, entry: u16) ?WinSpec {
     var spec: WinSpec = .{};
     spec.members[0] = .{ .entry = entry, .span = 0 };
     spec.n_members = 1;
     var walked: usize = 0;
     while (walked < spec.n_members) : (walked += 1) {
-        if (!winWalkMember(out, usage, &spec, walked)) return null;
+        if (!winWalkMember(out, usage, evidence, &spec, walked)) return null;
     }
     spec.total_span = 0;
     for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
@@ -1966,7 +1966,7 @@ fn windowEligible(out: []const u8, usage: []const u8, entry: u16) ?WinSpec {
     return spec;
 }
 
-fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) bool {
+fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec: *WinSpec, mi: usize) bool {
     const span_max: u32 = 1024;
     const entry: u32 = spec.members[mi].entry;
     var pc: u32 = entry;
@@ -2055,6 +2055,22 @@ fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) 
                 // CPUs read identically.
                 const pinned_bw = db_pin != null and (db_pin.? == 0x40 or db_pin.? == 0x41);
                 if (!pinned_bw and v >= 0x2100 and v < 0x4380) return false;
+                // An UNSHIFTED low-mirror site (mixed or absent evidence
+                // keeps the rewriter's hands off it) means WRAM on the
+                // S-CPU but the SA-1's OWN I-RAM in the copy — a tree
+                // containing one computes different results per CPU
+                // (measured: the offloaded sound path took the wrong
+                // branch at the START beep and the menu never reset its
+                // frame counter). Pure-ROM evidence is fine: same bytes
+                // on both buses.
+                if (!pinned_bw and v < 0x2000) {
+                    const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
+                    const shifted = if (e != 0)
+                        e == usage_map.site_wram_low
+                    else
+                        usage_map.mode(op) == .abs or v >= 0x100;
+                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) return false;
+                }
             },
             .long, .long_x => {
                 const b = out[file + 3];
@@ -2064,6 +2080,14 @@ fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) 
                 // re-banked every covered site, so seeing one here means
                 // the walk wandered into unrewritten territory.
                 if (b == 0x7E or b == 0x7F) return false;
+                // Same I-RAM hazard as the absolute arm: an unshifted
+                // indexed-long low-mirror site diverges on the SA-1
+                // unless its measured traffic was pure ROM.
+                if (usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and v < 0x2000) {
+                    const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
+                    const shifted = e != 0 and e == usage_map.site_wram_low;
+                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) return false;
+                }
             },
         }
         pc += len;
@@ -2182,6 +2206,7 @@ const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool };
 fn emitWindowOffloads(
     out: []u8,
     usage: []const u8,
+    evidence: ?[]const u8,
     header_off: u32,
     candidates: []const Candidate,
     allow_async_in: bool,
@@ -2207,7 +2232,7 @@ fn emitWindowOffloads(
         // The async monopoly, as in the S3 path: a sibling's un-fenced
         // send mid-flight deadlocks the dispatcher.
         if (n > 0 and chosen[0].is_async) break;
-        const spec = windowEligible(out, usage, e) orelse continue;
+        const spec = windowEligible(out, usage, evidence, e) orelse continue;
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
         chosen[n] = .{ .entry = e, .spec = spec, .is_async = allow_async and !c.no_async and n == 0 };
         n += 1;
@@ -3374,7 +3399,7 @@ pub fn convertWholeGame(
         // dispatcher's CRV feeds the shim below. The dispatcher and NMI
         // prologue live in this same bank-0 carve, after the shim slot.
         const crv: ?u16 = if (win_candidates.len != 0)
-            emitWindowOffloads(out, cov, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, &res)
+            emitWindowOffloads(out, cov, site_evidence, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, &res)
         else
             null;
 
