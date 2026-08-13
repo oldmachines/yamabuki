@@ -18,7 +18,8 @@ const std = @import("std");
 const timing = @import("timing.zig");
 const serialize = @import("serialize.zig");
 const Bus = @import("memory/bus.zig").Bus;
-const Cartridge = @import("cart/cartridge.zig").Cartridge;
+const cart_mod = @import("cart/cartridge.zig");
+const Cartridge = cart_mod.Cartridge;
 const Cpu = @import("cpu/wdc65816.zig").Cpu;
 const CpuFlags = @import("cpu/wdc65816.zig").Flags;
 const Dma = @import("memory/dma.zig").Dma;
@@ -30,8 +31,15 @@ const usage_map = @import("usage_map.zig");
 /// states are tied to the core revision that wrote them, standard for
 /// in-development emulators).
 pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
+/// Version 8 appends the cartridge RAM (SRAM/BW-RAM, `cartridge.max_sram`
+/// bytes) after the serialized payload. It was never in the payload —
+/// harmless while cart RAM meant battery saves, fatal for SA-1
+/// conversions whose whole game state lives in BW-RAM: every state load
+/// or rewind press wiped the game. Version-7 states still load (their
+/// cart RAM is simply not restored — it was never saved).
 // v7: the header's spare bytes carry a structural fingerprint of the layout.
-pub const state_version: u32 = 7;
+pub const state_version: u32 = 8;
+const state_version_no_cart_ram: u32 = 7;
 pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
@@ -415,12 +423,16 @@ pub fn Console(comptime cfg: CoreConfig) type {
 
         // --- save states ---------------------------------------------------
 
-        /// Exact byte size of a save state (header + payload). Comptime-known
-        /// and stable for the whole session — what libretro's
-        /// retro_serialize_size must report.
+        /// Exact byte size of a save state (header + payload + cart RAM).
+        /// Comptime-known and stable for the whole session — what
+        /// libretro's retro_serialize_size must report.
         pub const state_size: usize = blk: {
             @setEvalBranchQuota(100_000);
-            break :blk state_header_size + serialize.byteSize(Self);
+            break :blk state_header_size + serialize.byteSize(Self) + cart_mod.max_sram;
+        };
+        const state_payload_size: usize = blk: {
+            @setEvalBranchQuota(100_000);
+            break :blk serialize.byteSize(Self);
         };
 
         /// Structural fingerprint of the serialized layout, carried in the
@@ -435,13 +447,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// requires a console built from the same ROM.
         pub fn saveState(self: *const Self, out: []u8) usize {
             std.debug.assert(out.len >= state_size);
-            const payload_size: u32 = @intCast(state_size - state_header_size);
             @memcpy(out[0..4], &state_magic);
             std.mem.writeInt(u32, out[4..8], state_version, .little);
-            std.mem.writeInt(u32, out[8..12], payload_size, .little);
+            std.mem.writeInt(u32, out[8..12], @intCast(state_payload_size), .little);
             out[12] = @intFromEnum(cfg.accuracy);
             std.mem.writeInt(u24, out[13..16], state_fingerprint, .little);
             _ = serialize.write(Self, self, out[state_header_size..]);
+            // Cart RAM after the payload: battery SRAM on a plain cart,
+            // the game's whole working state on an SA-1 conversion.
+            @memcpy(out[state_header_size + state_payload_size ..][0..cart_mod.max_sram], &self.bus.cart.sram);
             return state_size;
         }
 
@@ -452,11 +466,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
         pub fn loadState(self: *Self, in: []const u8) StateError!void {
             if (in.len < state_header_size) return error.WrongSize;
             if (!std.mem.eql(u8, in[0..4], &state_magic)) return error.BadMagic;
-            if (std.mem.readInt(u32, in[4..8], .little) != state_version)
+            const ver = std.mem.readInt(u32, in[4..8], .little);
+            if (ver != state_version and ver != state_version_no_cart_ram)
                 return error.UnsupportedVersion;
-            const payload = in[state_header_size..];
-            if (std.mem.readInt(u32, in[8..12], .little) != payload.len or
-                payload.len != state_size - state_header_size)
+            const with_cart_ram = ver == state_version;
+            const expect: usize = if (with_cart_ram) state_size else state_size - cart_mod.max_sram;
+            const payload = in[state_header_size..@min(in.len, state_header_size + state_payload_size)];
+            if (std.mem.readInt(u32, in[8..12], .little) != state_payload_size or
+                in.len != expect)
                 return error.WrongSize;
             if (in[12] != @intFromEnum(cfg.accuracy)) return error.Corrupt;
             // A state whose layout fingerprint disagrees was written by a
@@ -466,6 +483,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (std.mem.readInt(u24, in[13..16], .little) != state_fingerprint)
                 return error.UnsupportedVersion;
             _ = serialize.read(Self, self, payload) catch return error.Corrupt;
+            // Cart RAM rides after the payload since version 8; an older
+            // state simply never saved it, and the machine keeps what it
+            // has (battery SRAM semantics — the pre-8 status quo).
+            if (with_cart_ram)
+                @memcpy(&self.bus.cart.sram, in[state_header_size + state_payload_size ..][0..cart_mod.max_sram]);
             self.postLoad();
         }
     };
@@ -1278,6 +1300,31 @@ test "save states are tied to the accuracy that wrote them" {
     }
     b.init(.accurate, try Cartridge.load(alloc, rom));
     try std.testing.expectError(error.Corrupt, b.loadState(buf));
+}
+
+test "save states carry cart RAM (the payload serializes the console's cart)" {
+    const alloc = std.testing.allocator;
+    const rom = try buildSpinRom(alloc);
+    defer alloc.free(rom);
+
+    const a = try alloc.create(FastConsole);
+    defer {
+        a.cart.deinit(alloc);
+        alloc.destroy(a);
+    }
+    a.init(try Cartridge.load(alloc, rom));
+    a.runFrame();
+    a.bus.cart.sram[0x1234] = 0xAB; // the state an SA-1 conversion lives in
+
+    const buf = try alloc.alloc(u8, FastConsole.state_size);
+    defer alloc.free(buf);
+    _ = a.saveState(buf);
+
+    // Clobber, load, restored — the payload carries the cart's RAM, which
+    // is the whole game state on an SA-1 conversion.
+    a.bus.cart.sram[0x1234] = 0;
+    try a.loadState(buf);
+    try std.testing.expectEqual(@as(u8, 0xAB), a.bus.cart.sram[0x1234]);
 }
 
 test "a $4210 edge-wait can win the race against the NMI handler's own ack" {

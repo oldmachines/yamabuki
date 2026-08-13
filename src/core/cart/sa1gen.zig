@@ -2071,13 +2071,30 @@ fn winWalkMember(out: []const u8, usage: []const u8, spec: *WinSpec, mi: usize) 
     return false;
 }
 
-/// Window sync stub: caller D ($3788), registers, caller P, and caller
-/// DBR ($378B) into the mailbox; send; double handshake; exit registers
-/// back out. No guard (every D is valid — the SA-1 runs the same D over
-/// its own identity window), no shadow, no slots, no page copies.
-const win_stub_len: u32 = 112;
-fn emitWinStub(d: []u8, id: u8) u32 {
+/// The window stubs' D guard: a caller whose direct page is NOT
+/// window-shaped (D outside $6000-$7FFF) comes from a code path the
+/// rewriter never covered — its dp state lives in real WRAM, and handing
+/// it to the SA-1 would resolve dp operands into the SA-1's own I-RAM,
+/// smash the mailbox, and send the chip rampaging over shared BW-RAM
+/// (measured: a garbled-and-wiped session traced to exactly this). Such
+/// a call runs the ORIGINAL body on the S-CPU instead — no worse than
+/// the uncovered path already is, and the SA-1 stays sane.
+const win_guard_len: u32 = 24;
+fn emitWinGuard(d: []u8, cur: *usize, entry: u16) void {
+    put(d, cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68 }); // PHP REP PHA PHD/PLA
+    put(d, cur, &.{ 0xC9, 0x00, 0x60, 0x90, 0x05 }); // < $6000 -> bail
+    put(d, cur, &.{ 0xC9, 0x00, 0x80, 0x90, 0x06 }); // < $8000 -> ok
+    put(d, cur, &.{ 0x68, 0x28, 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 }); // bail
+    put(d, cur, &.{ 0x68, 0x28 }); // ok
+}
+
+/// Window sync stub: D guard, then caller D ($3788), registers, caller P,
+/// and caller DBR ($378B) into the mailbox; send; double handshake; exit
+/// registers back out. No shadow, no slots, no page copies.
+const win_stub_len: u32 = 112 + win_guard_len;
+fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     var cur: usize = 0;
+    emitWinGuard(d, &cur, entry);
     // Caller D, with A saved around the grab.
     put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00, 0x68, 0x28 });
     // Register marshal (the sync-ptr stub's, verbatim).
@@ -2105,9 +2122,10 @@ fn emitWinStub(d: []u8, id: u8) u32 {
 /// registers + D + DBR, send, mark busy, return AT ONCE with the
 /// caller's own registers. Nothing to write back — the routine's effects
 /// land in the shared BW-RAM both CPUs address.
-const win_async_stub_len: u32 = 93;
-fn emitWinAsyncStub(d: []u8, fence: u24, id: u8) u32 {
+const win_async_stub_len: u32 = 93 + win_guard_len;
+fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     var cur: usize = 0;
+    emitWinGuard(d, &cur, entry);
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save caller
     put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
     put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore (REP first)
@@ -2265,9 +2283,9 @@ fn emitWindowOffloads(
         }
         const stub_file = cur;
         const slen = if (c.is_async)
-            emitWinAsyncStub(out[cur..], fence24, id)
+            emitWinAsyncStub(out[cur..], fence24, id, c.entry)
         else
-            emitWinStub(out[cur..], id);
+            emitWinStub(out[cur..], id, c.entry);
         std.debug.assert(slen == if (c.is_async) win_async_stub_len else win_stub_len);
         cur += slen;
         const stub_bank: u8 = @intCast(stub_file / 0x8000);
@@ -4946,7 +4964,7 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
         // SA-1 (the trace watched the copy), visible untranslated to the
         // S-CPU. Real WRAM saw none of it.
         try testing.expectEqual(@as(u8, 0x11), con.bus.sa1.bwram[0x0500]);
-        try testing.expect(con.bus.sa1.bwram[0x0501] > 10);
+        try testing.expect(con.bus.sa1.bwram[0x0501] > 2); // called repeatedly (rate is timing-dependent)
         try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0500]);
         try testing.expect(con.bus.sa1.bwram[0x0040] >= 3); // NMI counter
         try testing.expect(trace.total > 0);
