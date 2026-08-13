@@ -304,10 +304,13 @@ pub fn run(
         }
     };
     // Battery save: restored before the first frame, autosaved on a
-    // debounced dirty check, flushed at menu-open/state-load/quit.
+    // debounced dirty check, flushed at menu-open/state-load/quit. Gated
+    // on the BATTERY, not on RAM: a window-converted cart carries the
+    // game's WRAM in BW-RAM, and persisting that would boot the next
+    // session into stale mid-game state.
     var sram: ?saves.Sram = null;
     if (opts.saves_dir) |dir| {
-        if (con.cartridge().hasSram()) {
+        if (con.cartridge().hasBattery()) {
             sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
             if (sram) |*s| s.load(io, con, err);
         }

@@ -79,6 +79,7 @@ pub const Reason = enum {
     wg_dp_dynamic,
     wg_stack_dynamic,
     wg_blockmove_source,
+    wg_split_overflow,
 
     pub fn describe(self: Reason) []const u8 {
         return switch (self) {
@@ -99,6 +100,7 @@ pub const Reason = enum {
             .wg_uses_irq => "the game takes IRQs; whole-game migration forwards only NMI so far",
             .wg_nmi_ambiguous => "native and emulation NMI handlers both ran and differ; the SA-1's CNV can point at only one",
             .wg_unsupported_op => "an executed instruction (block move, BRK/COP, STP) cannot run on the SA-1 side",
+            .wg_split_overflow => "more context-split sites (measured under both a system DBR and a WRAM pin) than the thunk table holds",
         };
     }
 };
@@ -116,6 +118,13 @@ pub const Stats = struct {
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
     rewritten_abs: u32 = 0,
+    /// Context-split sites (window mode): absolutes below $2000 whose
+    /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
+    /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
+    /// untouched). One operand byte cannot serve both, so each site
+    /// becomes a JSR to a DBR-dispatching thunk that runs the original
+    /// op with the right operand for the caller it actually has.
+    split_sites: u16 = 0,
     /// dp sites covered wholesale by the D=$3000 window move.
     dp_sites: u32 = 0,
     regions_moved: u8 = 0,
@@ -260,7 +269,7 @@ pub fn convert(
 
     // --- header -----------------------------------------------------------
     out[header.offset + 0x15] = 0x23; // SA-1 map mode
-    out[header.offset + 0x16] = 0x35; // SA-1 + RAM + battery
+    out[header.offset + 0x16] = 0x34; // SA-1 + RAM, NO battery: BW-RAM is working memory
     // BW-RAM: at least the SA-1-standard 32 KiB, more if the plan spilled.
     out[header.offset + 0x18] = if (plan.viable and plan.bwram_used > 32 * 1024) 0x07 else 0x05;
 
@@ -2331,6 +2340,12 @@ const wg_window_shim_max = 33 + 23;
 /// + JMP + sig + unm + mar + blocks + NMI prologue.
 const win_disp_max: u32 = 26 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + nmi_prologue_len;
 
+/// Context-split thunk: the DBR dispatch plus both flavors of the
+/// original 3-byte op (see the emission comment in convertWholeGame).
+const split_thunk_len: u32 = 24;
+/// Sites one conversion can thunk (Gradius III measures ~100).
+const split_thunk_max: usize = 192;
+
 const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool };
 
 /// Choose and emit window offloads onto the REWRITTEN image. The
@@ -3324,6 +3339,10 @@ pub fn convertWholeGame(
     // Re-bank $7E long sites into the identity window (bank $7E does not
     // exist on the SA-1 bus; bank $00's low $0800 is the same I-RAM).
     bank = 0;
+    // Context-split sites collected for thunking (see Stats.split_sites);
+    // patched after the pass, once the bank-0 carve is paintable.
+    var thunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
+    var n_thunks: usize = 0;
     while (bank < 0x40) : (bank += 1) {
         const bank_file = bank * 0x8000;
         if (bank_file >= out.len) break;
@@ -3456,6 +3475,23 @@ pub fn convertWholeGame(
                     // reads $01:8000+X via `LDY $0000,X`) and stays; real
                     // table bases shift.
                     const e: u8 = if (site_evidence) |s| s[cpu_addr] | s[0x80_0000 | cpu_addr] else 0;
+                    // A CONTEXT-SPLIT site: measured under BOTH a system
+                    // DBR (the mirror — needs the shift) and a WRAM pin
+                    // (re-banked to $40/$41 — needs the operand as-is).
+                    // The same cell, two idioms, opposite rewrites: no
+                    // single operand serves both callers (measured on
+                    // Gradius III's mode helpers — shifted broke stage-1
+                    // loading, unshifted broke the title path). The site
+                    // becomes a JSR to a DBR-dispatching thunk instead.
+                    if (window and v < 0x2000 and
+                        e == usage_map.site_wram_low | usage_map.site_wram_bank)
+                    {
+                        if (n_thunks == split_thunk_max)
+                            return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
+                        thunks[n_thunks] = .{ .file = file, .v = v, .op = op };
+                        n_thunks += 1;
+                        continue;
+                    }
                     const shift_it = if (e != 0)
                         e == usage_map.site_wram_low
                     else
@@ -3519,6 +3555,54 @@ pub fn convertWholeGame(
     }
     res.stats.d_moved = bwram;
 
+    // Context-split thunks: each collected site becomes `JSR thunk`, and
+    // the thunk dispatches on the RUNTIME data bank — the one fact the
+    // static rewrite could not know. The template restores the caller's
+    // exact flags immediately before the original op, so every op class
+    // (loads, stores, RMW, carry-consuming ADC/SBC, flag-transparent
+    // stores inside a CMP/branch pair) behaves byte-for-byte as in situ:
+    //
+    //   PHP / SEP #$20 / PHA / PHB / PLA   ; A.lo = DBR, entry flags saved
+    //   BMI sys / BIT #$40 / BEQ sys       ; bit7 clear + bit6 set = $40/$41
+    //   PLA / PLP / op v         / RTS     ; pinned caller: operand as-is
+    //   sys: PLA / PLP / op v+$6000 / RTS  ; system caller: the window
+    //
+    // JSR is bank-relative, so a site's thunk is carved in the site's own
+    // bank. The bank-0 carve below is still $FF at this point — paint it
+    // so the search cannot claim it (the shim/dispatcher emission writes
+    // over the paint unconditionally).
+    if (window and n_thunks != 0) {
+        @memset(out[carve .. carve + scaffold], 0x00);
+        var ti: usize = 0;
+        while (ti < n_thunks) {
+            const tbank: u32 = thunks[ti].file / 0x8000;
+            var tj = ti;
+            while (tj < n_thunks and thunks[tj].file / 0x8000 == tbank) tj += 1;
+            const need: u32 = @intCast((tj - ti) * split_thunk_len);
+            const lo = tbank * 0x8000;
+            const region = if (tbank == 0) out[0..header.offset] else out[lo..@min(lo + 0x8000, out.len)];
+            const found = patchgen.findFreeSpace(region, need) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
+            var tcur: u32 = @intCast((if (tbank == 0) 0 else lo) + found);
+            while (ti < tj) : (ti += 1) {
+                const t = thunks[ti];
+                const taddr: u16 = @intCast(0x8000 + (tcur % 0x8000));
+                const sh: u16 = t.v + wg_bw_window;
+                const tpl = [split_thunk_len]u8{
+                    0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
+                    0x30, 0x0A, 0x89, 0x40,           0xF0,                0x06, // BMI sys / BIT #$40 / BEQ sys
+                    0x68, 0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60,
+                    0x68, 0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60,
+                };
+                @memcpy(out[tcur..][0..split_thunk_len], &tpl);
+                tcur += split_thunk_len;
+                out[t.file] = 0x20; // JSR — same 3-byte footprint
+                std.mem.writeInt(u16, out[t.file + 1 ..][0..2], taddr, .little);
+            }
+        }
+        res.stats.split_sites = @intCast(n_thunks);
+    }
+
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
     // BW-RAM gates, select window block 0, reproduce the power-on direct
     // page and stack INSIDE the window (the game's own D/S establishes
@@ -3564,7 +3648,7 @@ pub fn convertWholeGame(
         // async offload injected its NMI prologue above.
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
-        out[header.offset + 0x16] = 0x35;
+        out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
         out[header.offset + 0x18] = 0x07; // 128 KiB BW-RAM: all of WRAM
         patchgen.recomputeChecksum(out, header.offset);
         res.stats.shim_addr = base16;
@@ -3695,7 +3779,7 @@ pub fn convertWholeGame(
     std.mem.writeInt(u16, out[header.offset + 0x3A ..][0..2], scpu_nmi, .little);
 
     out[header.offset + 0x15] = 0x23;
-    out[header.offset + 0x16] = 0x35;
+    out[header.offset + 0x16] = 0x34; // no battery: BW-RAM is working memory
     // BW-RAM size: 32 KiB is plenty when the game's state stayed in I-RAM,
     // but the window mode maps all 128 KiB of WRAM into it.
     out[header.offset + 0x18] = if (bwram) 0x07 else 0x05;
@@ -4151,7 +4235,10 @@ test "shell: header, shim, park, and vector all land; refusals name reasons" {
     defer gpa.free(res.image);
 
     const h = try header_mod.detect(res.image);
-    try testing.expectEqual(@as(u8, 0x35), h.chipset);
+    // $34 = SA-1 + RAM, NO battery: the BW-RAM is working memory, and a
+    // frontend that persisted it would boot the next session into stale
+    // mid-game state.
+    try testing.expectEqual(@as(u8, 0x34), h.chipset);
     try testing.expectEqual(cartridge.ChipKind.sa1, cartridge.identifyChip(h));
     try testing.expectEqual(res.stats.shim_addr, h.reset_vector);
     try testing.expectEqual(@as(u16, 0xFFFF), h.checksum ^ h.checksum_complement);
@@ -5237,6 +5324,86 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0500]);
         try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0501]);
     }
+}
+
+test "window: a context-split site serves both caller classes through its thunk" {
+    // One shared helper, two callers: a system-DBR caller (needs the
+    // +$6000 shift) and a $7E-pinned caller (pin re-banked to $40 —
+    // needs the operand untouched). Site evidence measures both, the
+    // rewriter emits the DBR-dispatch thunk, and at runtime BOTH callers
+    // reach the same BW-RAM cell. The system caller also carries SEC
+    // across the helper — the thunk must not eat the carry.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x000E], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0x22, 0x80, 0x80, 0x00, // JSL $00:8080 (system caller)
+        0x22, 0xC0, 0x80, 0x00, // JSL $00:80C0 (pinned caller)
+        0x80, 0xF6, // BRA back to the first JSL
+    });
+    @memcpy(rom[0x0080..0x008B], &[_]u8{
+        0x38, // SEC
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0x90, 0x03, // BCC +3 (carry lost -> skip)
+        0xEE, 0x42, 0x01, // INC $0142 (plain site, shifts to the window)
+        0x6B, // RTL
+    });
+    @memcpy(rom[0x00C0..0x00CD], &[_]u8{
+        0xA9, 0x7E, 0x48, 0xAB, // pin $7E (re-banked to $40)
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0xA9, 0x00, 0x48, 0xAB, // back to the system bank
+        0x6B, // RTL
+    });
+    @memcpy(rom[0x0100..0x0107], &[_]u8{
+        0xEE, 0x40, 0x01, // INC $0140 — the context-split site
+        0x9C, 0x41, 0x01, // STZ $0141 — and another
+        0x6B, // RTL
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8008, 0x800C }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8080, 0x8081, 0x8085, 0x8087, 0x808A }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x80C0, 0x80C2, 0x80C3, 0x80C4, 0x80C8, 0x80CA, 0x80CB, 0x80CC }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8100, 0x8103, 0x8106 }) |a| markOp(bytes, a);
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+    sites[0x8100] = usage_map.site_wram_low | usage_map.site_wram_bank;
+    sites[0x8103] = usage_map.site_wram_low | usage_map.site_wram_bank;
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the site
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+    // Both caller classes reached the SAME relocated cell; real WRAM saw
+    // nothing; the system caller's carry survived the thunk every lap.
+    try testing.expect(con.bus.sa1.bwram[0x0140] > 4);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0141]);
+    try testing.expect(con.bus.sa1.bwram[0x0142] > 2);
+    // $0140 counts both callers per lap, $0142 the system caller alone —
+    // 2:1 modulo the lap the frame boundary caught mid-flight (and modulo
+    // u8 wrap, so compare through the same wrap).
+    const both: u8 = con.bus.sa1.bwram[0x0140];
+    const sys_only: u8 = con.bus.sa1.bwram[0x0142];
+    const twice: u8 = sys_only *% 2;
+    try testing.expect(both -% twice <= 2 or twice -% both <= 2);
 }
 
 test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, NMI round-trips" {

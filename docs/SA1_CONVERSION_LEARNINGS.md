@@ -309,13 +309,28 @@ operand byte cannot serve both worlds. Diffing the two relocations
 byte-for-byte is what named the cluster: 286 bytes, 222 runs, every one
 a `$1x`↔`$7x` operand high byte.
 
-The candidate mechanisms, both real engineering: per-site DBR-dispatch
-thunks (a 3-byte `JSR` fits over the site, but the thunk must exit with
-the OP's own flag semantics — `CMP / STA / BEQ` callers make a naive
-save/restore wrong), or duplicating the shared helpers per caller class
-and re-pointing the pinned callers. Until one is built, offloads AND
-the full-game relocation are blocked on this game; the attract-cycle
-relocation remains the widest verified build.
+The DBR-dispatch thunk mechanism is BUILT and unit-tested (a 3-byte
+`JSR` over the site; the 24-byte thunk restores the caller's exact
+flags immediately before the original op, so loads, stores, RMW, and
+carry-consuming arithmetic all behave byte-for-byte in situ; sites in
+offload trees auto-refuse because JSR is a flow refusal) — and then the
+targeted probe showed Gradius III's flipped sites are NOT context-split
+at all: every probed site is pure low-WRAM *where covered*. The real
+disease is one level up:
+
+**Each movie is a different world, and evidence does not accumulate
+across worlds.** The full-game movie that added stage-1 coverage
+DISPLACED the attract-demo phases (game-over reaches the continue
+screen; attract never returns inside the budget), so sites covered only
+by the demo — including the title-exit countdown driver `INC $1C00` at
+`$00:A2DE`, behind a mode dispatch the static walk cannot pierce — fell
+back to stock bytes and broke the title path at f833. Adding a surface
+subtracts another; the covered-surface law needs ADDITIVE tooling:
+evidence and coverage union over MULTIPLE input movies (profile and
+verify each surface, rewrite from the union). That is the next
+mechanism, and it subsumes every displacement failure this arc hit.
+Until then, offloads and the full-game relocation stay blocked on this
+game; the attract-cycle relocation remains the widest verified build.
 
 A phase-dependence note from the same run: the sound pump measures
 MAINLINE context in attract and INTERRUPT context in gameplay — the

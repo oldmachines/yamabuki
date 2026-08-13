@@ -2070,6 +2070,11 @@ fn reportSa1(
             res.stats.rewritten_abs,
             res.stats.dp_sites,
         });
+        if (res.stats.split_sites != 0)
+            try out.print(
+                "  {} context-split site(s) dispatch on the runtime data bank through a\n  thunk (measured under both a system DBR and a WRAM pin — no single\n  operand serves both callers)\n",
+                .{res.stats.split_sites},
+            );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
             for (res.stats.offload_entries[0..res.stats.offload_count], 0..) |e, i| {

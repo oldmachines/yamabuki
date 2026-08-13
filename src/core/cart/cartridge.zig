@@ -87,6 +87,19 @@ pub const Cartridge = struct {
     pub fn hasSram(self: *const Cartridge) bool {
         return self.sram_mask != 0;
     }
+
+    /// Whether the cart RAM is battery-backed — the persistence question.
+    /// A window-relocated conversion carries the game's WRAM in BW-RAM:
+    /// working memory, declared WITHOUT battery, and writing it to disk
+    /// would boot the next session into stale mid-game state.
+    pub fn hasBattery(self: *const Cartridge) bool {
+        if (self.sram_mask == 0) return false;
+        // $FFD6 low nibble: 2/5/6 (and the exotic 9/A) carry a battery.
+        return switch (self.header.chipset & 0x0F) {
+            0x02, 0x05, 0x06, 0x09, 0x0A => true,
+            else => false,
+        };
+    }
 };
 
 pub fn identifyChip(h: Header) ChipKind {
