@@ -320,17 +320,39 @@ disease is one level up:
 
 **Each movie is a different world, and evidence does not accumulate
 across worlds.** The full-game movie that added stage-1 coverage
-DISPLACED the attract-demo phases (game-over reaches the continue
-screen; attract never returns inside the budget), so sites covered only
-by the demo — including the title-exit countdown driver `INC $1C00` at
-`$00:A2DE`, behind a mode dispatch the static walk cannot pierce — fell
-back to stock bytes and broke the title path at f833. Adding a surface
-subtracts another; the covered-surface law needs ADDITIVE tooling:
-evidence and coverage union over MULTIPLE input movies (profile and
-verify each surface, rewrite from the union). That is the next
-mechanism, and it subsumes every displacement failure this arc hit.
-Until then, offloads and the full-game relocation stay blocked on this
-game; the attract-cycle relocation remains the widest verified build.
+DISPLACED the attract-demo phases, so demo-only sites fell out of the
+rewrite. The additive tooling now exists: `--gen-sa1-patch` accepts
+several `--movie` flags — each a verification surface, all feeding one
+evidence/coverage union, every one required to pass. The proof campaign
+for it then found and fixed three more systemic defects: the anchored
+evidence pass was pressing the movie's buttons into the mid-game state
+(START = pause — evidence silently varied by surface set; it now runs
+input-free), the spread verdict's novelty budgets were per-run (now
+scaled by input epochs, dedup buffer 4,096), and per-site evidence
+decisions could split one cell's accessor population (now CELL
+COHERENCE: per unindexed operand below $2000, the union of its sites'
+evidence plus any pinned accessor decides ONE home — a pinned accessor
+is stuck at BW-RAM, so a {low, bank} cell's unpinned sites shift to
+follow; a single site measured under both contexts still takes the
+thunk).
+
+**And beneath all of it, the true floor, found by tick-level
+replication: the window relocation itself does not yet survive real
+gameplay.** Every window build — union-evidence and attract-evidence
+alike — persistently diverges once actual play begins: the relocated
+image's APU stream cursor runs one byte behind stock (the
+long-disclosed "audio phase-shifted by a sample", now precisely
+located: `$1F28`-class cells, cursor value one less, in-flight byte
+from one position earlier), and the cursor-adjacent cells hold STREAM
+DATA whose divergence delta changes every tick — permanently active,
+invisible to the held-offset excusal, historically absorbed only by
+each surface's lag-learned wall mask happening to cover them. The
+candidate resolutions, in order of principle: declare the APU stream
+mailbox wall-derived BY CONSTRUCTION (a class equivalence, not
+lag-learning luck); union the wall masks across surfaces; or fix the
+one-byte pump lag at its source in the relocation. Until one lands,
+no window build is gameplay-verified, and the attract-cycle relocation
+remains the widest honest patch.
 
 A phase-dependence note from the same run: the sound pump measures
 MAINLINE context in attract and INTERRUPT context in gameplay — the
