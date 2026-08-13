@@ -580,6 +580,20 @@ const Behavioral = struct {
 /// the mask), so the verdict keys on persistence: echoes self-heal within
 /// ticks over a bounded address set; corruption persists, spreads, or
 /// floods.
+///
+/// Movie input breaks pure tick-locking: a button edge lands at a WALL
+/// frame, and a run with less lag has executed MORE logic passes by then —
+/// each run consumes the edge at a different tick index, and from there a
+/// global pairing compares two different moments of the same correct game
+/// (measured on Gradius III's menu: 79 ticks of menu-vs-attract, then
+/// menu timers phase-offset forever). So the pairing realigns per input
+/// EPOCH: when one run's tick stream crosses an edge before the other's,
+/// the laggard advances alone — its surplus ticks have no counterpart and
+/// go uncompared — and the pairing re-anchors at both runs' first tick of
+/// the new epoch. The state carried ACROSS an edge from wall-time origins
+/// (pass counters, timers seeded from them) stays offset by exactly the
+/// passes the speedup bought; the persistence verdict excuses precisely
+/// that shape — a held constant offset — and nothing else.
 fn verifyBehavioral(
     gpa: std.mem.Allocator,
     base_image: []const u8,
@@ -598,11 +612,30 @@ fn verifyBehavioral(
     const mask = try learnWallMask(gpa, base_image, mov, state, total);
     defer gpa.free(mask);
 
+    // The movie's input edges: wall frames where a pad mask changes. Each
+    // edge starts a new pairing epoch (see the doc comment above).
+    const edges: []const u32 = blk: {
+        var list: std.array_list.Managed(u32) = .init(gpa);
+        if (mov) |m| {
+            var prev_mask: [2]u16 = .{ 0, 0 };
+            for (m.frames, 0..) |f, i| {
+                if (f[0] != prev_mask[0] or f[1] != prev_mask[1]) {
+                    try list.append(@intCast(i));
+                    prev_mask = f;
+                }
+            }
+        }
+        break :blk try list.toOwnedSlice();
+    };
+    defer gpa.free(edges);
+
     const Side = struct {
         con: *core.FastConsole,
         snap: *core.bus.Bus.TickSnap,
         prev: *core.bus.Bus.TickSnap,
         frame: u32 = 0,
+        /// Wall frame of the current (last returned) tick.
+        tick_wall: u32 = 0,
 
         fn init(al: std.mem.Allocator, image: []const u8) !@This() {
             const cart = try core.Cartridge.load(al, image);
@@ -620,9 +653,20 @@ fn verifyBehavioral(
             while (self.frame < budget) {
                 const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame);
                 self.frame += 1;
-                if (ticked) return true;
+                if (ticked) {
+                    self.tick_wall = self.frame - 1;
+                    return true;
+                }
             }
             return false;
+        }
+
+        /// Which input epoch this side's current tick sits in: the number
+        /// of edges its tick stream has sampled.
+        fn epoch(self: *const @This(), es: []const u32) usize {
+            var n: usize = 0;
+            while (n < es.len and es[n] <= self.tick_wall) n += 1;
+            return n;
         }
     };
 
@@ -658,8 +702,20 @@ fn verifyBehavioral(
     @memset(&base.snap.written, 0);
     var prev_frame: u32 = base.frame;
 
-    var bad: [util.Persistence.max_addrs + 1]u32 = undefined;
-    while (true) {
+    // Which home each WRAM cell actually lives in on the conversion,
+    // learned from the ticks where it AGREED with the baseline (0 unknown,
+    // 1 BW-RAM, 2 real WRAM). A window image splits homes by access idiom
+    // — low 8K and $7E-long cells live in BW-RAM, abs-addressed high WRAM
+    // stays put — and a divergence must be measured at the LIVE home: the
+    // stale other home is dead boot residue, and a delta against dead
+    // zeros drifts as the baseline moves, faking active divergence out of
+    // a held offset.
+    const home = try gpa.alloc(u8, wram_len);
+    defer gpa.free(home);
+    @memset(home, 0);
+
+    var bad: [util.Persistence.max_addrs + 1]util.Persistence.Bad = undefined;
+    outer: while (true) {
         if (!base.advance(mov, total)) break;
         out.ticks_base += 1;
         if (!conv.advance(mov, total)) {
@@ -669,6 +725,34 @@ fn verifyBehavioral(
             return out;
         }
         out.ticks_conv += 1;
+
+        // Epoch resync: an input edge reaches each run at its own tick
+        // index. When one side has crossed an edge the other hasn't, the
+        // pairing is between different epochs — advance the laggard alone
+        // (its surplus ticks have no counterpart) and re-anchor at both
+        // sides' first tick of the new epoch, comparing from there.
+        if (base.epoch(edges) != conv.epoch(edges)) {
+            while (base.epoch(edges) != conv.epoch(edges)) {
+                if (base.epoch(edges) > conv.epoch(edges)) {
+                    if (!conv.advance(mov, total)) {
+                        // The baseline reached the input edge and the
+                        // conversion never did: it hung.
+                        out.verdict = .{ .fail = .persistence };
+                        return out;
+                    }
+                    out.ticks_conv += 1;
+                } else {
+                    if (!base.advance(mov, total)) break :outer;
+                    out.ticks_base += 1;
+                }
+            }
+            base.prev.* = base.snap.*;
+            conv.prev.* = conv.snap.*;
+            @memset(&base.snap.live, 0);
+            @memset(&base.snap.written, 0);
+            prev_frame = base.frame;
+            continue;
+        }
 
         // Compare the PREVIOUS tick pair on the bytes this baseline
         // interval consumed.
@@ -690,11 +774,29 @@ fn verifyBehavioral(
                 // which the persistence verdict would otherwise read as
                 // immortal corruption.
                 const via_bw = conv.prev.sram[i];
-                if (bb == via_bw) break :blk via_bw;
-                if ((bb == 0x7E and via_bw == 0x40) or (bb == 0x7F and via_bw == 0x41)) break :blk bb;
                 const via_wram = conv.prev.wram[i];
-                if ((bb == 0x7E and via_wram == 0x40) or (bb == 0x7F and via_wram == 0x41)) break :blk bb;
-                break :blk via_wram;
+                // The home is learned ONCE, from a discriminating equality
+                // (the homes disagree and the baseline matches exactly
+                // one), and then sticks: a dead home's zero coincidentally
+                // matching a transiting baseline value must not re-teach
+                // the cell's address (measured: stock's $3A wrapping
+                // through 00 matched the stale WRAM zero and every later
+                // delta drifted again).
+                if (bb == via_bw or (bb == 0x7E and via_bw == 0x40) or (bb == 0x7F and via_bw == 0x41)) {
+                    if (home[i] == 0 and via_bw != via_wram) home[i] = 1;
+                    break :blk bb;
+                }
+                if (bb == via_wram or (bb == 0x7E and via_wram == 0x40) or (bb == 0x7F and via_wram == 0x41)) {
+                    if (home[i] == 0 and via_bw != via_wram) home[i] = 2;
+                    break :blk bb;
+                }
+                // Diverged at both homes: report the live home's value so
+                // the persistence delta tracks what the game computes.
+                break :blk switch (home[i]) {
+                    1 => via_bw,
+                    2 => via_wram,
+                    else => if (i < 0x2000) via_bw else via_wram,
+                };
             } else switch (convHome(plan, res, @intCast(i))) {
                 .wram => conv.prev.wram[i],
                 .sram => |off| conv.prev.sram[off],
@@ -702,14 +804,14 @@ fn verifyBehavioral(
             };
             if (bb == cb) continue;
             if (n_bad < bad.len) {
-                bad[n_bad] = @intCast(i);
+                bad[n_bad] = .{ .addr = @intCast(i), .delta = bb -% cb };
                 n_bad += 1;
             }
         }
         if (n_bad > 0 and out.stats.first_bad == null) {
             out.first_bad_frame = prev_frame;
             out.n_sample = @min(out.sample.len, n_bad);
-            @memcpy(out.sample[0..out.n_sample], bad[0..out.n_sample]);
+            for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr;
         }
         out.stats.feed(out.ticks_base - 2, bad[0..n_bad]);
 
@@ -1633,6 +1735,11 @@ fn runSa1Gen(
                             bv.stats.worst_run,
                         },
                     );
+                    if (bv.stats.heldCount() > 0)
+                        try out.print(
+                            "    {} cell(s) hold a constant offset (wall-time origins: pass counters and state seeded from them)\n",
+                            .{bv.stats.heldCount()},
+                        );
                     passed = .behavioral;
                 },
                 .fail => |why| {

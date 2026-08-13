@@ -6,8 +6,8 @@ fix the rule → regenerate*. Each rule cites the failure that forced it. The
 reference throughout is Vitor Vilela's hand-crafted SA-1 patch (v17), used as
 an answer key by byte-diffing, never as a source.
 
-The work lives on PR #115 (`claude/sa1-async-offload`, fourteen commits). The
-one-command entry point:
+The work lives on PR #115 (`claude/sa1-async-offload`). The one-command entry
+point:
 
 ```
 yamabuki-headless <rom> --gen-sa1-patch --window --wg-static \
@@ -124,8 +124,8 @@ Layered gates, strictest verdict that applies:
    controller poll, on the bytes the baseline actually consumed
    (read-before-write liveness), read from wherever the conversion homes
    them. For window images: BW-RAM identity offsets with an either-home
-   compare (WMDATA-port traffic still lands in real WRAM). Two equivalences
-   proved necessary:
+   compare (WMDATA-port traffic still lands in real WRAM). The equivalences
+   this tier had to learn, each proved necessary by a false verdict:
    - **The relocation's bank-value map is a data equivalence**: baseline
      `$7E` vs conversion `$40` (and `$7F`/`$41`) in a pointer's bank byte is
      the same logical value — and it diverges *permanently*, which the
@@ -137,6 +137,33 @@ Layered gates, strictest verdict that applies:
      handful of ticks and stops. Fail requires breadth (>64 addrs) *and*
      novelty across >30 ticks; a 512-entry dedup buffer keeps novelty
      detection alive through bursts.
+   - **Input edges break global tick pairing — realign per epoch.** A movie
+     delivers a button edge at a WALL frame, and a run with less lag has
+     executed more logic passes by then: each run consumes the edge at a
+     different tick index (Gradius III's menu: 79 ticks apart), and a global
+     pairing goes on to compare two different moments of the same correct
+     game. The tier re-anchors at each edge — the laggard's surplus ticks
+     have no counterpart and go uncompared — and pairs tick-locked within
+     each epoch.
+   - **A held constant offset is a wall-time origin, not corruption.** No
+     speedup can be tick-identical past its first input edge: any counter of
+     logic passes (GIII's `$3A`) lands offset by exactly the passes the
+     speedup bought, then evolves in lockstep with the baseline forever —
+     v17 itself shows the same residue class, larger (offset `$71` vs our
+     `$4F`, plus a zeroed sound-scratch block). Corruption cannot hold a
+     constant offset against a moving baseline: a stuck cell's offset moves
+     every time the baseline does, and every change counts as active
+     divergence. The persistence feed carries values, not just addresses,
+     and excuses exactly the held-offset shape.
+   - **Divergence must be measured at the cell's LIVE home.** A window image
+     splits homes by access idiom (low 8K and `$7E`-long cells live in
+     BW-RAM; abs-addressed high WRAM stays put). The live home is learned
+     once per cell from a *discriminating* equality — the homes disagree and
+     the baseline matches exactly one — and then sticks: a delta computed
+     against the dead home's stale zeros drifts as the baseline moves,
+     faking active divergence out of a held offset; and a baseline value
+     transiting 00 coincidentally matches the dead zero and would re-teach
+     the home wrongly (measured, both).
 3. **Persistence classifier** (`util.Persistence`) — pass{clean, echoes} /
    fail{persistence, spread, flood}. Echoes are real and benign: wall-derived
    values diverge transiently and self-heal.
@@ -192,22 +219,35 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**Verified builds** (both true to their labels):
+**The single patch exists.** `--state <bubble> --movie <menu movie>` produces
+one 2.7 KB patch: window relocation + `$9BCD` (397 B sound-streamer tree) +
+`$8C95` on the SA-1, **BEHAVIORALLY EQUIVALENT over 900 frames of real input
+including the menu** — dropped frames 287→186, mean utilisation 53%→40% on
+that movie. The "menu-beep semantic divergence" that blocked it dissolved
+under the tick-level dive: it was never the offload. It was three verifier
+artifacts deep — wall-anchored input pairing, drifting dead-home deltas, and
+home-poisoning by coincidental zeros (section 5's last three equivalences).
+The offloads had been correct the whole time; the harness's demand
+(tick-identical wall-time counters) was one no speedup — v17 included —
+could meet.
 
-- *Menu-correct*: window relocation only — FRAMES IDENTICAL over 900 frames
-  of real input including the menu; speed-neutral. (~1.8 KB patch)
-- *Bubble-speedup*: window + 3 offloaded trees ($9BCD, the 1,324-byte $8EF1
-  physics tree, $8C95) — BEHAVIORALLY EQUIVALENT on its (pre-menu) surface;
-  **dropped frames 343→200, mean utilisation 58%→17%** at the bubble stage.
-  v17 measures ~12% at the same scene. (~4.2 KB patch)
+**Superseded research builds** (both still true to their labels):
 
-**The single remaining blocker** to merging them: `$9BCD` genuinely diverges
-three frames after START — the sound dispatcher takes the other branch at
-the menu beep (`$18/$19` cursor = `$08C0` vs `$1200`, the two path constants
-at `$9028`'s gate) and the transition's `$3A` counter reset never runs. Not a
-classifier artifact; a real semantic difference in the sound path under the
-offload. Chase entry point: the `$9028` gate cells (`$0ED0`/`$11D0`, 16-bit
-compares) at frames 500-503, tick-level, on the preserved failing rung.
+- *Relocation-only*: FRAMES IDENTICAL over the same 900 frames;
+  speed-neutral. (~1.8 KB)
+- *Bubble build*: window + 3 trees including the 1,324-byte `$8EF1` physics
+  tree — **dropped frames 343→200, utilisation 58%→17%** at the bubble
+  stage (v17: ~12%), menu garbled. (~4.2 KB)
+
+**What keeps the single patch above 17%**: `$8EF1` is refused under menu
+coverage by the I-RAM-hazard rule — its tree contains unshifted low-mirror
+sites with mixed or absent evidence, which can be neither shifted (their
+measured S-CPU traffic includes other classes) nor left (an unshifted
+low-mirror address is the SA-1's own I-RAM in the copy). A genuinely mixed
+site is an architectural limit of verbatim copies — more evidence cannot
+unmix it. Candidate paths if it ever matters enough: a per-copy site rewrite
+proven safe under the tree's own DBR pins, or a narrower tree that excludes
+the hazard branch.
 
 **Known hard limits** (dynamic evidence forever): pointer *values* in data;
 WMDATA-port traffic (real WRAM always — GIII has exactly one port site);

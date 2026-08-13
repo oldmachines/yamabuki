@@ -612,8 +612,8 @@ pub fn maybeShot(
 }
 
 /// The behavioral tier's verdict machine: fed the diverging live-state
-/// addresses of each compared tick, it decides whether the divergence
-/// pattern is a wall-time echo or corruption.
+/// cells of each compared tick (address AND value offset), it decides
+/// whether the divergence pattern is a wall-time echo or corruption.
 ///
 /// The distinction, validated on Gradius III's own conversions: values the
 /// main loop DERIVES from wall-coupled state (an animation phase computed
@@ -625,6 +625,20 @@ pub fn maybeShot(
 /// or floods (a clobbered buffer diverges wholesale). Hence three limits,
 /// each with real headroom over the measured echoes (worst observed: run
 /// 17, 18 addresses, 1.4% of ticks).
+///
+/// One shape is excused even when it never heals: a cell whose divergence
+/// HOLDS A CONSTANT OFFSET while the run goes on. A conversion that removes
+/// slowdown gives the game more logic passes per wall second, and any
+/// counter of passes — or timer seeded from one across an input edge —
+/// lands offset by exactly the passes the speedup bought, then evolves in
+/// lockstep with the baseline forever (measured on Gradius III's menu:
+/// the $3A pass counter offset by the 79 passes the offloads gained, and
+/// v17's hand-made conversion shows the same class, larger). Corruption
+/// cannot hold a constant offset against a moving baseline: a stuck cell's
+/// offset changes every time the baseline moves, and each change counts as
+/// a fresh diverging tick. So: an address re-diverging at its established
+/// offset is a wall-time origin and feeds no failure axis; an offset
+/// CHANGE is active divergence and feeds them all.
 pub const Persistence = struct {
     /// Distinct diverging addresses tolerated before spread is even a
     /// question.
@@ -650,7 +664,16 @@ pub const Persistence = struct {
     /// corruption-by-flood.
     pub const max_bad_per_mille = 50;
 
+    /// One diverging live cell: where, and by how much (baseline minus
+    /// converted, wrapping). The offset is what separates a relocated
+    /// wall-time origin (holds) from active divergence (changes).
+    pub const Bad = struct { addr: u32, delta: u8 };
+
     addrs: [addr_buf]u32 = undefined,
+    deltas: [addr_buf]u8 = undefined,
+    /// Addresses that re-diverged at their established offset at least
+    /// once — the wall-time origins the verdict excused, for the report.
+    held: [addr_buf]bool = undefined,
     n_addrs: usize = 0,
     addr_overflow: bool = false,
     novelty_ticks: u32 = 0,
@@ -660,11 +683,41 @@ pub const Persistence = struct {
     worst_run: u32 = 0,
     first_bad: ?u32 = null,
 
-    /// One compared tick: `bad` is the diverging live addresses (empty =
+    /// One compared tick: `bad` is the diverging live cells (empty =
     /// clean). Order and duplicates don't matter.
-    pub fn feed(self: *Persistence, tick: u32, bad: []const u32) void {
+    pub fn feed(self: *Persistence, tick: u32, bad: []const Bad) void {
         self.ticks += 1;
-        if (bad.len == 0) {
+        var any_new = false;
+        var active = false;
+        for (bad) |b| {
+            const slot: ?usize = for (self.addrs[0..self.n_addrs], 0..) |x, i| {
+                if (x == b.addr) break i;
+            } else null;
+            if (slot) |i| {
+                if (self.deltas[i] == b.delta) {
+                    // Re-diverging at the established offset: the cell
+                    // evolves in lockstep with the baseline from a
+                    // relocated origin. Not corruption; feeds nothing.
+                    self.held[i] = true;
+                    continue;
+                }
+                self.deltas[i] = b.delta;
+                active = true;
+                continue;
+            }
+            any_new = true;
+            active = true;
+            if (self.n_addrs == addr_buf) {
+                self.addr_overflow = true;
+                continue;
+            }
+            self.addrs[self.n_addrs] = b.addr;
+            self.deltas[self.n_addrs] = b.delta;
+            self.held[self.n_addrs] = false;
+            self.n_addrs += 1;
+        }
+        if (any_new) self.novelty_ticks += 1;
+        if (!active) {
             self.run = 0;
             return;
         }
@@ -672,21 +725,14 @@ pub const Persistence = struct {
         self.run += 1;
         self.worst_run = @max(self.worst_run, self.run);
         if (self.first_bad == null) self.first_bad = tick;
-        var any_new = false;
-        for (bad) |a| {
-            const seen = for (self.addrs[0..self.n_addrs]) |x| {
-                if (x == a) break true;
-            } else false;
-            if (seen) continue;
-            any_new = true;
-            if (self.n_addrs == addr_buf) {
-                self.addr_overflow = true;
-                break;
-            }
-            self.addrs[self.n_addrs] = a;
-            self.n_addrs += 1;
-        }
-        if (any_new) self.novelty_ticks += 1;
+    }
+
+    /// How many addresses ever re-diverged at a held offset (the excused
+    /// wall-time origins).
+    pub fn heldCount(self: *const Persistence) usize {
+        var n: usize = 0;
+        for (self.held[0..self.n_addrs]) |h| n += @intFromBool(h);
+        return n;
     }
 
     pub const Verdict = union(enum) {
@@ -714,21 +760,49 @@ test "persistence: clean and transient-echo runs pass" {
     try std.testing.expectEqual(Persistence.Verdict{ .pass = .clean }, p.verdict());
 
     // Gradius III's measured shape: short scattered runs over 3 addresses,
-    // ~1.2% of ticks (40 of 3202 in the 3600-frame capture).
+    // ~1.2% of ticks (40 of 3202 in the 3600-frame capture). Each echo
+    // burst carries a different lag delta — echoes are not held offsets.
     p = .{};
     for (0..1000) |t| {
         const in_echo = (t % 250) < 8;
-        if (in_echo) p.feed(@intCast(t), &.{ 0x1F20, 0x1F28, 0x1F29 }) else p.feed(@intCast(t), &.{});
+        const d: u8 = @truncate(t / 250 + 1);
+        if (in_echo) p.feed(@intCast(t), &.{
+            .{ .addr = 0x1F20, .delta = d },
+            .{ .addr = 0x1F28, .delta = d +% 3 },
+            .{ .addr = 0x1F29, .delta = d +% 7 },
+        }) else p.feed(@intCast(t), &.{});
     }
     try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
 }
 
 test "persistence: a divergence that never heals is corruption" {
+    // A stuck cell against a moving baseline: the offset changes every
+    // tick, so every tick is active divergence.
     var p: Persistence = .{};
     for (0..100) |t| p.feed(@intCast(t), &.{});
-    for (100..200) |t| p.feed(@intCast(t), &.{0x0042}); // sticks forever
+    for (100..200) |t| p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }});
     try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
     try std.testing.expectEqual(@as(?u32, 100), p.first_bad);
+}
+
+test "persistence: a constant offset held forever is a wall-time origin, not corruption" {
+    // The removed-slowdown signature: a pass counter lands offset by the
+    // passes the speedup bought, then evolves in lockstep with the
+    // baseline for the rest of the run ($3A on Gradius III's menu, offset
+    // 79 — and v17's hand conversion shows the same class).
+    var p: Persistence = .{};
+    for (0..100) |t| p.feed(@intCast(t), &.{});
+    for (100..1000) |t| p.feed(@intCast(t), &.{
+        .{ .addr = 0x003A, .delta = 0x4F },
+        .{ .addr = 0x3D98, .delta = 0x01 },
+    });
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+    try std.testing.expectEqual(@as(usize, 2), p.heldCount());
+
+    // But an offset that then STARTS MOVING is a cell the conversion is
+    // actively computing wrong — the excusal must not survive the change.
+    for (1000..1040) |t| p.feed(@intCast(t), &.{.{ .addr = 0x003A, .delta = @truncate(t) }});
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
 }
 
 test "persistence: spreading addresses are corruption even when transient" {
@@ -738,7 +812,7 @@ test "persistence: spreading addresses are corruption even when transient" {
     while (t < 900) : (t += 1) {
         // A new address every bad tick, each healing immediately.
         if (t % 10 == 0) {
-            p.feed(t, &.{a});
+            p.feed(t, &.{.{ .addr = a, .delta = 1 }});
             a += 1;
         } else p.feed(t, &.{});
     }
@@ -752,9 +826,9 @@ test "persistence: a phase burst — many addresses, few novelty ticks — is an
     // when the transition does.
     var p: Persistence = .{};
     for (0..500) |t| p.feed(@intCast(t), &.{});
-    var burst: [40]u32 = undefined;
+    var burst: [40]Persistence.Bad = undefined;
     for (500..506) |t| {
-        for (&burst, 0..) |*a, i| a.* = @intCast(0x0020 + (t - 500) * 40 + i);
+        for (&burst, 0..) |*b, i| b.* = .{ .addr = @intCast(0x0020 + (t - 500) * 40 + i), .delta = 1 };
         p.feed(@intCast(t), &burst);
     }
     for (506..1000) |t| p.feed(@intCast(t), &.{});
@@ -765,7 +839,7 @@ test "persistence: a phase burst — many addresses, few novelty ticks — is an
     var a: u32 = 0x1000;
     for (0..1000) |t| {
         if (t % 10 == 0) {
-            p.feed(@intCast(t), &.{a});
+            p.feed(@intCast(t), &.{.{ .addr = a, .delta = 1 }});
             a += 1;
         } else p.feed(@intCast(t), &.{});
     }
@@ -775,8 +849,10 @@ test "persistence: a phase burst — many addresses, few novelty ticks — is an
 test "persistence: too many bad ticks are corruption even when bounded" {
     var p: Persistence = .{};
     for (0..1000) |t| {
-        // 10% bad, always the same byte, runs of 5 — flood without spread.
-        if (t % 50 < 5) p.feed(@intCast(t), &.{0x0042}) else p.feed(@intCast(t), &.{});
+        // 10% bad, always the same byte at an ever-moving offset, runs of
+        // 5 — flood without spread (a held offset would be excused; a
+        // flood is divergence the conversion keeps recomputing wrong).
+        if (t % 50 < 5) p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }}) else p.feed(@intCast(t), &.{});
     }
     try std.testing.expectEqual(Persistence.Verdict{ .fail = .flood }, p.verdict());
 }
