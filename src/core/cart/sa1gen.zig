@@ -3921,6 +3921,29 @@ pub fn convertWholeGame(
         out[off] -= 0x3E;
         res.stats.rewritten_long += 1;
     }
+    // The dispatch macro `STA $00 / JMP ($0000)` — BY SIGNATURE, coverage
+    // or not. GIII stamps this five-byte idiom ~140 times across three
+    // banks and the coverage-gated pointer-shift rule reaches only the
+    // few dozen the profiled surfaces execute; every uncovered sibling is
+    // a landmine (measured twice on the full-cycle tail: the first
+    // uncovered site read its pointer from dead real WRAM and BRK-stormed
+    // at f4640; with that one fixed by a coverage pad, the NEXT one
+    // halted the S-CPU on an STP inside ROM data at ~f6500 — post-fork
+    // trajectories visit sites no finite stock profile can lead). The
+    // signature is specific enough that a data collision is negligible,
+    // and a covered site is naturally skipped: its operand is already
+    // $6000, which no longer matches.
+    if (bwram) {
+        var f: u32 = 0;
+        while (f + 5 <= out.len) : (f += 1) {
+            if (out[f] == 0x85 and out[f + 1] == 0x00 and out[f + 2] == 0x6C and
+                out[f + 3] == 0x00 and out[f + 4] == 0x00)
+            {
+                std.mem.writeInt(u16, out[f + 3 ..][0..2], wg_bw_window, .little);
+                res.stats.rewritten_abs += 1;
+            }
+        }
+    }
     // Measured pointer-bank sources: table bytes (and immediate operands
     // the shape pass above didn't already reach) that carry $7E/$7F into
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is
