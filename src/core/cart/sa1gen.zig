@@ -2404,30 +2404,44 @@ fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     return @intCast(cur);
 }
 
-/// One dispatcher block for a window offload: game D as-is, game DBR
-/// from the mailbox, the shared unmarshal, WATCHDOG armed, the copy
-/// (IRQs open only across it), dispatcher DBR back, the shared marshal,
-/// dispatcher D back, signal. The watchdog: the SA-1's own linear timer
-/// restarts before each dispatch; a copy that overruns the budget takes
-/// the timer IRQ into the abort handler, which unwinds and signals
-/// "aborted" instead of wedging both CPUs forever (measured: the $8EF1
-/// walker's torn chain-head ROM cycles survived every cheaper guard).
-const win_block_len: u32 = 51;
+/// One dispatcher block for a window offload: game D as-is, WATCHDOG
+/// armed (while DBR is still the dispatcher's — the arm is absolute
+/// MMIO, and a game DBR would land it in BW-RAM), game DBR from the
+/// mailbox, the shared unmarshal, CLI, the copy, SEI, dispatcher DBR
+/// back, the shared marshal, exit-P I-bit repaired, dispatcher D back,
+/// signal. The watchdog: the SA-1's own linear timer restarts before
+/// each dispatch; a copy that overruns the budget takes the timer IRQ
+/// into the abort handler, which unwinds and signals "aborted" instead
+/// of wedging both CPUs forever (measured: the $8EF1 walker's torn
+/// chain-head ROM cycles survived every cheaper guard).
+///
+/// The I-bit dance: these trees are the INTERRUPT class — their game P
+/// arrives with I set, so without the CLI the watchdog would never
+/// fire for exactly the calls it exists to protect (the unmarshal's
+/// PLP hands game P to the copy). But P round-trips: the marshal
+/// stores the live post-copy P and the S-CPU caller PLPs it, so the
+/// forced CLI/SEI would leak a wrong I bit back into the GAME. Entry
+/// P's I bit is stashed at $378E before dispatch and patched into the
+/// stored exit P after the marshal. (PLB's N/Z clobber predates the
+/// watchdog and is measured non-load-bearing; I is not a flag to
+/// gamble on.)
+const win_block_len: u32 = 70;
 fn emitWinBlock(d: []u8, cur: *usize, id: u8, copy_addr: u16, copy_bank: u8, unm_addr: u16, mar_addr: u16, sig_addr: u16, dp_base: u16) void {
-    put(d, cur, &.{ 0xC9, id, 0xD0, 0x2F });
+    put(d, cur, &.{ 0xC9, id, 0xD0, 0x42 });
     put(d, cur, &.{0x8B}); // dispatcher DBR
     put(d, cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x5B }); // game D
-    put(d, cur, &.{ 0xE2, 0x20, 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
-    // Watchdog: restart the linear timer and drop any stale flag while A
-    // is still scratch (the unmarshal below loads the game registers).
+    put(d, cur, &.{ 0xE2, 0x20 });
+    put(d, cur, &.{ 0xAD, 0x86, 0x37, 0x29, 0x04, 0x8D, 0x8E, 0x37 }); // entry P's I bit -> $378E
     put(d, cur, &.{ 0x9C, 0x11, 0x22 }); // CTR: counters to zero
     put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // CIC: clear timer flag
+    put(d, cur, &.{ 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
     putJsr(d, cur, unm_addr);
-    put(d, cur, &.{0x58}); // CLI — the watchdog is live only across the copy
+    put(d, cur, &.{0x58}); // CLI — the watchdog covers the copy whatever game P says
     put(d, cur, &.{ 0x22, @truncate(copy_addr), @truncate(copy_addr >> 8), copy_bank });
     put(d, cur, &.{0x78}); // SEI
     put(d, cur, &.{0xAB}); // dispatcher DBR back
     putJsr(d, cur, mar_addr);
+    put(d, cur, &.{ 0xAD, 0x86, 0x37, 0x29, 0xFB, 0x0D, 0x8E, 0x37, 0x8D, 0x86, 0x37 }); // exit P I <- entry I
     put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // drop a crossing that never fired
     put(d, cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
     put(d, cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
@@ -2483,10 +2497,14 @@ const wg_prologue_len = 21;
 /// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
 /// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
-const wg_window_shim_max = 33 + 33;
+const wg_window_shim_max = 33 + 43;
+/// What the shim must program before releasing the SA-1 from reset:
+/// its reset vector and — S-CPU-side registers both — its IRQ vector,
+/// aimed at the watchdog's abort handler.
+const WinBoot = struct { crv: u16, civ: u16 };
 /// Bank-0 reservation for the window dispatcher: prologue + message loop
 /// + JMP + sig + unm + mar + abort + blocks + NMI prologue.
-const win_disp_max: u32 = 56 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len;
+const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
@@ -2500,7 +2518,11 @@ const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool };
 /// dispatcher (CRV is 16-bit) and the NMI prologue (a 16-bit vector)
 /// live in the bank-0 carve after the shim; stubs, copies, and the fence
 /// are long-addressed and carve from any bank's padding. Returns the CRV
-/// for the shim to program, or null when nothing offloaded.
+/// and CIV for the shim to program, or null when nothing offloaded.
+/// (CIV because $2207/8 is an S-CPU-SIDE register — the SA-1's own
+/// stores to it fall on deaf ports, measured as a frame-0 wedge when the
+/// prologue tried: the first timer IRQ vectored through CIV=0 into
+/// I-RAM garbage.)
 fn emitWindowOffloads(
     out: []u8,
     usage: []const u8,
@@ -2510,7 +2532,7 @@ fn emitWindowOffloads(
     allow_async_in: bool,
     bank0_at: u32,
     res: *Result,
-) ?u16 {
+) ?WinBoot {
     const nmi_native = std.mem.readInt(u16, out[header_off + 0x2A ..][0..2], .little);
     const nmi_emu = std.mem.readInt(u16, out[header_off + 0x3A ..][0..2], .little);
     const nmi_ok = nmi_native >= 0x8000 and
@@ -2626,18 +2648,19 @@ fn emitWindowOffloads(
     const base16: u16 = @intCast(0x8000 + (bank0_at % 0x8000));
     // Prologue: I-RAM/BW-RAM gates, CBM block 0 (the identity window!),
     // native mode, 16-bit X, stack under the mailbox, D — then the
-    // watchdog: CIV at the abort handler, the linear timer with a V
-    // budget, and the timer IRQ enabled (masked except across a copy).
-    // The handler's address falls out of the fixed section lengths.
-    const abort_addr: u16 = base16 + @as(u16, @intCast(56 + 12 + n * win_block_len + 3 + 19 + 21 + 24));
+    // watchdog: the linear timer with a V budget, CIC BEFORE CIE (the
+    // clear bit is the line mask — enabling with it unset asserts the
+    // IRQ line at once, and the first dispatch's PLP of a mainline
+    // caller's P would take it instantly). CIV is programmed by the
+    // S-CPU shim: $2207/8 is not writable from this side.
+    const abort_addr: u16 = base16 + @as(u16, @intCast(51 + 12 + n * win_block_len + 3 + 19 + 21 + 24));
     put(d, &dc, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x9C, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
-    put(d, &dc, &.{ 0xA9, @truncate(abort_addr), 0x8D, 0x07, 0x22 }); // CIV lo
-    put(d, &dc, &.{ 0xA9, @truncate(abort_addr >> 8), 0x8D, 0x08, 0x22 }); // CIV hi
-    put(d, &dc, &.{ 0xA9, 0x82, 0x8D, 0x10, 0x22 }); // TMC: linear, V compare
     put(d, &dc, &.{ 0xA9, win_watchdog_vcnt, 0x8D, 0x14, 0x22 }); // VCNT lo
     put(d, &dc, &.{ 0xA9, 0x00, 0x8D, 0x15, 0x22 }); // VCNT hi
-    put(d, &dc, &.{ 0xA9, 0x40, 0x8D, 0x0A, 0x22 }); // CIE: timer IRQ
-    std.debug.assert(dc == 56);
+    put(d, &dc, &.{ 0xA9, 0x82, 0x8D, 0x10, 0x22 }); // TMC: linear, V compare
+    put(d, &dc, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // CIC: line masked...
+    put(d, &dc, &.{ 0xA9, 0x40, 0x8D, 0x0A, 0x22 }); // ...THEN CIE: timer IRQ
+    std.debug.assert(dc == 51);
     const loop_addr: u16 = base16 + @as(u16, @intCast(dc));
     put(d, &dc, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
     const blocks_at = dc;
@@ -2679,7 +2702,7 @@ fn emitWindowOffloads(
     res.stats.offloaded = chosen[0].entry;
     res.stats.pointer_offloads = @intCast(n);
     res.stats.resident_offloads = @intCast(n); // by construction
-    return base16;
+    return .{ .crv = base16, .civ = abort_addr };
 }
 /// Extra prologue the BW-RAM window needs: select block 0, unprotect, and
 /// reproduce the power-on D and S inside the window (native mode first).
@@ -3885,7 +3908,7 @@ pub fn convertWholeGame(
         // Offloads first: eligibility walks the REWRITTEN image, and the
         // dispatcher's CRV feeds the shim below. The dispatcher and NMI
         // prologue live in this same bank-0 carve, after the shim slot.
-        const crv: ?u16 = if (win_candidates.len != 0)
+        const boot: ?WinBoot = if (win_candidates.len != 0)
             emitWindowOffloads(out, cov, site_evidence, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, &res)
         else
             null;
@@ -3896,13 +3919,17 @@ pub fn convertWholeGame(
         wn = emitStore(d, wn, 0x2224, 0x00); // SBM: S-CPU window = block 0
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
-        if (crv) |v| {
+        if (boot) |b| {
             // Boot the SA-1 into the window dispatcher; the async busy
             // flag starts idle (I-RAM is garbage at power-on, and SIWP
-            // must open before the S-CPU can zero it).
+            // must open before the S-CPU can zero it). CIV is aimed at
+            // the watchdog's abort handler from HERE — $2207/8 is an
+            // S-CPU-side register the SA-1 itself cannot program.
             wn = emitStore(d, wn, 0x2229, 0xFF);
-            wn = emitStore(d, wn, 0x2203, @truncate(v));
-            wn = emitStore(d, wn, 0x2204, @truncate(v >> 8));
+            wn = emitStore(d, wn, 0x2203, @truncate(b.crv));
+            wn = emitStore(d, wn, 0x2204, @truncate(b.crv >> 8));
+            wn = emitStore(d, wn, 0x2207, @truncate(b.civ));
+            wn = emitStore(d, wn, 0x2208, @truncate(b.civ >> 8));
             wn = emitStore(d, wn, 0x378C, 0x00); // sync mailbox-busy guard cell
             wn = emitStore(d, wn, 0x378D, 0x00); // watchdog aborted flag
             if (res.stats.async_entry != 0) wn = emitStore(d, wn, 0x378A, 0x00);
@@ -3922,8 +3949,8 @@ pub fn convertWholeGame(
         out[header.offset + 0x18] = 0x07; // 128 KiB BW-RAM: all of WRAM
         patchgen.recomputeChecksum(out, header.offset);
         res.stats.shim_addr = base16;
-        res.stats.park_addr = crv orelse 0;
-        res.stats.offloaded = if (crv == null) reset else res.stats.offloaded;
+        res.stats.park_addr = if (boot) |b| b.crv else 0;
+        res.stats.offloaded = if (boot == null) reset else res.stats.offloaded;
         return res;
     }
     // Where each unique helper's JSR target lives in bank $00: the helper
