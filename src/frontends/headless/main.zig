@@ -121,6 +121,11 @@ const Args = struct {
     /// Window debugging (undocumented): write each verification attempt's
     /// converted image to this path (last attempt wins).
     save_attempt: ?[]const u8 = null,
+    /// Window offloads (undocumented --wg-sync): never try the async
+    /// flavor. The async monopoly admits ONE tree; a passing async
+    /// first attempt ships alone even when the sync ladder would carry
+    /// more trees and more speedup.
+    wg_sync: bool = false,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1862,7 +1867,7 @@ fn runSa1Gen(
         }
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral and !args.wg_sync, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -3537,6 +3542,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
             out.behavioral_probe = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--wg-sync")) {
+            out.wg_sync = true;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
