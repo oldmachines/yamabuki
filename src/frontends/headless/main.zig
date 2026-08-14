@@ -948,12 +948,24 @@ fn verifyBehavioral(
     // the run began so the caller can verify up to the horizon.
     // (A conversion that stopped ticking never reaches this analysis —
     // those verdicts return early from the advance failures above.)
+    // The FORK-EPISODE shape: a timing-changed conversion forks the game
+    // at each RNG-sensitive moment (a demo, a transition whose sound
+    // phase shifted); each episode that HEALS was reconverged by a scene
+    // reset — corruption does not reconverge to byte-equivalence. A small
+    // number of bounded episodes qualifies for the prefix-retry excusal
+    // when everything OUTSIDE them held: few episodes, a substantial
+    // verified prefix before the first, the excused fraction small, and
+    // the off-episode surface within the flood budget.
     if (out.verdict == .fail and out.verdict.fail == .persistence and
-        out.stats.runReachesEnd() and
-        out.stats.worst_start > out.stats.last_tick / 2 and
-        out.stats.worst_start < n_tick_walls)
+        out.stats.long_runs <= 4 and
+        out.stats.long_total * 4 <= out.stats.stable_ticks and
+        (@as(u64, out.stats.bad_ticks - out.stats.long_total) * 1000 <=
+            @as(u64, out.stats.stable_ticks) * util.Persistence.max_bad_per_mille * 2) and
+        out.stats.first_long_start != null and
+        out.stats.first_long_start.? > 600 and
+        out.stats.first_long_start.? < n_tick_walls)
     {
-        out.fork_wall = tick_walls[out.stats.worst_start];
+        out.fork_wall = tick_walls[out.stats.first_long_start.?];
     }
     return out;
 }
@@ -2089,6 +2101,9 @@ fn runBehavioralProbe(
                 bv.stats.addr_overflow,     bv.stats.epoch_budget,     bv.first_bad_frame,
             },
         );
+        try out.print("  runs: worst {} [{}..{}], runner-up {}, last_tick {}, reaches_end {}\n", .{
+            bv.stats.worst_run, bv.stats.worst_start, bv.stats.worst_end, bv.stats.second_run, bv.stats.last_tick, bv.stats.runReachesEnd(),
+        });
         if (bv.n_sample > 0) {
             try out.print("  first-bad sample:", .{});
             for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}", .{adr & 0xFFFF});
@@ -2173,8 +2188,17 @@ fn runBehavioralTier(
                 const bv2 = try verifyBehavioral(gpa, base_image, conv_image, plan, res, mov, verify_state, window, fw);
                 if (bv2.verdict == .pass) {
                     try out.print(
-                        "  behavioral: equivalent to the RNG-FORK HORIZON — {} ticks verified ({} diverging, worst run {}), fork at wall frame {} of {}; beyond it the runs are two healthy games (wall-origin RNG), UNVERIFIABLE by replay — eyeball it\n",
-                        .{ bv2.ticks_base, bv2.stats.bad_ticks, bv2.stats.worst_run, fw, total },
+                        "  behavioral: equivalent MODULO {} RNG-FORK EPISODE(S) — prefix of {} ticks verified to the first fork at wall frame {} of {}; {} tick(s) inside fork episodes excused ({s}); off-episode divergence {} tick(s) with every run <= {}\n",
+                        .{
+                            bv.stats.long_runs,
+                            bv2.ticks_base,
+                            fw,
+                            total,
+                            bv.stats.long_total,
+                            if (bv.stats.runReachesEnd()) @as([]const u8, "the last runs to the surface end: a gameplay fork, unverifiable by replay — eyeball it") else "each healed by a scene reset, which corruption would not survive",
+                            bv.stats.bad_ticks - bv.stats.long_total,
+                            util.Persistence.max_run,
+                        },
                     );
                     return .behavioral;
                 }

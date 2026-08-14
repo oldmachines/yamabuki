@@ -713,6 +713,32 @@ pub const Persistence = struct {
     /// Tick of the worst run's last increment: a run reaching (near) the
     /// surface end is the RNG-fork signature, not corruption-and-recovery.
     worst_end: u32 = 0,
+    /// The runner-up run: the longest COMPLETED run other than the worst
+    /// one's own instance. When a late fork HEALS (an attract loop's
+    /// scene reset reloads the forked state and the tail re-converges),
+    /// this is what proves the rest of the surface stayed within the echo
+    /// budget — the strongest evidence the excursion was a fork and not
+    /// corruption, because corruption does not reconverge to
+    /// byte-equivalence through a reset.
+    second_run: u32 = 0,
+    /// Most recent counted bad tick (identifies which instance is ending).
+    last_bad: u32 = 0,
+    /// First tick of the currently open run (instance identity).
+    run_start: u32 = 0,
+    /// Fork-episode accounting: completed-or-open runs that exceeded the
+    /// persistence budget. A timing-changed conversion forks the game at
+    /// RNG-sensitive moments (each demo, each transition whose sound
+    /// state phase-shifted); every episode that HEALS was reconverged by
+    /// a scene reset — corruption does not reconverge to
+    /// byte-equivalence. The caller may excuse a small number of them
+    /// when everything outside verifies.
+    long_runs: u8 = 0,
+    /// Bad ticks spent inside long runs — subtracted for the caller's
+    /// adjusted flood check.
+    long_total: u32 = 0,
+    /// Start tick of the first long run: the horizon the prefix retry
+    /// verifies up to.
+    first_long_start: ?u32 = null,
     /// Highest tick index fed (indices may skip: the caller's epoch
     /// resyncs consume ticks without comparing them).
     last_tick: u32 = 0,
@@ -767,14 +793,32 @@ pub const Persistence = struct {
         }
         if (any_new) self.novelty_ticks += 1;
         if (!active) {
+            // A run just ended: keep the runner-up. The worst INSTANCE is
+            // the one whose start worst_start records; any other completed
+            // run — even one that tied the worst's length — counts here.
+            if (self.run > 0 and self.worst_start != self.run_start)
+                self.second_run = @max(self.second_run, self.run);
             self.run = 0;
             return;
         }
         self.bad_ticks += 1;
         self.run += 1;
+        if (self.run == 1) self.run_start = tick;
+        self.last_bad = tick;
+        if (self.run == max_run + 1) {
+            self.long_runs +|= 1;
+            self.long_total += max_run + 1;
+            if (self.first_long_start == null) self.first_long_start = self.run_start;
+        } else if (self.run > max_run + 1) {
+            self.long_total += 1;
+        }
         if (self.run > self.worst_run) {
+            // A new record: the DETHRONED instance, if it was a different
+            // one, becomes the runner-up.
+            if (self.worst_run > 0 and self.worst_start != self.run_start)
+                self.second_run = @max(self.second_run, self.worst_run);
             self.worst_run = self.run;
-            self.worst_start = tick + 1 - self.run;
+            self.worst_start = self.run_start;
             self.worst_end = tick;
         }
         if (self.first_bad == null) self.first_bad = tick;
