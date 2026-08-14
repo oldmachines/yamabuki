@@ -1847,12 +1847,25 @@ fn runSa1Gen(
     var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try conv_samples.ensureTotalCapacity(total_max);
 
+    // GREEDY MODE LADDER: the sync phase bisects to its MAXIMAL passing
+    // configuration first; then one async attempt competes against it on
+    // the measured result. Shipping the first passing attempt was wrong
+    // both ways round — an async first-pass ships a single tree when the
+    // sync ladder carries more (measured: async $9BCD alone cut dropped
+    // frames 237 to 234; the sync three-tree config cut them to 106),
+    // and a sync-only run never learns whether the async flavor was the
+    // better patch. `--wg-sync` skips the async phase.
+    const SyncPass = struct { res: core.sa1gen.Result, tier: SaTier, conv_sum: @TypeOf(sum) };
+    var sync_pass: ?SyncPass = null;
+    var phase_async = false;
     while (true) {
-        // Candidates minus the dropped culprits.
+        // Candidates minus the dropped culprits. The async phase fields
+        // the full list again: its monopoly ships one tree, and the sync
+        // drops were sync verdicts.
         var act: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
         var n_act: usize = 0;
         for (cands[0..n_cands]) |c| {
-            const is_dropped = for (dropped[0..n_dropped]) |d| {
+            const is_dropped = !phase_async and for (dropped[0..n_dropped]) |d| {
                 if (d == c.entry) break true;
             } else false;
             if (!is_dropped) {
@@ -1867,7 +1880,7 @@ fn runSa1Gen(
         }
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral and !args.wg_sync, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -1903,7 +1916,10 @@ fn runSa1Gen(
             // Every rung, numbered — the bisect overwrites the plain name,
             // and the failing rung is usually the interesting one.
             var nbuf: [256]u8 = undefined;
-            const numbered = std.fmt.bufPrint(&nbuf, "{s}.{d}", .{ ap, n_dropped }) catch ap;
+            const numbered = if (phase_async)
+                std.fmt.bufPrint(&nbuf, "{s}.async", .{ap}) catch ap
+            else
+                std.fmt.bufPrint(&nbuf, "{s}.{d}", .{ ap, n_dropped }) catch ap;
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = numbered, .data = res.image });
         }
         // The verify runs for this attempt, one per surface. Every
@@ -2001,8 +2017,50 @@ fn runSa1Gen(
         }
 
         if (passed) |tier| {
-            // Success: write the patch and the report.
-            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            if (!phase_async) {
+                // The sync ladder's maximal passing configuration. Try
+                // the async flavor when it exists and would differ —
+                // window mode, a first candidate never async-demoted,
+                // and the caller didn't opt out.
+                const async_worth = args.whole_game and args.window and !args.wg_sync and
+                    args.verify_behavioral and n_cands > 0 and !cands[0].no_async;
+                if (async_worth) {
+                    sync_pass = .{ .res = res, .tier = tier, .conv_sum = conv_sum };
+                    phase_async = true;
+                    try out.print(
+                        "  greedy: sync config PASSED ({} tree(s), {} dropped frame(s)); trying the async flavor...\n",
+                        .{ res.stats.offload_count, conv_sum.lag_frames },
+                    );
+                    try out.flush();
+                    continue;
+                }
+                try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+                return;
+            }
+            // Async passed too: ship whichever measured better.
+            const sp = sync_pass.?;
+            if (conv_sum.lag_frames < sp.conv_sum.lag_frames) {
+                try out.print(
+                    "  greedy: async config wins — {} vs {} dropped frame(s); shipping async\n",
+                    .{ conv_sum.lag_frames, sp.conv_sum.lag_frames },
+                );
+                try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            } else {
+                try out.print(
+                    "  greedy: sync config wins — {} vs {} dropped frame(s); shipping sync\n",
+                    .{ sp.conv_sum.lag_frames, conv_sum.lag_frames },
+                );
+                try reportSa1(io, gpa, out, args, image, sp.res, sp.tier, total, sum, sp.conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            }
+            return;
+        }
+
+        // A failed async flavor loses the competition and nothing more:
+        // the sync winner already exists and ships.
+        if (phase_async) {
+            const sp = sync_pass.?;
+            try out.print("  greedy: async flavor failed ({s}) — keeping the sync config ({} dropped frame(s))\n", .{ fail_why, sp.conv_sum.lag_frames });
+            try reportSa1(io, gpa, out, args, image, sp.res, sp.tier, total, sum, sp.conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
             return;
         }
 
