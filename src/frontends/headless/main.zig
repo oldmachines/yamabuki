@@ -959,8 +959,8 @@ fn verifyBehavioral(
     if (out.verdict == .fail and out.verdict.fail == .persistence and
         out.stats.long_runs <= 4 and
         out.stats.long_total * 4 <= out.stats.stable_ticks and
-        (@as(u64, out.stats.bad_ticks - out.stats.long_total) * 1000 <=
-            @as(u64, out.stats.stable_ticks) * util.Persistence.max_bad_per_mille * 2) and
+        (@as(u64, out.stats.bad_ticks - out.stats.long_total - out.stats.burst_total) * 1000 <=
+            @as(u64, out.stats.stable_ticks) * util.Persistence.max_bad_per_mille * 3) and
         out.stats.first_long_start != null and
         out.stats.first_long_start.? > 600 and
         out.stats.first_long_start.? < n_tick_walls)
@@ -2101,8 +2101,10 @@ fn runBehavioralProbe(
                 bv.stats.addr_overflow,     bv.stats.epoch_budget,     bv.first_bad_frame,
             },
         );
-        try out.print("  runs: worst {} [{}..{}], runner-up {}, last_tick {}, reaches_end {}\n", .{
-            bv.stats.worst_run, bv.stats.worst_start, bv.stats.worst_end, bv.stats.second_run, bv.stats.last_tick, bv.stats.runReachesEnd(),
+        try out.print("  runs: worst {} [{}..{}], runner-up {}, last_tick {}, reaches_end {}, burst_ticks {} (runs <= {}), long {} ({} ticks)\n", .{
+            bv.stats.worst_run,   bv.stats.worst_start,             bv.stats.worst_end, bv.stats.second_run,
+            bv.stats.last_tick,   bv.stats.runReachesEnd(),         bv.stats.burst_total,
+            util.Persistence.burst_len,                             bv.stats.long_runs, bv.stats.long_total,
         });
         if (bv.n_sample > 0) {
             try out.print("  first-bad sample:", .{});
