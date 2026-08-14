@@ -2261,6 +2261,40 @@ fn emitWinGuard(d: []u8, cur: *usize, entry: u16) void {
     put(d, cur, &.{ 0x68, 0x28 }); // ok
 }
 
+/// The VBLANK-PROXIMITY guard: the interleaving hazard, closed by
+/// construction. A tree that reads NMI-shared state can only tear when
+/// the NMI fires MID-TREE — stock's inline walk is interrupted BY the
+/// handler and only ever sees interleavings the game was built for; the
+/// concurrent SA-1 copy is not (measured: a torn chain head sent the
+/// $8EF1 walker into a ROM cycle and parked the mainline forever). But
+/// NMI timing is knowable at call time: latch the V counter, and a call
+/// starting within `margin` scanlines of the NMI at line 225 runs the
+/// ORIGINAL body inline instead — the stock path. Everywhere else the
+/// tree (worst case well under the margin at ~10.74MHz) completes
+/// before the NMI can touch anything it reads; inside vblank the NMI
+/// has already fired and the runway is a whole frame. The two OPVCT
+/// reads are toggle-balanced and $213F resets the toggle first; a game
+/// that itself consumes the H/V latch could be disturbed — the
+/// verification surfaces and the soak gate arbitrate that.
+const win_vblank_margin_lines: u8 = 32;
+const win_vblank_guard_len: u32 = 41;
+fn emitWinVblankGuard(d: []u8, cur: *usize, entry: u16) void {
+    put(d, cur, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP SEP #$20 PHA
+    // LONG-addressed PPU reads: the caller's DBR is live here (a pinned
+    // caller arrives with $40), and an absolute $2137 under it would
+    // read BW-RAM instead of the latch.
+    put(d, cur, &.{ 0xAF, 0x37, 0x21, 0x00 }); // SLHV: latch H/V
+    put(d, cur, &.{ 0xAF, 0x3F, 0x21, 0x00 }); // STAT78: reset the read toggle
+    put(d, cur, &.{ 0xAF, 0x3D, 0x21, 0x00, 0xEB }); // OPVCT low -> B
+    put(d, cur, &.{ 0xAF, 0x3D, 0x21, 0x00, 0x4A }); // OPVCT high; bit8 -> carry
+    put(d, cur, &.{ 0xB0, 0x0F }); // V >= 256: deep vblank, safe
+    put(d, cur, &.{ 0xEB, 0xC9, 225 - win_vblank_margin_lines }); // A = V low
+    put(d, cur, &.{ 0x90, 0x0A }); // below the window: safe
+    put(d, cur, &.{ 0xC9, 225, 0xB0, 0x06 }); // at/past NMI line: safe
+    put(d, cur, &.{ 0x68, 0x28, 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 }); // danger: inline
+    put(d, cur, &.{ 0x68, 0x28 }); // safe
+}
+
 /// The mailbox BUSY guard: the S-CPU's NMI keeps firing while a sync stub
 /// waits out its handshake, and the handler may call ANOTHER offloaded
 /// routine — the game's contexts shift by phase (measured: the sound
@@ -2285,11 +2319,12 @@ fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
 /// Window sync stub: D guard, then caller D ($3788), registers, caller P,
 /// and caller DBR ($378B) into the mailbox; send; double handshake; exit
 /// registers back out. No shadow, no slots, no page copies.
-const win_stub_len: u32 = 132 + win_guard_len + win_busy_guard_len;
+const win_stub_len: u32 = 132 + win_guard_len + win_busy_guard_len + win_vblank_guard_len;
 fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
     emitWinBusyGuard(d, &cur, entry);
+    emitWinVblankGuard(d, &cur, entry);
     // The mailbox is NMI-ATOMIC: busy is raised BEFORE the first mailbox
     // write and dropped AFTER the last mailbox read. The S-CPU's NMI
     // keeps firing through a stub, and a nested offload call landing in
@@ -5407,16 +5442,20 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         });
         // Root: pin the WRAM bank (or NOPs for the control), store a
         // marker, call the helper.
-        @memcpy(rom[0x0080..0x008E], if (pinned) &[_]u8{
+        @memcpy(rom[0x0080..0x0090], if (pinned) &[_]u8{
+            0x8B, // PHB — real trees save the caller's bank
             0xA9, 0x7E, 0x48, 0xAB, // LDA #$7E / PHA / PLB (re-banked to $40)
             0xA9, 0x11, 0x8D, 0x00, 0x05, // LDA #$11 / STA $0500
             0x22, 0xA0, 0x80, 0x00, // JSL $00:80A0
+            0xAB, // PLB — and restore it (the vblank guard's inline bail
+            // executes this body on the S-CPU; a root that leaked its pin
+            // was a test-world artifact no real tree exhibits)
             0x6B, // RTL
         } else &[_]u8{
-            0xEA, 0xEA, 0xEA, 0xEA,
-            0xA9, 0x11, 0x8D, 0x00,
-            0x05, 0x22, 0xA0, 0x80,
-            0x00, 0x6B,
+            0xEA, 0xEA, 0xEA, 0xEA, 0xEA,
+            0xA9, 0x11, 0x8D, 0x00, 0x05,
+            0x22, 0xA0, 0x80, 0x00,
+            0xEA, 0x6B,
         });
         // Helper: a live counter, then a never-taken branch guarding the
         // hazard-shaped site (statically discovered code, zero evidence).
@@ -5433,11 +5472,11 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         @memset(bytes, 0);
         for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8008 }) |a| markOp(bytes, a);
         if (pinned) {
-            for ([_]u32{ 0x8080, 0x8082, 0x8083 }) |a| markOp(bytes, a);
+            for ([_]u32{ 0x8080, 0x8081, 0x8083, 0x8084 }) |a| markOp(bytes, a);
         } else {
-            for ([_]u32{ 0x8080, 0x8081, 0x8082, 0x8083 }) |a| markOp(bytes, a);
+            for ([_]u32{ 0x8080, 0x8081, 0x8082, 0x8083, 0x8084 }) |a| markOp(bytes, a);
         }
-        for ([_]u32{ 0x8084, 0x8086, 0x8089, 0x808D }) |a| markOp(bytes, a);
+        for ([_]u32{ 0x8085, 0x8087, 0x808A, 0x808E, 0x808F }) |a| markOp(bytes, a);
         for ([_]u32{ 0x80A0, 0x80A3, 0x80A5, 0x80A7, 0x80AA }) |a| markOp(bytes, a);
         // The helper's live sites measured as $7E-mediated traffic (the
         // real trees' shape) so the rewriter leaves their operands to the
@@ -5446,7 +5485,7 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         defer gpa.free(sites);
         @memset(sites, 0);
         sites[0x80A0] = usage_map.site_wram_bank;
-        sites[0x8086] = usage_map.site_wram_bank;
+        sites[0x8087] = usage_map.site_wram_bank;
 
         const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
         var ref: ?Refusal = null;
