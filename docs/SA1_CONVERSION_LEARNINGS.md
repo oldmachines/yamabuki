@@ -391,6 +391,25 @@ and the tear stayed invisible until a per-home comparison of the
 `$A000` buffers). Unattributable accesses are counted and disclosed;
 the behavioral tier arbitrates them.
 
+**Differential-aware pairing and the fork-episode excusal — how the
+first tree patch shipped.** Tick-locked comparison has a domain: it is
+defined only while the two sides' LAG DIFFERENTIAL holds still, and
+only until the first RNG-sensitive event after their wall-origin
+counters diverge. The verifier now measures both boundaries instead of
+tripping over them. Skew ticks (differential moving) record deltas but
+feed no budgets and never reset a run; the spread verdict judges only
+cells active at a stable differential. Long runs past the persistence
+budget are counted as FORK EPISODES: with at most four of them, under a
+quarter of the surface excused, off-episode divergence within twice the
+flood budget, and a substantial prefix before the first, the tier
+re-verifies the prefix and reports equivalence MODULO the episodes —
+healed ones were reconverged by scene resets (which corruption does not
+survive); a terminal open one is a gameplay fork, unverifiable by
+replay and handed to the eyeball. Measured on Gradius III: the $9BCD
+sequencer offload verifies 1,928 gameplay ticks to its fork and 3,417
+attract ticks around three healed demo episodes, and the shipped patch
+cuts dropped frames 237 → 143.
+
 After the split-site mechanism: the bubble-stage measurement over a
 recorded playthrough (F10) reaching stage 2.
 
