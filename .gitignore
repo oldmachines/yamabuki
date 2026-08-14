@@ -30,3 +30,5 @@ _site/
 patches/*.bps
 patches/*.ips
 zig-out-cli/
+zig-out-gen/
+*.log
