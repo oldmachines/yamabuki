@@ -1708,6 +1708,34 @@ fn runSa1Gen(
         con_s.cart.deinit(gpa);
         gpa.destroy(con_s);
     }
+    // COVERAGE PAD: replay every surface PAST its movie end on throwaway
+    // consoles, coverage/evidence union only — no samples, no baselines,
+    // no verdict influence. The conversion runs AHEAD of stock by the
+    // removed slowdown, so a path stock first executes shortly AFTER the
+    // movie is reachable by the conversion WITHIN it — and an uncovered
+    // instruction there is invisible to the rewriter (measured: stock
+    // first ran the attract-cycle dispatch `JMP ($0000)` at ~f4850 of
+    // the 4800f surface; the converted run reached it at ~f4640 with
+    // the pointer operand unshifted — dead-WRAM pointer, BRK storm,
+    // permanent park behind a blank screen; latent in EVERY shipped
+    // window build, exposed only by post-movie soak probes).
+    if (args.whole_game and args.window and movs.len != 0) {
+        const cov_pad: u32 = 1500;
+        for (0..n_surf) |s| {
+            const cart_p = try core.Cartridge.load(gpa, image);
+            const con_p = try gpa.create(core.ProfilingConsole);
+            con_p.init(cart_p);
+            con_p.usage = &umap;
+            for (0..totals[s] + cov_pad) |i| {
+                feedMovie(con_p, movAt(movs, s), i);
+                con_p.runFrame();
+            }
+            con_p.cart.deinit(gpa);
+            gpa.destroy(con_p);
+        }
+        try out.print("  coverage pad: each surface profiled {} frames past its movie (lag-led paths)\n", .{cov_pad});
+        try out.flush();
+    }
     const cov_total = core.usage_map.countOpcodes(ub);
     const cov_late = cov_total - cov_early;
 
