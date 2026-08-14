@@ -2261,13 +2261,35 @@ fn emitWinGuard(d: []u8, cur: *usize, entry: u16) void {
     put(d, cur, &.{ 0x68, 0x28 }); // ok
 }
 
+/// The mailbox BUSY guard: the S-CPU's NMI keeps firing while a sync stub
+/// waits out its handshake, and the handler may call ANOTHER offloaded
+/// routine — the game's contexts shift by phase (measured: the sound
+/// pump is mainline in attract but interrupt-side at the title-exit
+/// transition), so a nested stub posts over the in-flight message,
+/// deadlocks both handshakes, parks the S-CPU forever and leaves the
+/// SA-1 mid-copy (the f830 freeze). A call that finds EITHER busy cell
+/// set ($378C sync in-flight, $378A async in-flight) is NMI-nested — it
+/// runs the original body inline on the S-CPU instead, which is exactly
+/// what the un-offloaded game would have done.
+const win_busy_guard_len: u32 = 30;
+fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
+    put(d, cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0xE2, 0x20 }); // PHP REP PHA SEP #$20
+    put(d, cur, &.{ 0xAF, 0x8C, 0x37, 0x00 }); // LDA sync busy
+    put(d, cur, &.{ 0x0F, 0x8A, 0x37, 0x00 }); // ORA async busy
+    put(d, cur, &.{ 0xD0, 0x06 }); // BNE bail
+    put(d, cur, &.{ 0xC2, 0x20, 0x68, 0x28, 0x80, 0x08 }); // ok: restore, skip bail
+    put(d, cur, &.{ 0xC2, 0x20, 0x68, 0x28 }); // bail: restore
+    put(d, cur, &.{ 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 });
+}
+
 /// Window sync stub: D guard, then caller D ($3788), registers, caller P,
 /// and caller DBR ($378B) into the mailbox; send; double handshake; exit
 /// registers back out. No shadow, no slots, no page copies.
-const win_stub_len: u32 = 112 + win_guard_len;
+const win_stub_len: u32 = 124 + win_guard_len + win_busy_guard_len;
 fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
+    emitWinBusyGuard(d, &cur, entry);
     // Caller D, with A saved around the grab.
     put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00, 0x68, 0x28 });
     // Register marshal (the sync-ptr stub's, verbatim).
@@ -2277,11 +2299,16 @@ fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 });
     // Caller DBR: the PHB byte, at the stack top now the PHP is pulled.
     put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 });
+    // Mark the mailbox in flight — BEFORE the send, so an NMI landing
+    // between them still sees the guard closed.
+    put(d, &cur, &.{ 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00 });
     // Send + double handshake.
     put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 });
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
+    // Handshake complete: release the mailbox.
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00 });
     // Exit registers from the mailbox; caller DBR back.
     put(d, &cur, &.{0xAB});
     put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 });
@@ -2295,10 +2322,11 @@ fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
 /// registers + D + DBR, send, mark busy, return AT ONCE with the
 /// caller's own registers. Nothing to write back — the routine's effects
 /// land in the shared BW-RAM both CPUs address.
-const win_async_stub_len: u32 = 93 + win_guard_len;
+const win_async_stub_len: u32 = 93 + win_guard_len + win_busy_guard_len;
 fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
+    emitWinBusyGuard(d, &cur, entry);
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save caller
     put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
     put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore (REP first)
@@ -2340,7 +2368,7 @@ const wg_prologue_len = 21;
 /// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
 /// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
-const wg_window_shim_max = 33 + 23;
+const wg_window_shim_max = 33 + 28;
 /// Bank-0 reservation for the window dispatcher: prologue + message loop
 /// + JMP + sig + unm + mar + blocks + NMI prologue.
 const win_disp_max: u32 = 26 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + nmi_prologue_len;
@@ -3745,6 +3773,7 @@ pub fn convertWholeGame(
             wn = emitStore(d, wn, 0x2229, 0xFF);
             wn = emitStore(d, wn, 0x2203, @truncate(v));
             wn = emitStore(d, wn, 0x2204, @truncate(v >> 8));
+            wn = emitStore(d, wn, 0x378C, 0x00); // sync mailbox-busy guard cell
             if (res.stats.async_entry != 0) wn = emitStore(d, wn, 0x378A, 0x00);
             put(d, &wn, &.{ 0x9C, 0x00, 0x22 }); // release reset
         }

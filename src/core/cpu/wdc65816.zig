@@ -63,10 +63,16 @@ pub var dbg_clock_fired: bool = false;
 pub var dbg_watch_lo: u16 = 0;
 pub var dbg_watch_hi: u16 = 0;
 pub var dbg_watch_from: u64 = 0;
+/// Only log watched writes of values >= this (0 = all).
+pub var dbg_watch_val_min: u8 = 0;
 var dbg_watch_n: usize = 0;
+var dbg_watch_armed: bool = false;
 /// TEMP diagnostics: instruction trace over a clock window.
 pub var dbg_trace_from: u64 = 0;
 pub var dbg_trace_to: u64 = 0;
+/// TEMP diagnostics: trace up to N SA-1 instructions once the watch arms.
+pub var dbg_trace_sa1: usize = 0;
+var dbg_trace_sa1_n: usize = 0;
 
 pub fn Cpu(comptime BusT: type) type {
     return struct {
@@ -172,6 +178,11 @@ pub fn Cpu(comptime BusT: type) type {
                 if (clk >= dbg_trace_from and clk < dbg_trace_to)
                     std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.p, clk });
             }
+            // SA-1-side trace: fires once the S-CPU-side watch has armed.
+            if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {
+                dbg_trace_sa1_n += 1;
+                std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p });
+            }
             const m8 = self.regs.e or (self.regs.p & Flags.m) != 0;
             const x8 = self.regs.e or (self.regs.p & Flags.x) != 0;
             if (m8) {
@@ -225,6 +236,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// the machine's state, never call/return bookkeeping.
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
             if (dbg_watch_lo != 0) {
+                if (@hasField(BusT, "clock") and self.bus.clock >= dbg_watch_from) dbg_watch_armed = true;
                 const bank: u8 = @intCast(addr >> 16);
                 const a16: u16 = @truncate(addr);
                 // Normalized low-WRAM offset across every addressing home:
@@ -238,12 +250,16 @@ pub fn Cpu(comptime BusT: type) type {
                     a16 - 0x6000
                 else
                     null;
-                if (off) |o| if (o >= dbg_watch_lo and o <= dbg_watch_hi and
-                    dbg_watch_n < 4096 and @hasField(BusT, "clock") and
-                    self.bus.clock >= dbg_watch_from)
+                if (off) |o| if (o >= dbg_watch_lo and o <= dbg_watch_hi and dbg_watch_n < 4096 and
+                    value >= dbg_watch_val_min)
                 {
-                    dbg_watch_n += 1;
-                    std.debug.print("[ww] pc={x:0>2}:{x:0>4} {x:0>6} <= {x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, addr, value, self.bus.clock });
+                    const has_clk = @hasField(BusT, "clock");
+                    const clk: u64 = if (has_clk) self.bus.clock else 0;
+                    if (has_clk and clk >= dbg_watch_from) dbg_watch_armed = true;
+                    if ((has_clk and clk >= dbg_watch_from) or (!has_clk and dbg_watch_armed)) {
+                        dbg_watch_n += 1;
+                        std.debug.print("[ww{s}] pc={x:0>2}:{x:0>4} {x:0>6} <= {x:0>2} clk={}\n", .{ if (has_clk) "" else "-sa1", self.regs.pbr, self.regs.pc, addr, value, clk });
+                    }
                 };
             }
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;

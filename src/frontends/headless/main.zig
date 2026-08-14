@@ -3433,6 +3433,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             var pit = std.mem.splitScalar(u8, v, '-');
             core.wdc65816.dbg_trace_from = try std.fmt.parseInt(u64, pit.next().?, 10);
             core.wdc65816.dbg_trace_to = try std.fmt.parseInt(u64, pit.next().?, 10);
+        } else if (std.mem.eql(u8, a, "--trace-sa1")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_trace_sa1 = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--watch-min")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_watch_val_min = try std.fmt.parseInt(u8, v, 16);
         } else if (std.mem.eql(u8, a, "--watch-from")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_watch_from = try std.fmt.parseInt(u64, v, 10);
