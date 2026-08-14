@@ -126,6 +126,13 @@ const Args = struct {
     /// first attempt ships alone even when the sync ladder would carry
     /// more trees and more speedup.
     wg_sync: bool = false,
+    /// Window offloads (undocumented --wg-drop <hex16>, repeatable):
+    /// pre-seed the bisect's dropped list — exclude a tree the surfaces
+    /// pass but live play proves unsafe (measured: the $8EF1 walker
+    /// races NMI-side slot mutations into a ROM cycle at the continue
+    /// screen; movie surfaces never exhibit that interleaving).
+    wg_drop: [8]u32 = @splat(0),
+    n_wg_drop: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1842,6 +1849,14 @@ fn runSa1Gen(
     var dropped: [profile.conversion_set_max]u24 = undefined;
     var dropped_why: [profile.conversion_set_max][]const u8 = undefined;
     var n_dropped: usize = 0;
+    // Pre-seeded drops (`--wg-drop`): trees live play proved unsafe.
+    for (args.wg_drop[0..args.n_wg_drop]) |d| {
+        dropped[n_dropped] = @intCast(d);
+        dropped_why[n_dropped] = "excluded by --wg-drop (unsafe in live play)";
+        n_dropped += 1;
+        try out.print("  --wg-drop: excluding offload $00:{x:0>4}\n", .{d});
+        try out.flush();
+    }
     var total_max: u32 = 0;
     for (totals[0..n_surf]) |t| total_max = @max(total_max, t);
     var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
@@ -3602,6 +3617,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.behavioral_probe = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wg-sync")) {
             out.wg_sync = true;
+        } else if (std.mem.eql(u8, a, "--wg-drop")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_drop == out.wg_drop.len) return error.TooManyDrops;
+            out.wg_drop[out.n_wg_drop] = try std.fmt.parseInt(u16, v, 16);
+            out.n_wg_drop += 1;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
