@@ -2345,7 +2345,7 @@ fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
 const win_stub_len: u32 = 158 + win_guard_len + win_busy_guard_len + win_vblank_guard_len;
 const win_nmi_off_extra: u32 = 27;
 /// Covered `STA $4200` sites re-pointed at mirror thunks (bank $00).
-const NmiSites = struct { at: [4]u32, n: usize };
+const NmiSites = struct { at: [8]u32, n: usize };
 const win_nmi_thunk_len: u32 = 8;
 fn emitWinStub(d: []u8, id: u8, entry: u16, nmi_off: bool) u32 {
     var cur: usize = 0;
@@ -2553,7 +2553,7 @@ const wg_window_shim_max = 33 + 48;
 const WinBoot = struct { crv: u16, civ: u16 };
 /// Bank-0 reservation for the window dispatcher: prologue + message loop
 /// + JMP + sig + unm + mar + abort + blocks + NMI prologue + mirror thunks.
-const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 4 * win_nmi_thunk_len;
+const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
