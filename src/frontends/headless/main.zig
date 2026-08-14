@@ -140,6 +140,12 @@ const Args = struct {
     /// screen; movie surfaces never exhibit that interleaving).
     wg_drop: [8]u32 = @splat(0),
     n_wg_drop: usize = 0,
+    /// --wg-nmi-off <hex16> (repeatable): wrap these trees' sync stubs
+    /// in NMI/IRQ-off across the dispatch (closes the concurrent-
+    /// mutation hazard by construction; implies the tree never ships
+    /// async).
+    wg_nmi_off: [8]u32 = @splat(0),
+    n_wg_nmi_off: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1864,6 +1870,19 @@ fn runSa1Gen(
         try out.print("  --wg-drop: excluding offload $00:{x:0>4}\n", .{d});
         try out.flush();
     }
+    // Interrupt-masked dispatches (`--wg-nmi-off`): trees whose read-set
+    // the S-CPU's own interrupt handlers mutate — the stub masks NMI/IRQ
+    // across the handshake so the copy runs against quiescent state.
+    for (args.wg_nmi_off[0..args.n_wg_nmi_off]) |e| {
+        for (cands[0..n_cands]) |*c| {
+            if ((c.entry & 0xFFFF) == e) {
+                c.nmi_off = true;
+                c.no_async = true;
+            }
+        }
+        try out.print("  --wg-nmi-off: interrupt-masked dispatch for $00:{x:0>4}\n", .{e});
+        try out.flush();
+    }
     var total_max: u32 = 0;
     for (totals[0..n_surf]) |t| total_max = @max(total_max, t);
     var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
@@ -1905,6 +1924,14 @@ fn runSa1Gen(
             core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
+        if (args.n_wg_nmi_off != 0) {
+            if (converted) |cr| {
+                if (cr.stats.nmi_off_shadow != 0)
+                    try out.print("  wg-nmi-off: NMITIMEN shadow at ${x:0>4}\n", .{cr.stats.nmi_off_shadow})
+                else
+                    try out.print("  wg-nmi-off: NO NMITIMEN shadow found — wrap NOT emitted\n", .{});
+            } else |_| {}
+        }
         var res = converted catch |e| switch (e) {
             error.Refused => {
                 const r = refusal.?;
@@ -3658,6 +3685,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             if (out.n_wg_drop == out.wg_drop.len) return error.TooManyDrops;
             out.wg_drop[out.n_wg_drop] = try std.fmt.parseInt(u16, v, 16);
             out.n_wg_drop += 1;
+        } else if (std.mem.eql(u8, a, "--wg-nmi-off")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_nmi_off == out.wg_nmi_off.len) return error.TooManyDrops;
+            out.wg_nmi_off[out.n_wg_nmi_off] = try std.fmt.parseInt(u16, v, 16);
+            out.n_wg_nmi_off += 1;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);

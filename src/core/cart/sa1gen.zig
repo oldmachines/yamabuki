@@ -180,6 +180,9 @@ pub const Stats = struct {
     offload_copy: [offload_max]u24 = @splat(0),
     /// Each copy's length in bytes, same order.
     offload_copy_len: [offload_max]u32 = @splat(0),
+    /// The game's NMITIMEN-shadow address the nmi-off wrap restores
+    /// $4200 from (0: none found — a requested wrap was NOT emitted).
+    nmi_off_shadow: u16 = 0,
 };
 
 pub const Result = struct {
@@ -217,6 +220,14 @@ pub const Candidate = struct {
     /// async reorders execution by design, so only that tier can ever
     /// accept it.
     no_async: bool = false,
+    /// Wrap this tree's sync stub in NMI/IRQ-off across the dispatch
+    /// (--wg-nmi-off): the S-CPU spins through the whole copy anyway,
+    /// and masking its interrupts makes CONCURRENT MUTATION of the
+    /// tree's read-set impossible by construction — the hazard class
+    /// that defeated both the vblank guard (timing) and the watchdog
+    /// (whose abort re-ran the body inline over the same torn state).
+    /// Implies no_async: an async tree runs concurrently by design.
+    nmi_off: bool = false,
 };
 
 /// Convert a plain LoROM image into an SA-1 cart per `plan`. `usage` is the
@@ -2319,8 +2330,18 @@ fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
 /// Window sync stub: D guard, then caller D ($3788), registers, caller P,
 /// and caller DBR ($378B) into the mailbox; send; double handshake; exit
 /// registers back out. No shadow, no slots, no page copies.
+///
+/// With `nmi_shadow` (--wg-nmi-off): SEI + NMITIMEN masked (keeping the
+/// game's auto-joypad bit) across the send-and-wait, restored from the
+/// game's own shadow byte before ANY exit path — the caller's P (and
+/// its I bit) round-trips untouched because it was marshaled BEFORE the
+/// SEI. While the S-CPU waits here, nothing on it can mutate the tree's
+/// read-set: the concurrency hazard is closed by construction, not by
+/// timing. A straddled NMI is delivered late (real HW: fires on
+/// re-enable during vblank; this emulator: skipped like a lag frame).
 const win_stub_len: u32 = 158 + win_guard_len + win_busy_guard_len + win_vblank_guard_len;
-fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
+const win_nmi_off_extra: u32 = 27;
+fn emitWinStub(d: []u8, id: u8, entry: u16, nmi_shadow: ?u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
     emitWinBusyGuard(d, &cur, entry);
@@ -2344,11 +2365,28 @@ fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 });
     // Caller DBR: the PHB byte, at the stack top now the PHP is pulled.
     put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 });
+    if (nmi_shadow) |sh| {
+        // Interrupts off for the whole handshake: caller P is already in
+        // the mailbox, so the SEI never leaks back. RDNMI ack first —
+        // the game's own bracket idiom.
+        put(d, &cur, &.{0x78}); // SEI
+        put(d, &cur, &.{ 0xAF, 0x10, 0x42, 0x00 }); // RDNMI ack
+        put(d, &cur, &.{ 0xAF, @truncate(sh), @truncate(sh >> 8), 0x00 });
+        put(d, &cur, &.{ 0x29, 0x01 }); // keep auto-joypad only
+        put(d, &cur, &.{ 0x8F, 0x00, 0x42, 0x00 });
+    }
     // Send + double handshake.
     put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 });
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
+    if (nmi_shadow) |sh| {
+        // Restore the game's NMITIMEN before ANY exit path (the aborted
+        // check below JMLs away); the exit PLP restores the caller's I.
+        put(d, &cur, &.{ 0xAF, 0x10, 0x42, 0x00 }); // RDNMI ack
+        put(d, &cur, &.{ 0xAF, @truncate(sh), @truncate(sh >> 8), 0x00 });
+        put(d, &cur, &.{ 0x8F, 0x00, 0x42, 0x00 });
+    }
     // Exit registers from the mailbox; caller DBR back.
     put(d, &cur, &.{0xAB});
     put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 });
@@ -2517,7 +2555,7 @@ const split_thunk_len: u32 = 24;
 /// Sites one conversion can thunk (Gradius III measures ~100).
 const split_thunk_max: usize = 192;
 
-const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool };
+const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool, nmi_off: bool };
 
 /// Choose and emit window offloads onto the REWRITTEN image. The
 /// dispatcher (CRV is 16-bit) and the NMI prologue (a 16-bit vector)
@@ -2559,10 +2597,47 @@ fn emitWindowOffloads(
         if (n > 0 and chosen[0].is_async) break;
         const spec = windowEligible(out, usage, evidence, e) orelse continue;
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
-        chosen[n] = .{ .entry = e, .spec = spec, .is_async = allow_async and !c.no_async and n == 0 };
+        chosen[n] = .{
+            .entry = e,
+            .spec = spec,
+            .is_async = allow_async and !c.no_async and !c.nmi_off and n == 0,
+            .nmi_off = c.nmi_off,
+        };
         n += 1;
     }
     if (n == 0) return null;
+
+    // The game's own NMITIMEN shadow, for the nmi-off wrap: a covered
+    // `LDA $abs / STA $4200` names the byte the game restores $4200
+    // from (GIII: $1E82, relocated $7E82 — the game brackets its own
+    // fades with exactly this idiom, RDNMI ack included). Scanned on
+    // the REWRITTEN image so the operand is already window-shifted.
+    // Without a shadow the wrap cannot restore and is skipped.
+    const nmi_shadow: ?u16 = blk: {
+        var want = false;
+        for (chosen[0..n]) |c| {
+            if (c.nmi_off and !c.is_async) want = true;
+        }
+        if (!want) break :blk null;
+        var found: ?u16 = null;
+        var bank: u32 = 0;
+        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
+            var a16: u32 = 0x8000;
+            while (a16 < 0x10000) : (a16 += 1) {
+                const cpu = bank << 16 | a16;
+                if ((usage[cpu] | usage[0x80_0000 | cpu]) & usage_map.flag_opcode == 0) continue;
+                const f = bank * 0x8000 + (a16 - 0x8000);
+                if (f + 5 >= out.len) continue;
+                if (out[f] == 0xAD and out[f + 3] == 0x8D and out[f + 4] == 0x00 and out[f + 5] == 0x42) {
+                    const sh = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
+                    if (found != null and found.? != sh) break :blk null; // ambiguous
+                    found = sh;
+                }
+            }
+        }
+        break :blk found;
+    };
+    res.stats.nmi_off_shadow = nmi_shadow orelse 0;
 
     // Any-bank sizes.
     var any_len: u32 = 0;
@@ -2572,7 +2647,7 @@ fn emitWindowOffloads(
         if (c.is_async) {
             has_async = true;
             any_len += fenceLen(.{}) + win_async_stub_len;
-        } else any_len += win_stub_len;
+        } else any_len += win_stub_len + (if (c.nmi_off and nmi_shadow != null) win_nmi_off_extra else 0);
     }
     const any_at = 0x8000 + (patchgen.findFreeSpace(out[0x8000 .. out.len - 1], any_len) orelse return null);
     var cur: u32 = any_at;
@@ -2632,11 +2707,15 @@ fn emitWindowOffloads(
             cur += flen;
         }
         const stub_file = cur;
+        const stub_shadow: ?u16 = if (c.nmi_off) nmi_shadow else null;
         const slen = if (c.is_async)
             emitWinAsyncStub(out[cur..], fence24, id, c.entry)
         else
-            emitWinStub(out[cur..], id, c.entry);
-        std.debug.assert(slen == if (c.is_async) win_async_stub_len else win_stub_len);
+            emitWinStub(out[cur..], id, c.entry, stub_shadow);
+        std.debug.assert(slen == if (c.is_async)
+            win_async_stub_len
+        else
+            win_stub_len + (if (stub_shadow != null) win_nmi_off_extra else 0));
         cur += slen;
         const stub_bank: u8 = @intCast(stub_file / 0x8000);
         const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
