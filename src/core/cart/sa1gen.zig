@@ -2285,11 +2285,21 @@ fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
 /// Window sync stub: D guard, then caller D ($3788), registers, caller P,
 /// and caller DBR ($378B) into the mailbox; send; double handshake; exit
 /// registers back out. No shadow, no slots, no page copies.
-const win_stub_len: u32 = 124 + win_guard_len + win_busy_guard_len;
+const win_stub_len: u32 = 132 + win_guard_len + win_busy_guard_len;
 fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
     emitWinBusyGuard(d, &cur, entry);
+    // The mailbox is NMI-ATOMIC: busy is raised BEFORE the first mailbox
+    // write and dropped AFTER the last mailbox read. The S-CPU's NMI
+    // keeps firing through a stub, and a nested offload call landing in
+    // an unguarded window overwrites the marshal (the tree then runs
+    // with the NESTED call's registers) or the exit registers (the outer
+    // caller resumes with them) — measured live as rampaging indexed
+    // writes, a smashed stack top, and a wild RTL into open bus while
+    // the music played on. Fully transparent wrapper: PHP/SEP/PHA
+    // around the store.
+    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48, 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00, 0x68, 0x28 });
     // Caller D, with A saved around the grab.
     put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00, 0x68, 0x28 });
     // Register marshal (the sync-ptr stub's, verbatim).
@@ -2299,21 +2309,18 @@ fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
     put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 });
     // Caller DBR: the PHB byte, at the stack top now the PHP is pulled.
     put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 });
-    // Mark the mailbox in flight — BEFORE the send, so an NMI landing
-    // between them still sees the guard closed.
-    put(d, &cur, &.{ 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00 });
     // Send + double handshake.
     put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 });
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
     put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
-    // Handshake complete: release the mailbox.
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00 });
     // Exit registers from the mailbox; caller DBR back.
     put(d, &cur, &.{0xAB});
     put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 });
     put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 });
     put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 });
+    // Mailbox reads done — NOW release it (A preserved around the store).
+    put(d, &cur, &.{ 0x48, 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00, 0x68 });
     put(d, &cur, &.{ 0x28, 0x6B });
     return @intCast(cur);
 }
@@ -2322,7 +2329,7 @@ fn emitWinStub(d: []u8, id: u8, entry: u16) u32 {
 /// registers + D + DBR, send, mark busy, return AT ONCE with the
 /// caller's own registers. Nothing to write back — the routine's effects
 /// land in the shared BW-RAM both CPUs address.
-const win_async_stub_len: u32 = 93 + win_guard_len + win_busy_guard_len;
+const win_async_stub_len: u32 = 111 + win_guard_len + win_busy_guard_len;
 fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     var cur: usize = 0;
     emitWinGuard(d, &cur, entry);
@@ -2330,6 +2337,10 @@ fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save caller
     put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
     put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore (REP first)
+    // Raise busy BEFORE the marshal (see the sync stub: an NMI-nested
+    // call in the marshal window would overwrite the mailbox and the
+    // async tree would run with the nested call's registers).
+    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48, 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00, 0x68, 0x28 });
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // re-save P,A,X,Y
     put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
     put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
@@ -2341,6 +2352,8 @@ fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
     // D last — the PLA clobbers A, which the mailbox already holds.
     put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00 });
     put(d, &cur, &.{ 0xE2, 0x20, 0xA9, id, 0x8F, 0x00, 0x22, 0x00, 0x8F, 0x8A, 0x37, 0x00 });
+    // $378A now covers the in-flight async; drop the marshal guard.
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00 });
     put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, 0x6B });
     return @intCast(cur);
 }
