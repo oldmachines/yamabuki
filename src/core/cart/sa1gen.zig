@@ -2448,9 +2448,14 @@ fn emitWinBlock(d: []u8, cur: *usize, id: u8, copy_addr: u16, copy_bank: u8, unm
 }
 
 /// The watchdog budget: linear-timer V target. V increments every 2048
-/// master clocks, so 48 is ~4.6ms — a normal tree finishes in well under
-/// half a millisecond; a runaway is cut off inside one lag frame.
-const win_watchdog_vcnt: u8 = 48;
+/// master clocks, so 200 is ~19ms. Generous ON PURPOSE: the big worker
+/// tree's LEGITIMATE runs average ~4.4ms (measured: a 48-line budget
+/// aborted them wholesale, and every abort double-applies the partial
+/// BW-RAM writes plus the inline re-run — 28 KiB of divergence by
+/// frame 422). The watchdog exists to catch INFINITE loops, where the
+/// alternative is a permanent freeze; cutting one off within ~1.2
+/// frames is plenty.
+const win_watchdog_vcnt: u8 = 200;
 
 /// The abort handler the SA-1's timer IRQ vectors to (CIV). IRQs are
 /// open ONLY between a dispatch block's CLI and SEI, so the sole
