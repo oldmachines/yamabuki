@@ -71,6 +71,9 @@ pub const Options = struct {
     /// `--movie`: a validated recorded playthrough to replay from power-on.
     /// Live input takes over when it ends.
     movie: ?util.movie.Movie,
+    /// The soft patch applied at boot (path), or null — the info panel
+    /// says which game the player is actually looking at.
+    patch_name: ?[]const u8,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -573,6 +576,36 @@ pub fn run(
                         try err.print("screenshot unavailable: no per-user data directory\n", .{});
                         try err.flush();
                     }
+                },
+                .info => if (glv) |g| {
+                    if (g.osd) |*o| {
+                        if (o.panel_on) {
+                            o.panelHide();
+                        } else {
+                            // The reference card: what the player is
+                            // actually looking at. panelShow copies the
+                            // rasterization out, so stack buffers suffice.
+                            const cart = con.cartridge();
+                            const title = std.mem.trimEnd(u8, &cart.header.title, " \x00");
+                            var l2buf: [64]u8 = undefined;
+                            const l2 = std.fmt.bufPrint(&l2buf, "chip {s}  region {s}  core {s}", .{
+                                @tagName(cart.chip), @tagName(opts.region), @tagName(opts.accuracy),
+                            }) catch "";
+                            var l3buf: [64]u8 = undefined;
+                            const l3 = std.fmt.bufPrint(&l3buf, "crc32 {x:0>8}  state slot {d}", .{
+                                opts.rom_crc, slot,
+                            }) catch "";
+                            var l4buf: [96]u8 = undefined;
+                            const l4: []const u8 = if (opts.patch_name) |p|
+                                std.fmt.bufPrint(&l4buf, "patch {s}", .{std.fs.path.basename(p)}) catch "patch applied"
+                            else
+                                "no patch (original image)";
+                            o.panelShow(&.{ title, l2, l3, l4 });
+                        }
+                    }
+                } else {
+                    try err.print("info: the panel needs the GL video path\n", .{});
+                    try err.flush();
                 },
                 // Hotplug actions can only come from pad_added/removed,
                 // which the branch above consumed.
