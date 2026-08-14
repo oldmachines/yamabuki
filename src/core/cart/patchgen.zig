@@ -40,6 +40,7 @@
 const std = @import("std");
 const header_mod = @import("header.zig");
 const cartridge = @import("cartridge.zig");
+const usage_map = @import("../usage_map.zig");
 
 pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 
@@ -81,6 +82,8 @@ pub const Result = struct {
     trampolines: u8,
     /// Observed MEMSEL-clearing stores neutralised to NOPs.
     memsel_stores_nopped: u8,
+    /// Covered long-bank operands lifted into the $80+ mirrors.
+    banks_lifted: u32 = 0,
 };
 
 pub const Options = struct {
@@ -99,6 +102,19 @@ pub const Options = struct {
     /// identifies the cart, and MEMSEL — which the stub pins — is what
     /// actually selects the speed.
     keep_map_mode: bool = false,
+    /// BANK LIFTING (a bsnes-format usage map, or null to skip): rewrite
+    /// every covered long-bank operand — JSL/JML and the long data forms
+    /// — whose bank is $00-$3F to the $80+ mirror. The stub-and-
+    /// trampoline model assumes execution RIDES PBR into the fast
+    /// mirrors, but a game that long-calls with explicit bank-$00
+    /// operands (measured: Gradius III's frame loop does on every call)
+    /// drops back to the slow mirror instructions after each interrupt
+    /// and stays there — zero gain. The system area mirrors identically
+    /// in $80-$BF (WRAM low, MMIO), ROM turns fast, and banks $40+ are
+    /// never touched (SA-1 BW-RAM lives there). The SA-1's own decoder
+    /// treats $80-$BF exactly like $00-$3F, so lifted operands stay
+    /// consistent when a tree copy executes them.
+    lift_usage: ?[]const u8 = null,
 };
 
 /// The reset stub: LDA #$01 / STA $420D / JML $80:<reset>. 9 bytes.
@@ -216,6 +232,42 @@ pub fn generate(
     }
 
     if (!opts.keep_map_mode) out[header.offset + 0x15] |= 0x10; // the FastROM speed bit
+
+    // Bank lifting (see Options.lift_usage). LoROM only — the composed
+    // window images are LoROM by construction, and the plain generator
+    // path passes null.
+    var lifted: u32 = 0;
+    if (opts.lift_usage) |usage| {
+        std.debug.assert(header.mapping == .lorom);
+        const n_banks = out.len / 0x8000;
+        for (0..n_banks) |bank| {
+            var a16: u32 = 0x8000;
+            while (a16 < 0x10000) {
+                const pc: u32 = @intCast(bank << 16 | a16);
+                const cov = usage[pc] | usage[0x80_0000 | pc];
+                if (cov & usage_map.flag_opcode == 0) {
+                    a16 += 1;
+                    continue;
+                }
+                const file = bank * 0x8000 + (a16 - 0x8000);
+                const op = out[file];
+                const m8 = cov & usage_map.flag_m != 0;
+                const x8 = cov & usage_map.flag_x != 0;
+                const is_long = op == 0x22 or op == 0x5C or
+                    usage_map.mode(op) == .long or usage_map.mode(op) == .long_x;
+                // Lift only banks the ROM actually occupies (plus bank 0's
+                // WRAM/MMIO longs, which mirror identically). This keeps
+                // hands off the window conversion's $3F negative-offset
+                // idiom — $3F:FFxx wraps into $40 BW-RAM, and $BF would
+                // wrap into $C0 ROM instead.
+                if (is_long and file + 3 < out.len and out[file + 3] < @min(n_banks, 0x40)) {
+                    out[file + 3] |= 0x80;
+                    lifted += 1;
+                }
+                a16 += usage_map.instrLen(op, m8, x8);
+            }
+        }
+    }
     recomputeChecksum(out, header.offset);
 
     return .{
@@ -223,6 +275,7 @@ pub fn generate(
         .stub_addr = stub_addr,
         .trampolines = @intCast(n_targets),
         .memsel_stores_nopped = nopped,
+        .banks_lifted = lifted,
     };
 }
 

@@ -1944,6 +1944,7 @@ fn runSa1Gen(
                 .memsel_store_pcs = con.prof.memsel_pcs[0..con.prof.n_memsel_pcs],
                 .allow_coprocessor = true,
                 .keep_map_mode = true,
+                .lift_usage = ub,
             }, &fr_ref) catch |e| {
                 if (e == error.Refused) {
                     try out.print("wg-fastrom refused: {s}\n", .{fr_ref.?.reason.describe()});
@@ -1954,8 +1955,8 @@ fn runSa1Gen(
             };
             res.image = fr.image;
             try out.print(
-                "  wg-fastrom: MEMSEL stub at $00:{x:0>4}, {} trampoline(s), {} MEMSEL store(s) neutralised\n",
-                .{ fr.stub_addr, fr.trampolines, fr.memsel_stores_nopped },
+                "  wg-fastrom: MEMSEL stub at $00:{x:0>4}, {} trampoline(s), {} MEMSEL store(s) neutralised, {} long bank(s) lifted to the fast mirrors\n",
+                .{ fr.stub_addr, fr.trampolines, fr.memsel_stores_nopped, fr.banks_lifted },
             );
             try out.flush();
         }
