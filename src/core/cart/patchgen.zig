@@ -89,6 +89,16 @@ pub const Options = struct {
     /// is redundant once the stub runs, a store of 0 is the bug being
     /// prevented — NOPing either pins MEMSEL at 1.
     memsel_store_pcs: []const u24 = &.{},
+    /// COMPOSITION MODE (the SA-1 window conversion layers FastROM on
+    /// top): the standing coprocessor refusal is wrong for an image OUR
+    /// converter produced — the game demonstrably runs on the S-CPU, and
+    /// the SA-1 MMC serves the $80+ mirrors at fast timing under MEMSEL
+    /// like any FastROM cart.
+    allow_coprocessor: bool = false,
+    /// Skip the $FFD5 speed-bit edit: an SA-1 image's map byte ($23)
+    /// identifies the cart, and MEMSEL — which the stub pins — is what
+    /// actually selects the speed.
+    keep_map_mode: bool = false,
 };
 
 /// The reset stub: LDA #$01 / STA $420D / JML $80:<reset>. 9 bytes.
@@ -115,7 +125,8 @@ pub fn generate(
     const header = try header_mod.detect(image);
 
     if (header.fastRom()) return refuse(refusal, .{ .reason = .already_fastrom });
-    if (cartridge.identifyChip(header) != .none) return refuse(refusal, .{ .reason = .coprocessor });
+    if (!opts.allow_coprocessor and cartridge.identifyChip(header) != .none)
+        return refuse(refusal, .{ .reason = .coprocessor });
     if (header.mapping == .exhirom) return refuse(refusal, .{ .reason = .exhirom });
 
     const reset = header.reset_vector;
@@ -204,7 +215,7 @@ pub fn generate(
         }
     }
 
-    out[header.offset + 0x15] |= 0x10; // the FastROM speed bit
+    if (!opts.keep_map_mode) out[header.offset + 0x15] |= 0x10; // the FastROM speed bit
     recomputeChecksum(out, header.offset);
 
     return .{

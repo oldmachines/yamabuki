@@ -126,6 +126,13 @@ const Args = struct {
     /// first attempt ships alone even when the sync ladder would carry
     /// more trees and more speedup.
     wg_sync: bool = false,
+    /// Window mode (undocumented --wg-fastrom): layer the FastROM
+    /// transform onto every converted attempt image — MEMSEL stub,
+    /// interrupt trampolines into the $80 mirrors, observed MEMSEL
+    /// stores NOPed. The SA-1 MMC serves the fast mirrors under MEMSEL
+    /// like any FastROM cart, so this cuts ~25% off every remaining
+    /// S-CPU ROM cycle, orthogonally to the offload trees.
+    wg_fastrom: bool = false,
     /// Window offloads (undocumented --wg-drop <hex16>, repeatable):
     /// pre-seed the bisect's dropped list — exclude a tree the surfaces
     /// pass but live play proves unsafe (measured: the $8EF1 walker
@@ -1898,7 +1905,7 @@ fn runSa1Gen(
             core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
-        const res = converted catch |e| switch (e) {
+        var res = converted catch |e| switch (e) {
             error.Refused => {
                 const r = refusal.?;
                 try out.print("refused: {s}\n", .{r.reason.describe()});
@@ -1926,6 +1933,32 @@ fn runSa1Gen(
             else => return e,
         };
 
+        // The FastROM layer, applied to every attempt image BEFORE
+        // verification so the verified artifact IS the shipped one. The
+        // profiler's observed MEMSEL stores come from the surface-0
+        // power-on baseline (the stock `STZ $420D` init idiom runs at
+        // boot). Refusal is fatal: the flag is an explicit request.
+        if (args.wg_fastrom and args.whole_game and args.window) {
+            var fr_ref: ?core.patchgen.Refusal = null;
+            const fr = core.patchgen.generate(gpa, res.image, .{
+                .memsel_store_pcs = con.prof.memsel_pcs[0..con.prof.n_memsel_pcs],
+                .allow_coprocessor = true,
+                .keep_map_mode = true,
+            }, &fr_ref) catch |e| {
+                if (e == error.Refused) {
+                    try out.print("wg-fastrom refused: {s}\n", .{fr_ref.?.reason.describe()});
+                    try out.flush();
+                    std.process.exit(1);
+                }
+                return e;
+            };
+            res.image = fr.image;
+            try out.print(
+                "  wg-fastrom: MEMSEL stub at $00:{x:0>4}, {} trampoline(s), {} MEMSEL store(s) neutralised\n",
+                .{ fr.stub_addr, fr.trampolines, fr.memsel_stores_nopped },
+            );
+            try out.flush();
+        }
         if (args.save_attempt) |ap| {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
             // Every rung, numbered — the bisect overwrites the plain name,
@@ -3617,6 +3650,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.behavioral_probe = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wg-sync")) {
             out.wg_sync = true;
+        } else if (std.mem.eql(u8, a, "--wg-fastrom")) {
+            out.wg_fastrom = true;
         } else if (std.mem.eql(u8, a, "--wg-drop")) {
             const v = it.next() orelse return error.MissingValue;
             if (out.n_wg_drop == out.wg_drop.len) return error.TooManyDrops;
