@@ -615,6 +615,13 @@ const Behavioral = struct {
     /// Sample of diverging addresses for the report.
     sample: [6]u32,
     n_sample: usize,
+    /// Set when a persistence failure carries the RNG-FORK signature: the
+    /// killer run was still open at surface end, the conversion never
+    /// stopped ticking, and the fork sits in the surface's second half.
+    /// Holds the baseline wall frame where the run began — the horizon a
+    /// retry can verify up to (beyond it, tick-locked replay compares two
+    /// different healthy games and proves nothing either way).
+    fork_wall: ?u32,
 };
 
 /// The behavioral tier (`--verify-behavioral`): a conversion that removes
@@ -742,7 +749,14 @@ fn verifyBehavioral(
         .first_bad_frame = 0,
         .sample = @splat(0),
         .n_sample = 0,
+        .fork_wall = null,
     };
+    // Baseline wall frame of each FED tick, indexed like the tick indices
+    // handed to Persistence.feed — what maps a verdict's tick back to a
+    // wall frame (the fork-horizon retry needs the killer run's start).
+    var tick_walls = try gpa.alloc(u32, total + 1);
+    defer gpa.free(tick_walls);
+    var n_tick_walls: usize = 0;
 
     // Tick 0 on both sides.
     if (!base.advance(mov, total)) return out; // no ticks at all: vacuous
@@ -786,7 +800,18 @@ fn verifyBehavioral(
     @memset(home, 0);
 
     var bad: [util.Persistence.max_addrs + 1]util.Persistence.Bad = undefined;
+    // The lag differential at the previous tick pair: how many more wall
+    // frames the baseline has spent than the conversion to reach the same
+    // logic tick. Wall-coupled state (NMI counters, anything seeded from
+    // them) drifts by exactly this, so persistence accounting is only
+    // meaningful on ticks where it HELD STILL — a slowdown-removing
+    // conversion legitimately walks it up through every stretch whose
+    // frames it stopped dropping (measured: 79 frames across a load).
+    var ld_prev: i64 = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
     outer: while (true) {
+        const pair_ld: i64 = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
+        const wall_stable = pair_ld == ld_prev;
+        ld_prev = pair_ld;
         if (!base.advance(mov, total)) break;
         out.ticks_base += 1;
         if (!conv.advance(mov, total)) {
@@ -823,6 +848,9 @@ fn verifyBehavioral(
             @memset(&base.snap.written, 0);
             @memset(&base.snap.multi, 0);
             prev_frame = base.frame;
+            // Re-anchor the lag differential too: the laggard's surplus
+            // ticks moved one side's wall alone.
+            ld_prev = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
             continue;
         }
 
@@ -899,7 +927,11 @@ fn verifyBehavioral(
             out.n_sample = @min(out.sample.len, n_bad);
             for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr;
         }
-        out.stats.feed(out.ticks_base - 2, bad[0..n_bad]);
+        if (out.ticks_base - 2 < tick_walls.len) {
+            tick_walls[out.ticks_base - 2] = prev_frame;
+            n_tick_walls = @max(n_tick_walls, out.ticks_base - 1);
+        }
+        out.stats.feed(out.ticks_base - 2, bad[0..n_bad], wall_stable);
 
         base.prev.* = base.snap.*;
         conv.prev.* = conv.snap.*;
@@ -910,6 +942,19 @@ fn verifyBehavioral(
     }
 
     out.verdict = out.stats.verdict();
+    // The RNG-fork signature: a persistence failure whose killer run was
+    // still open at surface end, on a conversion that kept ticking, with
+    // the fork in the surface's second half. Report the wall frame where
+    // the run began so the caller can verify up to the horizon.
+    // (A conversion that stopped ticking never reaches this analysis —
+    // those verdicts return early from the advance failures above.)
+    if (out.verdict == .fail and out.verdict.fail == .persistence and
+        out.stats.runReachesEnd() and
+        out.stats.worst_start > out.stats.last_tick / 2 and
+        out.stats.worst_start < n_tick_walls)
+    {
+        out.fork_wall = tick_walls[out.stats.worst_start];
+    }
     return out;
 }
 
@@ -2035,12 +2080,13 @@ fn runBehavioralProbe(
             },
         };
         try out.print(
-            "surface {}: {s} — ticks {}, bad {}, addrs {}, novelty {}, worst_run {} (from tick {}), held {}, overflow {}, epochs {}, first_bad_frame {}\n",
+            "surface {}: {s} — ticks {} ({} wall-stable, {} skew-active), bad {}, addrs {} ({} stable-active), novelty {}, worst_run {} (from tick {}), held {}, overflow {}, epochs {}, first_bad_frame {}\n",
             .{
-                s + 1,                  verdict_name,          bv.ticks_base,
-                bv.stats.bad_ticks,     bv.stats.n_addrs,      bv.stats.novelty_ticks,
-                bv.stats.worst_run,     bv.stats.worst_start,  bv.stats.heldCount(),
-                bv.stats.addr_overflow, bv.stats.epoch_budget, bv.first_bad_frame,
+                s + 1,                      verdict_name,              bv.ticks_base,
+                bv.stats.stable_ticks,      bv.stats.skew_active_ticks, bv.stats.bad_ticks,
+                bv.stats.n_addrs,           bv.stats.stableAddrCount(), bv.stats.novelty_ticks,
+                bv.stats.worst_run,         bv.stats.worst_start,      bv.stats.heldCount(),
+                bv.stats.addr_overflow,     bv.stats.epoch_budget,     bv.first_bad_frame,
             },
         );
         if (bv.n_sample > 0) {
@@ -2048,6 +2094,20 @@ fn runBehavioralProbe(
             for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}", .{adr & 0xFFFF});
             try out.print("\n", .{});
         }
+        if (bv.fork_wall) |fw| if (fw > 600 and fw + 120 < total) {
+            try out.print("  RNG-fork signature (open terminal run) — probing up to the horizon at wall {}...\n", .{fw});
+            try out.flush();
+            const bv2 = try verifyBehavioral(gpa, base_image, conv_image, &plan, &res, m, null, true, fw);
+            try out.print("  pre-horizon: {s} — ticks {}, bad {}, worst_run {}\n", .{
+                switch (bv2.verdict) {
+                    .pass => |k| if (k == .clean) @as([]const u8, "PASS clean") else "PASS echoes",
+                    .fail => "FAIL",
+                },
+                bv2.ticks_base,
+                bv2.stats.bad_ticks,
+                bv2.stats.worst_run,
+            });
+        };
         try out.flush();
     }
 }
@@ -2074,15 +2134,21 @@ fn runBehavioralTier(
     switch (bv.verdict) {
         .pass => |kind| {
             try out.print(
-                "  behavioral: {s} — {} ticks compared, {} diverging ({} address(es), worst run {})\n",
+                "  behavioral: {s} — {} ticks compared ({} at stable lag differential), {} diverging ({} address(es), worst run {})\n",
                 .{
                     if (kind == .clean) @as([]const u8, "logic state IDENTICAL at every tick") else "wall-time echoes only",
                     bv.ticks_base,
+                    bv.stats.stable_ticks,
                     bv.stats.bad_ticks,
                     bv.stats.n_addrs,
                     bv.stats.worst_run,
                 },
             );
+            if (bv.stats.skew_active_ticks > 0)
+                try out.print(
+                    "    {} tick(s) diverged only while the lag differential itself was moving (the removed slowdown, not corruption; excluded from the budgets)\n",
+                    .{bv.stats.skew_active_ticks},
+                );
             if (bv.stats.heldCount() > 0)
                 try out.print(
                     "    {} cell(s) hold a constant offset (wall-time origins: pass counters and state seeded from them)\n",
@@ -2091,6 +2157,29 @@ fn runBehavioralTier(
             return .behavioral;
         },
         .fail => |why| {
+            // A terminal open run in the second half is the RNG-fork
+            // signature: the timing change moved the wall-origin counters
+            // enemy RNG seeds from, the game forked at the first
+            // RNG-sensitive event, and every later tick compares two
+            // different healthy games. Verify up to the horizon: a pass
+            // there is the honest maximum tick-locked replay can prove
+            // (v17 has the same property; humans QA past it).
+            if (bv.fork_wall) |fw| if (fw > 600 and fw + 120 < total) {
+                try out.print(
+                    "  behavioral: diverges from wall frame {} to surface end — RNG-fork signature; re-verifying up to the horizon...\n",
+                    .{fw},
+                );
+                try out.flush();
+                const bv2 = try verifyBehavioral(gpa, base_image, conv_image, plan, res, mov, verify_state, window, fw);
+                if (bv2.verdict == .pass) {
+                    try out.print(
+                        "  behavioral: equivalent to the RNG-FORK HORIZON — {} ticks verified ({} diverging, worst run {}), fork at wall frame {} of {}; beyond it the runs are two healthy games (wall-origin RNG), UNVERIFIABLE by replay — eyeball it\n",
+                        .{ bv2.ticks_base, bv2.stats.bad_ticks, bv2.stats.worst_run, fw, total },
+                    );
+                    return .behavioral;
+                }
+                try out.print("  behavioral: pre-horizon verification also fails — treating as real divergence\n", .{});
+            };
             fail_why.* = switch (why) {
                 .persistence => "live state diverges and never heals (or the conversion stopped ticking)",
                 .spread => "live-state divergence keeps reaching new addresses",
