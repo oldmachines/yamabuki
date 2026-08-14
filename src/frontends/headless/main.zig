@@ -1924,12 +1924,12 @@ fn runSa1Gen(
             core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
-        if (args.n_wg_nmi_off != 0) {
+        if (args.n_wg_nmi_off != 0 and !phase_async) {
             if (converted) |cr| {
-                if (cr.stats.nmi_off_shadow != 0)
-                    try out.print("  wg-nmi-off: NMITIMEN shadow at ${x:0>4}\n", .{cr.stats.nmi_off_shadow})
+                if (cr.stats.nmi_off_sites != 0)
+                    try out.print("  wg-nmi-off: {} STA-$4200 site(s) thunked through the $378F mirror\n", .{cr.stats.nmi_off_sites})
                 else
-                    try out.print("  wg-nmi-off: NO NMITIMEN shadow found — wrap NOT emitted\n", .{});
+                    try out.print("  wg-nmi-off: NO usable $4200 writer sites — wrap NOT emitted\n", .{});
             } else |_| {}
         }
         var res = converted catch |e| switch (e) {
