@@ -354,12 +354,12 @@ pub fn main(init: std.process.Init) !void {
     // place. The tool that found every window-mode blocker so far.
     defer if (args.dump_ram) |dpath| {
         const fc = &con.fast;
-        const buf = gpa.alloc(u8, 0x20000 + 0x10000 + 0x10000 + 0x800) catch unreachable;
+        const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
         @memset(buf, 0);
         @memcpy(buf[0..0x20000], &fc.bus.wram.data);
-        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x10000], fc.bus.sa1.bwram[0..0x10000]);
-        @memcpy(buf[0x30000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
-        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x40000..][0..0x800], &fc.bus.sa1.iram);
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
+        @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
         std.debug.print("[dump] pc={x:0>2}:{x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p });
         if (fc.bus.cart.chip == .sa1)
@@ -510,6 +510,12 @@ fn loadMovie(
 /// Returns true when the frame completed a logic tick (the snapshot is
 /// filled and `snap.live` holds the interval's consumption since the
 /// caller last cleared it).
+/// TEMP experiment: delay the CONVERTED side's movie feed by this many
+/// frames (a frame-aligned boot pad displaces the game's timeline; input
+/// must follow it or every press lands early in game-time and forks the
+/// run). Set by the undocumented --conv-pad flag.
+pub var dbg_conv_pad: u32 = 0;
+
 fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
     con.bus.input_polled = false;
     snap.captured = false;
@@ -681,6 +687,10 @@ fn verifyBehavioral(
         frame: u32 = 0,
         /// Wall frame of the current (last returned) tick.
         tick_wall: u32 = 0,
+        /// Boot-pad displacement: this side's game timeline runs this many
+        /// wall frames behind the movie's recording, so its inputs (and
+        /// its input-edge epochs) shift to follow.
+        pad: u32 = 0,
 
         fn init(al: std.mem.Allocator, image: []const u8) !@This() {
             const cart = try core.Cartridge.load(al, image);
@@ -697,7 +707,7 @@ fn verifyBehavioral(
 
         fn advance(self: *@This(), m: ?util.movie.Movie, budget: u32) bool {
             while (self.frame < budget) {
-                const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame);
+                const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame -| self.pad);
                 self.frame += 1;
                 if (ticked) {
                     self.tick_wall = self.frame - 1;
@@ -711,13 +721,14 @@ fn verifyBehavioral(
         /// of edges its tick stream has sampled.
         fn epoch(self: *const @This(), es: []const u32) usize {
             var n: usize = 0;
-            while (n < es.len and es[n] <= self.tick_wall) n += 1;
+            while (n < es.len and es[n] <= self.tick_wall -| self.pad) n += 1;
             return n;
         }
     };
 
     var base = try Side.init(gpa, base_image);
     var conv = try Side.init(gpa, conv_image);
+    conv.pad = dbg_conv_pad;
     if (state) |sb| {
         try base.con.loadState(sb);
         try seedConverted(conv.con, sb, plan, res);
@@ -1788,13 +1799,13 @@ fn runSa1Gen(
             }
         }
 
-        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0) {
-            try out.print("  pointer-bank provenance: {} proven ROM source byte(s), {} access(es) unresolved\n", .{ ptr_ev.n_proven, ptr_ev.unresolved });
+        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0) {
+            try out.print("  value provenance: {} pointer-bank byte(s) ({} unresolved), {} dp,X word(s) ({} unresolved)\n", .{ ptr_ev.n_proven, ptr_ev.unresolved, ptr_ev.n_idx, ptr_ev.idx_unresolved });
             try out.flush();
         }
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev.proven[0..ptr_ev.n_proven], args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], args.verify_behavioral, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         const res = converted catch |e| switch (e) {
@@ -2334,10 +2345,10 @@ fn reportSa1(
                 "  {} context-split site(s) dispatch on the runtime data bank through a\n  thunk (measured under both a system DBR and a WRAM pin — no single\n  operand serves both callers)\n",
                 .{res.stats.split_sites},
             );
-        if (res.stats.rewritten_ptr_banks != 0)
+        if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0)
             try out.print(
-                "  {} measured pointer-bank ROM source byte(s) re-banked ([dp]/DMA bank\n  bytes that travel as data — the idiom operand rewrites cannot reach)\n",
-                .{res.stats.rewritten_ptr_banks},
+                "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000 (addressing state travelling as\n  data — the idioms operand rewrites cannot reach)\n",
+                .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words },
             );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
@@ -3411,6 +3422,25 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
             out.behavioral_probe = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--clock-pc")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
+        } else if (std.mem.eql(u8, a, "--conv-pad")) {
+            const v = it.next() orelse return error.MissingValue;
+            dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--trace-clk")) {
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            core.wdc65816.dbg_trace_from = try std.fmt.parseInt(u64, pit.next().?, 10);
+            core.wdc65816.dbg_trace_to = try std.fmt.parseInt(u64, pit.next().?, 10);
+        } else if (std.mem.eql(u8, a, "--watch-from")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_watch_from = try std.fmt.parseInt(u64, v, 10);
+        } else if (std.mem.eql(u8, a, "--watch")) {
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            core.wdc65816.dbg_watch_lo = try std.fmt.parseInt(u16, pit.next().?, 16);
+            core.wdc65816.dbg_watch_hi = if (pit.next()) |h| try std.fmt.parseInt(u16, h, 16) else core.wdc65816.dbg_watch_lo;
         } else if (std.mem.eql(u8, a, "--save-attempt")) {
             out.save_attempt = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--tick-dump")) {

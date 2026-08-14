@@ -121,6 +121,8 @@ pub const Stats = struct {
     /// Measured pointer-bank source bytes re-banked (window mode): ROM
     /// bytes proven to feed [dp] pointer bank bytes / DMA bank registers.
     rewritten_ptr_banks: u32 = 0,
+    /// Measured dp,X pointer table words rewritten −$6000 (window mode).
+    rewritten_idx_words: u32 = 0,
     /// Context-split sites (window mode): absolutes below $2000 whose
     /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
     /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
@@ -2711,16 +2713,19 @@ pub fn convertWholeGame(
     /// absolute whose observed traffic was all ROM stays put; one whose
     /// traffic was all low WRAM shifts into the window.
     site_evidence: ?[]const u8,
-    /// Pointer-bank provenance (window mode): ROM bytes a profiled run
-    /// PROVED to feed [dp] long-indirect pointer bank bytes or DMA A-bus
-    /// bank registers with $7E/$7F. Bank bytes that travel as DATA are the
-    /// one $7E-naming idiom the operand rewrite cannot reach — these bytes
-    /// re-bank with the world so value-mediated traffic lands in BW-RAM
-    /// like everything else (measured: Gradius III's stage loader builds
-    /// its buffer pointers from a bank-$01 ROM table; without this the
-    /// $A000+/$E000+/$7F buffers tear out of the relocation and gameplay
-    /// sprites never render).
-    ptr_bank_srcs: ?[]const u32,
+    /// Value provenance (window mode): ROM bytes a profiled run PROVED to
+    /// feed addressing state that operand rewrites cannot reach. Two
+    /// families: `proven` — [dp] pointer bank bytes / DMA A-bus bank
+    /// registers carrying $7E/$7F (re-banked −$3E so value-mediated
+    /// traffic lands in BW-RAM with everything else; measured: the stage
+    /// loader's bank-$01 table, whose tear blanked every gameplay sprite);
+    /// `idx_proven` — X-register table words carrying full dp,X pointers
+    /// beyond the moved low 8 KiB (rewritten −$6000 so the relocated
+    /// D=$6000 wraps back onto the original target; measured: the HDMA
+    /// channel builder's $43x0 register words, whose +$6000 drift silently
+    /// voided channel-7 setup and phase-shifted the APU pump into the
+    /// gameplay RNG fork).
+    ptr_ev: ?*const usage_map.PtrBankEvidence,
     static_walk: bool,
     /// UNIFORM WINDOW MODE (v17's actual architecture): the game KEEPS
     /// RUNNING ON THE S-CPU and only its memory moves — WRAM's low 8 KiB
@@ -3623,15 +3628,33 @@ pub fn convertWholeGame(
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is
     // a bank byte is dynamic, so the only static check left is that it
     // still holds $7E/$7F (the shape pass may have re-banked it first).
-    if (bwram) if (ptr_bank_srcs) |srcs| for (srcs) |ca| {
-        const src_bank: u32 = (ca >> 16) & 0x7F;
-        const a16: u32 = ca & 0xFFFF;
-        if (a16 < 0x8000) continue;
-        const f = src_bank * 0x8000 + (a16 - 0x8000);
-        if (f >= out.len) continue;
-        if (out[f] == 0x7E or out[f] == 0x7F) {
-            out[f] -= 0x3E;
-            res.stats.rewritten_ptr_banks += 1;
+    if (bwram) if (ptr_ev) |pe| {
+        for (pe.proven[0..pe.n_proven]) |ca| {
+            const src_bank: u32 = (ca >> 16) & 0x7F;
+            const a16: u32 = ca & 0xFFFF;
+            if (a16 < 0x8000) continue;
+            const f = src_bank * 0x8000 + (a16 - 0x8000);
+            if (f >= out.len) continue;
+            if (out[f] == 0x7E or out[f] == 0x7F) {
+                out[f] -= 0x3E;
+                res.stats.rewritten_ptr_banks += 1;
+            }
+        }
+        // dp,X pointer words: the recorded address names the word's LAST
+        // byte. Only a word still naming something beyond the moved low
+        // 8 KiB is rewritten — the window offset pre-subtracted, so the
+        // relocated direct page wraps back onto the original target.
+        for (pe.idx_proven[0..pe.n_idx]) |ca| {
+            const src_bank: u32 = (ca >> 16) & 0x7F;
+            const a16: u32 = ca & 0xFFFF;
+            if (a16 < 0x8001) continue;
+            const f = src_bank * 0x8000 + (a16 - 0x8000);
+            if (f >= out.len or f == 0) continue;
+            const word = std.mem.readInt(u16, out[f - 1 ..][0..2], .little);
+            if (word >= 0x2000) {
+                std.mem.writeInt(u16, out[f - 1 ..][0..2], word -% wg_bw_window, .little);
+                res.stats.rewritten_idx_words += 1;
+            }
         }
     };
     // D and S follow their memory into the window.

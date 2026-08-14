@@ -111,6 +111,21 @@ pub const PtrBankEvidence = struct {
     /// the conversion cannot repair; a verdict input, not just a counter.
     unresolved: u32,
 
+    /// Direct-page INDEX provenance — the same disease through the other
+    /// register: `LDX $0000,Y / STA $00,X` with X = $4370 reaches the DMA
+    /// registers THROUGH the direct page (D=$0000 + X), so the window's
+    /// D=$6000 move sends the write into ROM void — the channel setup
+    /// silently no-ops and every store pays slow-ROM instead of MMIO
+    /// timing (measured: +2 cycles per write, the drift that phase-shifts
+    /// the APU pump and forks gameplay). The X values are ROM table words;
+    /// each proven word is rewritten −$6000 so the moved D wraps back onto
+    /// the original target (dp addressing wraps in bank 0). Recorded here:
+    /// ROM addresses of the LAST byte of the X-load whose value carried a
+    /// dp,X access beyond the moved low 8 KiB.
+    idx_proven: [max_proven]u32,
+    n_idx: usize,
+    idx_unresolved: u32,
+
     pub const none: u32 = 0xFFFF_FFFF;
     pub const max_proven = 256;
     pub const init: PtrBankEvidence = .{
@@ -118,6 +133,9 @@ pub const PtrBankEvidence = struct {
         .proven = undefined,
         .n_proven = 0,
         .unresolved = 0,
+        .idx_proven = undefined,
+        .n_idx = 0,
+        .idx_unresolved = 0,
     };
 
     pub fn addProven(self: *PtrBankEvidence, addr: u32) void {
@@ -132,7 +150,43 @@ pub const PtrBankEvidence = struct {
         self.proven[self.n_proven] = a;
         self.n_proven += 1;
     }
+
+    pub fn addIdxProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.idx_proven[0..self.n_idx]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_idx == max_proven) {
+            self.idx_unresolved += 1;
+            return;
+        }
+        self.idx_proven[self.n_idx] = a;
+        self.n_idx += 1;
+    }
 };
+
+/// Loads of X whose read bytes (or immediate operand) are the byte-for-byte
+/// source of the register: LDX #/dp/dp,Y/abs/abs,Y.
+pub fn loadXSource(op: u8) bool {
+    return switch (op) {
+        0xA2, 0xA6, 0xB6, 0xAE, 0xBE => true,
+        else => false,
+    };
+}
+
+/// Instructions that change X by means other than a tracked load — the
+/// register's provenance dies here. (TXA/TXS/TXY read X and keep it.)
+pub fn clobbersX(op: u8) bool {
+    return switch (op) {
+        0xAA, 0xBA, 0xCA, 0xE8, 0xFA, 0xBB, 0x44, 0x54 => true,
+        else => false,
+    };
+}
+
+/// dp,X data forms — the dp_idx modes minus the two dp,Y ones (LDX/STX).
+pub fn isDpX(op: u8) bool {
+    return mode(op) == .dp_idx and op != 0xB6 and op != 0x96;
+}
 
 /// Low-8K WRAM offset of a CPU address, if it names one: bank $7E's first
 /// 8 KiB or the system-bank mirror — the same cells either way.

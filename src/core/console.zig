@@ -62,7 +62,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w" };
 
         cart: Cartridge,
         bus: Bus,
@@ -82,6 +82,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// storing. Zero-sized unless `cfg.profile`.
         prev_load_end: if (cfg.profile) u32 else void,
         prev_load_w: if (cfg.profile) u8 else void,
+        /// ROM source of the CURRENT X register value (last byte of the
+        /// load that set it), or `none` once anything else touched X.
+        x_src: if (cfg.profile) u32 else void,
+        x_w: if (cfg.profile) u8 else void,
 
         region: timing.Region,
         /// Current scanline within the frame (0-based).
@@ -127,6 +131,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.usage = null;
                 self.prev_load_end = usage_map.PtrBankEvidence.none;
                 self.prev_load_w = 0;
+                self.x_src = usage_map.PtrBankEvidence.none;
+                self.x_w = 0;
             }
         }
 
@@ -360,7 +366,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     u.noteWrite(a, width);
                     if (op != null) u.noteSite(pc, a);
                 }
-                if (u.ptr_banks) |pb| self.trackPtrBanks(pb, pc, op, m8, width);
+                if (u.ptr_banks) |pb| self.trackPtrBanks(pb, pc, op, m8, x8, width);
             }
         }
 
@@ -371,7 +377,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// Pointer-bank provenance (see `usage_map.PtrBankEvidence`): runs
         /// once per profiled step, after the usage map has recorded the
         /// step's accesses.
-        fn trackPtrBanks(self: *Self, pb: *usage_map.PtrBankEvidence, pc: u24, op_o: ?u8, m8: bool, width: u8) void {
+        fn trackPtrBanks(self: *Self, pb: *usage_map.PtrBankEvidence, pc: u24, op_o: ?u8, m8: bool, x8: bool, width: u8) void {
             const none = usage_map.PtrBankEvidence.none;
             const op = op_o orelse {
                 // Interrupt dispatch between the load and the store would
@@ -414,6 +420,24 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     }
                 }
             }
+            // 2b. A dp,X data access resolving BEYOND the moved low 8 KiB
+            //    (X carried a full pointer — MMIO registers, or anything
+            //    else the D move would drag +$6000 away from): prove X's
+            //    ROM source word so the conversion can pre-subtract the
+            //    window offset from it.
+            if (usage_map.isDpX(op)) {
+                const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
+                if (tgt) |t| {
+                    const tb: u8 = @truncate(t >> 16);
+                    const a16: u16 = @truncate(t);
+                    if (tb == 0x00 and a16 >= 0x2000) {
+                        if (self.x_src != none and self.x_w == 2)
+                            pb.addIdxProven(self.x_src)
+                        else
+                            pb.idx_unresolved += 1;
+                    }
+                }
+            }
             // 2. A [dp]/[dp],Y data access that resolved into bank $7E/$7F:
             //    prove the pointer's bank-byte cell's remembered source.
             if (op & 0x0F == 0x07) {
@@ -447,6 +471,25 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         self.prev_load_w = w;
                     }
                 }
+            }
+            // 4. X-register provenance: a plain X-load from ROM (or its
+            //    immediate) sets it; anything else that writes X kills it.
+            if (usage_map.loadXSource(op)) {
+                self.x_src = none;
+                self.x_w = 0;
+                const w: u8 = if (x8) 1 else 2;
+                if (op == 0xA2) {
+                    self.x_src = (pc +% w) & 0x7F_FFFF;
+                    self.x_w = w;
+                } else if (dataAddr(self.bus.last_data_read)) |r| {
+                    if (usage_map.siteClass(r) == usage_map.site_rom) {
+                        self.x_src = r & 0x7F_FFFF;
+                        self.x_w = w;
+                    }
+                }
+            } else if (usage_map.clobbersX(op)) {
+                self.x_src = none;
+                self.x_w = 0;
             }
         }
 

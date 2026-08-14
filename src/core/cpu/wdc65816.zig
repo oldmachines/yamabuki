@@ -56,6 +56,18 @@ pub const Regs = struct {
 
 pub const ExecState = enum(u8) { running, waiting, stopped };
 
+/// TEMP calibration: print bus.clock at the first fetch of this bank-0 PC.
+pub var dbg_clock_pc: u16 = 0;
+pub var dbg_clock_fired: bool = false;
+/// TEMP diagnostics: log writes to this WRAM-offset range (banks $7E/$40).
+pub var dbg_watch_lo: u16 = 0;
+pub var dbg_watch_hi: u16 = 0;
+pub var dbg_watch_from: u64 = 0;
+var dbg_watch_n: usize = 0;
+/// TEMP diagnostics: instruction trace over a clock window.
+pub var dbg_trace_from: u64 = 0;
+pub var dbg_trace_to: u64 = 0;
+
 pub fn Cpu(comptime BusT: type) type {
     return struct {
         const Self = @This();
@@ -148,6 +160,18 @@ pub fn Cpu(comptime BusT: type) type {
                 return;
             }
 
+            if (dbg_clock_pc != 0 and !dbg_clock_fired and
+                self.regs.pbr == 0 and self.regs.pc == dbg_clock_pc and
+                @hasField(BusT, "clock"))
+            {
+                dbg_clock_fired = true;
+                std.debug.print("[clk] pc=00:{x:0>4} clock={}\n", .{ self.regs.pc, self.bus.clock });
+            }
+            if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
+                const clk = self.bus.clock;
+                if (clk >= dbg_trace_from and clk < dbg_trace_to)
+                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.p, clk });
+            }
             const m8 = self.regs.e or (self.regs.p & Flags.m) != 0;
             const x8 = self.regs.e or (self.regs.p & Flags.x) != 0;
             if (m8) {
@@ -200,6 +224,28 @@ pub fn Cpu(comptime BusT: type) type {
         /// (see `push8`), so `last_data_write` records only writes that change
         /// the machine's state, never call/return bookkeeping.
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (dbg_watch_lo != 0) {
+                const bank: u8 = @intCast(addr >> 16);
+                const a16: u16 = @truncate(addr);
+                // Normalized low-WRAM offset across every addressing home:
+                // banks $7E/$40 directly, the system-bank mirror below
+                // $2000, and the relocated window $6000-$7FFF.
+                const off: ?u16 = if (bank == 0x7E or bank == 0x40)
+                    a16
+                else if ((bank & 0x7F) < 0x40 and a16 < 0x2000)
+                    a16
+                else if ((bank & 0x7F) < 0x40 and a16 >= 0x6000 and a16 < 0x8000)
+                    a16 - 0x6000
+                else
+                    null;
+                if (off) |o| if (o >= dbg_watch_lo and o <= dbg_watch_hi and
+                    dbg_watch_n < 4096 and @hasField(BusT, "clock") and
+                    self.bus.clock >= dbg_watch_from)
+                {
+                    dbg_watch_n += 1;
+                    std.debug.print("[ww] pc={x:0>2}:{x:0>4} {x:0>6} <= {x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, addr, value, self.bus.clock });
+                };
+            }
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);
