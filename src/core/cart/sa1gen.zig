@@ -5595,6 +5595,39 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     try testing.expectEqual(@as(u4, 0), con.bus.sa1.cmeg);
 }
 
+test "window: the BW-RAM window mirrors in banks $80-$BF like the hardware" {
+    // The FastROM bank lift turns `LDA $03:0002,X` into `LDA $83:0002,X`.
+    // GIII's slot walker serves ROM nodes AND relocated-WRAM nodes through
+    // that one instruction (stock reads the WRAM mirror; the conversion
+    // reads the window), so bank $83's $6000-$7FFF must reach the SAME
+    // BW-RAM bytes as bank $03's — as it does on the real chip.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    con.runFrame(); // boot: shim opens SBM/SWEN
+    con.bus.write8(0x00_6012, 0xA7);
+    try testing.expectEqual(@as(u8, 0xA7), con.bus.read8(0x00_6012));
+    try testing.expectEqual(@as(u8, 0xA7), con.bus.read8(0x03_6012));
+    try testing.expectEqual(@as(u8, 0xA7), con.bus.read8(0x83_6012));
+    con.bus.write8(0xA1_6013, 0x5C); // write through a high mirror too
+    try testing.expectEqual(@as(u8, 0x5C), con.bus.read8(0x21_6013));
+}
+
 test "window offload: a tree runs on the SA-1 against the shared window, sync and async" {
     const gpa = testing.allocator;
     const console = @import("../console.zig");

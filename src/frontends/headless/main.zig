@@ -386,7 +386,7 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
         if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
-        std.debug.print("[dump] pc={x:0>2}:{x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p });
+        std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
         if (fc.bus.cart.chip == .sa1)
             std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
     };

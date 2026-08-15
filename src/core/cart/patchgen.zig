@@ -260,7 +260,24 @@ pub fn generate(
                 // hands off the window conversion's $3F negative-offset
                 // idiom — $3F:FFxx wraps into $40 BW-RAM, and $BF would
                 // wrap into $C0 ROM instead.
-                if (is_long and file + 3 < out.len and out[file + 3] < @min(n_banks, 0x40)) {
+                //
+                // NEGATIVE-IDIOM BASES ($FFxx) are never lifted at all: the
+                // wrapped walk can land in OPEN BUS, where the value read
+                // is the MDR — the instruction's own last-fetched operand
+                // byte, i.e. THE BANK BYTE. Lifting $02:FFFF,X to $82
+                // changed Gradius III's slot-scan garbage reads from $0202
+                // to $8282; the value seeds the walker's link cells, $02xx
+                // is WRAM-domain where $82xx is ROM-domain, and the walks
+                // diverged into a ROM self-cycle at the stage-1 boss
+                // (frozen game, watchdog blind — the loop is on the S-CPU).
+                // Keeping the stock bank keeps the garbage stock-equal.
+                const a16_op: u16 = if (file + 3 < out.len)
+                    std.mem.readInt(u16, out[file + 1 ..][0..2], .little)
+                else
+                    0;
+                if (is_long and file + 3 < out.len and out[file + 3] < @min(n_banks, 0x40) and
+                    a16_op < 0xFF00)
+                {
                     out[file + 3] |= 0x80;
                     lifted += 1;
                 }
