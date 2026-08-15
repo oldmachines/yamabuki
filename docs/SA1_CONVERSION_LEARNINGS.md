@@ -435,3 +435,121 @@ measured evidence, and verification.** The profiler closed most of that gap
 by harvesting the knowledge from execution instead of approximating it from
 bytes; coverage closes most of the rest; the residue is what the behavioral
 tier is for.
+
+## 10. The concurrency arc — earning the third tree
+
+The physics tree ($8EF1) was the difference between 48% and 17%
+utilisation, and it kept freezing live play long after every surface
+verified clean. Recovering it took four mechanisms and disproved two.
+
+**The SA-1 timer watchdog — recovery, not prevention.** Every dispatch
+block restarts the SA-1's linear timer and opens IRQs only across the
+copy; a copy that outlives a generous V-budget takes the timer IRQ into
+an abort handler that unwinds to the dispatcher, flags the S-CPU stub,
+and lets it re-run the ORIGINAL body inline from the caller's entry
+registers (the abort path skips the exit marshal precisely so the
+mailbox still holds them). What the build taught:
+
+- CIV is an S-CPU-side register. The SA-1's own stores to $2207/8 land
+  on deaf ports; the boot shim must program it, like CRV.
+- In a level-model IRQ line, the CLEAR bit is the mask. Writing CIE
+  with CIC unset asserts the line instantly — and the unmarshal's PLP
+  of a mainline caller's P (I=0) takes it into a zero vector.
+- The unmarshal opens interrupts BEFORE any deliberate CLI, because
+  game P arrives through it. Interrupt-class trees arrive with I set,
+  so the block must CLI for the watchdog to cover them at all — and
+  must repair the I bit in the marshaled exit P afterwards, because P
+  round-trips to the S-CPU caller.
+- Budgets must be sized to the largest LEGITIMATE run, not the typical
+  one: the sequencer tree averages ~4.4ms/entry, and a 4.6ms budget
+  aborted healthy runs wholesale. An abort is only safe when the
+  alternative was a permanent wedge — every abort re-applies partial
+  BW-RAM writes, so frequent aborts ARE the corruption.
+- The watchdog is blind to the failure it was built for whenever the
+  S-CPU, not the SA-1, is the one looping: an inline walk over torn
+  state shows a clean mailbox, an idle SA-1, and a silent watchdog.
+
+**Interrupt-masked dispatch — the fix that held.** Concurrent mutation
+of a tree's read-set cannot be dodged by timing (the vblank guard) or
+recovered from after the fact (the watchdog re-runs inline over the
+same torn state). It has to be excluded: the tree's sync stub masks
+NMITIMEN across the whole handshake — the S-CPU is spinning anyway, a
+straddled NMI is one lag frame — and restores it before any exit path.
+The restore source is the trap: the game's own shadow byte is not
+phase-accurate (GIII's transitions write $4200=0 without touching it,
+and restoring the stale value re-enables NMI inside the game's own
+interrupts-off bracket). A write-only register is mirrored correctly
+by REWRITING ITS WRITERS: every covered `STA $4200` becomes a JSR to
+an eight-byte thunk that stores A to an I-RAM mirror first, then to
+the register. Wrap only the trees that need it — the mask costs the
+straddle probability times the dispatch time, which is negligible for
+a 0.5ms tree called eight times a second and ruinous for a 4.4ms tree
+called every frame.
+
+**The coverage boundary moves with the lag differential.** The
+conversion runs ahead of stock by the removed slowdown, so a path
+stock first executes shortly AFTER a movie's end is reachable by the
+conversion WITHIN it — and an uncovered instruction there is invisible
+to every rewrite rule. Profiling each surface a thousand-plus frames
+past its movie (coverage only, no verdict influence) closes that
+margin. It cannot close the deeper one: after an RNG fork the two
+sides visit scenes in different orders, and no finite stock profile
+leads a forked trajectory. Idioms that gate control flow must not
+depend on coverage at all — the dispatch macro `STA $00 / JMP ($0000)`
+appears ~140 times in three banks, coverage had shifted 28, and any
+uncovered one is a boot-to-BRK-storm landmine. A five-byte signature
+is specific enough to rewrite statically; covered sites skip naturally
+because their operand no longer matches.
+
+**Open bus reads the instruction's own bytes.** The FastROM bank lift
+changed `LDA $02:FFFF,X` to bank $82 — and the slot walker executes
+that read with table-range X on purpose, landing in $4400-$5FFF where
+the value returned is the MDR: the last-fetched operand byte, i.e. THE
+BANK BYTE. Stock seeds its link scratch with $0202 (WRAM-domain when
+consumed); the lifted site seeded $8282 (ROM-domain), and the walks
+diverged into a data self-cycle ($03:FF02 holds $FF00 — a one-node
+loop sitting in stock ROM, reachable by any walk that ingests a
+garbage head). The law generalises: any rewrite that changes an
+instruction's bytes changes what its open-bus reads return, so sites
+whose effective address can leave mapped space must keep their bytes.
+Negative-idiom bases (operand ≥ $FF00) are the systematic visitors and
+are excluded from the lift outright.
+
+**Reading soak verdicts.** The end-of-frame RAM dump samples a fixed
+phase: the same pc on every probe is not a hang until a trace proves
+it, and busy=1 with the SA-1 mid-copy is the per-frame NMI-phase
+dispatch caught in flight whenever the screen still advances. The
+converse tells too: a static screen with live audio is not "parked" —
+it is forced-blank with an NMI-less wait (game dead), or a stopped
+CPU (STP in ROM data — trace-clk returns zero lines, the definitive
+tell). Judge soaks by animation plus trace, never by hash alone; on
+post-fork surfaces the conversion legitimately parks on screens stock
+never visits, and only responsiveness (a synthesized START press) or
+a pc/trace check separates parked from dead.
+
+**Process rules written in blood.** Generate against a scratch copy of
+the ROM — the generator writes its BPS next to the input, and one
+auto-bisected 0-tree run silently replaced the shipped patch (restored
+only because the generator is deterministic: rebuild the old commit in
+a worktree, re-run the exact command, byte-identical output). Soak the
+rung that ships: the plain `--save-attempt` name is the LAST attempt —
+the losing async flavor — and the winner is the numbered sync rung;
+`--patch` + sha256 against the rungs before soaking, every time. And
+save states carry corruption with them: a state saved during a poisoned
+session dies on every build, fixed or not, because the poison is in the
+saved chains — regression-test states must be taken BEFORE the damage,
+or the fix verified at mechanism level (trace the same clock window on
+both builds and compare the loaded values).
+
+**Where the arc stands.** Relocation + three trees + FastROM with all
+of the above: 237 → 115 dropped frames, 57% → 17% utilisation, both
+soak surfaces alive and cycling for 120k combined frames, the watchdog
+silent throughout. One live defect remains open: a rare sorts-to-front
+slot insertion at the stage-1 boss still ingests a garbage link from
+the sentinel's neighbour bytes and follows it into the $FF00 self-
+cycle — on the S-CPU, inline, invisible to every guard. The chase is
+paused at the game's algorithm semantics, where the next hop needs
+stock ground truth at the same logical moment; the instrument that
+resolves it is a recorded playthrough (F10) reaching the boss, replayed
+on both stock and the conversion by the behavioral tier, which finds
+the first divergent cell mechanically.
