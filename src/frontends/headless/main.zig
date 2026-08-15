@@ -146,6 +146,17 @@ const Args = struct {
     /// async).
     wg_nmi_off: [8]u32 = @splat(0),
     n_wg_nmi_off: usize = 0,
+    /// --cover-image <patched.sfc> + --cover-movie <f.ymv>: harvest
+    /// COVERAGE (opcode + width bits only, no site evidence) from a
+    /// movie replayed on a PREVIOUS CONVERSION of this game, merged
+    /// into the union wherever the instruction byte matches the stock
+    /// image. This is how gameplay only reachable on the conversion
+    /// (a recorded run whose inputs are conv-timed dies early when
+    /// replayed on stock) still teaches the rewriter which code
+    /// exists: which instructions execute is address-space-invariant
+    /// even though their operands were rewritten.
+    cover_image: ?[]const u8 = null,
+    cover_movie: ?[]const u8 = null,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1734,6 +1745,64 @@ fn runSa1Gen(
             gpa.destroy(con_p);
         }
         try out.print("  coverage pad: each surface profiled {} frames past its movie (lag-led paths)\n", .{cov_pad});
+        try out.flush();
+    }
+    // CONVERSION-SIDE COVERAGE HARVEST (--cover-image + --cover-movie):
+    // stock replays of a conv-recorded run die early (the inputs are
+    // conv-timed), so gameplay only the conversion reaches — measured:
+    // the stage-1 boss arrival — never covers its handlers and their
+    // low-WRAM reads stay unshifted, reading dead memory. WHICH
+    // instructions execute is address-space-invariant, so a replay on
+    // the PREVIOUS conversion donates opcode/width coverage wherever
+    // the instruction byte matches stock (rewrites change operands, not
+    // opcodes; the previous build's scaffolding differs byte-for-byte
+    // and filters itself out). Site evidence is NOT harvested — conv
+    // effective addresses describe the post-relocation world.
+    if (args.cover_image != null and args.cover_movie != null) {
+        const ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image.?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image.?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const ci = core.header.stripCopierHeader(ci_raw);
+        const mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie.?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie.?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const cm = util.movie.parse(gpa, mb) catch {
+            try out.print("error: '{s}' is not a valid movie\n", .{args.cover_movie.?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        defer gpa.free(tmp);
+        @memset(tmp, 0);
+        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp };
+        const ccart = try core.Cartridge.load(gpa, ci);
+        const ccon = try gpa.create(core.ProfilingConsole);
+        ccon.init(ccart);
+        ccon.usage = &cover_map;
+        for (0..cm.frames.len + 600) |i| {
+            feedMovie(ccon, cm, i);
+            ccon.runFrame();
+        }
+        ccon.cart.deinit(gpa);
+        gpa.destroy(ccon);
+        var merged: u32 = 0;
+        var pc: u32 = 0;
+        while (pc < core.usage_map.cpu_map_len) : (pc += 1) {
+            if (tmp[pc] & core.usage_map.flag_opcode == 0) continue;
+            const bank = (pc >> 16) & 0x7F;
+            const a16 = pc & 0xFFFF;
+            if (bank > 0x3F or a16 < 0x8000) continue;
+            const file = bank * 0x8000 + (a16 - 0x8000);
+            if (file >= image.len or file >= ci.len) continue;
+            if (image[file] != ci[file]) continue; // scaffolding / rewritten opcode
+            if (ub[pc] & core.usage_map.flag_opcode == 0) merged += 1;
+            ub[pc] |= tmp[pc];
+        }
+        try out.print("  cover harvest: {} instruction(s) newly covered from the conversion-side replay\n", .{merged});
         try out.flush();
     }
     const cov_total = core.usage_map.countOpcodes(ub);
@@ -3718,6 +3787,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             if (out.n_wg_nmi_off == out.wg_nmi_off.len) return error.TooManyDrops;
             out.wg_nmi_off[out.n_wg_nmi_off] = try std.fmt.parseInt(u16, v, 16);
             out.n_wg_nmi_off += 1;
+        } else if (std.mem.eql(u8, a, "--cover-image")) {
+            out.cover_image = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--cover-movie")) {
+            out.cover_movie = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
