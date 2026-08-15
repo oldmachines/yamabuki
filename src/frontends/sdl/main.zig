@@ -240,7 +240,6 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
-        .patch_name = booted.patch_name,
     };
 }
 
@@ -367,8 +366,6 @@ const Booted = struct {
     rom_crc: u32,
     /// The core the console was built on (movies replay only on their own).
     accuracy: core.Accuracy,
-    /// The soft patch applied at boot (path), or null for the original.
-    patch_name: ?[]const u8,
 };
 
 /// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
@@ -409,10 +406,8 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         try err.flush();
         return error.BootFailed;
     };
-    var patch_used: ?[]const u8 = null;
     if (args.patch) |patch_path| {
         image = try applySoftPatch(io, gpa, image, patch_path, err);
-        patch_used = patch_path;
     } else if (args.frames == 0) {
         // Launch discovery: a same-basename softpatch, a patch-folder match,
         // or a registry entry. Whether it is used is the per-game choice the
@@ -500,7 +495,6 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         .shader = if (pg) |p| p.shader else null,
         .rewind = if (pg) |p| p.rewind else null,
         .rom_crc = util.movie.imageCrc(core.header.stripCopierHeader(image)),
-        .patch_name = patch_used,
         .accuracy = accuracy,
     };
 }

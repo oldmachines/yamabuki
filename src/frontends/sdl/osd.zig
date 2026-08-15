@@ -166,18 +166,6 @@ pub const Osd = struct {
     text_w: u32 = 0,
     ttl: u32 = 0,
 
-    /// The INFO PANEL: a multi-line reference card (game identity, cart
-    /// chip, patch, region) toggled by its hotkey. No TTL — it stays up
-    /// until toggled off.
-    panel_tex: gl.Uint = 0,
-    panel_w: u32 = 0,
-    panel_h: u32 = 0,
-    panel_on: bool = false,
-
-    pub const panel_max_lines = 6;
-    /// Panel line cap — bounds the rasterization buffers.
-    pub const panel_chars = 44;
-
     pub fn init(api: gl.Api, dialect: Dialect) !Osd {
         var self: Osd = .{ .api = api };
 
@@ -210,12 +198,6 @@ pub const Osd = struct {
         api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        api.glGenTextures(1, @ptrCast(&self.panel_tex));
-        api.glBindTexture(gl.TEXTURE_2D, self.panel_tex);
-        api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        api.glTexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
         return self;
     }
@@ -225,47 +207,6 @@ pub const Osd = struct {
         if (self.program != 0) api.glDeleteProgram(self.program);
         if (self.vbo != 0) api.glDeleteBuffers(1, @ptrCast(&self.vbo));
         if (self.tex != 0) api.glDeleteTextures(1, @ptrCast(&self.tex));
-        if (self.panel_tex != 0) api.glDeleteTextures(1, @ptrCast(&self.panel_tex));
-    }
-
-    /// Rasterize up to `panel_max_lines` lines (each capped at
-    /// `panel_chars`) into the panel texture and show it. The panel stays
-    /// until `panelHide` — it is a reference card, not a toast.
-    pub fn panelShow(self: *Osd, lines: []const []const u8) void {
-        const lw_max: usize = panel_chars * (@as(usize, glyph_w) + 1);
-        const lh: usize = @as(usize, glyph_h) + 2; // leading between lines
-        const n_lines = @min(lines.len, panel_max_lines);
-        var w: usize = 0;
-        for (lines[0..n_lines]) |l| w = @max(w, @min(l.len, @as(usize, panel_chars)) * (@as(usize, glyph_w) + 1));
-        if (w == 0) return;
-        const h = n_lines * lh;
-
-        var buf: [lw_max * lh * panel_max_lines * 4]u8 = @splat(0);
-        var lbuf: [lw_max * glyph_h * 4]u8 = undefined;
-        for (lines[0..n_lines], 0..) |l, i| {
-            const n = @min(l.len, @as(usize, panel_chars));
-            if (n == 0) continue;
-            const lw = n * (@as(usize, glyph_w) + 1);
-            @memset(lbuf[0 .. lw * glyph_h * 4], 0);
-            rasterize(lbuf[0 .. lw * glyph_h * 4], lw, l[0..n]);
-            for (0..glyph_h) |row| {
-                const src = lbuf[row * lw * 4 ..][0 .. lw * 4];
-                const dst = buf[((i * lh + row) * w) * 4 ..][0 .. lw * 4];
-                @memcpy(dst, src);
-            }
-        }
-
-        const api = self.api;
-        api.glBindTexture(gl.TEXTURE_2D, self.panel_tex);
-        api.glPixelStorei(gl.UNPACK_ALIGNMENT, 4);
-        api.glTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, @intCast(w), @intCast(h), 0, gl.RGBA, gl.UNSIGNED_BYTE, buf[0..].ptr);
-        self.panel_w = @intCast(w);
-        self.panel_h = @intCast(h);
-        self.panel_on = true;
-    }
-
-    pub fn panelHide(self: *Osd) void {
-        self.panel_on = false;
     }
 
     /// Rasterize `text` and start (or restart) the countdown. Truncates past
@@ -296,7 +237,6 @@ pub const Osd = struct {
     /// caller must reset the viewport to the *whole* window first (the chain
     /// leaves it letterboxed to the picture).
     pub fn draw(self: *Osd, window: Size, box: Box) void {
-        if (self.panel_on) self.drawPanel(window, box);
         if (self.ttl == 0) return;
         self.ttl -= 1;
         if (self.text_w == 0) return;
@@ -350,42 +290,6 @@ pub const Osd = struct {
             text_h_px,
             .{ 0, 0, 1, 1 },
         );
-    }
-
-    /// The info panel: top-left of the picture, same pixel density rules
-    /// as the toast, dimmed backing so it reads over any scene.
-    fn drawPanel(self: *Osd, window: Size, box: Box) void {
-        if (self.panel_w == 0 or self.panel_h == 0) return;
-        const api = self.api;
-        const scale: f32 = @floatFromInt(@max(1, box.h / 224));
-        const pad = 3 * scale;
-        const margin = 4 * scale;
-
-        const text_w_px = @as(f32, @floatFromInt(self.panel_w)) * scale;
-        const text_h_px = @as(f32, @floatFromInt(self.panel_h)) * scale;
-        const bar_w = text_w_px + 2 * pad;
-        const bar_h = text_h_px + 2 * pad;
-
-        const bar_left = @as(f32, @floatFromInt(box.x)) + margin;
-        // GL origin is bottom-left; the panel hangs from the picture's top.
-        const bar_bottom = @as(f32, @floatFromInt(box.y)) + @as(f32, @floatFromInt(box.h)) - margin - bar_h;
-
-        api.glViewport(0, 0, @intCast(window.w), @intCast(window.h));
-        api.glUseProgram(self.program);
-        api.glBindBuffer(gl.ARRAY_BUFFER, self.vbo);
-        if (self.a_pos >= 0) api.glEnableVertexAttribArray(@intCast(self.a_pos));
-        if (self.a_uv >= 0) api.glEnableVertexAttribArray(@intCast(self.a_uv));
-
-        api.glUniform1i(self.u_use_tex, 0);
-        api.glUniform4fv(self.u_color, 1, &[4]f32{ 0, 0, 0, 1 });
-        self.drawQuad(window, bar_left, bar_bottom, bar_w, bar_h, .{ 0, 0, 1, 1 });
-
-        api.glActiveTexture(gl.TEXTURE0);
-        api.glBindTexture(gl.TEXTURE_2D, self.panel_tex);
-        api.glUniform1i(self.u_tex, 0);
-        api.glUniform1i(self.u_use_tex, 1);
-        api.glUniform4fv(self.u_color, 1, &[4]f32{ 1, 1, 1, 1 });
-        self.drawQuad(window, bar_left + pad, bar_bottom + pad, text_w_px, text_h_px, .{ 0, 0, 1, 1 });
     }
 
     /// One quad, `(x, y, w, h)` in window pixels with GL's own bottom-left
