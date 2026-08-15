@@ -551,6 +551,9 @@ fn loadMovie(
 /// must follow it or every press lands early in game-time and forks the
 /// run). Set by the undocumented --conv-pad flag.
 pub var dbg_conv_pad: u32 = 0;
+/// Undocumented --site-ev <hex24>: after profiling, print the union
+/// evidence byte and coverage flags for this instruction address.
+pub var dbg_site_ev: u32 = 0;
 
 fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
     con.bus.input_polled = false;
@@ -1803,6 +1806,13 @@ fn runSa1Gen(
             ub[pc] |= tmp[pc];
         }
         try out.print("  cover harvest: {} instruction(s) newly covered from the conversion-side replay\n", .{merged});
+        try out.flush();
+    }
+    if (dbg_site_ev != 0) {
+        const p: u32 = dbg_site_ev;
+        try out.print("  [site-ev] ${x:0>6}: cov={x:0>2} cov80={x:0>2} ev={x:0>2} ev80={x:0>2}\n", .{
+            p, ub[p], ub[0x80_0000 | p], site_ev[p], site_ev[0x80_0000 | p],
+        });
         try out.flush();
     }
     const cov_total = core.usage_map.countOpcodes(ub);
@@ -3797,6 +3807,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--conv-pad")) {
             const v = it.next() orelse return error.MissingValue;
             dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--site-ev")) {
+            const v = it.next() orelse return error.MissingValue;
+            dbg_site_ev = try std.fmt.parseInt(u24, v, 16);
         } else if (std.mem.eql(u8, a, "--trace-clk")) {
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, '-');

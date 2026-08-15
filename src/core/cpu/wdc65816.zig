@@ -176,7 +176,7 @@ pub fn Cpu(comptime BusT: type) type {
             if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
                 const clk = self.bus.clock;
                 if (clk >= dbg_trace_from and clk < dbg_trace_to)
-                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.p, clk });
+                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p, clk });
             }
             // SA-1-side trace: fires once the S-CPU-side watch has armed.
             if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {

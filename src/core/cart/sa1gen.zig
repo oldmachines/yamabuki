@@ -2558,6 +2558,7 @@ const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_l
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
 const split_thunk_len: u32 = 24;
+const idx_thunk_len: u32 = 16;
 /// Sites one conversion can thunk (Gradius III measures ~100).
 const split_thunk_max: usize = 192;
 
@@ -3659,6 +3660,10 @@ pub fn convertWholeGame(
     // patched after the pass, once the bank-0 carve is paintable.
     var thunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
     var n_thunks: usize = 0;
+    // Index-split sites (tiny base, measured low|rom): dispatched on the
+    // index register's magnitude instead of the DBR.
+    var ithunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
+    var n_ithunks: usize = 0;
     // CELL COHERENCE (window mode): per-site evidence decisions can split
     // one cell's accessor population — gameplay evidence shifted a sound
     // cell's readers while its pinned writers stayed, and the two homes
@@ -3853,6 +3858,29 @@ pub fn convertWholeGame(
                         n_thunks += 1;
                         continue;
                     }
+                    // A site SPLIT ON ITS INDEX: a tiny-base indexed abs
+                    // measured reading BOTH the WRAM-low mirror (small
+                    // index — the operand really is a data base) and ROM
+                    // (huge index — "X is the pointer"). One operand
+                    // cannot serve both (measured: Gradius III's level-
+                    // script walker `LDA $0003,Y` reads spawn records at
+                    // dp offsets AND walks ROM through the same bytes —
+                    // left unshifted, every stage-1 enemy wave silently
+                    // failed to spawn: transient content diverges in runs
+                    // shorter than the persistence budget, so the tier
+                    // never saw it). The site becomes a JSR to a thunk
+                    // that dispatches on the index register's magnitude.
+                    const site_x8 = (cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_x != 0;
+                    if (window and v < 0x100 and !site_x8 and
+                        (usage_map.mode(op) == .abs_x or usage_map.mode(op) == .abs_y) and
+                        e == usage_map.site_wram_low | usage_map.site_rom)
+                    {
+                        if (n_ithunks == split_thunk_max)
+                            return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
+                        ithunks[n_ithunks] = .{ .file = file, .v = v, .op = op };
+                        n_ithunks += 1;
+                        continue;
+                    }
                     // Cell coherence (unindexed, single-context site): a
                     // {low, bank} CELL's home is BW-RAM — its pinned
                     // accessors are stuck there — so this unpinned site
@@ -4032,6 +4060,46 @@ pub fn convertWholeGame(
             }
         }
         res.stats.split_sites = @intCast(n_thunks);
+    }
+    // Index-split thunks: dispatch on the index register's magnitude.
+    // The compare runs under saved flags (CPY clobbers carry, which the
+    // replaced load must leave untouched); the load runs LAST so the
+    // exit flags are the op's own. Sites are collected only with x16
+    // widths (an 8-bit index over a tiny base can never reach ROM).
+    //
+    //   PHP / CPY #($2000-v) / BCS rom
+    //   PLP / op v+$6000 / RTS
+    //   rom: PLP / op v / RTS
+    if (window and n_ithunks != 0) {
+        var ti: usize = 0;
+        while (ti < n_ithunks) {
+            const tbank: u32 = ithunks[ti].file / 0x8000;
+            var tj = ti;
+            while (tj < n_ithunks and ithunks[tj].file / 0x8000 == tbank) tj += 1;
+            const need: u32 = @intCast((tj - ti) * idx_thunk_len);
+            const lo = tbank * 0x8000;
+            const region = if (tbank == 0) out[0..header.offset] else out[lo..@min(lo + 0x8000, out.len)];
+            const found = patchgen.findFreeSpace(region, need) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
+            var tcur: u32 = @intCast((if (tbank == 0) 0 else lo) + found);
+            while (ti < tj) : (ti += 1) {
+                const t = ithunks[ti];
+                const taddr: u16 = @intCast(0x8000 + (tcur % 0x8000));
+                const sh: u16 = t.v + wg_bw_window;
+                const lim: u16 = 0x2000 - t.v;
+                const cp: u8 = if (usage_map.mode(t.op) == .abs_y) 0xC0 else 0xE0;
+                const tpl = [idx_thunk_len]u8{
+                    0x08, cp,   @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05,
+                    0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60,
+                    0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60,
+                };
+                @memcpy(out[tcur..][0..idx_thunk_len], &tpl);
+                tcur += idx_thunk_len;
+                out[t.file] = 0x20; // JSR — same 3-byte footprint
+                std.mem.writeInt(u16, out[t.file + 1 ..][0..2], taddr, .little);
+            }
+        }
+        res.stats.split_sites += @intCast(n_ithunks);
     }
 
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
