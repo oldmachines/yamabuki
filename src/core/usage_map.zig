@@ -83,6 +83,21 @@ pub fn siteClass(addr: u24) u8 {
     return if (bank >= 0xC0 or (bank & 0x7F) >= 0x40) site_rom else site_other;
 }
 
+/// Site classification for a run on a WINDOW-CONVERTED image, mapping the
+/// relocated homes back to the classes the same access has in STOCK: the
+/// BW-RAM window ($6000-$7FFF, system banks) is the moved WRAM low 8K,
+/// and banks $40/$41 are the moved $7E/$7F. Everything else classifies as
+/// stock. Used by the conversion-side evidence harvest — sites that only
+/// gameplay reachable on the conversion executes (a recorded run's boss
+/// arrival) get their evidence from the world they actually ran in.
+pub fn siteClassConvWindow(addr: u24) u8 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (bank == 0x40 or bank == 0x41) return site_wram_bank;
+    if ((bank & 0x7F) <= 0x3F and a16 >= 0x6000 and a16 < 0x8000) return site_wram_low;
+    return siteClass(addr);
+}
+
 /// Pointer-bank PROVENANCE — the dynamic answer to the one idiom the
 /// operand rewriter cannot reach: a [dp] long-indirect access whose pointer
 /// bank byte is DATA. `LDA $01:0000,X / STA $22 / ... / STA [$20]` writes
@@ -215,13 +230,17 @@ pub const UsageMap = struct {
     /// Optional per-site evidence map, same length, indexed by the
     /// INSTRUCTION address (`site_*` bits). Null when nobody asked.
     sites: ?[]u8 = null,
+    /// Classify effective addresses through the window-conversion
+    /// normalizer (the run executes a converted image; evidence must
+    /// describe the stock world). See `siteClassConvWindow`.
+    conv_window_homes: bool = false,
     /// Optional pointer-bank provenance tracking. Null when nobody asked.
     ptr_banks: ?*PtrBankEvidence = null,
 
     /// Record where an instruction's data access actually landed.
     pub fn noteSite(self: *const UsageMap, pc: u24, addr: u24) void {
         const s = self.sites orelse return;
-        s[pc] |= siteClass(addr);
+        s[pc] |= if (self.conv_window_homes) siteClassConvWindow(addr) else siteClass(addr);
     }
 
     /// One executed instruction: opcode byte and its operand bytes.

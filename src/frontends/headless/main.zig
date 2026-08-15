@@ -1781,7 +1781,17 @@ fn runSa1Gen(
         const tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
         defer gpa.free(tmp);
         @memset(tmp, 0);
-        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp };
+        // Evidence rides along, classified through the window normalizer
+        // (window -> wram_low, $40/$41 -> wram_bank): sites that ONLY the
+        // conversion-side gameplay executes would otherwise be covered
+        // yet evidence-free, and the tiny-base indexed exemption keeps
+        // evidence-free sites unshifted — measured: the boss-arrival
+        // script reads stayed dead even after the coverage harvest, so
+        // the scroll never locked and the boss never spawned.
+        const tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        defer gpa.free(tmp_ev);
+        @memset(tmp_ev, 0);
+        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp, .sites = tmp_ev, .conv_window_homes = true };
         const ccart = try core.Cartridge.load(gpa, ci);
         const ccon = try gpa.create(core.ProfilingConsole);
         ccon.init(ccart);
@@ -1793,6 +1803,7 @@ fn runSa1Gen(
         ccon.cart.deinit(gpa);
         gpa.destroy(ccon);
         var merged: u32 = 0;
+        var merged_ev: u32 = 0;
         var pc: u32 = 0;
         while (pc < core.usage_map.cpu_map_len) : (pc += 1) {
             if (tmp[pc] & core.usage_map.flag_opcode == 0) continue;
@@ -1804,8 +1815,12 @@ fn runSa1Gen(
             if (image[file] != ci[file]) continue; // scaffolding / rewritten opcode
             if (ub[pc] & core.usage_map.flag_opcode == 0) merged += 1;
             ub[pc] |= tmp[pc];
+            if (tmp_ev[pc] != 0) {
+                if (site_ev[pc] == 0) merged_ev += 1;
+                site_ev[pc] |= tmp_ev[pc];
+            }
         }
-        try out.print("  cover harvest: {} instruction(s) newly covered from the conversion-side replay\n", .{merged});
+        try out.print("  cover harvest: {} instruction(s) newly covered, {} site(s) newly evidenced from the conversion-side replay\n", .{ merged, merged_ev });
         try out.flush();
     }
     if (dbg_site_ev != 0) {
