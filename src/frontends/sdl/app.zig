@@ -31,6 +31,22 @@ const patchfind = @import("patchfind.zig");
 /// (the default) uses the cart header's region byte.
 pub const RegionArg = enum { auto, ntsc, pal };
 
+/// A transient on-screen message (slot changes, state saves/loads,
+/// recording start/stop): one line at the picture's bottom-left for a
+/// couple of seconds, drawn into the compose buffer so both render paths
+/// show it and the shader shades it like game pixels.
+const Toast = struct {
+    buf: [48]u8 = undefined,
+    len: usize = 0,
+    frames: u32 = 0,
+
+    fn set(self: *Toast, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(&self.buf, fmt, args) catch return;
+        self.len = s.len;
+        self.frames = 120; // ~2 s
+    }
+};
+
 /// Everything the session needs, already merged from defaults ← config ← CLI
 /// by `main.zig`. Fields mirror the CLI flags they came from.
 pub const Options = struct {
@@ -375,6 +391,10 @@ pub fn run(
     // movie runs out, then live input takes over; its end hashes are
     // checked right after the final frame's audio drain.
     var rec: ?std.array_list.Managed([2]u16) = null;
+    // Transient on-screen toast (state slots, saves/loads, recording):
+    // drawn into the compose buffer like every overlay, so both render
+    // paths show it and the shader shades it.
+    var toast: Toast = .{};
     var play_movie: ?util.movie.Movie = opts.movie;
     var play_idx: usize = 0;
     var movie_end_check = false;
@@ -474,6 +494,7 @@ pub fn run(
                     .save_state => {
                         saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
                         if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                        toast.set("STATE SAVED - SLOT {d}", .{slot});
                         mnu = null;
                     },
                     .load_state => {
@@ -484,11 +505,18 @@ pub fn run(
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
                             discardMovieModes(&rec, &play_movie, "load state", err);
-                        }
+                            toast.set("STATE LOADED - SLOT {d}", .{slot});
+                        } else toast.set("NO STATE IN SLOT {d}", .{slot});
                         mnu = null;
                     },
-                    .slot_next => slot = if (slot == 8) 1 else slot + 1,
-                    .slot_prev => slot = if (slot == 1) 8 else slot - 1,
+                    .slot_next => {
+                        slot = if (slot == 8) 1 else slot + 1;
+                        toast.set("SLOT {d}", .{slot});
+                    },
+                    .slot_prev => {
+                        slot = if (slot == 1) 8 else slot - 1;
+                        toast.set("SLOT {d}", .{slot});
+                    },
                     .config_dirty => {
                         persistConfig(io, gpa, &opts, err);
                         binds = input.resolve(&opts.cfg.input, err);
@@ -543,13 +571,15 @@ pub fn run(
                 .save_state => {
                     saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
                     if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                    toast.set("STATE SAVED - SLOT {d}", .{slot});
                 },
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
                         discardMovieModes(&rec, &play_movie, "load state", err);
-                    }
+                        toast.set("STATE LOADED - SLOT {d}", .{slot});
+                    } else toast.set("NO STATE IN SLOT {d}", .{slot});
                 },
                 .record_movie => {
                     if (rec != null) {
@@ -558,9 +588,11 @@ pub fn run(
                         writeMovie(io, gpa, &opts, con, rec.?.items, audio_hash, err);
                         rec.?.deinit();
                         rec = null;
+                        toast.set("RECORDING SAVED", .{});
                     } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
                         try err.print("movie: cannot record during playback\n", .{});
                         try err.flush();
+                        toast.set("CANNOT RECORD DURING PLAYBACK", .{});
                     } else if (opts.movies_dir == null) {
                         try err.print("movie: recording unavailable — no per-user data directory\n", .{});
                         try err.flush();
@@ -578,17 +610,20 @@ pub fn run(
                         rec = .init(gpa);
                         try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
                         try err.flush();
+                        toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
                     }
                 },
                 .slot_next => {
                     slot = if (slot == 8) 1 else slot + 1;
                     try err.print("state slot {d}\n", .{slot});
                     try err.flush();
+                    toast.set("SLOT {d}", .{slot});
                 },
                 .slot_prev => {
                     slot = if (slot == 1) 8 else slot - 1;
                     try err.print("state slot {d}\n", .{slot});
                     try err.flush();
+                    toast.set("SLOT {d}", .{slot});
                 },
                 .screenshot => {
                     if (opts.shots_dir != null) {
@@ -706,9 +741,20 @@ pub fn run(
             ui.drawText(&surf, 4, 4, if (rec != null) "* REC" else "> MOVIE", ui.color.accent);
             break :blk compose[0..fb.len];
         } else fb;
+        // The toast rides ON TOP of whatever the ladder picked; when the
+        // ladder picked the raw framebuffer it gets its own compose copy.
+        const final_px: []const u16 = if (toast.frames == 0) src_px else blk: {
+            toast.frames -= 1;
+            if (src_px.ptr != compose.ptr) @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            const ty: i32 = @as(i32, @intCast(height)) - @as(i32, @intCast(ui.line_h)) - 4;
+            ui.fillRect(&surf, 2, ty - 2, ui.textWidth(toast.buf[0..toast.len]) + 4, ui.line_h + 2, ui.color.panel);
+            ui.drawText(&surf, 4, ty, toast.buf[0..toast.len], ui.color.accent);
+            break :blk compose[0..fb.len];
+        };
 
         if (glv) |g| gl_path: {
-            g.chain().upload(src_px, width, height);
+            g.chain().upload(final_px, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
@@ -801,7 +847,7 @@ pub fn run(
                 tex_w = width;
                 tex_h = height;
             }
-            _ = sdl.SDL_UpdateTexture(texture.?, null, src_px.ptr, @intCast(width * 2));
+            _ = sdl.SDL_UpdateTexture(texture.?, null, final_px.ptr, @intCast(width * 2));
             _ = sdl.SDL_RenderClear(r);
             _ = sdl.SDL_RenderTexture(r, texture.?, null, null);
             _ = sdl.SDL_RenderPresent(r);
