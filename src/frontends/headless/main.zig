@@ -189,7 +189,7 @@ const Args = struct {
 const report_frames_default: u32 = 3600;
 
 /// Input surfaces one generator run accepts (each `--movie` is one).
-const max_movies: usize = 4;
+const max_movies: usize = 6;
 
 /// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
 /// same standard patches/fastrom-compat.zon entries are verified to.
