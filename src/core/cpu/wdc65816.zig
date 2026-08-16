@@ -73,6 +73,16 @@ pub var dbg_trace_to: u64 = 0;
 /// TEMP diagnostics: trace up to N SA-1 instructions once the watch arms.
 pub var dbg_trace_sa1: usize = 0;
 var dbg_trace_sa1_n: usize = 0;
+/// TEMP diagnostics, BW-RAM window conversions: report data accesses to the
+/// ABANDONED WRAM homes. Once the low 8 KiB moves to $6000-$7FFF and banks
+/// $7E/$7F move to $40/$41, nothing the game runs should ever touch real
+/// WRAM again — so every hit here is a site the rewrite failed to move, and
+/// the PC names it. Reports each (PBR,PC) once; the value is the ceiling on
+/// distinct sites, not on accesses.
+pub var dbg_stale: usize = 0;
+pub var dbg_stale_from: u64 = 0;
+var dbg_stale_seen: [512]u32 = @splat(0);
+var dbg_stale_n: usize = 0;
 
 pub fn Cpu(comptime BusT: type) type {
     return struct {
@@ -225,7 +235,25 @@ pub fn Cpu(comptime BusT: type) type {
         /// That distinction is what lets the frame-budget profiler tell a wait
         /// loop from a working one: a wait polls the same address every time
         /// round, and a loop that is computing something walks memory.
+        /// See `dbg_stale`. Off unless armed, and deliberately not inlined
+        /// into the hot path's fast case.
+        fn noteStale(self: *Self, addr: u24, comptime kind: u8) void {
+            const bank: u8 = @intCast(addr >> 16);
+            const a16: u16 = @truncate(addr);
+            const abandoned = bank == 0x7E or bank == 0x7F or
+                ((bank & 0x7F) < 0x40 and a16 < 0x2000);
+            if (!abandoned) return;
+            if (@hasField(BusT, "clock") and self.bus.clock < dbg_stale_from) return;
+            const key: u32 = @as(u32, self.regs.pbr) << 16 | self.regs.pc;
+            for (dbg_stale_seen[0..dbg_stale_n]) |k| if (k == key) return;
+            if (dbg_stale_n == dbg_stale_seen.len or dbg_stale_n == dbg_stale) return;
+            dbg_stale_seen[dbg_stale_n] = key;
+            dbg_stale_n += 1;
+            std.debug.print("[stale] {c} pc={x:0>2}:{x:0>4} addr={x:0>6} d={x:0>4} db={x:0>2} x={x:0>4} y={x:0>4}\n", .{ kind, self.regs.pbr, self.regs.pc, addr, self.regs.d, self.regs.dbr, self.regs.x, self.regs.y });
+        }
+
         pub inline fn read8(self: *Self, addr: u24) u8 {
+            if (dbg_stale != 0) self.noteStale(addr, 'r');
             if (@hasField(BusT, "last_data_read")) self.bus.last_data_read = addr;
             if (@hasDecl(BusT, "noteTickRead")) self.bus.noteTickRead(addr);
             return self.bus.read8(addr);
@@ -235,6 +263,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// (see `push8`), so `last_data_write` records only writes that change
         /// the machine's state, never call/return bookkeeping.
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (dbg_stale != 0) self.noteStale(addr, 'w');
             if (dbg_watch_lo != 0) {
                 if (@hasField(BusT, "clock") and self.bus.clock >= dbg_watch_from) dbg_watch_armed = true;
                 const bank: u8 = @intCast(addr >> 16);

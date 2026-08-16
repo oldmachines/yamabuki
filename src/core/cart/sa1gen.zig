@@ -130,6 +130,12 @@ pub const Stats = struct {
     /// becomes a JSR to a DBR-dispatching thunk that runs the original
     /// op with the right operand for the caller it actually has.
     split_sites: u16 = 0,
+    /// Of `split_sites`, how many dispatch on the INDEX register instead
+    /// of the DBR (tiny-base indexed absolutes, whose home is decided by
+    /// magnitude), and how many of the whole population needed a far stub
+    /// because their own bank had no room left for a body.
+    idx_split_sites: u16 = 0,
+    split_far: u16 = 0,
     /// dp sites covered wholesale by the D=$3000 window move.
     dp_sites: u32 = 0,
     regions_moved: u8 = 0,
@@ -2558,9 +2564,220 @@ const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_l
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
 const split_thunk_len: u32 = 24;
-const idx_thunk_len: u32 = 24;
+/// Index-split thunk: the DBR test, the X-width test, the magnitude
+/// compare, and both flavors of the original 3-byte op — A-PRESERVING, so
+/// every op class (stores included) can be thunked, not just LDA shapes.
+const idx_thunk_len: u32 = 35;
 /// Sites one conversion can thunk (Gradius III measures ~100).
 const split_thunk_max: usize = 192;
+/// Index-split sites one conversion can thunk. Far larger than the DBR
+/// flavor: with `--wg-static` every tiny-base indexed absolute in code the
+/// profile never reached is thunked on principle, because no evidence
+/// exists to prove which home it walks.
+const idx_thunk_max: usize = 2048;
+
+/// A bank-local padding allocator for the thunk populations.
+///
+/// `findFreeSpace` hands out the tail of the ONE largest run, which is the
+/// right shape for a single scaffold and the wrong one for a population:
+/// Gradius III's bank $00 carries its slack in several runs, and demanding
+/// 2 KiB in a single stretch for 62 thunks refused a conversion that fits
+/// comfortably across four. This walks every run in turn, and it skips the
+/// scaffold's carve by ADDRESS instead of by painting over it — the paint
+/// trick relied on the carve's run staying shorter than its neighbours,
+/// which is not a property anyone maintains.
+///
+/// $FF ONLY, unlike `findFreeSpace`: a long run of $00 is as often a real
+/// table of zeros as it is slack, and this allocator takes MANY small runs
+/// across MANY banks rather than one obvious tail, so it meets the
+/// ambiguous ones. Measured: a run of $00 in bank $0E was graphics data,
+/// and thunks written into it rendered pictures the original never showed.
+const PadAlloc = struct {
+    region: []const u8,
+    /// File offset of `region[0]`.
+    base: u32,
+    /// Reserved span (file offsets); empty when lo == hi.
+    lo: u32 = 0,
+    hi: u32 = 0,
+    scan: usize = 0,
+    cur: u32 = 0,
+    end: u32 = 0,
+
+    /// The same 8-byte cushion `findFreeSpace` keeps between real bytes
+    /// and whatever it hands out.
+    const margin = 8;
+
+    /// Rewind the scan. Safe because everything already handed out has
+    /// been WRITTEN by then, so a fresh pass reads it as occupied — which
+    /// is what lets a caller that failed to fit a 35-byte body come back
+    /// and ask for a 5-byte stub instead.
+    fn rewind(self: *@This()) void {
+        self.scan = 0;
+        self.cur = 0;
+        self.end = 0;
+    }
+
+    /// Padding still on offer, net of the per-run margin. Used to decide
+    /// bodies-or-stubs BEFORE placing anything: a bank that cannot hold
+    /// every body should hold no body at all, because a half-filled bank
+    /// leaves the tail thunks without even their 5-byte stub.
+    fn freeBytes(self: *const @This()) u32 {
+        var total: u32 = 0;
+        var i: usize = 0;
+        while (i < self.region.len) {
+            if (self.region[i] != 0xFF) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
+            var s = self.base + @as(u32, @intCast(i));
+            var e = self.base + @as(u32, @intCast(j));
+            i = j;
+            if (self.hi > self.lo and s < self.hi and e > self.lo) {
+                const left = if (self.lo > s) self.lo - s else 0;
+                const right = if (e > self.hi) e - self.hi else 0;
+                if (left >= right) e = s + left else s = e - right;
+            }
+            if (e > s + margin) total += e - s - margin;
+        }
+        return total;
+    }
+
+    fn next(self: *@This(), need: u32) ?u32 {
+        if (self.cur + need <= self.end) {
+            defer self.cur += need;
+            return self.cur;
+        }
+        while (self.scan < self.region.len) {
+            if (self.region[self.scan] != 0xFF) {
+                self.scan += 1;
+                continue;
+            }
+            var j = self.scan + 1;
+            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
+            var s = self.base + @as(u32, @intCast(self.scan));
+            var e = self.base + @as(u32, @intCast(j));
+            self.scan = j;
+            // Clipped against the reservation, keeping the larger half.
+            if (self.hi > self.lo and s < self.hi and e > self.lo) {
+                const left = if (self.lo > s) self.lo - s else 0;
+                const right = if (e > self.hi) e - self.hi else 0;
+                if (left >= right) e = s + left else s = e - right;
+            }
+            if (e >= s + need + margin) {
+                self.cur = s + margin;
+                self.end = e;
+                defer self.cur += need;
+                return self.cur;
+            }
+        }
+        return null;
+    }
+};
+
+/// A `PadAlloc` over one bank of `out`. Bank $00 stops at the header and
+/// reserves the scaffold's carve; every other bank is its whole 32 KiB.
+fn padAllocFor(out: []const u8, header_off: u32, bank: u32, carve: u32, carve_len: u32) PadAlloc {
+    if (bank == 0) return .{
+        .region = out[0..header_off],
+        .base = 0,
+        .lo = carve,
+        .hi = carve + carve_len,
+    };
+    const lo = bank * 0x8000;
+    return .{ .region = out[lo..@min(lo + 0x8000, out.len)], .base = lo };
+}
+
+/// A padding allocator for thunk BODIES that will not fit their own bank;
+/// the site's bank keeps only the 5-byte stub.
+///
+/// It walks banks DOWNWARD from the top, and that direction is load-
+/// bearing twice over. Bank $00 is excluded because it is the bank under
+/// pressure and spending less of it is the whole point — but the low banks
+/// generally are: they hold the code, so they hold the sites, so they are
+/// the ones that still need their own stubs. Measured: filling upward from
+/// bank $01 emptied bank $02's padding on bank $00's behalf and then had
+/// nowhere to put bank $02's own stubs.
+const FarPad = struct {
+    out: []const u8,
+    header_off: u32,
+    /// 0 until the first call; the top bank thereafter.
+    bank: u32 = 0,
+    pad: ?PadAlloc = null,
+
+    fn next(self: *@This(), need: u32) ?u32 {
+        if (self.bank == 0) self.bank = @intCast((self.out.len + 0x7FFF) / 0x8000 - 1);
+        while (self.bank >= 1) {
+            if (self.pad == null)
+                self.pad = padAllocFor(self.out, self.header_off, self.bank, 0, 0);
+            if (self.pad.?.next(need)) |at| return at;
+            self.pad = null;
+            self.bank -= 1;
+        }
+        return null;
+    }
+};
+
+/// Bank-local stub for a thunk body that had to go to another bank:
+/// `JSL far / RTS`. The body ends in RTL instead of RTS, so the pair
+/// returns to the site exactly as an in-bank thunk would, and the two
+/// pushes the body indexes off the stack ($02,S) sit at the same depth
+/// either way. Five bytes of the pressured bank instead of thirty-five.
+const far_stub_len: u32 = 5;
+
+/// Place one thunk body for a site and return the address its `JSR` should
+/// name. Prefers the site's own bank; falls back to the stub-plus-far-body
+/// shape. `near` and `far_body` are the same template with RTS/RTL tails.
+fn placeThunk(out: []u8, local: *PadAlloc, far: *FarPad, near: []const u8, far_body: []const u8, force_far: bool, n_far: *u16) ?u16 {
+    if (!force_far) {
+        if (local.next(@intCast(near.len))) |at| {
+            @memcpy(out[at..][0..near.len], near);
+            return @intCast(0x8000 + (at % 0x8000));
+        }
+        local.rewind();
+    }
+    n_far.* += 1;
+    const stub = local.next(far_stub_len) orelse return null;
+    const body = far.next(@intCast(far_body.len)) orelse return null;
+    @memcpy(out[body..][0..far_body.len], far_body);
+    out[stub] = 0x22; // JSL
+    std.mem.writeInt(u16, out[stub + 1 ..][0..2], @as(u16, @intCast(0x8000 + (body % 0x8000))), .little);
+    out[stub + 3] = @intCast(body / 0x8000);
+    out[stub + 4] = 0x60; // RTS
+    return @intCast(0x8000 + (stub % 0x8000));
+}
+
+/// The DBR-dispatch thunk body (see the emission comment in
+/// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
+fn splitThunkBody(op: u8, v: u16, ret: u8) [split_thunk_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    return .{
+        0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
+        0x30, 0x0A, 0x89, 0x40,        0xF0,             0x06, // BMI sys / BIT #$40 / BEQ sys
+        0x68, 0x28, op,   @truncate(v), @truncate(v >> 8), ret,
+        0x68, 0x28, op,   @truncate(sh), @truncate(sh >> 8), ret,
+    };
+}
+
+/// The index-dispatch thunk body (see the emission comment in
+/// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
+fn idxThunkBody(op: u8, v: u16, ret: u8) [idx_thunk_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
+    return .{
+        0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
+        0x30, 0x04, 0x89, 0x40, 0xD0, 0x11, // BMI sys / BIT #$40 / BNE rom
+        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // sys: LDA $02,S / BIT #$10 / BNE low
+        cp,   @truncate(lim),        @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
+        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
+        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  ret, // rom: as written
+    };
+}
+
+/// Diagnostics: report each bank's thunk demand against its padding.
+const dbg_thunk_pad = false;
 
 const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool, nmi_off: bool };
 
@@ -3594,6 +3811,7 @@ pub fn convertWholeGame(
             wg_sa1_nmi_len + wg_scpu_nmi_len +
             @as(u32, wg_service.len) + wg_shim_len;
     var carve: u32 = undefined; // bank $00: scaffold (+ trampolines if split)
+    var carve_len: u32 = 0; // what the carve reserves, for the thunk allocator
     var split = false;
     // Split mode: where each helper landed (file offset), first-fit across
     // every bank's largest padding run — helpers are self-contained and the
@@ -3601,11 +3819,13 @@ pub fn convertWholeGame(
     var helper_at: [wg_uniq_max]u32 = undefined;
     if (patchgen.findFreeSpace(image[0..header.offset], scaffold + helper_len)) |c| {
         carve = c;
+        carve_len = scaffold + helper_len;
     } else {
         split = true;
         const b0_need = scaffold + 4 * @as(u32, @intCast(n_uniq)) + 1;
         carve = patchgen.findFreeSpace(image[0..header.offset], b0_need) orelse
             return refuse(refusal, .{ .reason = .no_free_space, .detail = b0_need });
+        carve_len = b0_need;
         // The largest padding run in each bank beyond $00, cursor at its
         // start plus the same 8-byte margin findFreeSpace keeps.
         const Run = struct { cur: u32, end: u32 };
@@ -3660,9 +3880,9 @@ pub fn convertWholeGame(
     // patched after the pass, once the bank-0 carve is paintable.
     var thunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
     var n_thunks: usize = 0;
-    // Index-split sites (tiny base, measured low|rom): dispatched on the
-    // index register's magnitude instead of the DBR.
-    var ithunks: [split_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
+    // Index-split sites (tiny base, measured low|rom or NOT MEASURED AT
+    // ALL): dispatched on the index register's magnitude instead of the DBR.
+    var ithunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
     var n_ithunks: usize = 0;
     // CELL COHERENCE (window mode): per-site evidence decisions can split
     // one cell's accessor population — gameplay evidence shifted a sound
@@ -3874,10 +4094,24 @@ pub fn convertWholeGame(
                     // load overwrites anyway. The recorded x-width is NOT
                     // trusted (last-run only); the thunk dispatches on
                     // the caller's live X flag.
-                    if (window and v < 0x100 and (op == 0xB9 or op == 0xBD) and
-                        e == usage_map.site_wram_low | usage_map.site_rom)
+                    //
+                    // UNMEASURED sites take the thunk too, and that is the
+                    // point of it. A tiny-base indexed absolute the profile
+                    // never reached used to be left in place on the "X is
+                    // the pointer" hunch — which is right for a ROM walk and
+                    // WRONG for a data base, and the wrong half writes into
+                    // the WRAM the window abandoned, silently. Measured on
+                    // the real cart: `STA $0030,Y` at $02:8C8B stored the
+                    // laser's collision record to dead memory, so the beam
+                    // passed through everything it hit. The thunk decides at
+                    // run time and is right in both worlds; the price is a
+                    // JSR/RTS per access. `--wg-static` is what puts those
+                    // sites in coverage in the first place.
+                    const im = usage_map.mode(op);
+                    if (window and v < 0x100 and (im == .abs_x or im == .abs_y) and
+                        (e == 0 or e == usage_map.site_wram_low | usage_map.site_rom))
                     {
-                        if (n_ithunks == split_thunk_max)
+                        if (n_ithunks == idx_thunk_max)
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
                         ithunks[n_ithunks] = .{ .file = file, .v = v, .op = op };
                         n_ithunks += 1;
@@ -4029,40 +4263,11 @@ pub fn convertWholeGame(
     //   sys: PLA / PLP / op v+$6000 / RTS  ; system caller: the window
     //
     // JSR is bank-relative, so a site's thunk is carved in the site's own
-    // bank. The bank-0 carve below is still $FF at this point — paint it
-    // so the search cannot claim it (the shim/dispatcher emission writes
-    // over the paint unconditionally).
-    if (window and n_thunks != 0) {
-        @memset(out[carve .. carve + scaffold], 0x00);
-        var ti: usize = 0;
-        while (ti < n_thunks) {
-            const tbank: u32 = thunks[ti].file / 0x8000;
-            var tj = ti;
-            while (tj < n_thunks and thunks[tj].file / 0x8000 == tbank) tj += 1;
-            const need: u32 = @intCast((tj - ti) * split_thunk_len);
-            const lo = tbank * 0x8000;
-            const region = if (tbank == 0) out[0..header.offset] else out[lo..@min(lo + 0x8000, out.len)];
-            const found = patchgen.findFreeSpace(region, need) orelse
-                return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
-            var tcur: u32 = @intCast((if (tbank == 0) 0 else lo) + found);
-            while (ti < tj) : (ti += 1) {
-                const t = thunks[ti];
-                const taddr: u16 = @intCast(0x8000 + (tcur % 0x8000));
-                const sh: u16 = t.v + wg_bw_window;
-                const tpl = [split_thunk_len]u8{
-                    0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
-                    0x30, 0x0A, 0x89, 0x40,           0xF0,                0x06, // BMI sys / BIT #$40 / BEQ sys
-                    0x68, 0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60,
-                    0x68, 0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60,
-                };
-                @memcpy(out[tcur..][0..split_thunk_len], &tpl);
-                tcur += split_thunk_len;
-                out[t.file] = 0x20; // JSR — same 3-byte footprint
-                std.mem.writeInt(u16, out[t.file + 1 ..][0..2], taddr, .little);
-            }
-        }
-        res.stats.split_sites = @intCast(n_thunks);
-    }
+    // bank — from ANY of that bank's padding runs (see PadAlloc), with the
+    // scaffold's carve reserved by address, and behind a 5-byte far stub
+    // once that bank runs dry (see placeThunk).
+    var pad: PadAlloc = undefined;
+    var far: FarPad = .{ .out = out, .header_off = header.offset };
     // Index-split thunks: dispatch on the index register's magnitude.
     // WIDTH-PROOF: the site's recorded width is only the LAST run's — a
     // caller can arrive in x8, where a 16-bit CPY immediate misparses
@@ -4071,47 +4276,111 @@ pub fn convertWholeGame(
     // full-screen beam that never collided). The caller's pushed X flag
     // is tested first: an 8-bit index over a tiny base can only reach
     // the low mirror, so x8 callers take the window path unconditionally
-    // and only x16 callers run the compare. A is used as scratch, which
-    // is why only LDA-shaped sites (the op overwrites A anyway) are
-    // collected. The compare runs under saved flags (CPY clobbers carry,
-    // which a load must leave untouched); the load runs LAST so the exit
-    // flags are the op's own.
+    // and only x16 callers run the compare.
     //
-    //   PHP / SEP #$20 / LDA $01,S / BIT #$10 / BNE low
+    // A is SAVED across the scratch load — the same PHA-under-SEP trick
+    // the DBR thunk uses, which pushes one byte whatever the caller's M
+    // was and pulls it back under the restored M. That is what lets
+    // STORES be thunked: the v1 template scratched A and so could only
+    // serve LDA shapes, and every `STA $00xx,Y` in unmeasured code was
+    // left pointing at abandoned WRAM. The compare runs under saved
+    // flags (CPY clobbers carry, which a load must leave untouched); the
+    // op runs LAST so the exit flags are its own.
+    //
+    // The DBR is tested FIRST, because the operand only shifts for a
+    // caller whose data bank is a system bank. Three worlds share one
+    // site and the unshifted operand serves two of them: a caller pinned
+    // to $40/$41 means the tiny base is that bank's own low page (the
+    // in-tree hazard shape — an uncovered site the root's pin makes
+    // safe), and a system-bank caller with a huge index is walking ROM.
+    // Only system bank + small index is the abandoned-WRAM case, and
+    // only that one moves into the window.
+    //
+    //   PHP / SEP #$20 / PHA / PHB / PLA
+    //   BMI sys / BIT #$40 / BNE rom          ; $40-$7F: pinned, as-is
+    //   sys: LDA $02,S / BIT #$10 / BNE low   ; x8 index cannot leave the page
     //   CPY #($2000-v) / BCS rom
-    //   low: PLP / op v+$6000 / RTS
-    //   rom: PLP / op v / RTS
-    if (window and n_ithunks != 0) {
-        var ti: usize = 0;
-        while (ti < n_ithunks) {
-            const tbank: u32 = ithunks[ti].file / 0x8000;
-            var tj = ti;
-            while (tj < n_ithunks and ithunks[tj].file / 0x8000 == tbank) tj += 1;
-            const need: u32 = @intCast((tj - ti) * idx_thunk_len);
-            const lo = tbank * 0x8000;
-            const region = if (tbank == 0) out[0..header.offset] else out[lo..@min(lo + 0x8000, out.len)];
-            const found = patchgen.findFreeSpace(region, need) orelse
-                return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
-            var tcur: u32 = @intCast((if (tbank == 0) 0 else lo) + found);
-            while (ti < tj) : (ti += 1) {
-                const t = ithunks[ti];
-                const taddr: u16 = @intCast(0x8000 + (tcur % 0x8000));
-                const sh: u16 = t.v + wg_bw_window;
-                const lim: u16 = 0x2000 - t.v;
-                const cp: u8 = if (usage_map.mode(t.op) == .abs_y) 0xC0 else 0xE0;
-                const tpl = [idx_thunk_len]u8{
-                    0x08, 0xE2, 0x20, 0xA3, 0x01, 0x89, 0x10, 0xD0, 0x05, // PHP/SEP#$20/LDA $01,S/BIT #$10/BNE low
-                    cp,   @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
-                    0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60, // low: PLP / op v+$6000 / RTS
-                    0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60, // rom: PLP / op v / RTS
-                };
-                @memcpy(out[tcur..][0..idx_thunk_len], &tpl);
-                tcur += idx_thunk_len;
+    //   low: PLA / PLP / op v+$6000 / RTS
+    //   rom: PLA / PLP / op v / RTS
+    // BOTH families are placed in ONE pass, merged in file order, and
+    // identical sites SHARE a body: `LDA $0000,Y` appears twenty-odd times
+    // in a bank and one thunk serves them all. Sharing is what brings a
+    // bank with 141 bytes of padding and 29 sites inside its budget — the
+    // per-site cost drops from 35 bytes to 3 (the JSR is the site).
+    const Th = struct { file: u32, v: u16, op: u8, idx: bool };
+    var all: [split_thunk_max + idx_thunk_max]Th = undefined;
+    var n_all: usize = 0;
+    {
+        var a: usize = 0;
+        var b: usize = 0;
+        while (a < n_thunks or b < n_ithunks) : (n_all += 1) {
+            if (b == n_ithunks or (a < n_thunks and thunks[a].file < ithunks[b].file)) {
+                all[n_all] = .{ .file = thunks[a].file, .v = thunks[a].v, .op = thunks[a].op, .idx = false };
+                a += 1;
+            } else {
+                all[n_all] = .{ .file = ithunks[b].file, .v = ithunks[b].v, .op = ithunks[b].op, .idx = true };
+                b += 1;
+            }
+        }
+    }
+    var seen: [split_thunk_max + idx_thunk_max]struct { v: u16, op: u8, idx: bool, addr: u16 } = undefined;
+    if (window and n_all != 0) {
+        var i: usize = 0;
+        while (i < n_all) {
+            const tbank: u32 = all[i].file / 0x8000;
+            var j = i;
+            while (j < n_all and all[j].file / 0x8000 == tbank) j += 1;
+            pad = padAllocFor(out, header.offset, tbank, carve, carve_len);
+            // Bodies or stubs, decided per bank BEFORE anything is
+            // written: a bank that cannot hold every DISTINCT body should
+            // hold none, because filling it with the first arrivals
+            // leaves the rest without even their 5-byte stub. That is how
+            // bank $00 — 1.5 KiB of slack against a 2 KiB scaffold —
+            // refused a conversion that fits comfortably.
+            var need: u32 = 0;
+            var n_seen: usize = 0;
+            for (all[i..j]) |t| {
+                var dup = false;
+                for (seen[0..n_seen]) |s| {
+                    if (s.v == t.v and s.op == t.op and s.idx == t.idx) dup = true;
+                }
+                if (dup) continue;
+                seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .addr = 0 };
+                n_seen += 1;
+                need += (if (t.idx) idx_thunk_len else split_thunk_len) + PadAlloc.margin;
+            }
+            const ff = pad.freeBytes() < need;
+            if (dbg_thunk_pad)
+                std.debug.print("[thunkpad] bank {x:0>2}: {} site(s), {} distinct, need {} free {} far {}\n", .{ tbank, j - i, n_seen, need, pad.freeBytes(), ff });
+            n_seen = 0;
+            while (i < j) : (i += 1) {
+                const t = all[i];
+                var taddr: u16 = 0;
+                var found = false;
+                for (seen[0..n_seen]) |s| {
+                    if (s.v == t.v and s.op == t.op and s.idx == t.idx) {
+                        taddr = s.addr;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    const placed = if (t.idx)
+                        placeThunk(out, &pad, &far, &idxThunkBody(t.op, t.v, 0x60), &idxThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
+                    else
+                        placeThunk(out, &pad, &far, &splitThunkBody(t.op, t.v, 0x60), &splitThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far);
+                    taddr = placed orelse return refuse(refusal, .{
+                        .reason = .no_free_space,
+                        .detail = if (t.idx) idx_thunk_len else split_thunk_len,
+                    });
+                    seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .addr = taddr };
+                    n_seen += 1;
+                }
                 out[t.file] = 0x20; // JSR — same 3-byte footprint
                 std.mem.writeInt(u16, out[t.file + 1 ..][0..2], taddr, .little);
             }
         }
-        res.stats.split_sites += @intCast(n_ithunks);
+        res.stats.split_sites = @intCast(n_all);
+        res.stats.idx_split_sites = @intCast(n_ithunks);
     }
 
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
@@ -4797,6 +5066,14 @@ fn onePlan(start: u32, len: u32, dest: profile.PlanDest, dest_off: u32, dp: bool
 fn markOp(usage: []u8, cpu_addr: u32) void {
     usage[cpu_addr] |= usage_map.flag_opcode | usage_map.flag_exec |
         usage_map.flag_m | usage_map.flag_x;
+}
+
+/// `markOp` for an instruction executed with 16-bit INDEX registers: the
+/// immediate's length differs, so the coverage map has to say so or every
+/// decode after it slides.
+fn markOpX16(usage: []u8, cpu_addr: u32) void {
+    usage[cpu_addr] |= usage_map.flag_opcode | usage_map.flag_exec | usage_map.flag_m;
+    usage[cpu_addr] &= ~usage_map.flag_x;
 }
 
 test "rewriter: long and low-abs sites move; indexed sites block their region" {
@@ -5787,11 +6064,15 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
 test "window offload: the root's DBR pin travels through in-tree JSLs and admits an uncovered site" {
     // The $8EF1 shape in miniature: the root pins the WRAM bank (the
     // window rewrite re-banks the idiom to $40), then JSLs a helper whose
-    // never-executed branch holds a tiny-base indexed absolute — no
-    // evidence, unshiftable, the SA-1's own I-RAM if the copy ran it
-    // unpinned. Every in-tree path to it carries the root's pin, under
-    // which it is BW-RAM data on both buses whatever X holds — so the
-    // tree is eligible. Without the pin idiom the same tree must refuse.
+    // never-executed branch holds an indexed absolute with MIXED evidence
+    // — unshiftable, and the SA-1's own I-RAM if the copy ran it unpinned.
+    // Every in-tree path to it carries the root's pin, under which it is
+    // BW-RAM data on both buses whatever X holds — so the tree is
+    // eligible. Without the pin idiom the same tree must refuse.
+    //
+    // (Mixed evidence, not zero: a ZERO-evidence tiny-base indexed site is
+    // no longer left in place at all — it becomes an index-split thunk,
+    // which is a different contract, tested separately.)
     const gpa = testing.allocator;
     const console = @import("../console.zig");
 
@@ -5844,12 +6125,14 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         for ([_]u32{ 0x80A0, 0x80A3, 0x80A5, 0x80A7, 0x80AA }) |a| markOp(bytes, a);
         // The helper's live sites measured as $7E-mediated traffic (the
         // real trees' shape) so the rewriter leaves their operands to the
-        // pin; the guarded ASL keeps ZERO evidence — the hazard shape.
+        // pin; the guarded ASL carries MIXED evidence — unshiftable by any
+        // rule, and unthunkable too, which is the hazard shape.
         const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
         defer gpa.free(sites);
         @memset(sites, 0);
         sites[0x80A0] = usage_map.site_wram_bank;
         sites[0x8087] = usage_map.site_wram_bank;
+        sites[0x80A7] = usage_map.site_wram_low | usage_map.site_other;
 
         const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
         var ref: ?Refusal = null;
@@ -5959,6 +6242,126 @@ test "window: a context-split site serves both caller classes through its thunk"
     const sys_only: u8 = con.bus.sa1.bwram[0x0142];
     const twice: u8 = sys_only *% 2;
     try testing.expect(both -% twice <= 2 or twice -% both <= 2);
+}
+
+test "window: an unmeasured tiny-base indexed site serves all three of its worlds" {
+    // The laser's defect, reduced. A tiny-base indexed absolute with NO
+    // evidence used to be left exactly as written, on the reasoning that
+    // "X is the pointer" — true for a ROM walk, catastrophic for a data
+    // base, whose accesses then land in the WRAM the window abandoned.
+    // The index-split thunk decides at run time, and there are THREE
+    // worlds to get right, not two:
+    //
+    //   system DBR + small index -> the window (+$6000)
+    //   pinned DBR ($40/$41)     -> as written (that bank's own low page)
+    //   system DBR + huge index  -> as written (a ROM walk)
+    //
+    // A STORE is the shape that proves the A-preserving template: the v1
+    // thunk scratched A and could only serve loads, which is why the
+    // laser's `STA $0030,Y` was never covered by the mechanism at all.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    rom[0x0202] = 0x5A; // the ROM byte the huge-index walk must find
+    @memcpy(rom[0x0000..0x0018], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, 0xC2, 0x10, // CLC / XCE / SEP #$30 / REP #$10
+        0x22, 0x80, 0x80, 0x00, // system caller, small Y
+        0x22, 0xA0, 0x80, 0x00, // $7E-pinned caller
+        0x22, 0xC0, 0x80, 0x00, // system caller, huge X
+        0x22, 0xE0, 0x80, 0x00, // system caller in x8
+        0x80, 0xEE, // BRA back to the first JSL
+    });
+    @memcpy(rom[0x0080..0x0090], &[_]u8{
+        0xA0, 0x10, 0x01, // LDY #$0110
+        0xA9, 0x11, // LDA #$11
+        0x38, // SEC — the thunk must not eat it
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0x90, 0x03, // BCC +3 (carry lost -> skip)
+        0xEE, 0x60, 0x01, // INC $0160
+        0x6B,
+    });
+    @memcpy(rom[0x00A0..0x00B2], &[_]u8{
+        0xA9, 0x7E, 0x48, 0xAB, // pin $7E (re-banked to $40)
+        0xA0, 0x10, 0x02, // LDY #$0210
+        0xA9, 0x22, // LDA #$22
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0xA9, 0x00, 0x48, 0xAB, // back to the system bank
+        0x6B,
+    });
+    @memcpy(rom[0x00C0..0x00C8], &[_]u8{
+        0xA2, 0x00, 0x82, // LDX #$8200 — past the mirror: a ROM walk
+        0x22, 0x10, 0x81, 0x00, // JSL $00:8110
+        0x6B,
+    });
+    @memcpy(rom[0x00E0..0x00ED], &[_]u8{
+        0xE2, 0x10, // SEP #$10 — 8-bit index
+        0xA0, 0x50, // LDY #$50
+        0xA9, 0x33, // LDA #$33
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0xC2, 0x10, // REP #$10
+        0x6B,
+    });
+    @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x99, 0x30, 0x00, 0x6B }); // STA $0030,Y / RTL
+    @memcpy(rom[0x0110..0x0117], &[_]u8{
+        0xBD, 0x02, 0x00, // LDA $0002,X — the same shape, a load
+        0x8D, 0x70, 0x01, // STA $0170 (plain site: shifts to the window)
+        0x6B,
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8006, 0x800A, 0x800E, 0x8012, 0x8016 }) |a| markOpX16(bytes, a);
+    // The x16 stretch: everything from the first REP to the last caller's
+    // SEP decodes with 16-bit indices.
+    for ([_]u32{ 0x8080, 0x8083, 0x8085, 0x8086, 0x808A, 0x808C, 0x808F }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80A0, 0x80A2, 0x80A3, 0x80A4, 0x80A7, 0x80A9, 0x80AD, 0x80AF, 0x80B0, 0x80B1 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80C0, 0x80C3, 0x80C7 }) |a| markOpX16(bytes, a);
+    markOpX16(bytes, 0x80E0);
+    for ([_]u32{ 0x80E2, 0x80E4, 0x80E6, 0x80EA }) |a| markOp(bytes, a);
+    markOpX16(bytes, 0x80EC);
+    for ([_]u32{ 0x8100, 0x8103, 0x8110, 0x8113, 0x8116 }) |a| markOpX16(bytes, a);
+
+    // No evidence anywhere: that is the whole point.
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the store
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0110]); // and over the load
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+
+    // World 1: system bank, small index -> the window.
+    try testing.expectEqual(@as(u8, 0x11), con.bus.sa1.bwram[0x0140]);
+    // World 2: pinned to $40 -> that bank's own $0240, NOT $40:6240.
+    try testing.expectEqual(@as(u8, 0x22), con.bus.sa1.bwram[0x0240]);
+    try testing.expectEqual(@as(u8, 0), con.bus.sa1.bwram[0x6240]);
+    // World 3: system bank, huge index -> ROM, read and parked in the window.
+    try testing.expectEqual(@as(u8, 0x5A), con.bus.sa1.bwram[0x0170]);
+    // An 8-bit index over a tiny base cannot leave the low page, whatever
+    // the compare would have said about a byte it never fetched.
+    try testing.expectEqual(@as(u8, 0x33), con.bus.sa1.bwram[0x0080]);
+    // Carry survived the thunk every lap, and real WRAM saw none of it.
+    try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
 }
 
 test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, NMI round-trips" {

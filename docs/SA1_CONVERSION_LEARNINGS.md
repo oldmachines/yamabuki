@@ -655,3 +655,113 @@ at $1E82. Each chase that maps another organ makes the next chase
 shorter — the two open defects (laser damage, the pre-boss phantom
 collision — plausibly one collision-engine defect seen from both
 sides) start from this map instead of from zero.
+
+## 12. The abandoned home — what an unconverted site actually does
+
+The laser passing through enemies, the missing enemy waves, the boss
+that never arrived: three reports, one mechanism, and none of the
+per-defect hunts found it. What found it was asking a question no
+reference run is needed to answer.
+
+**The stale-home law.** After the window relocation, the game's low
+8 KiB lives at `$6000-$7FFF` and its `$7E/$7F` banks live at
+`$40/$41`. Real WRAM — the system-bank mirror below `$2000` and banks
+`$7E/$7F` — is then *dead*, deliberately and completely. So every
+data access to it is a site the rewrite failed to move, and the
+program counter names it. That check needs no baseline, no movie
+pairing, no lag reasoning: it is a property of the converted image
+alone. `--stale <max-sites>` reports each offending (PBR,PC) once.
+
+Run against the laser recording, the shipped conversion produced
+twelve sites. Eight were tiny-base indexed absolutes — four loads and,
+critically, **four stores**, including `STA $0030,Y` at `$02:8C8B`
+writing the beam's own collision record to memory nothing reads. Three
+were plain absolutes (`CPY $020A`, `SBC $020A`, `LDY $0212`) under a
+system data bank. All twelve measured `cov=00`: not merely unevidenced,
+**never discovered at all**, so the rewrite loop — which is keyed on
+coverage, not on the instruction being there — skipped them whole.
+
+**Two rules had to change together.**
+
+*Reach.* `--wg-static` extends coverage by recursive descent from
+every executed instruction, and until now it had never been used on a
+real conversion. Without it, code the profile never ran is not
+rewritten, and "not rewritten" is not neutral: it is a live access to
+abandoned memory. The flag is the difference between a conversion that
+works on the recorded surfaces and one that works on the game.
+
+*Decision.* Statically discovered code has no evidence by
+construction, and the old rule left a tiny-base indexed absolute
+alone whenever evidence was absent — on the reasoning that a tiny base
+under an index is the "X is the pointer" idiom. That is right for a
+ROM walk and *wrong for a data base*, and the wrong half writes into
+the abandoned WRAM. Leaving it alone was never conservative; it was a
+coin flip. So an unmeasured tiny-base indexed absolute now becomes an
+index-split thunk on principle.
+
+**The thunk grew a third world.** Two dispatch questions collapse into
+one 35-byte body, and the unshifted operand serves two of the three
+answers:
+
+    system bank + small index  ->  the window (+$6000)
+    pinned bank ($40/$41)      ->  as written (that bank's own low page)
+    system bank + huge index   ->  as written (a ROM walk)
+
+The DBR test comes first (`PHB/PLA`, `BMI`/`BIT #$40`), the caller's
+pushed X flag second, the magnitude compare last. Testing the pin at
+run time is what lets an *uncovered site inside a DBR-pinned tree* —
+the shape the eligibility walk used to admit by proof — be thunked
+without breaking it.
+
+And the body is **A-preserving** (`PHA` under `SEP #$20`, one byte
+whatever the caller's M, pulled back under the restored M). That one
+change is why stores are covered at all: the v1 template scratched A,
+so it could only serve LDA shapes, and every `STA $00xx,Y` in
+unmeasured code stayed pointed at dead memory. The defect the
+mechanism was invented for was in the half of the mechanism that did
+not exist.
+
+**Ninety-one thunks do not fit where five did.** Scaling a mechanism
+from a handful of measured sites to a whole-image rule turned out to
+be mostly an *allocation* problem, and each failure taught a rule:
+
+- **One run is not the budget.** `findFreeSpace` hands out the tail of
+  the single largest padding run — right for one scaffold, wrong for a
+  population. Bank $00 holds 1476 bytes of slack against a 2 KiB
+  scaffold; the thunks have to come from whatever is left, in as many
+  pieces as it takes.
+- **Reserve by address, not by paint.** The old trick painted the
+  scaffold's carve with `$00` so the search would not claim it — which
+  only works while the painted run stays shorter than its neighbours.
+  The allocator now skips the carve by address.
+- **$FF only.** A long run of `$00` is as often a real table of zeros
+  as it is slack. A whole-image allocator meets the ambiguous ones,
+  and 300 bytes written into a `$00` run in bank $0E rendered pictures
+  the original never showed. `findFreeSpace` takes one obvious tail
+  and gets away with it; this allocator cannot.
+- **A far body behind a near stub.** `JSR` is bank-relative, so the
+  body wants the site's own bank — but 35 bytes each will not fit, and
+  5 will: `JSL far / RTS` in the site's bank, `RTL` tails in the body.
+  The two pushes the body indexes off the stack sit at the same depth
+  either way.
+- **All or none, per bank.** Filling a bank with the first arrivals
+  leaves the tail sites without even their stub. The bodies-or-stubs
+  decision is made per bank, before anything is written, over the
+  whole demand.
+- **Fill far banks downward.** The low banks hold the code, so they
+  hold the sites, so they are the banks that still need their own
+  stubs. Filling upward from bank $01 spent bank $02's padding on bank
+  $00's bodies and then had nowhere to put bank $02's own.
+- **Share bodies.** `LDA $0000,Y` appears twenty-odd times in a bank
+  and one thunk serves them all. 91 sites became 51 distinct bodies,
+  and a bank with 141 bytes of padding and 29 sites came inside its
+  budget only because of it.
+
+**The result, stated honestly.** Zero stale sites across six
+recordings and ~34 000 frames, and the conversion verified FRAMES
+IDENTICAL — every one of 3000 frames pixel-identical to stock, which
+no previous build achieved. But that build carries no offload tree and
+no FastROM: the tree that shipped at 48% utilization now fails
+verification in this configuration, and FastROM layered on top trips
+the pixel gate outright. Correctness first, then speed; the two are
+being paid for in that order.

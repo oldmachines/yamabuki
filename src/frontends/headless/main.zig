@@ -155,8 +155,13 @@ const Args = struct {
     /// replayed on stock) still teaches the rewriter which code
     /// exists: which instructions execute is address-space-invariant
     /// even though their operands were rewritten.
-    cover_image: ?[]const u8 = null,
-    cover_movie: ?[]const u8 = null,
+    /// Repeatable: each `--cover-image` opens a new pair, and the
+    /// `--cover-movie` after it fills the same slot. One recording covers
+    /// one scenario, and the defects live in the scenarios nobody
+    /// profiled — so the harvest has to take as many as there are.
+    cover_image: [4]?[]const u8 = @splat(null),
+    cover_movie: [4]?[]const u8 = @splat(null),
+    n_cover: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -551,9 +556,13 @@ fn loadMovie(
 /// must follow it or every press lands early in game-time and forks the
 /// run). Set by the undocumented --conv-pad flag.
 pub var dbg_conv_pad: u32 = 0;
-/// Undocumented --site-ev <hex24>: after profiling, print the union
-/// evidence byte and coverage flags for this instruction address.
-pub var dbg_site_ev: u32 = 0;
+/// Undocumented --site-ev <hex24>[,<hex24>...]: after profiling, print the
+/// union evidence byte and coverage flags for each instruction address.
+pub var dbg_site_ev: [16]u32 = @splat(0);
+pub var dbg_n_site_ev: usize = 0;
+/// Undocumented --ev-only: stop right after the --site-ev report, before any
+/// plan, conversion, or verification work.
+pub var dbg_ev_only: bool = false;
 
 fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
     con.bus.input_polled = false;
@@ -1761,20 +1770,21 @@ fn runSa1Gen(
     // opcodes; the previous build's scaffolding differs byte-for-byte
     // and filters itself out). Site evidence is NOT harvested — conv
     // effective addresses describe the post-relocation world.
-    if (args.cover_image != null and args.cover_movie != null) {
-        const ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image.?, gpa, .limited(64 * 1024 * 1024)) catch {
-            try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image.?});
+    for (0..args.n_cover) |ci_i| {
+        if (args.cover_image[ci_i] == null or args.cover_movie[ci_i] == null) continue;
+        const ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
         const ci = core.header.stripCopierHeader(ci_raw);
-        const mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie.?, gpa, .limited(64 * 1024 * 1024)) catch {
-            try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie.?});
+        const mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
         const cm = util.movie.parse(gpa, mb) catch {
-            try out.print("error: '{s}' is not a valid movie\n", .{args.cover_movie.?});
+            try out.print("error: '{s}' is not a valid movie\n", .{args.cover_movie[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
@@ -1820,16 +1830,18 @@ fn runSa1Gen(
                 site_ev[pc] |= tmp_ev[pc];
             }
         }
-        try out.print("  cover harvest: {} instruction(s) newly covered, {} site(s) newly evidenced from the conversion-side replay\n", .{ merged, merged_ev });
+        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev });
         try out.flush();
     }
-    if (dbg_site_ev != 0) {
-        const p: u32 = dbg_site_ev;
+    for (dbg_site_ev[0..dbg_n_site_ev]) |p| {
         try out.print("  [site-ev] ${x:0>6}: cov={x:0>2} cov80={x:0>2} ev={x:0>2} ev80={x:0>2}\n", .{
             p, ub[p], ub[0x80_0000 | p], site_ev[p], site_ev[0x80_0000 | p],
         });
-        try out.flush();
     }
+    if (dbg_n_site_ev != 0) try out.flush();
+    // --ev-only: the coverage/evidence answer is all that was wanted. Stop
+    // before the (much longer) plan-and-verify machinery.
+    if (dbg_ev_only) return;
     const cov_total = core.usage_map.countOpcodes(ub);
     const cov_late = cov_total - cov_early;
 
@@ -2718,8 +2730,8 @@ fn reportSa1(
         });
         if (res.stats.split_sites != 0)
             try out.print(
-                "  {} context-split site(s) dispatch on the runtime data bank through a\n  thunk (measured under both a system DBR and a WRAM pin — no single\n  operand serves both callers)\n",
-                .{res.stats.split_sites},
+                "  {} split site(s) dispatch through a thunk instead of a fixed operand:\n  {} on the runtime data bank, {} on the index register's magnitude\n  (tiny-base indexed absolutes — no single operand serves a data base\n  and a ROM walk); {} of them behind a far stub for want of bank room\n",
+                .{ res.stats.split_sites, res.stats.split_sites - res.stats.idx_split_sites, res.stats.idx_split_sites, res.stats.split_far },
             );
         if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0)
             try out.print(
@@ -3813,18 +3825,29 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wg_nmi_off[out.n_wg_nmi_off] = try std.fmt.parseInt(u16, v, 16);
             out.n_wg_nmi_off += 1;
         } else if (std.mem.eql(u8, a, "--cover-image")) {
-            out.cover_image = it.next() orelse return error.MissingValue;
+            if (out.n_cover == out.cover_image.len) return error.TooManyArgs;
+            out.cover_image[out.n_cover] = it.next() orelse return error.MissingValue;
+            out.n_cover += 1;
         } else if (std.mem.eql(u8, a, "--cover-movie")) {
-            out.cover_movie = it.next() orelse return error.MissingValue;
+            // Fills the pair the last --cover-image opened.
+            if (out.n_cover == 0) return error.MissingValue;
+            out.cover_movie[out.n_cover - 1] = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
         } else if (std.mem.eql(u8, a, "--conv-pad")) {
             const v = it.next() orelse return error.MissingValue;
             dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--ev-only")) {
+            dbg_ev_only = true;
         } else if (std.mem.eql(u8, a, "--site-ev")) {
             const v = it.next() orelse return error.MissingValue;
-            dbg_site_ev = try std.fmt.parseInt(u24, v, 16);
+            var pit = std.mem.splitScalar(u8, v, ',');
+            while (pit.next()) |one| {
+                if (dbg_n_site_ev == dbg_site_ev.len) break;
+                dbg_site_ev[dbg_n_site_ev] = try std.fmt.parseInt(u24, one, 16);
+                dbg_n_site_ev += 1;
+            }
         } else if (std.mem.eql(u8, a, "--trace-clk")) {
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, '-');
@@ -3833,6 +3856,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--trace-sa1")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_trace_sa1 = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--stale")) {
+            // "<max-sites>" or "<max-sites>:<from-clock>"
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            core.wdc65816.dbg_stale = try std.fmt.parseInt(usize, pit.next().?, 10);
+            if (pit.next()) |f| core.wdc65816.dbg_stale_from = try std.fmt.parseInt(u64, f, 10);
         } else if (std.mem.eql(u8, a, "--watch-min")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_watch_val_min = try std.fmt.parseInt(u8, v, 16);
