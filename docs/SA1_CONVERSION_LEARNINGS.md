@@ -553,3 +553,105 @@ stock ground truth at the same logical moment; the instrument that
 resolves it is a recorded playthrough (F10) reaching the boss, replayed
 on both stock and the conversion by the behavioral tier, which finds
 the first divergent cell mechanically.
+
+## 11. The QA loop — what live play teaches that no surface can
+
+Six live reports in two days, each one a defect class no verification
+surface had ever seen, each one converted into a deterministic
+specimen and then a mechanism. The loop itself is the lesson: a
+player's F10 recording replays bit-exactly on the build it was
+recorded on, so every "it broke here" becomes a power-on-reproducible
+laboratory — and once a recording joins the surface list, no future
+patch can ship if it breaks that exact run.
+
+**Recordings bind to their native build.** A movie is a script of
+inputs against one build's timing. Replayed on stock, conv-timed
+inputs die within seconds (the recorded boss run parks at the
+continue screen with score 200); replayed on a LATER conversion,
+restored content invalidates the dodges (waves that now exist kill a
+route flown through empty space). Every deep-content recording is a
+one-build instrument, and each new frontier needs a fresh one.
+
+**The coverage-source asymmetry, and the harvest.** Coverage and
+evidence come from STOCK replays — but stock's replay of a
+conv-recorded movie never reaches what the player reached. Gameplay
+only the conversion can reach (the boss arrival) therefore never
+covers its handlers on ANY build, and their low-WRAM reads stay
+unshifted: reading dead memory, missing the scroll lock, overshooting
+into the game's own insertion landmine. The fix is two-stage
+harvesting from a replay on the PREVIOUS conversion: coverage first
+(which instructions execute is address-space-invariant; merge only
+where the instruction byte matches stock, which self-filters the old
+build's scaffolding), then EVIDENCE through a normalizing classifier
+that maps relocated homes back to stock classes (window → wram_low,
+$40/$41 → wram_bank). Coverage without evidence is a half-measure:
+covered-but-evidence-free sites still fall to the heuristic
+exemptions, which is precisely where the boss script died. And
+harvested evidence carries a caveat coverage does not: a broken run
+executes broken paths, so its measured classes can misrepresent stock
+— hygiene (gating on stock co-coverage or plausible values) remains
+open work.
+
+**Transient content is invisible to run-budget verification.** An
+enemy wave lives ~20 ticks; the persistence budget tolerates runs of
+30. Entirely missing content — every early wave of stage 1 — verified
+as "wall-time echoes" for days. The structural rule: divergence
+BUDGETS measure persistence, and anything whose natural lifetime is
+shorter than the budget can be wholesale absent without failing. The
+eyeball and the VRAM-diff (one tile of arrow, one column of missing
+spawn records) are the only instruments for this class. Corollary
+found the same day in the other direction: WRAM logic state can match
+stock perfectly while the SCREEN is wrong (the menu cursor moved in
+memory, never on screen) — pixels are unverified by design, so
+UI-reactive rendering needs either pixel-diff spot checks against
+stock or a player.
+
+**The index-split class — one instruction, two worlds, split by a
+register's magnitude.** The level-script walker's `LDA $0003,Y`
+serves spawn-record reads (small Y, the WRAM-low mirror) AND ROM
+walks (huge Y) through the same three bytes; measured evidence says
+wram_low|rom, and no static operand serves both. The mechanism: a
+runtime thunk dispatching on the index register — the third dispatch
+mechanism beside the DBR-split thunk (low|bank) and cell coherence
+(unindexed). Two hard-won details of the thunk itself: the site's
+recorded index width is only the LAST run's, so the thunk must be
+WIDTH-PROOF at runtime — the v1 16-bit CPY immediate misparsed under
+an x8 caller, whose third byte ($20 of #$2000) executes as JSR into
+garbage; v2 tests the caller's pushed X flag first, and an 8-bit
+index over a tiny base can only reach the low mirror, so x8 callers
+take the window path unconditionally. And the thunk scratches A, so
+only LDA-shaped sites qualify (the load overwrites A anyway; its high
+byte survives an 8-bit scratch).
+
+**Evidence growth shrinks the eligible forest — honestly.** Every
+newly evidenced instruction inside an offload tree's span is a new
+chance for the eligibility walk to find a genuine SA-1-bus hazard it
+previously could not see. The physics tree that verified clean for
+days was refused the moment the boss-path instructions inside it
+became visible — correctly: those reads are I-RAM on the SA-1. The
+utilization cost (17% → 48%) is the price of honesty, and the
+recovery path is mechanical, not epistemic: make the split thunks
+tree-portable (the thunk template already reads identically on both
+buses; only the JSR's bank-relativity from a copied tree needs
+copy-local thunk emission).
+
+**Auto-bisect convicts a failure, not a cause.** The 25-byte sound
+pump was "convicted" on the boss surface — but its failure was at
+frame 831, the old title-transition wedge, nothing to do with the
+boss; the movie's replay forked away from the real crime scene before
+reaching it. A surface failure names the first thing that broke on
+THAT replay, which is not necessarily the thing the player reported.
+Dropping the pump still shipped (its f831 failure was real), but the
+boss froze again — attribution requires the failure and the report to
+be the same event.
+
+**The engine map earns its keep.** Chasing six defects through one
+game bought a reusable schema: object records at $0400-$0FFF, stride
+$40, handler pointer at +0; the slot walker at $9082; the object
+update loop at $EA7A (X = slot, dp $FC = cursor, scroll deltas first,
+handler dispatch after); the allocator free-pointer in dp $FC; script
+channels around $1A40 with the game's own NMITIMEN shadow discipline
+at $1E82. Each chase that maps another organ makes the next chase
+shorter — the two open defects (laser damage, the pre-boss phantom
+collision — plausibly one collision-engine defect seen from both
+sides) start from this map instead of from zero.
