@@ -2558,7 +2558,7 @@ const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_l
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
 const split_thunk_len: u32 = 24;
-const idx_thunk_len: u32 = 16;
+const idx_thunk_len: u32 = 24;
 /// Sites one conversion can thunk (Gradius III measures ~100).
 const split_thunk_max: usize = 192;
 
@@ -3870,9 +3870,11 @@ pub fn convertWholeGame(
                     // shorter than the persistence budget, so the tier
                     // never saw it). The site becomes a JSR to a thunk
                     // that dispatches on the index register's magnitude.
-                    const site_x8 = (cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_x != 0;
-                    if (window and v < 0x100 and !site_x8 and
-                        (usage_map.mode(op) == .abs_x or usage_map.mode(op) == .abs_y) and
+                    // LDA shapes only: the thunk scratches A, which the
+                    // load overwrites anyway. The recorded x-width is NOT
+                    // trusted (last-run only); the thunk dispatches on
+                    // the caller's live X flag.
+                    if (window and v < 0x100 and (op == 0xB9 or op == 0xBD) and
                         e == usage_map.site_wram_low | usage_map.site_rom)
                     {
                         if (n_ithunks == split_thunk_max)
@@ -4062,13 +4064,22 @@ pub fn convertWholeGame(
         res.stats.split_sites = @intCast(n_thunks);
     }
     // Index-split thunks: dispatch on the index register's magnitude.
-    // The compare runs under saved flags (CPY clobbers carry, which the
-    // replaced load must leave untouched); the load runs LAST so the
-    // exit flags are the op's own. Sites are collected only with x16
-    // widths (an 8-bit index over a tiny base can never reach ROM).
+    // WIDTH-PROOF: the site's recorded width is only the LAST run's — a
+    // caller can arrive in x8, where a 16-bit CPY immediate misparses
+    // (the $20 of #$2000 executes as JSR — measured: the laser's shot
+    // path derailed inside the v1 thunk and built a degenerate
+    // full-screen beam that never collided). The caller's pushed X flag
+    // is tested first: an 8-bit index over a tiny base can only reach
+    // the low mirror, so x8 callers take the window path unconditionally
+    // and only x16 callers run the compare. A is used as scratch, which
+    // is why only LDA-shaped sites (the op overwrites A anyway) are
+    // collected. The compare runs under saved flags (CPY clobbers carry,
+    // which a load must leave untouched); the load runs LAST so the exit
+    // flags are the op's own.
     //
-    //   PHP / CPY #($2000-v) / BCS rom
-    //   PLP / op v+$6000 / RTS
+    //   PHP / SEP #$20 / LDA $01,S / BIT #$10 / BNE low
+    //   CPY #($2000-v) / BCS rom
+    //   low: PLP / op v+$6000 / RTS
     //   rom: PLP / op v / RTS
     if (window and n_ithunks != 0) {
         var ti: usize = 0;
@@ -4089,9 +4100,10 @@ pub fn convertWholeGame(
                 const lim: u16 = 0x2000 - t.v;
                 const cp: u8 = if (usage_map.mode(t.op) == .abs_y) 0xC0 else 0xE0;
                 const tpl = [idx_thunk_len]u8{
-                    0x08, cp,   @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05,
-                    0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60,
-                    0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60,
+                    0x08, 0xE2, 0x20, 0xA3, 0x01, 0x89, 0x10, 0xD0, 0x05, // PHP/SEP#$20/LDA $01,S/BIT #$10/BNE low
+                    cp,   @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
+                    0x28, t.op, @truncate(sh),  @truncate(sh >> 8),  0x60, // low: PLP / op v+$6000 / RTS
+                    0x28, t.op, @truncate(t.v), @truncate(t.v >> 8), 0x60, // rom: PLP / op v / RTS
                 };
                 @memcpy(out[tcur..][0..idx_thunk_len], &tpl);
                 tcur += idx_thunk_len;
