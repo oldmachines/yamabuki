@@ -862,3 +862,68 @@ see, so there are no jump tables to recover either.
 The audit's real service was not the landmine list. It was refusing to let
 a number be read as a conclusion — and then killing a hypothesis of its
 own making within the hour.
+
+## 14. The audit's first bill
+
+The audit named four hazards; three of them were `LDA $03:0000,X` in the
+slot walker, and fixing all four broke a build that shipped. That sequence
+is the lesson, not a footnote to it.
+
+**Correct is not free, and the audit does not price its own findings.**
+The `long,X` thunk is right: with a small X those three sites read the low
+mirror, which moved, and leaving them reads memory nothing writes. But the
+slot walker is the hottest loop Gradius III has, and a thunk there costs a
+`JSL` and an `RTL` — some thirty cycles a call. Paying it moved the
+timeline far enough that the behavioural tier stopped accepting the
+configuration that had been shipping for days. Nothing was corrupted: the
+conversion just ran differently enough that the verifier could no longer
+tell removed slowdown from divergence.
+
+So the rule now thunks `long,X` only where there is **no evidence at all**
+— where nothing has been measured, nothing is known, and the site is
+unlikely to be hot precisely because no profile ever ran it. Sites like the
+walker's, measured `low|rom`, stay as they were and stay in the audit's
+hazard list. Named, not silently forgiven, and not silently paid for
+either. That is a worse conversion than the one that thunked them, and a
+better one than the one that did not know they existed.
+
+**A regression I introduced, and how it hid.** The v1→v3 index-thunk
+rewrite also touched the five sites that were already thunked and already
+shipping. It was strictly more correct — A-preserving, data-bank-aware —
+and it was eight bytes and ~17 cycles more expensive on a hot path.
+Changing a working path while generalising it is how a day disappears:
+after the change, `--wg-static` looked like it broke the offload tree, then
+FastROM looked like it wedged at frame 831, and neither was true. What
+finally separated cause from coincidence was building the pre-session
+commit in a worktree and running the SAME image through both binaries: the
+verifier's numbers came back byte-identical, which cleared the verifier and
+left only the image. The three lines of difference were the whole story.
+
+**The general shape:** when generalising a mechanism, keep the exact
+behaviour on the inputs it already served. The v2 template is still in the
+tree, used for precisely the shape it always served (an `LDA` measured
+`low|rom`), and the new templates take everything else.
+
+**Two measurements worth keeping.** `--audit --save-attempt` produces a
+converted image in about six minutes — profile plus one conversion, no
+verification — which is the right granularity for asking "did this rule
+change the image?" instead of "did this rule ship?". And `--hash-stream`
+writes one frame hash per frame: collapse consecutive duplicates and two
+runs of the same game show the same picture sequence however much lag
+differs between them. It confirmed independently that the shipped
+relocation is frame-identical to stock, and it showed that the tree build
+renders 60 pictures stock never showed against the *shipping* build's 157
+— which is how we know novelty is not the defect signal it looks like.
+
+**What the tree investigation actually established.** `--wg-static` and the
+ninety-odd thunks are behaviourally inert on the verification surface:
+images built with and without them produce byte-identical tier statistics.
+Delta-debugging FastROM's 673 bank lifts showed the culprits are among the
+584 **call** lifts, not the 89 data-long lifts — reverting every data lift
+changed nothing — so the divergence is execution speed, not a poisoned
+read. The tree build soaks 40 000 frames with the mailbox idle, the S-CPU
+in ROM and no aborted dispatch. And dropping the tree makes the verdict
+*worse* (a 514-tick run against 157), which means the auto-bisect ladder
+assumes something false: that removing an offload monotonically improves
+the verdict. When the failure is a lag artifact, removing a tree moves the
+fork instead of removing it, and the ladder walks downhill.

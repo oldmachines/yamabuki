@@ -165,6 +165,11 @@ const Args = struct {
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
+    /// Undocumented --hash-stream: write one u64 frame hash per frame to
+    /// this path. The picture stream is the comparison that survives a lag
+    /// differential, so this is the cheap sound oracle for "did the build
+    /// change what the game DOES, or only how fast it does it".
+    hash_stream: ?[]const u8 = null,
     s2_keep: ?[]const u8 = null,
     /// Resume from an SDL-player save state instead of power-on (plain runs
     /// and --sa1-report). Same-image, same-core states only.
@@ -412,6 +417,16 @@ pub fn main(init: std.process.Init) !void {
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
+    // --hash-stream: one u64 per frame, little-endian. The PICTURE STREAM
+    // is the one comparison that survives a lag differential — collapse
+    // consecutive equal hashes and two runs of the same game show the same
+    // sequence however many times each lag repeat appears. Comparing two
+    // CONVERSIONS this way (rather than a conversion against stock) is what
+    // makes it usable on a build whose whole purpose is to be faster.
+    var hash_stream: ?std.array_list.Managed(u64) = if (args.hash_stream != null)
+        .init(gpa)
+    else
+        null;
     const frames = args.frames orelse if (mov) |m| @as(u32, @intCast(m.frames.len)) else 1;
     for (0..frames) |i| {
         if (mov) |m| {
@@ -420,6 +435,7 @@ pub fn main(init: std.process.Init) !void {
             con.setButtons(1, f[1]);
         }
         con.runFrame();
+        if (hash_stream) |*hs| try hs.append(core.console.hashFrame(con.framebuffer()));
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
             .wav = if (args.wav != null) &audio_all else null,
@@ -453,6 +469,12 @@ pub fn main(init: std.process.Init) !void {
     });
     try out.flush();
 
+    if (args.hash_stream) |path| {
+        const hs = &hash_stream.?;
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(hs.items) });
+        try out.print("wrote {s} ({} frame hashes)\n", .{ path, hs.items.len });
+        try out.flush();
+    }
     if (args.ppm) |path| {
         try util.writeFramebufferPpm(gpa, io, path, fb, width, @intCast(fb.len / width));
         try out.print("wrote {s}\n", .{path});
@@ -2101,6 +2123,13 @@ fn runSa1Gen(
         // asked for. Reported on the FIRST attempt, which is the full
         // candidate set — the one whose decisions describe the whole image.
         if (dbg_audit) {
+            // Honour --save-attempt here too: the audit path is the SIX
+            // MINUTE way to get a converted image (profile + one
+            // conversion) instead of the forty-minute ladder, which makes
+            // it the right tool for diffing one rewrite rule against
+            // another.
+            if (args.save_attempt) |ap|
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
             try printAudit(out, image, ub, &res);
             try out.flush();
             return;
@@ -3957,6 +3986,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.n_movies += 1;
         } else if (std.mem.eql(u8, a, "--state")) {
             out.state = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--hash-stream")) {
+            out.hash_stream = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--s2-keep")) {
             out.s2_keep = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {

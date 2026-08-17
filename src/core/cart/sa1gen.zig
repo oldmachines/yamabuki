@@ -2658,6 +2658,13 @@ const split_thunk_len: u32 = 24;
 /// compare, and both flavors of the original 3-byte op — A-PRESERVING, so
 /// every op class (stores included) can be thunked, not just LDA shapes.
 const idx_thunk_len: u32 = 35;
+/// The same thunk WITHOUT the data-bank test, for a site whose measured
+/// evidence already rules a BW-RAM pin out. The test costs ~17 cycles on
+/// every call and these sites are hot — Gradius III's five measured
+/// split sites are its level-script walker, and paying for a question
+/// their evidence has already answered moved the whole timeline far
+/// enough to flip the behavioural verdict on a build that shipped.
+const idx_thunk_short_len: u32 = 27;
 /// Sites one conversion can thunk (Gradius III measures ~100).
 const split_thunk_max: usize = 192;
 /// Index-split sites one conversion can thunk. Far larger than the DBR
@@ -2875,6 +2882,48 @@ fn longThunkBody(op: u8, v: u16, bank: u8) [long_thunk_len]u8 {
         0xE0, @truncate(lim),      @truncate(lim >> 8), 0xB0, 0x07, // CPX #lim / BCS rom
         0x68, 0x28, op, @truncate(sh),  @truncate(sh >> 8),  bank, 0x6B, // low
         0x68, 0x28, op, @truncate(v),   @truncate(v >> 8),   bank, 0x6B, // rom
+    };
+}
+
+/// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
+/// already served: an LDA shape whose measured evidence is low|rom. Those
+/// five sites in Gradius III are the level-script walker, they are hot,
+/// and they are on a path that SHIPS — so they get the body that shipped,
+/// to the cycle. A is scratch here, which is why only LDA qualifies: the
+/// load overwrites it, and an 8-bit scratch leaves the B accumulator
+/// alone. Generalising this template — even to something strictly more
+/// correct — changed the timeline enough to fail a build that passed.
+const idx_thunk_v2_len: u32 = 24;
+fn idxThunkBodyV2(op: u8, v: u16, ret: u8) [idx_thunk_v2_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
+    return .{
+        0x08, 0xE2, 0x20, 0xA3, 0x01, 0x89, 0x10, 0xD0, 0x05, // PHP/SEP/LDA $01,S/BIT #$10/BNE low
+        cp,   @truncate(lim),       @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
+        0x28, op, @truncate(sh),  @truncate(sh >> 8),  ret, // low: PLP / op v+$6000
+        0x28, op, @truncate(v),   @truncate(v >> 8),   ret, // rom: PLP / op v
+    };
+}
+
+/// The index-dispatch thunk for a site MEASURED never to run under a
+/// BW-RAM pin: the data-bank arm is dropped and only the index is asked
+/// about. Same A-preserving shape, eight bytes and ~17 cycles cheaper.
+///
+///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
+///   CPY #($2000-v) / BCS rom
+///   low: PLA / PLP / op v+$6000 / RTS
+///   rom: PLA / PLP / op v / RTS
+fn idxThunkBodyShort(op: u8, v: u16, ret: u8) [idx_thunk_short_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
+    return .{
+        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
+        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
+        cp,   @truncate(lim),       @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
+        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
+        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  ret, // rom: as written
     };
 }
 
@@ -4045,7 +4094,10 @@ pub fn convertWholeGame(
     // bytes (a `JSL`, not a `JSR`) and the body's operand carries a bank.
     var lthunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8, bank: u8 } = undefined;
     var n_lthunks: usize = 0;
-    var ithunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
+    // `pin`: the site has NO evidence, so a caller pinned to $40/$41 is
+    // still possible and the thunk must test the data bank. A site whose
+    // measurement already excludes the pin takes the short body.
+    var ithunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8, pin: bool } = undefined;
     var n_ithunks: usize = 0;
     // CELL COHERENCE (window mode): per-site evidence decisions can split
     // one cell's accessor population — gameplay evidence shifted a sound
@@ -4214,17 +4266,30 @@ pub fn convertWholeGame(
                             res.stats.rewritten_long += 1;
                             auditNote(&res.audit, file, op, v, le, .shifted);
                         } else if (window and usage_map.mode(op) == .long_x and
-                            (b & 0x7F) <= 0x3F and v < 0x100 and
-                            (le == 0 or le & usage_map.site_wram_low != 0))
+                            (b & 0x7F) <= 0x3F and v < 0x100 and le == 0)
                         {
                             // The index-split class in the addressing mode
                             // the absolute thunk cannot reach. Same idiom,
-                            // same ambiguity — `LDA $00:0000,X` is the slot
+                            // same ambiguity — `LDA $03:0000,X` is the slot
                             // walker's chain-follow with a small X and a ROM
                             // table walk with a big one — but the site is
                             // FOUR bytes, so `JSL` fits where `JSR` did not,
                             // and a long call names its own bank: these
                             // thunks need no bank-local home at all.
+                            //
+                            // UNMEASURED SITES ONLY, and that restriction is
+                            // a measured trade rather than caution. The
+                            // walker's three `long,X` reads at $00:90AE-C4
+                            // ARE measured low|rom, so they qualify on
+                            // shape — and thunking them puts a JSL/RTL, some
+                            // thirty cycles, in the hottest loop the game
+                            // has. That alone moved the timeline enough that
+                            // the behavioural tier stopped accepting a
+                            // configuration which had shipped. A conversion
+                            // whose whole purpose is speed cannot spend it
+                            // there on a hazard the evidence says is rare.
+                            // They stay listed as `left_mixed` in the audit
+                            // instead: named, not silently forgiven.
                             //
                             // Only the index is in question here. A long
                             // access carries its bank in the operand, so DBR
@@ -4327,7 +4392,7 @@ pub fn convertWholeGame(
                     {
                         if (n_ithunks == idx_thunk_max)
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
-                        ithunks[n_ithunks] = .{ .file = file, .v = v, .op = op };
+                        ithunks[n_ithunks] = .{ .file = file, .v = v, .op = op, .pin = e == 0 };
                         n_ithunks += 1;
                         auditNote(&res.audit, file, op, v, e, .thunk_index);
                         continue;
@@ -4531,7 +4596,22 @@ pub fn convertWholeGame(
     // in a bank and one thunk serves them all. Sharing is what brings a
     // bank with 141 bytes of padding and 29 sites inside its budget — the
     // per-site cost drops from 35 bytes to 3 (the JSR is the site).
-    const Th = struct { file: u32, v: u16, op: u8, idx: bool };
+    const Th = struct {
+        file: u32,
+        v: u16,
+        op: u8,
+        idx: bool,
+        pin: bool,
+        /// Which of the three index bodies this site takes (see each one).
+        fn v2(self: @This()) bool {
+            return self.idx and !self.pin and (self.op == 0xB9 or self.op == 0xBD);
+        }
+        fn len(self: @This()) u32 {
+            if (!self.idx) return split_thunk_len;
+            if (self.pin) return idx_thunk_len;
+            return if (self.v2()) idx_thunk_v2_len else idx_thunk_short_len;
+        }
+    };
     var all: [split_thunk_max + idx_thunk_max]Th = undefined;
     var n_all: usize = 0;
     {
@@ -4539,15 +4619,15 @@ pub fn convertWholeGame(
         var b: usize = 0;
         while (a < n_thunks or b < n_ithunks) : (n_all += 1) {
             if (b == n_ithunks or (a < n_thunks and thunks[a].file < ithunks[b].file)) {
-                all[n_all] = .{ .file = thunks[a].file, .v = thunks[a].v, .op = thunks[a].op, .idx = false };
+                all[n_all] = .{ .file = thunks[a].file, .v = thunks[a].v, .op = thunks[a].op, .idx = false, .pin = false };
                 a += 1;
             } else {
-                all[n_all] = .{ .file = ithunks[b].file, .v = ithunks[b].v, .op = ithunks[b].op, .idx = true };
+                all[n_all] = .{ .file = ithunks[b].file, .v = ithunks[b].v, .op = ithunks[b].op, .idx = true, .pin = ithunks[b].pin };
                 b += 1;
             }
         }
     }
-    var seen: [split_thunk_max + idx_thunk_max]struct { v: u16, op: u8, idx: bool, addr: u16 } = undefined;
+    var seen: [split_thunk_max + idx_thunk_max]struct { v: u16, op: u8, idx: bool, pin: bool, addr: u16 } = undefined;
     if (window and n_all != 0) {
         var i: usize = 0;
         while (i < n_all) {
@@ -4566,12 +4646,12 @@ pub fn convertWholeGame(
             for (all[i..j]) |t| {
                 var dup = false;
                 for (seen[0..n_seen]) |s| {
-                    if (s.v == t.v and s.op == t.op and s.idx == t.idx) dup = true;
+                    if (s.v == t.v and s.op == t.op and s.idx == t.idx and s.pin == t.pin) dup = true;
                 }
                 if (dup) continue;
-                seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .addr = 0 };
+                seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .pin = t.pin, .addr = 0 };
                 n_seen += 1;
-                need += (if (t.idx) idx_thunk_len else split_thunk_len) + PadAlloc.margin;
+                need += t.len() + PadAlloc.margin;
             }
             const ff = pad.freeBytes() < need;
             if (dbg_thunk_pad)
@@ -4582,21 +4662,25 @@ pub fn convertWholeGame(
                 var taddr: u16 = 0;
                 var found = false;
                 for (seen[0..n_seen]) |s| {
-                    if (s.v == t.v and s.op == t.op and s.idx == t.idx) {
+                    if (s.v == t.v and s.op == t.op and s.idx == t.idx and s.pin == t.pin) {
                         taddr = s.addr;
                         found = true;
                     }
                 }
                 if (!found) {
-                    const placed = if (t.idx)
+                    const placed = if (!t.idx)
+                        placeThunk(out, &pad, &far, &splitThunkBody(t.op, t.v, 0x60), &splitThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
+                    else if (t.pin)
                         placeThunk(out, &pad, &far, &idxThunkBody(t.op, t.v, 0x60), &idxThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
+                    else if (t.v2())
+                        placeThunk(out, &pad, &far, &idxThunkBodyV2(t.op, t.v, 0x60), &idxThunkBodyV2(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else
-                        placeThunk(out, &pad, &far, &splitThunkBody(t.op, t.v, 0x60), &splitThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far);
+                        placeThunk(out, &pad, &far, &idxThunkBodyShort(t.op, t.v, 0x60), &idxThunkBodyShort(t.op, t.v, 0x6B), ff, &res.stats.split_far);
                     taddr = placed orelse return refuse(refusal, .{
                         .reason = .no_free_space,
-                        .detail = if (t.idx) idx_thunk_len else split_thunk_len,
+                        .detail = t.len(),
                     });
-                    seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .addr = taddr };
+                    seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .pin = t.pin, .addr = taddr };
                     n_seen += 1;
                 }
                 out[t.file] = 0x20; // JSR — same 3-byte footprint
@@ -6616,6 +6700,66 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
+}
+
+test "window: measured evidence drops the thunk's data-bank arm" {
+    // The same site as the three-worlds test, but MEASURED as low|rom —
+    // which rules a BW-RAM pin out, so the thunk should not pay ~17 cycles
+    // a call asking. It did, once, and the cost alone moved Gradius III's
+    // timeline far enough to flip a behavioural verdict that had shipped.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x000C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, 0xC2, 0x10, // CLC / XCE / SEP #$30 / REP #$10
+        0x22, 0x80, 0x80, 0x00, // the caller
+        0x80, 0xFA, // BRA back to it
+    });
+    @memcpy(rom[0x0080..0x008D], &[_]u8{
+        0xA0, 0x10, 0x01, // LDY #$0110
+        0xA9, 0x44, // LDA #$44
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0xEE, 0x60, 0x01, // INC $0160
+        0x6B,
+    });
+    @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x99, 0x30, 0x00, 0x6B }); // STA $0030,Y / RTL
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8006, 0x800A }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8080, 0x8083, 0x8085, 0x8089, 0x808C }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8100, 0x8103 }) |a| markOpX16(bytes, a);
+
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+    sites[0x8100] = usage_map.site_wram_low | usage_map.site_rom;
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]);
+    // The SHORT prologue: PHP / SEP #$20 / PHA / LDA $02,S — no PHB/PLA.
+    const body = std.mem.readInt(u16, res.image[0x0101..0x0103], .little) - 0x8000;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x08, 0xE2, 0x20, 0x48, 0xA3, 0x02 }, res.image[body..][0..6]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+    try testing.expectEqual(@as(u8, 0x44), con.bus.sa1.bwram[0x0140]);
+    try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
 }
 
 test "window: a tiny-base LONG,X site splits on its index through a JSL thunk" {
