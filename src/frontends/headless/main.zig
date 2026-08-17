@@ -159,8 +159,8 @@ const Args = struct {
     /// `--cover-movie` after it fills the same slot. One recording covers
     /// one scenario, and the defects live in the scenarios nobody
     /// profiled — so the harvest has to take as many as there are.
-    cover_image: [4]?[]const u8 = @splat(null),
-    cover_movie: [4]?[]const u8 = @splat(null),
+    cover_image: [8]?[]const u8 = @splat(null),
+    cover_movie: [8]?[]const u8 = @splat(null),
     n_cover: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
