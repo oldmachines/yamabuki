@@ -4537,6 +4537,17 @@ pub fn convertWholeGame(
                     // no single operand serves its two callers and no
                     // per-cell home argument applies either — the site
                     // becomes a JSR to a DBR-dispatching thunk.
+                    // NOTE, measured 2026-08-17: widening this to any
+                    // evidence NAMING the bank (`bank` alone as well as
+                    // `low|bank`) is the obvious generalisation and it
+                    // breaks the offload trees. Sites measured only under a
+                    // pin are exactly what a pinned tree is full of, and a
+                    // JSR thunk is not portable into a tree COPY — the copy
+                    // runs in another bank, where the bank-relative JSR
+                    // lands on garbage, so the eligibility walk refuses the
+                    // tree outright. The `long,X` flavor escapes this
+                    // because JSL names its own bank; this one needs
+                    // copy-local thunk emission first.
                     if (window and v < 0x2000 and
                         e == usage_map.site_wram_low | usage_map.site_wram_bank)
                     {

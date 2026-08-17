@@ -6,13 +6,24 @@ fix the rule → regenerate*. Each rule cites the failure that forced it. The
 reference throughout is Vitor Vilela's hand-crafted SA-1 patch (v17), used as
 an answer key by byte-diffing, never as a source.
 
-The work lives on PR #115 (`claude/sa1-async-offload`). The one-command entry
-point:
+The work lives on PR #115 (`claude/sa1-async-offload`). The entry point, in
+the shape that actually ships a two-tree patch:
 
 ```
-yamabuki-headless <rom> --gen-sa1-patch --window --wg-static \
-    --verify-behavioral --state <gameplay.state> --movie <inputs.ymv> --skip 0
+yamabuki-headless <rom> --gen-sa1-patch --window --wg-static --wg-fastrom \
+    --verify-behavioral --state <gameplay.state> \
+    --movie <surface1.ymv> ... --movie <surface5.ymv> \
+    --cover-image <prev-build.sfc> --cover-movie <recorded-on-it.ymv> \
+    --conv-pad 1500 --wg-nmi-off 8ef1 --wg-drop 8c95 --out <patch.bps>
 ```
+
+**Do not reconstruct this command from prose.** Three separate
+reconstructions went wrong in one day — missing `--wg-fastrom`, then
+`--verify-behavioral`, then something never identified — and each cost
+hours of misattributed blame, because a build that silently drops a flag
+still produces a plausible patch. Every generated patch now carries its
+own invocation in `<patch>.bps.cmd`, and every run echoes it as line one.
+Read that file; do not remember the command.
 
 ---
 
@@ -267,26 +278,29 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**The shipping patch is the full-cycle relocation.** Under the widest
-surface yet — 4,800 frames covering the logo auto-advance, title with
-music, menu, and the attract gameplay demo — the relocation-only patch is
-BEHAVIORALLY EQUIVALENT (worst active run 3) and cycles the whole attract
-sequence untouched. Speed-neutral, but correct everywhere a player can
-reach without a controller.
+**Current, 2026-08-17.** The shipping patch is the two-tree window
+conversion: `$9BCD` (sequencer) and `$8EF1` (the 1,324-byte physics tree)
+both executing on the SA-1, plus FastROM, 121 index-split thunks, and
+`--wg-static`. Five verification surfaces, three cover harvests.
 
-**The offloaded builds are honest speedups on narrower surfaces, and the
-widest surface caught them.** The three-tree build (`$9BCD` + the
-1,324-byte `$8EF1` physics tree + `$8C95`) verified BEHAVIORALLY
-EQUIVALENT over 1,800 frames including the menu — dropped frames
-287→186, utilisation **53%→23%** — and its earning history is real: the
-wall-time verdict work and the pin propagation (sections 5 and 6) were
-both required and both stand. But the 4,800-frame surface added the
-title-music phase, and there every offload build diverges at ~f830: the
-copies enter states their S-CPU originals never do (the slot walker's
-runaway cursor), the divergence spreads, and live play freezes — the
-attract-demo wedge a play session found first. The auto-bisect dropped
-all three and shipped the relocation, which is the system working as
-designed: the widest coverage wins the argument.
+    combat surface   stock mean 58% / p95 100%  ->  18% / 63%
+    boss surface     stock mean 44% / p95  87%  ->  17% / 39%
+    dropped frames   237 -> 114
+    (Vilela's hand-written v17, for scale: 12% mean)
+
+The **p95** column is the one that answers "does it still feel slow" —
+the heaviest five percent of frames no longer saturate the CPU. Live
+play: correct through stage 1, laser confirmed working, boss ARRIVES for
+the first time. Gates: all five surfaces behaviourally equivalent, zero
+stale sites across six recordings, 80k+40k soaks with every frame in the
+last ten thousand a distinct picture.
+
+Open: the stage-1 boss renders garbled, traced to one uncovered
+instruction and fixed by a player recording that finally reaches it
+(section 17).
+
+Everything below is how it got here, in the order the failures forced it,
+and several of the walls named as permanent turned out not to be.
 
 Two walls that fell along the way, for the record: the "menu-beep
 semantic divergence" was three verifier artifacts (section 5's last
@@ -981,3 +995,119 @@ from prose notes — missing `--wg-fastrom`, then `--verify-behavioral`, then
 neither. The generator now echoes its own argv as the first line of every
 run and writes it to `<patch>.bps.cmd`. Every hour lost to that would have
 been one `cat`.
+
+## 16. Recovering the physics tree — a leaf, and three allocators
+
+`$8EF1` is the prize: the difference between 48% utilisation and 17%. It
+had been parked for days behind an NMI-interleaving hazard, then behind
+an eligibility refusal. The refusal turned out to be one line of
+diagnostic output:
+
+    [win $8ef1] member $9028: I-RAM hazard long_x $03:0000 at $90ae evidence 03
+
+`LDA $03:0000,X` in the slot walker. An unshifted low-mirror indexed long
+is the SA-1's OWN I-RAM, so a tree containing one computes different
+results per CPU — a correct refusal of a real hazard.
+
+**The thunk removes the hazard; the walk could not see that it had.** An
+index-split thunk is SA-1-safe by construction: its window arm addresses
+the identity window, the same bytes at the same addresses on both buses,
+and its as-written arm only runs once the index has carried the address
+past `$2000`. But a `JSL` into a thunk looked like a far call to another
+bank and was refused on sight. So thunk bodies are now handed to the
+eligibility walk, **a call into one is a LEAF rather than a member**, and
+the caller's data-bank pin survives it (the thunk's only bank traffic is
+a balanced `PHB`/`PLA` it reads and discards). Walking *into* one would
+see the as-written arm out of context and refuse the tree over the very
+hazard the thunk exists to remove.
+
+The `long,X` flavour is uniquely suited to this, and it is worth knowing
+why: **`JSL` names its own bank, so a copied tree member carries a thunk
+call unchanged.** The `JSR` flavour does not — a copy runs in another
+bank, where a bank-relative `JSR` lands on garbage. That asymmetry decides
+which generalisations are available (see section 17's third round).
+
+**Then three allocators, each hiding the next.** Making the tree eligible
+raised the copies' demand and every offload vanished:
+
+- **Silence.** `findFreeSpace` failing for the tree copies did `orelse
+  return null` — every offload abandoned, `$9BCD` lost along with the new
+  tree, 116 dropped frames becoming 186, and nothing in the log. A
+  zero-offload patch is indistinguishable from a game with nothing worth
+  offloading, which is exactly how it hid. It now says so.
+- **The wrong unit.** Reserving the whole biggest BANK for copies was
+  worse: the far pool then ate banks `$01`-`$04`, which need their padding
+  for their own 5-byte stubs, and the thunks stopped fitting at all. The
+  right unit is the **run's tail** — that is where `findFreeSpace`
+  allocates from, so thunks filling the head cost the copies nothing.
+- **A parameter accepted and ignored.** `padAllocFor` took a reservation
+  and applied it only to bank `$00`. The tail was reserved in name only,
+  thunks wrote 395 bytes into it, and the copies still did not fit —
+  visible as a 2,165-byte run where 2,560 was supposed to be. This is the
+  worst of the three: silently dropped arguments read as working code.
+
+## 17. The boss — four ways to misread the same evidence
+
+`$8EF1` landed and the stage-1 boss ARRIVED for the first time in the
+project's history. It rendered as garbage. Chasing it took four rounds,
+and the shape of the mistake is the same each time: **treating what the
+evidence happened to show as proof of what it could show.**
+
+A save state of the scene plus `--stale` made every round measurable —
+and note the instrument, because it is the one that works when the bug is
+inside an offload: the stale detector reported program counters *inside
+bank `$0D`*, which is where tree copies live, so the tree was demonstrably
+reading its own I-RAM.
+
+**Round 1 — out of range.** `$00:90DF`, `LDA $02:FFFF,X`. A base at or
+above `$FF00` wraps FORWARD into the next bank's low page: `$02:FFFF` + 7
+is `$03:0006`. Three separate checks missed it for the same reason — they
+test `v < $2000`, and `$FFFF` is not: the thunk rule, the window shift,
+and the eligibility walk's hazard check, the last of which is why the tree
+was admitted. The thunk for it differs in shape from the tiny-base one:
+**two compares** (the mirror is a range here, not a ceiling — an index
+below `$10000-v` has not wrapped and is still reading this bank's ROM
+tail), **no A scratch** (the dispatch reads X alone), **`REP #$10`
+instead of a width test** (setting the X flag zeroes XH, so an x8
+caller's index has the same numeric value read as sixteen bits), and a
+window arm that keeps the distance by **advancing the bank** —
+`$01:FFFF` + `$6000` is `$02:5FFF`.
+
+**Round 2 — measured ROM-only.** `$00:911D` and `$00:9155`, more
+instances of the same walker read, left alone because their evidence was
+ROM-only across five surfaces and two cover harvests. The boss path is
+where they reach the mirror. So the evidence test came out entirely:
+reaching that branch already means the site is not provably pure-low, and
+the thunk is correct in BOTH worlds, so ambiguity gets the thunk and only
+a proof of pure-low earns the cheaper static shift. **Priced before
+shipping** on two images differing only in that rule: 93 → 121 thunks
+costs one point of mean utilisation, identical dropped frames.
+
+**Round 3 — the generalisation that costs both trees.** Widening the
+DBR-split thunk the same way (fire on any evidence naming the bank, not
+just `low|bank`) is the obvious next step and it must not be taken as
+written. Sites measured only under a pin are exactly what a pinned tree
+is full of; they become `JSR` thunks; a `JSR` is not portable into a
+copy; the walk refuses the tree. Reverted, with the reason left at the
+site. It needs copy-local thunk emission first — which section 16
+explains the `long,X` flavour never needed.
+
+**Round 4 — not an evidence problem at all.** `$02:9588`, `LDA $08D0`,
+came back `cov=00 ev=00`. Nothing had ever reached it: no surface, no
+harvest, not `--wg-static`'s descent. Anchoring the profiler at the boss
+save state does not help either — a window-converted state loaded onto
+the stock console does not run the boss path.
+
+**And the reason the reach was missing is the lesson worth keeping.** The
+cover harvest can only donate coverage for code a recording actually
+EXECUTES. No recording in this project had ever reached a working stage-1
+boss **because the boss had never worked** — `boss-conv.ymv` was captured
+on a build where it never appeared. The defect hid behind itself, and the
+only thing that could dislodge it was a player reaching the boss on a
+build where it finally arrives. That recording donates 711 instructions
+and 308 evidenced sites, and `$02:9588` comes back `wram_low` — pure low,
+so it takes a plain static shift at no runtime cost at all.
+
+**A recording is only written when it is STOPPED.** `F10` starts, `F10`
+again stops and flushes. Two round trips were lost to a recording that
+was never stopped and therefore never existed.
