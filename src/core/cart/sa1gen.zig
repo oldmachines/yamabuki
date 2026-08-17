@@ -4431,9 +4431,21 @@ pub fn convertWholeGame(
                             res.stats.rewritten_long += 1;
                             auditNote(&res.audit, file, op, v, le, .shifted);
                         } else if (window and usage_map.mode(op) == .long_x and
-                            (b & 0x7F) <= 0x3F and (v < 0x100 or v >= 0xFF00) and
-                            (le == 0 or le & usage_map.site_wram_low != 0))
+                            (b & 0x7F) <= 0x3F and (v < 0x100 or v >= 0xFF00))
                         {
+                            // NO evidence test. Reaching here already means
+                            // the site is not provably pure-low (that case
+                            // shifted statically above), and every other
+                            // reading of the evidence has now been wrong at
+                            // least once. `$00:911D` and `$00:9155` measured
+                            // ROM-ONLY across five surfaces and two cover
+                            // harvests, were left alone on that authority,
+                            // and read the mirror on the boss path — inside
+                            // an offloaded copy, where the mirror is the
+                            // SA-1's own I-RAM. Evidence that never saw the
+                            // mirror is not proof there is no mirror, and
+                            // the thunk is correct in BOTH worlds, so it is
+                            // the answer whenever the shape is ambiguous.
                             // The index-split class in the addressing mode
                             // the absolute thunk cannot reach. Same idiom,
                             // same ambiguity — `LDA $03:0000,X` is the slot
