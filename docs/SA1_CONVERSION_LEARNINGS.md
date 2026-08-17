@@ -927,3 +927,57 @@ in ROM and no aborted dispatch. And dropping the tree makes the verdict
 assumes something false: that removing an offload monotonically improves
 the verdict. When the failure is a lag artifact, removing a tree moves the
 fork instead of removing it, and the ladder walks downhill.
+
+## 15. The verdict that punished the speedup
+
+A day went into attributing a verification failure to `--wg-static`, then
+to FastROM, then to my own thunk template. It was none of them. It was one
+branch in the behavioural tier, and the instrumentation that found it took
+twenty minutes to write.
+
+**A failure that could not be compared to a pass.** The tier printed rich
+statistics when a surface passed — ticks compared, stable-lag ticks,
+diverging ticks, worst run — and a single sentence when it failed. So a
+passing run and a failing run could not be diffed field by field, and every
+hypothesis about the difference had to be inferred from the image instead.
+Printing the same numbers on both paths ended the guessing immediately:
+
+    behavioral: FAIL — live state diverges and never heals
+      stats: 1259 ticks compared, 7 diverging, worst run 4, long runs 0
+
+Seven diverging ticks out of 1259, worst run 4, no long runs — and a
+verdict of "diverges and never heals". The verdict was never about
+divergence.
+
+**The bug.** `persistence` carried two unrelated causes under one message:
+live state that diverged, and a pairing that simply stopped. The tier pairs
+logic ticks, and at an input edge it advances whichever side is behind in
+epoch. A conversion that removed slowdown spends FEWER wall frames per
+logic tick, so it sits at an EARLIER wall frame than the baseline — and
+catching it up to the baseline's epoch burns its remaining frame budget.
+Near the end of a surface it runs out, and the tier called that "the
+conversion stopped ticking".
+
+So the tier punished a build for being faster, which is the one thing every
+build is trying to be. Worse, it did so *conditionally*: whether the last
+input edge fell inside or outside the budget depended on the exact lag
+differential, so any timing change at all — FastROM, an offload tree, eight
+bytes of thunk on a hot path — could flip a verdict without touching
+correctness. That is the whole explanation for a day of unstable
+attribution, and for the earlier observation that DROPPING a tree made the
+verdict worse: it moved the differential, not the correctness.
+
+**The fix** is to name what happened. Exhausting the budget while catching
+up to an edge is the end of the COMPARABLE REGION, not a hang: every tick
+paired so far was paired honestly and the verdict belongs to them. The
+genuine hang — the conversion stopping while the baseline still ticks — is
+a different exit and still fails. Both are now printed by name, on pass and
+on fail, along with the tier's inputs, because a surface whose tail went
+uncompared should say so rather than quietly counting as a clean pass.
+
+**And the invocation goes with the artifact.** Three times in one day a
+generation could not be reproduced because the command was reconstructed
+from prose notes — missing `--wg-fastrom`, then `--verify-behavioral`, then
+neither. The generator now echoes its own argv as the first line of every
+run and writes it to `<patch>.bps.cmd`. Every hour lost to that would have
+been one `cat`.

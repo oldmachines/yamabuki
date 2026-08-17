@@ -204,6 +204,12 @@ const Args = struct {
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
+    /// This process's own argv, joined and quoted. Written beside every
+    /// generated patch and echoed into the log, because a generation that
+    /// cannot be re-issued exactly cannot be reproduced — and three
+    /// separate days went into reconstructing one from prose notes, each
+    /// time missing a different flag.
+    cmdline: []const u8 = "",
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
@@ -695,6 +701,38 @@ const Behavioral = struct {
     /// retry can verify up to (beyond it, tick-locked replay compares two
     /// different healthy games and proves nothing either way).
     fork_wall: ?u32,
+    /// HOW the tick-locked pairing ended. A `persistence` verdict has two
+    /// completely different causes wearing one message — live state that
+    /// diverged and never healed, and a run that simply stopped pairing —
+    /// and telling them apart by eye is impossible: a surface with SEVEN
+    /// diverging ticks out of 1259 and a worst run of 4 was reported as
+    /// "live state diverges and never heals" for a whole day.
+    exit: Exit = .compared_to_budget,
+
+    const Exit = enum {
+        /// The baseline ran out of budget first. Normal for a conversion
+        /// that removed slowdown: it needs fewer wall frames per tick.
+        compared_to_budget,
+        /// Neither side ever produced a tick.
+        no_ticks,
+        /// The CONVERSION ran out of budget while the baseline still had
+        /// ticks to give — it hung, or is slower than the baseline.
+        conversion_ran_out,
+        /// The conversion ran out while being caught up to an input edge
+        /// the baseline had already crossed. NOT a failure — see the
+        /// comment at the break — but disclosed, because the surface's
+        /// tail went uncompared.
+        conversion_ran_out_at_edge,
+
+        fn describe(self: Exit) []const u8 {
+            return switch (self) {
+                .compared_to_budget => "baseline exhausted its budget (normal)",
+                .no_ticks => "neither side produced a logic tick",
+                .conversion_ran_out => "CONVERSION exhausted its budget with the baseline still ticking",
+                .conversion_ran_out_at_edge => "comparable region ended at an input edge (the conversion, being ahead, ran out of budget catching up)",
+            };
+        }
+    };
 };
 
 /// The behavioral tier (`--verify-behavioral`): a conversion that removes
@@ -832,10 +870,14 @@ fn verifyBehavioral(
     var n_tick_walls: usize = 0;
 
     // Tick 0 on both sides.
-    if (!base.advance(mov, total)) return out; // no ticks at all: vacuous
+    if (!base.advance(mov, total)) {
+        out.exit = .no_ticks;
+        return out; // vacuous
+    }
     if (!conv.advance(mov, total)) {
         // The baseline reached gameplay and the conversion never did.
         out.verdict = .{ .fail = .persistence };
+        out.exit = .conversion_ran_out;
         return out;
     }
     out.ticks_base = 1;
@@ -891,6 +933,7 @@ fn verifyBehavioral(
             // The conversion fell behind for the rest of the budget while
             // the baseline kept ticking: it hung or slowed catastrophically.
             out.verdict = .{ .fail = .persistence };
+            out.exit = .conversion_ran_out;
             return out;
         }
         out.ticks_conv += 1;
@@ -904,10 +947,30 @@ fn verifyBehavioral(
             while (base.epoch(edges) != conv.epoch(edges)) {
                 if (base.epoch(edges) > conv.epoch(edges)) {
                     if (!conv.advance(mov, total)) {
-                        // The baseline reached the input edge and the
-                        // conversion never did: it hung.
-                        out.verdict = .{ .fail = .persistence };
-                        return out;
+                        // NOT a hang, and calling it one was costing real
+                        // builds. The conversion is AHEAD — it spends
+                        // fewer wall frames per logic tick, which is the
+                        // entire point — so it sits at an earlier wall
+                        // frame than the baseline, and catching it up to
+                        // the baseline's epoch burns whatever budget it
+                        // has left. Near the end of a surface it runs out.
+                        // That is the end of the COMPARABLE REGION, not a
+                        // failure: everything paired so far was paired
+                        // honestly, and the verdict belongs to those
+                        // ticks. (The genuine hang is the other exit —
+                        // the conversion stopping while the baseline
+                        // still ticks, in the main pairing above.)
+                        //
+                        // Measured: a surface with SEVEN diverging ticks
+                        // out of 1259 and a worst run of 4 was reported
+                        // as "live state diverges and never heals", and
+                        // whether a build hit this depended on where the
+                        // last input edge fell relative to its own lag
+                        // differential — so any timing change (FastROM, a
+                        // tree, a thunk) could flip a verdict without
+                        // touching correctness.
+                        out.exit = .conversion_ran_out_at_edge;
+                        break :outer;
                     }
                     out.ticks_conv += 1;
                 } else {
@@ -1579,6 +1642,14 @@ fn runSa1Gen(
     // another displaces — while verification runs per surface and every
     // one must pass. Zero movies = the one legacy surface (attract).
     const n_surf: usize = @max(1, movs.len);
+    // First line of every generator run, so a log is self-describing even
+    // when the run fails and writes no patch. `--skip` is spelled out
+    // because it defaults to 300 and silently changes how much of each
+    // surface gets VERIFIED, which is exactly the kind of difference a
+    // reconstructed command loses.
+    try out.print("invocation: {s}\n", .{args.cmdline});
+    try out.print("  (skip {} frame(s) before each surface's verification budget)\n", .{args.skip});
+    try out.flush();
     var totals: [max_movies]u32 = undefined;
     for (0..n_surf) |s| {
         const frames = args.frames orelse if (movs.len != 0)
@@ -2475,6 +2546,16 @@ fn runBehavioralTier(
                     bv.stats.worst_run,
                 },
             );
+            try out.print(
+                "    inputs: {} frame(s), movie {} frame(s), {s}, {s}\n    pairing ended: {s}\n",
+                .{
+                    total,
+                    if (mov) |m| @as(u32, @intCast(m.frames.len)) else 0,
+                    if (verify_state != null) @as([]const u8, "seeded from a state") else "from power-on",
+                    if (window) @as([]const u8, "window homes") else "plan homes",
+                    bv.exit.describe(),
+                },
+            );
             if (bv.stats.skew_active_ticks > 0)
                 try out.print(
                     "    {} tick(s) diverged only while the lag differential itself was moving (the removed slowdown, not corruption; excluded from the budgets)\n",
@@ -2527,6 +2608,47 @@ fn runBehavioralTier(
             };
             fail_frame.* = bv.first_bad_frame;
             try out.print("  behavioral: FAIL — {s}\n", .{fail_why.*});
+            // The SAME statistics a pass prints, and the tier's inputs
+            // besides. A pass used to report "2517 ticks compared, worst
+            // run 24" while a failure reported a sentence — so a passing
+            // run and a failing one could not be diffed field by field,
+            // and a day went into inferring what one line would have
+            // said. A verdict that cannot be compared to another verdict
+            // is not evidence.
+            try out.print(
+                "    inputs: {} frame(s), movie {} frame(s), {s}, {s}\n" ++
+                    "    pairing ended: {s}\n" ++
+                    "    stats: {} ticks compared ({} at stable lag differential), {} diverging\n" ++
+                    "      ({} address(es), {} stable-active), novelty {}, held {}, epochs {}\n" ++
+                    "      worst run {} [{}..{}], runner-up {}, reaches end {}, bursts {} (runs <= {}),\n" ++
+                    "      long runs {} ({} ticks), last tick {}, addr overflow {}\n",
+                .{
+                    total,
+                    if (mov) |m| @as(u32, @intCast(m.frames.len)) else 0,
+                    if (verify_state != null) @as([]const u8, "seeded from a state") else "from power-on",
+                    if (window) @as([]const u8, "window homes") else "plan homes",
+                    bv.exit.describe(),
+                    bv.ticks_base,
+                    bv.stats.stable_ticks,
+                    bv.stats.bad_ticks,
+                    bv.stats.n_addrs,
+                    bv.stats.stableAddrCount(),
+                    bv.stats.novelty_ticks,
+                    bv.stats.heldCount(),
+                    bv.stats.epoch_budget,
+                    bv.stats.worst_run,
+                    bv.stats.worst_start,
+                    bv.stats.worst_end,
+                    bv.stats.second_run,
+                    bv.stats.runReachesEnd(),
+                    bv.stats.burst_total,
+                    util.Persistence.burst_len,
+                    bv.stats.long_runs,
+                    bv.stats.long_total,
+                    bv.stats.last_tick,
+                    bv.stats.addr_overflow,
+                },
+            );
             if (bv.n_sample > 0) {
                 try out.print("    first at baseline frame {}, e.g.:", .{bv.first_bad_frame});
                 for (bv.sample[0..bv.n_sample]) |adr| {
@@ -2749,8 +2871,14 @@ fn reportSa1(
         try out.flush();
         std.process.exit(1);
     };
+    // The invocation, beside its own artifact. A patch whose command has
+    // to be remembered is a patch nobody can regenerate.
+    const cmd_path = try std.fmt.allocPrint(gpa, "{s}.cmd", .{path});
+    const cmd_data = try std.fmt.allocPrint(gpa, "{s}\n", .{args.cmdline});
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cmd_path, .data = cmd_data }) catch {};
 
-    try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
+    try out.print("wrote {s} ({} bytes)\n", .{ path, bps.len });
+    try out.print("wrote {s}\n\n", .{cmd_path});
     if (args.window) {
         try out.print(
             \\uniform window relocation (v17's architecture):
@@ -3929,8 +4057,22 @@ fn printWramFootprint(out: *std.Io.Writer, fp: core.profile.WramFootprint) !void
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // Not deinit'd — the returned Args slice into it, and `gpa` is the
     // process arena.
+    // The invocation, verbatim, before anything consumes it.
+    var cmd: std.array_list.Managed(u8) = .init(gpa);
+    {
+        var cit = try util.argIterator(init, gpa);
+        var first = true;
+        while (cit.next()) |a| {
+            if (!first) try cmd.append(' ');
+            first = false;
+            const quote = std.mem.indexOfAny(u8, a, " \t\"") != null;
+            if (quote) try cmd.append('"');
+            try cmd.appendSlice(a);
+            if (quote) try cmd.append('"');
+        }
+    }
     var it = try util.argIterator(init, gpa);
-    var out: Args = .{ .rom = undefined };
+    var out: Args = .{ .rom = undefined, .cmdline = cmd.items };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--frames")) {
