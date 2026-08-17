@@ -121,6 +121,11 @@ pub const Stats = struct {
     /// Instructions the profile never executed that `--wg-static`'s
     /// recursive descent found anyway — the reach the audit is measuring.
     cov_static_added: u32 = 0,
+    /// Non-zero when EVERY offload was abandoned because the tree copies
+    /// needed this many contiguous bytes and no padding run was that big.
+    /// A silent zero-offload patch is indistinguishable from a game with
+    /// nothing worth offloading; this tells them apart.
+    offload_space_short: u32 = 0,
     /// Measured pointer-bank source bytes re-banked (window mode): ROM
     /// bytes proven to feed [dp] pointer bank bytes / DMA bank registers.
     rewritten_ptr_banks: u32 = 0,
@@ -2807,17 +2812,27 @@ const PadAlloc = struct {
     }
 };
 
-/// A `PadAlloc` over one bank of `out`. Bank $00 stops at the header and
-/// reserves the scaffold's carve; every other bank is its whole 32 KiB.
-fn padAllocFor(out: []const u8, header_off: u32, bank: u32, carve: u32, carve_len: u32) PadAlloc {
+/// A `PadAlloc` over one bank of `out`, honouring a reserved span given as
+/// (offset, length) in FILE offsets. Bank $00 stops at the header, where
+/// the scaffold's carve is the thing reserved; other banks are their whole
+/// 32 KiB, where the reservation is the tail of the biggest run kept back
+/// for offload tree copies. Passing the reservation and then ignoring it
+/// for every bank but $00 is how the thunks quietly wrote 395 bytes into
+/// that tail and lost the trees anyway.
+fn padAllocFor(out: []const u8, header_off: u32, bank: u32, res_at: u32, res_len: u32) PadAlloc {
     if (bank == 0) return .{
         .region = out[0..header_off],
         .base = 0,
-        .lo = carve,
-        .hi = carve + carve_len,
+        .lo = res_at,
+        .hi = res_at + res_len,
     };
     const lo = bank * 0x8000;
-    return .{ .region = out[lo..@min(lo + 0x8000, out.len)], .base = lo };
+    return .{
+        .region = out[lo..@min(lo + 0x8000, out.len)],
+        .base = lo,
+        .lo = res_at,
+        .hi = res_at + res_len,
+    };
 }
 
 /// A padding allocator for thunk BODIES that will not fit their own bank;
@@ -2836,19 +2851,72 @@ const FarPad = struct {
     /// 0 until the first call; the top bank thereafter.
     bank: u32 = 0,
     pad: ?PadAlloc = null,
+    /// Reserved span (file offsets) inside `keep_bank`: the TAIL of the
+    /// image's biggest padding run, kept for the offload tree copies.
+    ///
+    /// The copies need ONE contiguous block and cannot be split, while a
+    /// thunk body fits anywhere — so when they compete, the thunks must
+    /// yield. Measured: they did not, making the physics tree eligible
+    /// pushed the copies' demand past what was left, EVERY offload was
+    /// silently abandoned, and the patch shipped 186 dropped frames where
+    /// it had been doing 116. Reserving the whole BANK was worse still:
+    /// the far pool then ate banks $01-$04, which need their padding for
+    /// their own 5-byte stubs. The tail is the right unit — it is where
+    /// `findFreeSpace` allocates from, so thunks filling the head of the
+    /// same run cost the copies nothing.
+    keep_bank: u32 = 0,
+    keep_lo: u32 = 0,
+    keep_hi: u32 = 0,
 
     fn next(self: *@This(), need: u32) ?u32 {
         if (self.bank == 0) self.bank = @intCast((self.out.len + 0x7FFF) / 0x8000 - 1);
         while (self.bank >= 1) {
-            if (self.pad == null)
-                self.pad = padAllocFor(self.out, self.header_off, self.bank, 0, 0);
+            if (self.pad == null) self.pad = if (self.bank == self.keep_bank)
+                padAllocFor(self.out, self.header_off, self.bank, self.keep_lo, self.keep_hi - self.keep_lo)
+            else
+                padAllocFor(self.out, self.header_off, self.bank, 0, 0);
             if (self.pad.?.next(need)) |at| return at;
             self.pad = null;
             self.bank -= 1;
         }
+        if (dbg_thunk_pad)
+            std.debug.print("[farpad] EXHAUSTED for {} bytes\n", .{need});
         return null;
     }
 };
+
+/// How much of the biggest padding run to keep back for offload tree
+/// copies. Gradius III's two trees are 397 and 1324 bytes plus their
+/// stubs and fence — a shade over 2 KB — and 2.5 KiB leaves headroom
+/// without starving the thunk bodies, which have the rest of the image.
+const copy_reserve: u32 = 2560;
+
+/// The single biggest $FF run outside bank $00 — the one `findFreeSpace`
+/// will hand the offload tree copies, and whose tail `FarPad` keeps back
+/// for them. Returns its bank and its END file offset (exclusive).
+const BigRun = struct { bank: u32 = 0, end: u32 = 0, len: u32 = 0 };
+fn biggestRun(out: []const u8, header_off: u32) BigRun {
+    var best: BigRun = .{};
+    var bank: u32 = 1;
+    while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
+        const lo = bank * 0x8000;
+        const region = out[lo..@min(lo + 0x8000, out.len)];
+        var i: usize = 0;
+        while (i < region.len) {
+            if (region[i] != 0xFF) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < region.len and region[j] == 0xFF) j += 1;
+            const len: u32 = @intCast(j - i);
+            if (len > best.len) best = .{ .bank = bank, .end = @intCast(lo + j), .len = len };
+            i = j;
+        }
+        _ = header_off;
+    }
+    return best;
+}
 
 /// Bank-local stub for a thunk body that had to go to another bank:
 /// `JSL far / RTS`. The body ends in RTL instead of RTS, so the pair
@@ -3088,7 +3156,17 @@ fn emitWindowOffloads(
             any_len += fenceLen(.{}) + win_async_stub_len;
         } else any_len += win_stub_len + (if (c.nmi_off and nmi_sites != null) win_nmi_off_extra else 0);
     }
-    const any_at = 0x8000 + (patchgen.findFreeSpace(out[0x8000 .. out.len - 1], any_len) orelse return null);
+    // The copies need ONE contiguous run and cannot be split, which puts
+    // them in direct competition with the thunk bodies already written
+    // into the same padding. When the run is not there, EVERY offload is
+    // silently abandoned and the patch ships with none — measured: making
+    // the physics tree eligible raised the requirement past what was left
+    // and cost the sequencer tree too, 116 dropped frames back to 186,
+    // with nothing in the log to say why. Disclose it.
+    const any_at = 0x8000 + (patchgen.findFreeSpace(out[0x8000 .. out.len - 1], any_len) orelse {
+        res.stats.offload_space_short = any_len;
+        return null;
+    });
     var cur: u32 = any_at;
 
     // Copies first (their addresses feed the blocks and stubs).
@@ -4604,7 +4682,17 @@ pub fn convertWholeGame(
     // scaffold's carve reserved by address, and behind a 5-byte far stub
     // once that bank runs dry (see placeThunk).
     var pad: PadAlloc = undefined;
-    var far: FarPad = .{ .out = out, .header_off = header.offset };
+    const big: BigRun = if (window) biggestRun(out, header.offset) else .{};
+    const keep: u32 = @min(copy_reserve, big.len -| PadAlloc.margin);
+    var far: FarPad = .{
+        .out = out,
+        .header_off = header.offset,
+        .keep_bank = big.bank,
+        .keep_lo = big.end - keep,
+        .keep_hi = big.end,
+    };
+    if (dbg_thunk_pad and window)
+        std.debug.print("[farpad] biggest run: bank {x:0>2}, {} bytes, reserving {} for tree copies\n", .{ big.bank, big.len, keep });
     // Index-split thunks: dispatch on the index register's magnitude.
     // WIDTH-PROOF: the site's recorded width is only the LAST run's — a
     // caller can arrive in x8, where a 16-bit CPY immediate misparses

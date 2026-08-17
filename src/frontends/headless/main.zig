@@ -2188,6 +2188,13 @@ fn runSa1Gen(
             core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
+        if (converted) |cr| {
+            if (cr.stats.offload_space_short != 0)
+                try out.print(
+                    "  offloads ABANDONED: the tree copies need {} contiguous byte(s) and no\n  padding run is that big — the thunk bodies are in the same padding\n",
+                    .{cr.stats.offload_space_short},
+                );
+        } else |_| {}
         if (args.n_wg_nmi_off != 0 and !phase_async) {
             if (converted) |cr| {
                 if (cr.stats.nmi_off_sites != 0)
