@@ -118,6 +118,9 @@ pub const Stats = struct {
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
     rewritten_abs: u32 = 0,
+    /// Instructions the profile never executed that `--wg-static`'s
+    /// recursive descent found anyway — the reach the audit is measuring.
+    cov_static_added: u32 = 0,
     /// Measured pointer-bank source bytes re-banked (window mode): ROM
     /// bytes proven to feed [dp] pointer bank bytes / DMA bank registers.
     rewritten_ptr_banks: u32 = 0,
@@ -192,9 +195,82 @@ pub const Stats = struct {
     nmi_off_sites: u8 = 0,
 };
 
+/// What the rewriter DID with one memory-touching site, and why.
+///
+/// Recorded as the decision is made, never re-derived afterwards: an audit
+/// that reimplements the rules is an audit that can disagree with them,
+/// and the whole value of this is being able to trust the count.
+pub const Verdict = enum(u8) {
+    /// The operand moved into the BW-RAM window (+$6000).
+    shifted,
+    /// A long's bank byte re-banked $7E/$7F -> $40/$41 (or the $7D wrap).
+    rebanked,
+    /// Replaced by a JSR to a thunk dispatching on the runtime data bank.
+    thunk_dbr,
+    /// Replaced by a JSR to a thunk dispatching on the index magnitude.
+    thunk_index,
+    /// Operand at or above $2000: MMIO or ROM, and native either way.
+    left_high,
+    /// A data bank STATICALLY proved to be BW-RAM here, so the operand is
+    /// already this bank's own low page. Sound when the tracker is right;
+    /// the tracker is the thing being trusted.
+    left_pinned,
+    /// Measured traffic never touched low WRAM (a ROM walk, MMIO, or
+    /// bank-mediated). Leaving it is what the evidence asked for.
+    left_rom,
+    /// Measured traffic INCLUDES low WRAM but is not only low WRAM, and
+    /// the site's shape fits no thunk. Left pointing at the abandoned
+    /// home on the paths where the low-WRAM half is the live one — a
+    /// hazard with evidence behind it, which makes it the worst kind.
+    left_mixed,
+    /// No evidence at all, and the shape is not one the static rules
+    /// move. Left as written on a guess.
+    left_unproven,
+};
+
+pub const AuditSite = struct { file: u32, op: u8, v: u16, ev: u8, verdict: Verdict };
+
+/// How many hazard sites the audit will name before it starts counting
+/// instead. A list nobody can read is not evidence.
+const audit_list_max: usize = 768;
+
+pub const Audit = struct {
+    counts: [std.enums.values(Verdict).len]u32 = @splat(0),
+    /// The hazard classes only (`left_pinned`, `left_mixed`,
+    /// `left_unproven`); everything else is a decision, not a risk.
+    sites: [audit_list_max]AuditSite = undefined,
+    n_sites: usize = 0,
+    /// Hazard sites past the list's end.
+    truncated: u32 = 0,
+    /// Instructions per bank in the map the REWRITER used — dynamic
+    /// coverage plus whatever `--wg-static` reached. A bank at zero here
+    /// is a bank the rewriter has never touched an instruction in.
+    bank_ops: [0x40]u32 = @splat(0),
+
+    pub fn count(self: *const Audit, v: Verdict) u32 {
+        return self.counts[@intFromEnum(v)];
+    }
+};
+
+fn auditNote(a: *Audit, file: u32, op: u8, v: u16, ev: u8, verdict: Verdict) void {
+    a.counts[@intFromEnum(verdict)] += 1;
+    switch (verdict) {
+        .left_pinned, .left_mixed, .left_unproven => {},
+        else => return,
+    }
+    if (a.n_sites == a.sites.len) {
+        a.truncated += 1;
+        return;
+    }
+    a.sites[a.n_sites] = .{ .file = file, .op = op, .v = v, .ev = ev, .verdict = verdict };
+    a.n_sites += 1;
+}
+
 pub const Result = struct {
     image: []u8,
     stats: Stats,
+    /// Per-site conversion verdicts (window/whole-game rewrites only).
+    audit: Audit = .{},
     /// Per plan region (same order), what happened to it.
     fate: [profile.plan_region_cap]RegionFate,
     /// Per plan region, how many sites the rewriter actually re-pointed.
@@ -3276,6 +3352,12 @@ pub fn convertWholeGame(
     // refusal policy keys on it.
     const cov: []const u8 = if (static_walk) try extendCoverage(gpa, image, header, usage) else usage;
     defer if (static_walk) gpa.free(@constCast(cov));
+    // Reach, for the audit: instructions the profile never ran that the
+    // recursive descent found anyway.
+    const cov_added: u32 = if (static_walk)
+        usage_map.countOpcodes(cov) - usage_map.countOpcodes(usage)
+    else
+        0;
     // Executed flags are merged across the $80-$BF fast mirrors throughout:
     // the same ROM byte, the same file offset, possibly only ever executed
     // through the mirror.
@@ -3871,6 +3953,18 @@ pub fn convertWholeGame(
     const out = try gpa.dupe(u8, image);
     errdefer gpa.free(out);
     var res: Result = .{ .image = out, .stats = .{}, .fate = @splat(.not_attempted) };
+    res.stats.cov_static_added = cov_added;
+    {
+        var ab: u32 = 0;
+        while (ab < 0x40 and ab * 0x8000 < out.len) : (ab += 1) {
+            var aa: u32 = 0x8000;
+            while (aa < 0x10000) : (aa += 1) {
+                const ac = (ab << 16) | aa;
+                if ((cov[ac] | cov[0x80_0000 | ac]) & usage_map.flag_opcode != 0)
+                    res.audit.bank_ops[ab] += 1;
+            }
+        }
+    }
     res.stats.static_skipped = static_skipped;
 
     // Re-bank $7E long sites into the identity window (bank $7E does not
@@ -4015,6 +4109,7 @@ pub fn convertWholeGame(
                 .long, .long_x => {
                     const b = out[file + 3];
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    const le: u8 = if (site_evidence) |s| s[cpu_addr] | s[0x80_0000 | cpu_addr] else 0;
                     if (bwram) {
                         // $7E/$7F are not on the SA-1's bus; $40/$41 are the
                         // same bytes of BW-RAM, at the same offsets — and
@@ -4022,6 +4117,7 @@ pub fn convertWholeGame(
                         if (b == 0x7E or b == 0x7F) {
                             out[file + 3] = b - 0x3E;
                             res.stats.rewritten_long += 1;
+                            auditNote(&res.audit, file, op, v, le, .rebanked);
                         } else if (b == 0x7D and v >= 0xFF00) {
                             // The NEGATIVE-OFFSET idiom: `SBC $7D:FFFB,X`
                             // wraps through the bank boundary into
@@ -4031,6 +4127,7 @@ pub fn convertWholeGame(
                             // wraps into $40 the same distance.
                             out[file + 3] = 0x3F;
                             res.stats.rewritten_long += 1;
+                            auditNote(&res.audit, file, op, v, le, .rebanked);
                         } else if ((b & 0x7F) <= 0x3F and v < 0x2000 and
                             (usage_map.mode(op) == .long or blk: {
                                 // Indexed long through a system bank is
@@ -4046,13 +4143,35 @@ pub fn convertWholeGame(
                         {
                             std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
                             res.stats.rewritten_long += 1;
+                            auditNote(&res.audit, file, op, v, le, .shifted);
+                        } else if ((b & 0x7F) <= 0x3F and v < 0x2000) {
+                            // An indexed long through a system bank whose
+                            // evidence did not clear it: the mirror and a
+                            // ROM table share the shape, and nothing here
+                            // decides between them.
+                            auditNote(&res.audit, file, op, v, le, if (le == 0)
+                                .left_unproven
+                            else if (le & usage_map.site_wram_low != 0)
+                                .left_mixed
+                            else
+                                .left_rom);
+                        } else {
+                            auditNote(&res.audit, file, op, v, le, .left_high);
                         }
                     } else if (b == 0x7E and v < 0x800) {
                         out[file + 3] = 0x00;
                         res.stats.rewritten_long += 1;
                     }
                 },
-                .abs, .abs_x, .abs_y => if (bwram and !dbr_bw) {
+                .abs, .abs_x, .abs_y => if (bwram and dbr_bw) {
+                    // Skipped because the data bank is provably BW-RAM
+                    // here. Audited rather than silent: the pin comes from
+                    // a static tracker, and a wrong pin leaves a live site
+                    // addressing the abandoned home.
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    const pe: u8 = if (site_evidence) |s| s[cpu_addr] | s[0x80_0000 | cpu_addr] else 0;
+                    auditNote(&res.audit, file, op, v, pe, if (v < 0x2000) .left_pinned else .left_high);
+                } else if (bwram) {
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                     // Measured evidence first: a site whose observed data
                     // traffic was ALL low-WRAM shifts; a site that ever
@@ -4076,6 +4195,7 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
                         thunks[n_thunks] = .{ .file = file, .v = v, .op = op };
                         n_thunks += 1;
+                        auditNote(&res.audit, file, op, v, e, .thunk_dbr);
                         continue;
                     }
                     // A site SPLIT ON ITS INDEX: a tiny-base indexed abs
@@ -4115,6 +4235,7 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
                         ithunks[n_ithunks] = .{ .file = file, .v = v, .op = op };
                         n_ithunks += 1;
+                        auditNote(&res.audit, file, op, v, e, .thunk_index);
                         continue;
                     }
                     // Cell coherence (unindexed, single-context site): a
@@ -4134,10 +4255,19 @@ pub fn convertWholeGame(
                         e == usage_map.site_wram_low
                     else
                         usage_map.mode(op) == .abs or v >= 0x100;
-                    if (!shift_it) continue;
-                    if (v < 0x2000) {
+                    if (v >= 0x2000) {
+                        auditNote(&res.audit, file, op, v, e, .left_high);
+                    } else if (!shift_it) {
+                        auditNote(&res.audit, file, op, v, e, if (e == 0)
+                            .left_unproven
+                        else if (e & usage_map.site_wram_low != 0)
+                            .left_mixed
+                        else
+                            .left_rom);
+                    } else {
                         std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
                         res.stats.rewritten_abs += 1;
+                        auditNote(&res.audit, file, op, v, e, .shifted);
                     }
                 },
                 // Indirect control flow reads its *pointer* from bank $00:

@@ -765,3 +765,77 @@ no FastROM: the tree that shipped at 48% utilization now fails
 verification in this configuration, and FastROM layered on top trips
 the pixel gate outright. Correctness first, then speed; the two are
 being paid for in that order.
+
+## 13. The audit — a denominator at last
+
+Every defect in section 12 was found by playing the game until something
+broke. That works, and it is not a method: it has no denominator. You
+cannot tell a game with three landmines left from one with three hundred,
+and you cannot tell either from a game with none.
+
+`--audit` converts once, prints what the rewriter decided about every
+memory-touching site it saw, and stops before verification — minutes
+instead of the whole ladder. The verdicts are **recorded as the decisions
+are made**, never re-derived afterwards: an audit that reimplements the
+rules is an audit that can disagree with them, and then it is worse than
+nothing.
+
+Nine verdicts, of which six are decisions and three are bets:
+
+    shifted / rebanked / thunk_dbr / thunk_index    the site was converted
+    left_high     operand >= $2000 — MMIO or ROM, native either way
+    left_rom      measured traffic never touched low WRAM
+    ---
+    left_pinned   the data bank was STATICALLY proved BW-RAM here
+    left_mixed    measured low WRAM, but not only, and no thunk shape fits
+    left_unproven no evidence at all, and the shape is not one we move
+
+The last three are the ones that address the abandoned home. Naming them
+as a class is the whole point.
+
+**What it said about Gradius III.** 1531 sites decided: 690 shifted, 115
+re-banked, 88 thunked, 447 left high, 157 left on ROM evidence, and **34
+still addressing the pre-conversion home** — of which 30 are `left_pinned`
+whose *measured* evidence agrees with the static pin (low risk, and now
+visible), and four are not:
+
+    $00:90ae  LDA $000000,X   ev low|rom    the slot walker
+    $00:90ba  LDA $000002,X   ev low|rom|other
+    $00:90c4  LDA $000000,X   ev low|rom
+    $00:f330  LDA $000000,X   ev (none)
+
+All four are `long,X` with a tiny base — the *same* index-split class the
+absolute thunk was built for, in the one addressing mode the thunk does
+not cover. Three of them sit in the slot walker at `$00:9082-$90AA`: the
+routine at the centre of the boss freeze and the collision defects. The
+audit found in one run what six QA sessions had been circling.
+
+**And the reach number is the real headline.** Per bank, instructions the
+rewriter has ever seen — executed, plus everything `--wg-static`'s
+recursive descent added:
+
+    $00  8338      $01  0      $02  2559     $03..$0F  0
+
+Fourteen of sixteen banks, ~29 KB of content each, and not one instruction
+seen in any of them. Most of that is graphics — but not all of it, and the
+audit cannot tell which, so it says so. The proof that it is not all
+graphics was already in hand from the menu chase:
+
+    $01:AAF7  LDA $0101   UNCHANGED
+    $04:E884  LDA $0101   UNCHANGED
+    $05:E2D9  LDA $0101   UNCHANGED
+
+Three live instructions reading the menu's redraw flag out of low WRAM, in
+three different dark banks, none of them rewritten, none of them
+discovered by any recording or by static descent. The descent seeds from
+executed code and follows control flow; the way into those banks is an
+indirect mode dispatch, and indirect dispatch is exactly what static
+analysis cannot follow. That is the same wall as the `JMP ($0000)` macro,
+met from the other side.
+
+So the honest statement of where the conversion stands is not "we fixed
+the laser". It is: **the rewriter has seen two of sixteen banks, and every
+instruction in the other fourteen that touches low WRAM is unconverted.**
+The next lever is reach across bank boundaries — jump-table and
+dispatch-table recovery seeded by measured coverage — not another
+recording.

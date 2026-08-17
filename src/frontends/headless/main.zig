@@ -563,6 +563,9 @@ pub var dbg_n_site_ev: usize = 0;
 /// Undocumented --ev-only: stop right after the --site-ev report, before any
 /// plan, conversion, or verification work.
 pub var dbg_ev_only: bool = false;
+/// --audit: convert ONCE, print the per-site conversion audit, and stop
+/// before verification — minutes instead of the whole ladder.
+pub var dbg_audit: bool = false;
 
 fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
     con.bus.input_polled = false;
@@ -2094,6 +2097,15 @@ fn runSa1Gen(
             else => return e,
         };
 
+        // --audit: the conversion is the answer; verification is not being
+        // asked for. Reported on the FIRST attempt, which is the full
+        // candidate set — the one whose decisions describe the whole image.
+        if (dbg_audit) {
+            try printAudit(out, image, ub, &res);
+            try out.flush();
+            return;
+        }
+
         // The FastROM layer, applied to every attempt image BEFORE
         // verification so the verified artifact IS the shipped one. The
         // profiler's observed MEMSEL stores come from the surface-0
@@ -2856,6 +2868,113 @@ fn reportSa1(
 /// stopped growing. New instructions still appearing in the last tenth of
 /// a run mean the profile had not settled — so whatever the rewriter did,
 /// it did on partial evidence.
+/// The conversion audit (`--audit`): what the rewriter did with every
+/// memory-touching site it saw, and — the part that matters — what it left
+/// alone and why.
+///
+/// The point is a DENOMINATOR. Until this existed, unconverted sites were
+/// discovered by playing the game until something broke: twelve of them
+/// turned up that way, and the laser bug lived among them for a week. A
+/// census does not prove the conversion correct — it cannot, because the
+/// hard question is which home an operand addresses at run time and that is
+/// not a static property — but it turns "what else is broken?" from a QA
+/// lottery into a list with a length.
+fn printAudit(
+    out: *std.Io.Writer,
+    image: []const u8,
+    ub: []const u8,
+    res: *const core.sa1gen.Result,
+) !void {
+    const V = core.sa1gen.Verdict;
+    const a = &res.audit;
+
+    try out.print("\nCONVERSION AUDIT\n", .{});
+
+    // --- reach: how much of the ROM the rewriter can even see ----------
+    const dyn = core.usage_map.countOpcodes(ub);
+    try out.print(
+        "\n  reach: {} instruction(s) executed while profiling",
+        .{dyn},
+    );
+    if (res.stats.cov_static_added != 0)
+        try out.print(", + {} found by static\n  descent (--wg-static)", .{res.stats.cov_static_added})
+    else
+        try out.print("\n  (--wg-static NOT used: code the profile never ran was never rewritten)", .{});
+    try out.print("\n", .{});
+
+    // Per bank: instructions seen against bytes that are not blank fill.
+    // A bank with content and no coverage is either graphics or code
+    // nobody has played into — this cannot tell which, and says so.
+    try out.print("\n  per bank — executed / seen by the rewriter / non-blank bytes:\n   ", .{});
+    var bank: u32 = 0;
+    var dark_banks: u32 = 0;
+    while (bank * 0x8000 < image.len) : (bank += 1) {
+        var ran: u32 = 0;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu = (bank << 16) | a16;
+            if ((ub[cpu] | ub[0x80_0000 | cpu]) & core.usage_map.flag_opcode != 0) ran += 1;
+        }
+        const seen = res.audit.bank_ops[bank];
+        const lo = bank * 0x8000;
+        const hi = @min(lo + 0x8000, image.len);
+        var content: u32 = 0;
+        for (image[lo..hi]) |b| content += @intFromBool(b != 0xFF and b != 0x00);
+        if (seen == 0 and content > 0x1000) dark_banks += 1;
+        try out.print(" ${x:0>2}:{}/{}/{}", .{ bank, ran, seen, content });
+        if (bank % 4 == 3) try out.print("\n   ", .{});
+    }
+    try out.print("\n  {} bank(s) hold content the rewriter has never seen an instruction in\n", .{dark_banks});
+    try out.print("  (graphics and unplayed code look identical from here — this is a\n  prompt to record a surface, not a defect count)\n", .{});
+
+    // --- what happened to the sites it did see -------------------------
+    const rows = [_]struct { v: V, label: []const u8 }{
+        .{ .v = .shifted, .label = "moved into the window (+$6000)" },
+        .{ .v = .rebanked, .label = "re-banked $7E/$7F -> $40/$41" },
+        .{ .v = .thunk_dbr, .label = "thunked, dispatching on the data bank" },
+        .{ .v = .thunk_index, .label = "thunked, dispatching on the index" },
+        .{ .v = .left_high, .label = "left: operand >= $2000 (MMIO or ROM)" },
+        .{ .v = .left_rom, .label = "left: measured traffic never touched low WRAM" },
+        .{ .v = .left_pinned, .label = "left: data bank statically proved BW-RAM" },
+        .{ .v = .left_mixed, .label = "LEFT: measured low WRAM, but not only" },
+        .{ .v = .left_unproven, .label = "LEFT: no evidence, shape not provable" },
+    };
+    var total: u32 = 0;
+    for (rows) |r| total += a.count(r.v);
+    try out.print("\n  {} memory-touching site(s) decided:\n", .{total});
+    for (rows) |r| {
+        const n = a.count(r.v);
+        if (n == 0) continue;
+        try out.print("    {d:>6}  {s}\n", .{ n, r.label });
+    }
+
+    const hazards = a.count(.left_pinned) + a.count(.left_mixed) + a.count(.left_unproven);
+    if (hazards == 0) {
+        try out.print("\n  No site was left addressing the abandoned home on a guess.\n", .{});
+        return;
+    }
+    try out.print(
+        "\n  {} site(s) still address the pre-conversion home. Each is a bet that\n" ++
+            "  the path reaching it does not want low WRAM; `--stale` is the way to\n" ++
+            "  collect the ones that lose.\n\n",
+        .{hazards},
+    );
+    for (a.sites[0..a.n_sites]) |s| {
+        const b: u32 = s.file / 0x8000;
+        const a16: u32 = 0x8000 + (s.file % 0x8000);
+        var ev: [4]u8 = "----".*;
+        if (s.ev & core.usage_map.site_wram_low != 0) ev[0] = 'L';
+        if (s.ev & core.usage_map.site_rom != 0) ev[1] = 'R';
+        if (s.ev & core.usage_map.site_wram_bank != 0) ev[2] = 'B';
+        if (s.ev & core.usage_map.site_other != 0) ev[3] = 'O';
+        try out.print("    ${x:0>2}:{x:0>4}  op ${x:0>2}  ${x:0>4}  ev {s}  {s}\n", .{
+            b, a16, s.op, s.v, &ev, @tagName(s.verdict),
+        });
+    }
+    if (a.truncated != 0)
+        try out.print("    ... and {} more (list capped)\n", .{a.truncated});
+}
+
 fn printCoverage(out: *std.Io.Writer, total_ops: u32, late_ops: u32, frames: u32) !void {
     const late_pct = @as(f64, @floatFromInt(late_ops)) * 100 /
         @as(f64, @floatFromInt(@max(1, total_ops)));
@@ -3840,6 +3959,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--ev-only")) {
             dbg_ev_only = true;
+        } else if (std.mem.eql(u8, a, "--audit")) {
+            dbg_audit = true;
         } else if (std.mem.eql(u8, a, "--site-ev")) {
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, ',');
