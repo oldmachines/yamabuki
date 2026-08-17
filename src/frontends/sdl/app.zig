@@ -385,12 +385,20 @@ pub fn run(
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
     // Input-movie state. Recording appends the masks actually fed to each
-    // EXECUTED frame; anything that breaks the input-stream model (reset,
-    // load state, rewind) discards it rather than writing a movie that
-    // cannot replay. Playback drives both pads from power-on until the
-    // movie runs out, then live input takes over; its end hashes are
-    // checked right after the final frame's audio drain.
+    // EXECUTED frame; anything that breaks the input-stream model DURING a
+    // take (reset, load state, rewind) discards it rather than writing a
+    // movie that cannot replay. Playback drives both pads from the movie's
+    // start until it runs out, then live input takes over; its end hashes
+    // are checked right after the final frame's audio drain.
     var rec: ?std.array_list.Managed([2]u16) = null;
+    // The machine the take started on, when that was not power-on: recording
+    // captures it up front and the movie carries it, so a session can start a
+    // recording deep into a game instead of replaying the road to get there.
+    var rec_anchor: ?[]u8 = null;
+    // Whether the console is still exactly as it powered on. A take started
+    // here needs no anchor, which keeps "boot and record" writing the small
+    // version-1 file it always did.
+    var at_power_on = true;
     // Transient on-screen toast (state slots, saves/loads, recording):
     // drawn into the compose buffer like every overlay, so both render
     // paths show it and the shader shades it.
@@ -488,7 +496,8 @@ pub fn run(
                             .pal => con.setRegion(.pal),
                         }
                         if (rw) |*r| r.clear();
-                        discardMovieModes(&rec, &play_movie, "reset", err);
+                        at_power_on = true;
+                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "reset", err);
                         mnu = null;
                     },
                     .save_state => {
@@ -504,7 +513,9 @@ pub fn run(
                             if (sram) |*s| s.flush(io, con, err);
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
-                            discardMovieModes(&rec, &play_movie, "load state", err);
+                            at_power_on = false;
+                            at_power_on = false;
+                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "load state", err);
                             toast.set("STATE LOADED - SLOT {d}", .{slot});
                         } else toast.set("NO STATE IN SLOT {d}", .{slot});
                         mnu = null;
@@ -566,7 +577,8 @@ pub fn run(
                         .pal => con.setRegion(.pal),
                     }
                     if (rw) |*r| r.clear();
-                    discardMovieModes(&rec, &play_movie, "reset", err);
+                    at_power_on = true;
+                    discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "reset", err);
                 },
                 .save_state => {
                     saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
@@ -577,7 +589,8 @@ pub fn run(
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
-                        discardMovieModes(&rec, &play_movie, "load state", err);
+                        at_power_on = false;
+                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "load state", err);
                         toast.set("STATE LOADED - SLOT {d}", .{slot});
                     } else toast.set("NO STATE IN SLOT {d}", .{slot});
                 },
@@ -585,9 +598,11 @@ pub fn run(
                     if (rec != null) {
                         // Stop: the movie's hashes describe the machine as it
                         // stands right now, after the last recorded frame.
-                        writeMovie(io, gpa, &opts, con, rec.?.items, audio_hash, err);
+                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, err);
                         rec.?.deinit();
                         rec = null;
+                        if (rec_anchor) |a| gpa.free(a);
+                        rec_anchor = null;
                         toast.set("RECORDING SAVED", .{});
                     } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
                         try err.print("movie: cannot record during playback\n", .{});
@@ -596,21 +611,35 @@ pub fn run(
                     } else if (opts.movies_dir == null) {
                         try err.print("movie: recording unavailable — no per-user data directory\n", .{});
                         try err.flush();
-                    } else {
-                        // Start from power-on: that is the only state a
-                        // replay can reconstruct.
-                        con.repower();
-                        switch (opts.region) {
-                            .auto => {},
-                            .ntsc => con.setRegion(.ntsc),
-                            .pal => con.setRegion(.pal),
-                        }
+                    } else if (at_power_on) {
+                        // Nothing has run yet, so the inputs alone reconstruct
+                        // the session: no anchor, and the file stays version 1.
                         if (rw) |*r| r.clear();
                         audio_hash = core.console.audio_hash_init;
                         rec = .init(gpa);
                         try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
                         try err.flush();
                         toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
+                    } else {
+                        // Mid-session: capture the machine as the anchor the
+                        // movie will carry. Recording a late stage should not
+                        // require replaying the road to it — but the take is
+                        // only honest if the anchor is captured BEFORE the
+                        // first recorded frame runs, which is here.
+                        if (gpa.alloc(u8, core.AnyConsole.state_size)) |anchor| {
+                            _ = con.saveState(anchor);
+                            rec_anchor = anchor;
+                            if (rw) |*r| r.clear();
+                            audio_hash = core.console.audio_hash_init;
+                            rec = .init(gpa);
+                            try err.print("movie: recording from here ({d} KiB start state carried; press again to stop and save)\n", .{anchor.len / 1024});
+                            try err.flush();
+                            toast.set("RECORDING FROM HERE - F10 STOPS", .{});
+                        } else |_| {
+                            try err.print("movie: cannot record — out of memory for the start state\n", .{});
+                            try err.flush();
+                            toast.set("RECORDING FAILED - OUT OF MEMORY", .{});
+                        }
                     }
                 },
                 .slot_next => {
@@ -673,10 +702,11 @@ pub fn run(
         con.setButtons(1, feed[1]);
         if (rewinding) {
             _ = rw.?.rewindStep(con);
-            discardMovieModes(&rec, &play_movie, "rewind", err);
+            discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "rewind", err);
         } else if (!halted) {
             con.runFrame();
             frames_run += 1;
+            at_power_on = false;
             if (rec) |*r| r.append(feed) catch {};
             if (play_movie) |m| {
                 if (play_idx < m.frames.len) {
@@ -1857,11 +1887,15 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
 
 /// Encode and write one screenshot, named by the first free index — no
 /// wall-clock dependency, and the names sort in capture order.
-/// Reset, load-state, and rewind rewrite history, which an input stream
-/// cannot follow: a recording in progress is discarded (a movie that cannot
-/// replay must not be written) and a replay in progress hands input back.
+/// Reset, load-state, and rewind rewrite history MID-TAKE, which an input
+/// stream cannot follow: a recording in progress is discarded (a movie that
+/// cannot replay must not be written) and a replay in progress hands input
+/// back. Note this is about time travel *during* a recording — starting one
+/// from a loaded state is fine, and carries that state as the movie's anchor.
 fn discardMovieModes(
+    gpa: std.mem.Allocator,
     rec: *?std.array_list.Managed([2]u16),
+    rec_anchor: *?[]u8,
     play: *?util.movie.Movie,
     why: []const u8,
     err: *std.Io.Writer,
@@ -1869,6 +1903,8 @@ fn discardMovieModes(
     if (rec.*) |*r| {
         r.deinit();
         rec.* = null;
+        if (rec_anchor.*) |a| gpa.free(a);
+        rec_anchor.* = null;
         err.print("movie: recording discarded ({s} breaks replay determinism)\n", .{why}) catch {};
         err.flush() catch {};
     }
@@ -1888,6 +1924,7 @@ fn writeMovie(
     opts: *const Options,
     con: *core.AnyConsole,
     frames: []const [2]u16,
+    anchor: ?[]u8,
     audio_hash: u64,
     err: *std.Io.Writer,
 ) void {
@@ -1906,6 +1943,7 @@ fn writeMovie(
         .end_frame_hash = core.console.hashFrame(con.framebuffer()),
         .end_audio_hash = audio_hash,
         .frames = @constCast(frames),
+        .anchor = anchor,
     };
     const data = util.movie.encode(gpa, m) catch |e| {
         err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
@@ -1918,7 +1956,9 @@ fn writeMovie(
         err.flush() catch {};
         return;
     };
-    err.print("movie: {s} ({} frames, end hashes recorded)\n", .{ path, frames.len }) catch {};
+    err.print("movie: {s} ({} frames{s}, end hashes recorded)\n", .{
+        path, frames.len, if (anchor != null) ", anchored to a start state" else ", from power-on",
+    }) catch {};
     err.flush() catch {};
 }
 

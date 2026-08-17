@@ -349,6 +349,28 @@ pub fn main(init: std.process.Init) !void {
     const movs: []const util.movie.Movie = movs_buf[0..args.n_movies];
     const mov: ?util.movie.Movie = if (movs.len != 0) movs[0] else null;
 
+    // A verification surface is replayed on BOTH the stock image and the
+    // conversion. An anchor only restores the machine it was taken on, so in
+    // window mode — where the conversion's WRAM lives in BW-RAM and the shim's
+    // D/S moves never ran for a saved state — one of those two replays is
+    // guaranteed to be nonsense whichever image the anchor came from. Nonsense
+    // that still produces frames and hashes is the worst failure this system
+    // has, so it is refused here rather than measured.
+    if (args.window) for (movs, 0..) |m, i| {
+        if (m.anchor == null) continue;
+        try out.print(
+            "error: --movie '{s}' is anchored to a save state, which window mode cannot verify\n" ++
+                "       (a window image cannot be seeded mid-game, and a stock replay of an anchored\n" ++
+                "       recording starts from the wrong machine — one side would be measuring noise)\n" ++
+                "       use it as --cover-movie instead: the harvest replays it on its own image and\n" ++
+                "       donates the coverage and evidence, which is what a late-game recording is for.\n",
+            .{args.movies[i]},
+        );
+        try out.flush();
+        std.process.exit(2);
+    };
+
+
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
@@ -400,6 +422,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    // After --state on purpose: a movie's own anchor is the machine ITS
+    // inputs were recorded against, so it wins over a session-wide one.
+    try anchorMovie(con, mov, "movie", out);
 
     // Window debugging (undocumented --dump-ram): dump memories after the
     // run — WRAM (128K), BW-RAM's first 64K, VRAM — plus the CPU's resting
@@ -1159,6 +1184,7 @@ fn runTickDump(
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try anchorMovie(con, mov, "movie", out);
 
     const snap = try gpa.create(core.bus.Bus.TickSnap);
     snap.* = .{};
@@ -1304,6 +1330,29 @@ fn seedConverted(
             .bwram => @memcpy(sa1.bwram[r.dest_off..][0..r.len], src),
         }
     }
+}
+
+/// Restore the machine a movie's inputs were recorded against, before its
+/// first frame runs. A movie recorded from power-on carries no anchor and
+/// this is a no-op; an anchored one is meaningless without it, so a state
+/// this console refuses is fatal rather than skipped — replaying anchored
+/// inputs from power-on produces a plausible-looking run of pure nonsense.
+///
+/// The console must be the image the anchor was taken on. That holds for
+/// replay, the stale detector and the cover harvest (all replay a recording
+/// on its own image); it does NOT hold for a stock-side verification surface
+/// in window mode, which is refused at load time instead.
+fn anchorMovie(con: anytype, mov: ?util.movie.Movie, what: []const u8, out: *std.Io.Writer) !void {
+    const m = mov orelse return;
+    const a = m.anchor orelse return;
+    con.loadState(a) catch |e| {
+        try out.print("error: the {s} carries a start state this console cannot restore: {s}\n" ++
+            "       (a save state is tied to the core's layout and the image it was taken on)\n", .{ what, @errorName(e) });
+        try out.flush();
+        std.process.exit(1);
+    };
+    try out.print("movie anchor: {s} restored ({} frames replay from it)\n", .{ what, m.frames.len });
+    try out.flush();
 }
 
 fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
@@ -1723,6 +1772,16 @@ fn runSa1Gen(
     // attract too.
     const evidence_state: ?[]const u8 = if (args.window) state_bytes else null;
     const verify_state: ?[]const u8 = if (args.window) null else state_bytes;
+    // A surface's own anchor beats the session's --state: it IS the machine
+    // that surface's inputs were recorded against. Window mode never gets
+    // here with an anchored surface (refused at load, see checkSurfaceAnchors)
+    // so this only ever seeds an image whose layout matches the anchor's.
+    const surfaceAnchor = struct {
+        fn f(ms: []const util.movie.Movie, s: usize, fallback: ?[]const u8) ?[]const u8 {
+            if (s < ms.len) if (ms[s].anchor) |a| return a;
+            return fallback;
+        }
+    }.f;
     if (n_surf > 1) {
         try out.print("baseline (profiled) + verify runs over {} surfaces:", .{n_surf});
         for (totals[0..n_surf]) |t| try out.print(" {}f", .{t});
@@ -1814,7 +1873,7 @@ fn runSa1Gen(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
-    if (verify_state) |sb| con.loadState(sb) catch |e| {
+    if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
         try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
         try out.flush();
         std.process.exit(1);
@@ -1843,6 +1902,7 @@ fn runSa1Gen(
         const con_s = try gpa.create(core.ProfilingConsole);
         con_s.init(cart_s);
         con_s.usage = &umap;
+        if (surfaceAnchor(movs, s, verify_state)) |sb| try con_s.loadState(sb);
         var audio_s = core.console.audio_hash_init;
         var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
         try samples_s.ensureTotalCapacity(totals[s]);
@@ -1879,6 +1939,7 @@ fn runSa1Gen(
             const con_p = try gpa.create(core.ProfilingConsole);
             con_p.init(cart_p);
             con_p.usage = &umap;
+            if (surfaceAnchor(movs, s, verify_state)) |sb| try con_p.loadState(sb);
             for (0..totals[s] + cov_pad) |i| {
                 feedMovie(con_p, movAt(movs, s), i);
                 con_p.runFrame();
@@ -1936,6 +1997,10 @@ fn runSa1Gen(
         const ccon = try gpa.create(core.ProfilingConsole);
         ccon.init(ccart);
         ccon.usage = &cover_map;
+        // The harvest replays a recording on the very image it was made on,
+        // so an anchor restores exactly the machine it describes — this is
+        // the path that lets a LATE-GAME recording donate coverage at all.
+        try anchorMovie(ccon, cm, "cover movie", out);
         for (0..cm.frames.len + 600) |i| {
             feedMovie(ccon, cm, i);
             ccon.runFrame();
@@ -2311,7 +2376,7 @@ fn runSa1Gen(
                 const cart2 = try core.Cartridge.load(gpa, res.image);
                 const con2 = try gpa.create(core.ProfilingConsole);
                 con2.init(cart2);
-                if (verify_state) |sb| try seedConverted(con2, sb, &plan, &res);
+                if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
                 for (0..s_total) |i| {
                     feedMovie(con2, movAt(movs, s), i);
                     con2.runFrame();
@@ -2366,7 +2431,7 @@ fn runSa1Gen(
                 (!args.whole_game or args.window))
             {
                 if (n_surf > 1) try out.print("  surface {} of {}:\n", .{ s + 1, n_surf });
-                s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), verify_state, args.window, s_total, &fail_why, &fail_frame);
+                s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), surfaceAnchor(movs, s, verify_state), args.window, s_total, &fail_why, &fail_frame);
             }
             if (s_tier) |t| {
                 if (@intFromEnum(t) > @intFromEnum(passed.?)) passed = t;
@@ -3255,6 +3320,7 @@ fn runReport(
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try anchorMovie(con, mov, "movie", out);
 
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.

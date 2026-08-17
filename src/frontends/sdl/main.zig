@@ -282,7 +282,20 @@ fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted,
         try err.flush();
         return error.BootFailed;
     }
-    try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+    // An anchored movie's inputs mean nothing without the machine they were
+    // recorded against, so restoring it is part of loading the movie — and a
+    // state this console refuses is as fatal as a CRC mismatch.
+    if (m.anchor) |a| {
+        b.con.loadState(a) catch |e| {
+            try err.print("error: movie '{s}' carries a start state this build cannot restore: {s}\n" ++
+                "       (a save state is tied to the core's layout — re-record on this build)\n", .{ path, @errorName(e) });
+            try err.flush();
+            return error.BootFailed;
+        };
+        try err.print("movie: {s} — {} frames, replaying from its start state\n", .{ path, m.frames.len });
+    } else {
+        try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+    }
     try err.flush();
     return m;
 }
