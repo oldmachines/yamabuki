@@ -2836,6 +2836,34 @@ fn splitThunkBody(op: u8, v: u16, ret: u8) [split_thunk_len]u8 {
     };
 }
 
+/// The LONG,X index-dispatch thunk: 29 bytes, always entered by `JSL` and
+/// always leaving by `RTL`, so it needs no bank-local home.
+///
+/// No DBR test — a long access names its bank in the operand, so the only
+/// question is the index, and the answer is the same two-way split the
+/// absolute flavor makes: an index small enough to stay under $2000 is
+/// addressing the low mirror (which moved), anything bigger is walking ROM
+/// through the same bytes (which did not). The x8 arm short-circuits for
+/// the same reason it does there: an 8-bit index over a tiny base cannot
+/// leave the low page, and a 16-bit CPX immediate would misparse anyway.
+///
+///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
+///   CPX #($2000-v) / BCS rom
+///   low: PLA / PLP / op b:v+$6000,X / RTL
+///   rom: PLA / PLP / op b:v,X       / RTL
+const long_thunk_len: u32 = 29;
+fn longThunkBody(op: u8, v: u16, bank: u8) [long_thunk_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    return .{
+        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
+        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
+        0xE0, @truncate(lim),      @truncate(lim >> 8), 0xB0, 0x07, // CPX #lim / BCS rom
+        0x68, 0x28, op, @truncate(sh),  @truncate(sh >> 8),  bank, 0x6B, // low
+        0x68, 0x28, op, @truncate(v),   @truncate(v >> 8),   bank, 0x6B, // rom
+    };
+}
+
 /// The index-dispatch thunk body (see the emission comment in
 /// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
 fn idxThunkBody(op: u8, v: u16, ret: u8) [idx_thunk_len]u8 {
@@ -3976,6 +4004,10 @@ pub fn convertWholeGame(
     var n_thunks: usize = 0;
     // Index-split sites (tiny base, measured low|rom or NOT MEASURED AT
     // ALL): dispatched on the index register's magnitude instead of the DBR.
+    // Index-split sites in LONG,X form. Separate because the site is four
+    // bytes (a `JSL`, not a `JSR`) and the body's operand carries a bank.
+    var lthunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8, bank: u8 } = undefined;
+    var n_lthunks: usize = 0;
     var ithunks: [idx_thunk_max]struct { file: u32, v: u16, op: u8 } = undefined;
     var n_ithunks: usize = 0;
     // CELL COHERENCE (window mode): per-site evidence decisions can split
@@ -4144,11 +4176,36 @@ pub fn convertWholeGame(
                             std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
                             res.stats.rewritten_long += 1;
                             auditNote(&res.audit, file, op, v, le, .shifted);
+                        } else if (window and usage_map.mode(op) == .long_x and
+                            (b & 0x7F) <= 0x3F and v < 0x100 and
+                            (le == 0 or le & usage_map.site_wram_low != 0))
+                        {
+                            // The index-split class in the addressing mode
+                            // the absolute thunk cannot reach. Same idiom,
+                            // same ambiguity — `LDA $00:0000,X` is the slot
+                            // walker's chain-follow with a small X and a ROM
+                            // table walk with a big one — but the site is
+                            // FOUR bytes, so `JSL` fits where `JSR` did not,
+                            // and a long call names its own bank: these
+                            // thunks need no bank-local home at all.
+                            //
+                            // Only the index is in question here. A long
+                            // access carries its bank in the operand, so DBR
+                            // is not consulted and the three worlds collapse
+                            // to two: small index -> the window (mirrored in
+                            // every system bank), huge index -> as written.
+                            if (n_lthunks == idx_thunk_max)
+                                return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
+                            lthunks[n_lthunks] = .{ .file = file, .v = v, .op = op, .bank = b };
+                            n_lthunks += 1;
+                            auditNote(&res.audit, file, op, v, le, .thunk_index);
                         } else if ((b & 0x7F) <= 0x3F and v < 0x2000) {
                             // An indexed long through a system bank whose
-                            // evidence did not clear it: the mirror and a
-                            // ROM table share the shape, and nothing here
-                            // decides between them.
+                            // evidence did not clear it, in a shape the
+                            // thunk does not serve (a base too big to be the
+                            // pointer idiom): the mirror and a ROM table
+                            // share it, and nothing here decides between
+                            // them.
                             auditNote(&res.audit, file, op, v, le, if (le == 0)
                                 .left_unproven
                             else if (le & usage_map.site_wram_low != 0)
@@ -4511,6 +4568,36 @@ pub fn convertWholeGame(
         }
         res.stats.split_sites = @intCast(n_all);
         res.stats.idx_split_sites = @intCast(n_ithunks);
+    }
+    // The LONG,X flavor, placed entirely in the far pool: `JSL` names its
+    // own bank, so these thunks are free of the bank-local constraint that
+    // shapes everything above. Bodies are shared by (op, operand, bank).
+    if (window and n_lthunks != 0) {
+        const LSeen = struct { v: u16, op: u8, bank: u8, at: u32 };
+        var lseen: [idx_thunk_max]LSeen = undefined;
+        var n_lseen: usize = 0;
+        for (lthunks[0..n_lthunks]) |t| {
+            var at: u32 = 0;
+            var found = false;
+            for (lseen[0..n_lseen]) |s| {
+                if (s.v == t.v and s.op == t.op and s.bank == t.bank) {
+                    at = s.at;
+                    found = true;
+                }
+            }
+            if (!found) {
+                at = far.next(long_thunk_len) orelse
+                    return refuse(refusal, .{ .reason = .no_free_space, .detail = long_thunk_len });
+                @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
+                lseen[n_lseen] = .{ .v = t.v, .op = t.op, .bank = t.bank, .at = at };
+                n_lseen += 1;
+            }
+            out[t.file] = 0x22; // JSL — the same 4-byte footprint
+            std.mem.writeInt(u16, out[t.file + 1 ..][0..2], @as(u16, @intCast(0x8000 + (at % 0x8000))), .little);
+            out[t.file + 3] = @intCast(at / 0x8000);
+        }
+        res.stats.split_sites += @intCast(n_lthunks);
+        res.stats.idx_split_sites += @intCast(n_lthunks);
     }
 
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
@@ -6491,6 +6578,91 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
+}
+
+test "window: a tiny-base LONG,X site splits on its index through a JSL thunk" {
+    // The same idiom in the addressing mode the absolute thunk cannot
+    // reach: `LDA $00:0002,X` is the slot walker's chain-follow with a
+    // small X and a ROM table walk with a big one, and Gradius III has
+    // three of them inside the walker at $00:90AE-$90C4. The site is FOUR
+    // bytes, so `JSL` fits where `JSR` did not — and because a long call
+    // names its own bank, the thunk needs no bank-local home. No DBR test
+    // either: a long access carries its bank in the operand.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    rom[0x0202] = 0x5A; // the ROM byte the huge-index walk must find
+    @memcpy(rom[0x0000..0x0010], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, 0xC2, 0x10, // CLC / XCE / SEP #$30 / REP #$10
+        0x22, 0x80, 0x80, 0x00, // small-index caller
+        0x22, 0xA0, 0x80, 0x00, // huge-index caller
+        0x80, 0xF6, // BRA back to the first JSL
+    });
+    @memcpy(rom[0x0080..0x008D], &[_]u8{
+        0xA9, 0x5C, // LDA #$5C
+        0x8D, 0x12, 0x01, // STA $0112 (plain site: shifts to the window)
+        0xA2, 0x10, 0x01, // LDX #$0110
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0x6B,
+    });
+    @memcpy(rom[0x00A0..0x00A8], &[_]u8{
+        0xA2, 0x00, 0x82, // LDX #$8200 — past the mirror: a ROM walk
+        0x22, 0x10, 0x81, 0x00, // JSL $00:8110
+        0x6B,
+    });
+    // Two helpers with the SAME (op, operand, bank): they must share one
+    // thunk body.
+    @memcpy(rom[0x0100..0x0108], &[_]u8{
+        0xBF, 0x02, 0x00, 0x00, // LDA $00:0002,X — the split site
+        0x8D, 0x70, 0x01, // STA $0170
+        0x6B,
+    });
+    @memcpy(rom[0x0110..0x0118], &[_]u8{
+        0xBF, 0x02, 0x00, 0x00,
+        0x8D, 0x74, 0x01, // STA $0174
+        0x6B,
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8006, 0x800A, 0x800E }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8080, 0x8082, 0x8085, 0x8088, 0x808C }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80A0, 0x80A3, 0x80A7 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8100, 0x8104, 0x8107, 0x8110, 0x8114, 0x8117 }) |a| markOpX16(bytes, a);
+
+    // No evidence: the shape alone decides.
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 2), res.stats.idx_split_sites);
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL, same footprint
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x0110]);
+    // One body, two callers.
+    try testing.expectEqualSlices(u8, res.image[0x0101..0x0104], res.image[0x0111..0x0114]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+    // Small index: the read followed the store into the window.
+    try testing.expectEqual(@as(u8, 0x5C), con.bus.sa1.bwram[0x0170]);
+    // Huge index: the read still walked ROM.
+    try testing.expectEqual(@as(u8, 0x5A), con.bus.sa1.bwram[0x0174]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0112]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
 }
 
