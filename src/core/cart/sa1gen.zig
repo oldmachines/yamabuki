@@ -2376,7 +2376,14 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, thun
                 // Same I-RAM hazard as the absolute arm: an unshifted
                 // indexed-long low-mirror site diverges on the SA-1
                 // unless its measured traffic was pure ROM.
-                if (judge and usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and v < 0x2000) {
+                // A base at or above $FF00 wraps forward into the NEXT
+                // bank's low page, so it reaches the mirror just as surely
+                // as a base below $2000 — and testing only `v < $2000`
+                // is how `LDA $02:FFFF,X` was admitted into the physics
+                // tree and rendered the stage-1 boss out of I-RAM.
+                if (judge and usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and
+                    (v < 0x2000 or v >= 0xFF00))
+                {
                     const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
                     const shifted = e != 0 and e == usage_map.site_wram_low;
                     if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) {
@@ -3005,6 +3012,49 @@ fn idxThunkBodyV2(op: u8, v: u16, ret: u8) [idx_thunk_v2_len]u8 {
         cp,   @truncate(lim),       @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
         0x28, op, @truncate(sh),  @truncate(sh >> 8),  ret, // low: PLP / op v+$6000
         0x28, op, @truncate(v),   @truncate(v >> 8),   ret, // rom: PLP / op v
+    };
+}
+
+/// The NEGATIVE-BASE `long,X` thunk. `LDA $02:FFFF,X` reaches the byte
+/// BEFORE a bank boundary when X is small, wrapping forward into the next
+/// bank's low page — `$02:FFFF` + 7 is `$03:0006`, which is relocated WRAM
+/// on the S-CPU and the SA-1's OWN I-RAM inside an offloaded copy. The
+/// slot walker uses the idiom on the boss's node-insertion path, which is
+/// why the stage-1 boss rendered as garbage: the tree read I-RAM for its
+/// chain links. Every net missed it, because all three tested `v < $2000`
+/// and $FFFF is not — the thunk rule, the window shift, and the
+/// eligibility walk's hazard check, which is how the tree was admitted.
+///
+/// Two compares, because the low mirror is a RANGE here rather than a
+/// ceiling: X below `$10000 - v` has not wrapped yet and is still reading
+/// this bank's ROM tail; X that far plus $2000 or more has passed the
+/// mirror. Only between them is the address the one that moved.
+///
+/// No A scratch: the dispatch reads X only. `REP #$10` makes the
+/// immediates parse and X read whole whatever width the caller had —
+/// setting the X flag zeroes XH, so an x8 caller's index has the same
+/// numeric value either way — and PLP puts the caller's width back before
+/// the op, which runs last so the exit flags are its own.
+///
+///   PHP / REP #$10
+///   CPX #($10000-v) / BCC rom      ; not wrapped: ROM tail
+///   CPX #($10000-v+$2000) / BCS rom ; past the mirror
+///   low: PLP / op (b+1):(v+$6000) / RTL
+///   rom: PLP / op b:v              / RTL
+const long_neg_thunk_len: u32 = 25;
+fn longNegThunkBody(op: u8, v: u16, bank: u8) [long_neg_thunk_len]u8 {
+    const lo: u16 = @intCast(0x10000 - @as(u32, v)); // wrap threshold
+    const hi: u16 = lo +% 0x2000;
+    // EA' = EA + $6000: the +$6000 always carries out of a base >= $FF00,
+    // so the bank advances and the operand keeps the same distance.
+    const sh: u16 = v +% wg_bw_window;
+    const sb: u8 = bank +% 1;
+    return .{
+        0x08, 0xC2, 0x10, // PHP / REP #$10
+        0xE0, @truncate(lo),      @truncate(lo >> 8), 0x90, 0x0B, // CPX #lo / BCC rom
+        0xE0, @truncate(hi),      @truncate(hi >> 8), 0xB0, 0x06, // CPX #hi / BCS rom
+        0x28, op, @truncate(sh),  @truncate(sh >> 8), sb,   0x6B, // low: the window
+        0x28, op, @truncate(v),   @truncate(v >> 8),  bank, 0x6B, // rom: as written
     };
 }
 
@@ -4381,7 +4431,7 @@ pub fn convertWholeGame(
                             res.stats.rewritten_long += 1;
                             auditNote(&res.audit, file, op, v, le, .shifted);
                         } else if (window and usage_map.mode(op) == .long_x and
-                            (b & 0x7F) <= 0x3F and v < 0x100 and
+                            (b & 0x7F) <= 0x3F and (v < 0x100 or v >= 0xFF00) and
                             (le == 0 or le & usage_map.site_wram_low != 0))
                         {
                             // The index-split class in the addressing mode
@@ -4427,7 +4477,9 @@ pub fn convertWholeGame(
                             lthunks[n_lthunks] = .{ .file = file, .v = v, .op = op, .bank = b };
                             n_lthunks += 1;
                             auditNote(&res.audit, file, op, v, le, .thunk_index);
-                        } else if ((b & 0x7F) <= 0x3F and v < 0x2000) {
+                        } else if ((b & 0x7F) <= 0x3F and (v < 0x2000 or
+                            (usage_map.mode(op) == .long_x and v >= 0xFF00)))
+                        {
                             // An indexed long through a system bank whose
                             // evidence did not clear it, in a shape the
                             // thunk does not serve (a base too big to be the
@@ -4848,9 +4900,17 @@ pub fn convertWholeGame(
                 }
             }
             if (!found) {
-                at = far.next(long_thunk_len) orelse
-                    return refuse(refusal, .{ .reason = .no_free_space, .detail = long_thunk_len });
-                @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
+                // A base at or above $FF00 wraps forward into the NEXT
+                // bank's low page and needs the two-compare body; a tiny
+                // base stays in its own bank and needs the ceiling one.
+                const neg = t.v >= 0xFF00;
+                const want: u32 = if (neg) long_neg_thunk_len else long_thunk_len;
+                at = far.next(want) orelse
+                    return refuse(refusal, .{ .reason = .no_free_space, .detail = want });
+                if (neg)
+                    @memcpy(out[at..][0..long_neg_thunk_len], &longNegThunkBody(t.op, t.v, t.bank))
+                else
+                    @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
                 lseen[n_lseen] = .{ .v = t.v, .op = t.op, .bank = t.bank, .at = at };
                 n_lseen += 1;
                 if (n_lbodies < lbodies.len) {
@@ -6905,6 +6965,93 @@ test "window: measured evidence drops the thunk's data-bank arm" {
     try testing.expectEqual(@as(u8, 0x44), con.bus.sa1.bwram[0x0140]);
     try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
+}
+
+test "window: a NEGATIVE-base LONG,X site follows its wrap into the window" {
+    // `LDA $01:FFFF,X` reads the byte before a bank boundary, so a small X
+    // wraps FORWARD into the next bank's low page — the WRAM mirror, which
+    // moved. Gradius III's slot walker uses the idiom on the boss's
+    // node-insertion path, and inside an offloaded copy that page is the
+    // SA-1's own I-RAM: the stage-1 boss rendered out of I-RAM garbage.
+    // Every rule missed it by testing `v < $2000`.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    rom[0xFFFF] = 0x3C; // $01:FFFF — what an UNWRAPPED read must find
+    @memcpy(rom[0x0000..0x0014], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, 0xC2, 0x10, // CLC / XCE / SEP #$30 / REP #$10
+        0x22, 0x80, 0x80, 0x00, // X=7      -> wraps into the mirror
+        0x22, 0xA0, 0x80, 0x00, // X=0      -> not wrapped, ROM
+        0x22, 0xC0, 0x80, 0x00, // X=$8001  -> far past the mirror
+        0x80, 0xF2, // BRA back to the first JSL
+    });
+    @memcpy(rom[0x0080..0x0090], &[_]u8{
+        0xA9, 0x77, // LDA #$77
+        0x8D, 0x06, 0x00, // STA $0006 (plain site: shifts into the window)
+        0xA2, 0x07, 0x00, // LDX #$0007
+        0x22, 0x00, 0x81, 0x00, // JSL $00:8100
+        0x8D, 0x70, 0x01, // STA $0170
+        0x6B,
+    });
+    @memcpy(rom[0x00A0..0x00AB], &[_]u8{
+        0xA2, 0x00, 0x00, // LDX #$0000
+        0x22, 0x00, 0x81, 0x00,
+        0x8D, 0x74, 0x01, // STA $0174
+        0x6B,
+    });
+    @memcpy(rom[0x00C0..0x00CB], &[_]u8{
+        0xA2, 0x01, 0x80, // LDX #$8001
+        0x22, 0x00, 0x81, 0x00,
+        0x8D, 0x78, 0x01, // STA $0178
+        0x6B,
+    });
+    @memcpy(rom[0x0100..0x0105], &[_]u8{ 0xBF, 0xFF, 0xFF, 0x01, 0x6B }); // LDA $01:FFFF,X / RTL
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8006, 0x800A, 0x800E, 0x8012 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8080, 0x8082, 0x8085, 0x8088, 0x808C, 0x808F }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80A0, 0x80A3, 0x80A7, 0x80AA }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80C0, 0x80C3, 0x80C7, 0x80CA }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8100, 0x8104 }) |a| markOpX16(bytes, a);
+
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL over the site
+    // The window arm keeps the DISTANCE by advancing the bank: $01:FFFF
+    // + $6000 is $02:5FFF, so $02:5FFF + 7 is $02:6006 — the window cell
+    // the shifted `STA $0006` wrote.
+    const body = (@as(u32, res.image[0x0103] & 0x7F) * 0x8000) + (std.mem.readInt(u16, res.image[0x0101..0x0103], .little) - 0x8000);
+    try testing.expectEqual(@as(u8, 0xFF), res.image[body + 15]); // $5FFF low
+    try testing.expectEqual(@as(u8, 0x5F), res.image[body + 16]); // $5FFF high
+    try testing.expectEqual(@as(u8, 0x02), res.image[body + 17]); // bank + 1
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+    // Wrapped into the mirror: the read followed the store into the window.
+    try testing.expectEqual(@as(u8, 0x77), con.bus.sa1.bwram[0x0170]);
+    // Not wrapped: still this bank's own last ROM byte.
+    try testing.expectEqual(@as(u8, 0x3C), con.bus.sa1.bwram[0x0174]);
+    // Far past the mirror: whatever it reads, it is NOT the window cell.
+    try testing.expect(con.bus.sa1.bwram[0x0178] != 0x77);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0006]);
 }
 
 test "window: a tiny-base LONG,X site splits on its index through a JSL thunk" {
