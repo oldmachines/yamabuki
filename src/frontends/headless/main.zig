@@ -684,6 +684,12 @@ fn convHome(plan: *const profile.Plan, res: *const core.sa1gen.Result, i: u32) C
     return .wram;
 }
 
+/// Frames a side may go without polling input before the tier calls it
+/// stopped rather than merely out of budget. Five seconds: long enough
+/// that a load, a scene transition or a fade cannot trip it, short enough
+/// that a real wedge cannot hide under it.
+const hang_frames: u32 = 300;
+
 const Behavioral = struct {
     verdict: util.Persistence.Verdict,
     stats: util.Persistence,
@@ -716,8 +722,12 @@ const Behavioral = struct {
         /// Neither side ever produced a tick.
         no_ticks,
         /// The CONVERSION ran out of budget while the baseline still had
-        /// ticks to give — it hung, or is slower than the baseline.
+        /// ticks to give — after the epoch resync had advanced it alone.
+        /// The end of the comparable region, not a failure.
         conversion_ran_out,
+        /// The conversion went `hang_frames` without polling input while
+        /// the baseline kept ticking. This one IS a failure.
+        conversion_hung,
         /// The conversion ran out while being caught up to an input edge
         /// the baseline had already crossed. NOT a failure — see the
         /// comment at the break — but disclosed, because the surface's
@@ -728,7 +738,8 @@ const Behavioral = struct {
             return switch (self) {
                 .compared_to_budget => "baseline exhausted its budget (normal)",
                 .no_ticks => "neither side produced a logic tick",
-                .conversion_ran_out => "CONVERSION exhausted its budget with the baseline still ticking",
+                .conversion_ran_out => "comparable region ended (the conversion, pushed ahead by epoch resyncs, exhausted its budget)",
+                .conversion_hung => "the CONVERSION STOPPED POLLING while the baseline kept ticking",
                 .conversion_ran_out_at_edge => "comparable region ended at an input edge (the conversion, being ahead, ran out of budget catching up)",
             };
         }
@@ -809,6 +820,12 @@ fn verifyBehavioral(
         /// wall frames behind the movie's recording, so its inputs (and
         /// its input-edge epochs) shift to follow.
         pad: u32 = 0,
+        /// Frames the last `advance` call consumed. A failed call that
+        /// burned only a handful of them ran out of BUDGET; one that
+        /// burned hundreds without a poll actually stopped ticking. The
+        /// return value alone cannot tell those apart, and conflating
+        /// them is what made the tier reject faster builds.
+        span: u32 = 0,
 
         fn init(al: std.mem.Allocator, image: []const u8) !@This() {
             const cart = try core.Cartridge.load(al, image);
@@ -824,14 +841,17 @@ fn verifyBehavioral(
         }
 
         fn advance(self: *@This(), m: ?util.movie.Movie, budget: u32) bool {
+            const from = self.frame;
             while (self.frame < budget) {
                 const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame -| self.pad);
                 self.frame += 1;
                 if (ticked) {
                     self.tick_wall = self.frame - 1;
+                    self.span = self.frame - from;
                     return true;
                 }
             }
+            self.span = self.frame - from;
             return false;
         }
 
@@ -877,7 +897,7 @@ fn verifyBehavioral(
     if (!conv.advance(mov, total)) {
         // The baseline reached gameplay and the conversion never did.
         out.verdict = .{ .fail = .persistence };
-        out.exit = .conversion_ran_out;
+        out.exit = .conversion_hung;
         return out;
     }
     out.ticks_base = 1;
@@ -930,10 +950,19 @@ fn verifyBehavioral(
         if (!base.advance(mov, total)) break;
         out.ticks_base += 1;
         if (!conv.advance(mov, total)) {
-            // The conversion fell behind for the rest of the budget while
-            // the baseline kept ticking: it hung or slowed catastrophically.
+            // Ran out of budget, or hung — and only the SPAN tells them
+            // apart. The epoch resync below advances the conversion
+            // alone, so a faster conversion's frame counter is routinely
+            // pushed past the baseline's; it then exhausts the budget
+            // here having polled input a frame ago. That is the end of
+            // the comparable region. A conversion that truly stopped
+            // burns `hang_frames` without a single poll.
+            if (conv.span < hang_frames) {
+                out.exit = .conversion_ran_out;
+                break;
+            }
             out.verdict = .{ .fail = .persistence };
-            out.exit = .conversion_ran_out;
+            out.exit = .conversion_hung;
             return out;
         }
         out.ticks_conv += 1;
@@ -969,6 +998,11 @@ fn verifyBehavioral(
                         // differential — so any timing change (FastROM, a
                         // tree, a thunk) could flip a verdict without
                         // touching correctness.
+                        if (conv.span >= hang_frames) {
+                            out.verdict = .{ .fail = .persistence };
+                            out.exit = .conversion_hung;
+                            return out;
+                        }
                         out.exit = .conversion_ran_out_at_edge;
                         break :outer;
                     }
