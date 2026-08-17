@@ -2905,9 +2905,26 @@ fn printAudit(
     // Per bank: instructions seen against bytes that are not blank fill.
     // A bank with content and no coverage is either graphics or code
     // nobody has played into — this cannot tell which, and says so.
-    try out.print("\n  per bank — executed / seen by the rewriter / non-blank bytes:\n   ", .{});
+    // A bank the descent never entered is a problem only if it holds CODE,
+    // and "looks like code" is exactly the judgement a disassembler cannot
+    // make on a ROM with no markers. So do not judge it — measure three
+    // independent signals and print them side by side:
+    //
+    //   seen      instructions the rewriter has in hand
+    //   calls     JSL/JML sites in seen code naming this bank as a TARGET
+    //   data      long accesses and block moves in seen code naming it as
+    //             a SOURCE or destination — positive evidence of data
+    //   density   how often this bank's bytes are the opcodes that
+    //             dominate real 65816 code, against the two banks known to
+    //             be code as the yardstick
+    //
+    // A bank with no coverage, no calls, plenty of data references and a
+    // density a third of the code banks' is data, and the report should
+    // say so rather than raise an alarm it cannot substantiate.
+    const codey = [_]u8{ 0x60, 0x6B, 0x20, 0x22, 0xA9, 0x85, 0xAD, 0x8D };
+    try out.print("\n  per bank — ran / seen / calls-in / data-refs / density / non-blank:\n", .{});
     var bank: u32 = 0;
-    var dark_banks: u32 = 0;
+    var suspect: u32 = 0;
     while (bank * 0x8000 < image.len) : (bank += 1) {
         var ran: u32 = 0;
         var a16: u32 = 0x8000;
@@ -2919,13 +2936,30 @@ fn printAudit(
         const lo = bank * 0x8000;
         const hi = @min(lo + 0x8000, image.len);
         var content: u32 = 0;
-        for (image[lo..hi]) |b| content += @intFromBool(b != 0xFF and b != 0x00);
-        if (seen == 0 and content > 0x1000) dark_banks += 1;
-        try out.print(" ${x:0>2}:{}/{}/{}", .{ bank, ran, seen, content });
-        if (bank % 4 == 3) try out.print("\n   ", .{});
+        var hits: u32 = 0;
+        for (image[lo..hi]) |b| {
+            content += @intFromBool(b != 0xFF and b != 0x00);
+            for (codey) |c| hits += @intFromBool(b == c);
+        }
+        const dens: u32 = if (hi > lo) hits * 1000 / @as(u32, @intCast(hi - lo)) else 0;
+        // Code-like, never entered, and nothing references it as data: the
+        // only combination this report is willing to call suspicious.
+        const odd = seen == 0 and content > 0x1000 and dens >= 80 and
+            res.audit.bank_data[bank] == 0;
+        if (odd) suspect += 1;
+        try out.print("    ${x:0>2}  {d:>5} {d:>5} {d:>5} {d:>6}   .{d:0>3}  {d:>6}{s}\n", .{
+            bank,                      ran,  seen, res.audit.bank_calls[bank],
+            res.audit.bank_data[bank], dens, content,
+            if (odd) @as([]const u8, "   <-- code-like, never entered") else "",
+        });
     }
-    try out.print("\n  {} bank(s) hold content the rewriter has never seen an instruction in\n", .{dark_banks});
-    try out.print("  (graphics and unplayed code look identical from here — this is a\n  prompt to record a surface, not a defect count)\n", .{});
+    try out.print("  indirect transfers in seen code: {} JMP (abs), {} JMP/JSR (abs,X), {} JMP [abs]\n", .{
+        res.audit.n_ind_abs, res.audit.n_ind_absx, res.audit.n_ind_long,
+    });
+    if (suspect == 0)
+        try out.print("  No bank is code-like, unentered AND unreferenced as data.\n", .{})
+    else
+        try out.print("  {} bank(s) look like code the descent never entered — start there.\n", .{suspect});
 
     // --- what happened to the sites it did see -------------------------
     const rows = [_]struct { v: V, label: []const u8 }{

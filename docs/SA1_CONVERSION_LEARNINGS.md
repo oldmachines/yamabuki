@@ -810,32 +810,55 @@ not cover. Three of them sit in the slot walker at `$00:9082-$90AA`: the
 routine at the centre of the boss freeze and the collision defects. The
 audit found in one run what six QA sessions had been circling.
 
-**And the reach number is the real headline.** Per bank, instructions the
-rewriter has ever seen — executed, plus everything `--wg-static`'s
-recursive descent added:
+**The reach number, and the alarm it did not justify.** The first cut of
+this report said: instructions the rewriter has ever seen are 8338 in bank
+$00, 2559 in bank $02, and **zero in the other fourteen** — which hold
+~29 KB of content each. Read alone, that says the conversion has seen an
+eighth of the game, and the obvious next move is a better disassembler.
 
-    $00  8338      $01  0      $02  2559     $03..$0F  0
+It was the wrong reading, and what fixed it was not analysis but three
+more measurements. Alongside coverage the audit now counts, per bank:
+`JSL`/`JML` sites in seen code naming it as a TARGET; long accesses and
+block moves naming it as a data SOURCE; and how often its bytes are the
+eight opcodes that dominate real 65816 code, with the two known code banks
+as the yardstick.
 
-Fourteen of sixteen banks, ~29 KB of content each, and not one instruction
-seen in any of them. Most of that is graphics — but not all of it, and the
-audit cannot tell which, so it says so. The proof that it is not all
-graphics was already in hand from the menu chase:
+    bank     ran   seen  calls-in  data-refs  density
+    $00     6607   8338       484         71    .139
+    $02     2168   2559       205         14    .127
+    $01        0      0         0         31    .032
+    $03        0      0         0          6    .034
+    $04..$0F   0      0         0        0-2    .025-.032
 
-    $01:AAF7  LDA $0101   UNCHANGED
-    $04:E884  LDA $0101   UNCHANGED
-    $05:E2D9  LDA $0101   UNCHANGED
+Every other bank sits at a quarter of the code banks' opcode density, is
+never named by a far call, and several are read as data. Gradius III's
+executable code lives entirely in banks $00 and $02, and the rewriter
+holds all of it any recording reaches plus 3259 instructions of static
+descent. There is nothing dark to light up.
 
-Three live instructions reading the menu's redraw flag out of low WRAM, in
-three different dark banks, none of them rewritten, none of them
-discovered by any recording or by static descent. The descent seeds from
-executed code and follows control flow; the way into those banks is an
-indirect mode dispatch, and indirect dispatch is exactly what static
-analysis cannot follow. That is the same wall as the `JMP ($0000)` macro,
-met from the other side.
+**A false lead, retracted by the same evidence.** The menu chase had
+recorded `$01:AAF7`, `$04:E884` and `$05:E2D9` as three unshifted
+consumers of the redraw flag — all `AD 01 01` = `LDA $0101`, found by
+searching the ROM for the byte pattern. They are not instructions. The
+bytes around `$01:AAF7` are
 
-So the honest statement of where the conversion stands is not "we fixed
-the laser". It is: **the rewriter has seen two of sixteen banks, and every
-instruction in the other fourteen that touches low WRAM is unconverted.**
-The next lever is reach across bank boundaries — jump-table and
-dispatch-table recovery seeded by measured coverage — not another
-recording.
+    8e ab  c8 ab  fc ab  2a ac  5e ac  62 ac  96 ac  ca ac ...
+
+an ascending 16-bit pointer table, in which that `AD` is a pointer's HIGH
+BYTE and the `01 01` after it belongs to the next entry. Which is exactly
+the rate the census predicted: a low-operand absolute decodes out of
+arbitrary data roughly every 23 bytes, about thirty false sites for every
+real one. **Searching a ROM for an instruction finds data that spells
+it**, and the only defence is a signal that separates the two — which is
+what the density column is for.
+
+So reach is not the problem it briefly looked like. The one door static
+descent still cannot open is the 39 `JMP (abs)` dispatch macros in seen
+code: bank-confined, pointer built in RAM, and already handled by shifting
+the five-byte signature rather than by following it. There are zero
+`JMP/JSR (abs,X)` and zero `JMP [abs]` in the entire body of code we can
+see, so there are no jump tables to recover either.
+
+The audit's real service was not the landmine list. It was refusing to let
+a number be read as a conclusion — and then killing a hypothesis of its
+own making within the hour.

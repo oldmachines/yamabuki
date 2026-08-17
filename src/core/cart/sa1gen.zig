@@ -246,6 +246,20 @@ pub const Audit = struct {
     /// coverage plus whatever `--wg-static` reached. A bank at zero here
     /// is a bank the rewriter has never touched an instruction in.
     bank_ops: [0x40]u32 = @splat(0),
+    /// Per bank, how many `JSL`/`JML` sites in code the rewriter has seen
+    /// name it as a target. A dark bank that nothing ever calls is reached
+    /// some other way — or is not code at all.
+    bank_calls: [0x40]u32 = @splat(0),
+    /// Per bank, how many long DATA accesses (and block-move endpoints) in
+    /// seen code name it. Positive evidence that a bank the descent never
+    /// entered is a bank of DATA, not unreached code.
+    bank_data: [0x40]u32 = @splat(0),
+    /// Indirect control transfers in seen code, by shape: `JMP (abs)`,
+    /// `JMP (abs,X)` / `JSR (abs,X)`, `JMP [abs]`. Every one of these is a
+    /// door the descent cannot open.
+    n_ind_abs: u32 = 0,
+    n_ind_absx: u32 = 0,
+    n_ind_long: u32 = 0,
 
     pub fn count(self: *const Audit, v: Verdict) u32 {
         return self.counts[@intFromEnum(v)];
@@ -3988,8 +4002,31 @@ pub fn convertWholeGame(
             var aa: u32 = 0x8000;
             while (aa < 0x10000) : (aa += 1) {
                 const ac = (ab << 16) | aa;
-                if ((cov[ac] | cov[0x80_0000 | ac]) & usage_map.flag_opcode != 0)
-                    res.audit.bank_ops[ab] += 1;
+                if ((cov[ac] | cov[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
+                res.audit.bank_ops[ab] += 1;
+                const af = ab * 0x8000 + (aa - 0x8000);
+                switch (out[af]) {
+                    0x22, 0x5C => if (af + 3 < out.len) {
+                        const tb: u32 = out[af + 3] & 0x7F;
+                        if (tb < 0x40) res.audit.bank_calls[tb] += 1;
+                    },
+                    0x6C => res.audit.n_ind_abs += 1,
+                    0x7C, 0xFC => res.audit.n_ind_absx += 1,
+                    0xDC => res.audit.n_ind_long += 1,
+                    0x44, 0x54 => if (af + 2 < out.len) { // MVN/MVP: dst, src
+                        for ([2]u8{ out[af + 1], out[af + 2] }) |mb|
+                            if ((mb & 0x7F) < 0x40) {
+                                res.audit.bank_data[mb & 0x7F] += 1;
+                            };
+                    },
+                    else => switch (usage_map.mode(out[af])) {
+                        .long, .long_x => if (af + 3 < out.len) {
+                            const db: u32 = out[af + 3] & 0x7F;
+                            if (db < 0x40) res.audit.bank_data[db] += 1;
+                        },
+                        else => {},
+                    },
+                }
             }
         }
     }
