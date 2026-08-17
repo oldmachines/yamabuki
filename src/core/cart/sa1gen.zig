@@ -2092,7 +2092,7 @@ const WinSpec = struct {
 /// are dynamic evidence: under a marshalled game DBR they read the same
 /// BW-RAM or ROM on both CPUs; under a system DBR they differ (WRAM vs
 /// I-RAM) and S4 verification is the judge.
-fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, entry: u16) ?WinSpec {
+fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, thunks: []const u24, entry: u16) ?WinSpec {
     var spec: WinSpec = .{};
     spec.members[0] = .{ .entry = entry, .span = 0, .entry_pin = null, .pin_seen = true };
     spec.n_members = 1;
@@ -2111,7 +2111,7 @@ fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, ent
         for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
         var walked: usize = 0;
         while (walked < spec.n_members) : (walked += 1) {
-            if (!winWalkMember(out, usage, evidence, &spec, walked, false)) return null;
+            if (!winWalkMember(out, usage, evidence, thunks, &spec, walked, false)) return null;
         }
         var stable = spec.n_members == n_before;
         if (stable) for (spec.members[0..n_before], 0..) |m, i| {
@@ -2122,7 +2122,7 @@ fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, ent
     for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
     var walked: usize = 0;
     while (walked < spec.n_members) : (walked += 1) {
-        if (!winWalkMember(out, usage, evidence, &spec, walked, true)) return null;
+        if (!winWalkMember(out, usage, evidence, thunks, &spec, walked, true)) return null;
     }
     spec.total_span = 0;
     for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
@@ -2135,7 +2135,7 @@ fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, ent
 /// class) plus each in-tree JSL's pin. Zero compiles every print away.
 const dbg_win_root: u16 = 0;
 
-fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec: *WinSpec, mi: usize, judge: bool) bool {
+fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, thunks: []const u24, spec: *WinSpec, mi: usize, judge: bool) bool {
     const dbg = dbg_win_root != 0 and spec.members[0].entry == dbg_win_root and judge;
     const span_max: u32 = 1024;
     const entry: u32 = spec.members[mi].entry;
@@ -2185,10 +2185,28 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
                 return true;
             },
             0x22 => {
-                if (out[file + 3] != 0x00) {
+                // A call into an index-split thunk is a LEAF, not a
+                // member. The thunk is SA-1-safe by construction — its
+                // window arm addresses the identity window (the same
+                // bytes at the same addresses on both buses) and its
+                // as-written arm only runs once the index has carried the
+                // address past $2000, so neither arm can land on the low
+                // mirror that is the SA-1's own I-RAM. Walking into it
+                // would see the as-written arm out of context and refuse
+                // the whole tree over the very hazard the thunk exists to
+                // remove — which is what kept the physics tree out.
+                const tfull: u24 = @as(u24, out[file + 3] & 0x7F) << 16 |
+                    std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                var is_thunk = false;
+                for (thunks) |t| {
+                    if (t == tfull) is_thunk = true;
+                }
+                if (is_thunk) {
+                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: thunk call ${x:0>6} at ${x:0>4} — leaf\n", .{ entry, tfull, pc });
+                } else if (out[file + 3] != 0x00) {
                     if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: far JSL to bank {x:0>2} at ${x:0>4}\n", .{ entry, out[file + 3], pc });
                     return false;
-                }
+                } else jsl: {
                 const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                 if (tgt < 0x8000) {
                     if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: JSL below ROM (${x:0>4}) at ${x:0>4}\n", .{ entry, tgt, pc });
@@ -2220,6 +2238,8 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
                 // Transitive cleanliness: calling a dirty member dirties
                 // this one.
                 if (!spec.members[ci].dbr_clean) dbr_clean = false;
+                break :jsl;
+                }
             },
             // Wrong return shape, near calls, far jumps, interrupt ops,
             // and the ops that would swap the SA-1's stack from under it.
@@ -2279,7 +2299,21 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, spec
         // always deliver. (Cleanliness comes from the survey passes;
         // in-tree callees of callees are members too, so the meet over
         // every member's flag makes the property transitive.)
-        const in_tree_clean = op == 0x22 and out[file + 3] == 0x00 and blk: {
+        // A thunk is DBR-transparent by construction: its only bank
+        // traffic is a balanced PHB/PLA it reads and discards, and it
+        // exits through PLP. So the caller's pin survives it — which
+        // matters, because the pin is what admits the walker's uncovered
+        // sites, and losing it at a thunk call would refuse the tree just
+        // as surely as the hazard the thunk removed.
+        const thunk_call = op == 0x22 and out[file + 3] != 0x00 and blk: {
+            const tf: u24 = @as(u24, out[file + 3] & 0x7F) << 16 |
+                std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            for (thunks) |t| {
+                if (t == tf) break :blk true;
+            }
+            break :blk false;
+        };
+        const in_tree_clean = thunk_call or op == 0x22 and out[file + 3] == 0x00 and blk: {
             const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
             for (spec.members[0..spec.n_members]) |m| {
                 if (m.entry == tgt) break :blk m.dbr_clean;
@@ -2965,6 +2999,9 @@ fn emitWindowOffloads(
     candidates: []const Candidate,
     allow_async_in: bool,
     bank0_at: u32,
+    /// Index-split thunk bodies (24-bit): a `JSL` into one is a leaf the
+    /// eligibility walk must not mistake for a tree member.
+    thunks: []const u24,
     res: *Result,
 ) ?WinBoot {
     const nmi_native = std.mem.readInt(u16, out[header_off + 0x2A ..][0..2], .little);
@@ -2986,7 +3023,7 @@ fn emitWindowOffloads(
         // The async monopoly, as in the S3 path: a sibling's un-fenced
         // send mid-flight deadlocks the dispatcher.
         if (n > 0 and chosen[0].is_async) break;
-        const spec = windowEligible(out, usage, evidence, e) orelse continue;
+        const spec = windowEligible(out, usage, evidence, thunks, e) orelse continue;
         if (countCallSites(out, usage, e, 0x22) == 0) continue;
         chosen[n] = .{
             .entry = e,
@@ -4266,7 +4303,8 @@ pub fn convertWholeGame(
                             res.stats.rewritten_long += 1;
                             auditNote(&res.audit, file, op, v, le, .shifted);
                         } else if (window and usage_map.mode(op) == .long_x and
-                            (b & 0x7F) <= 0x3F and v < 0x100 and le == 0)
+                            (b & 0x7F) <= 0x3F and v < 0x100 and
+                            (le == 0 or le & usage_map.site_wram_low != 0))
                         {
                             // The index-split class in the addressing mode
                             // the absolute thunk cannot reach. Same idiom,
@@ -4277,19 +4315,29 @@ pub fn convertWholeGame(
                             // and a long call names its own bank: these
                             // thunks need no bank-local home at all.
                             //
-                            // UNMEASURED SITES ONLY, and that restriction is
-                            // a measured trade rather than caution. The
-                            // walker's three `long,X` reads at $00:90AE-C4
-                            // ARE measured low|rom, so they qualify on
-                            // shape — and thunking them puts a JSL/RTL, some
-                            // thirty cycles, in the hottest loop the game
-                            // has. That alone moved the timeline enough that
-                            // the behavioural tier stopped accepting a
-                            // configuration which had shipped. A conversion
-                            // whose whole purpose is speed cannot spend it
-                            // there on a hazard the evidence says is rare.
-                            // They stay listed as `left_mixed` in the audit
-                            // instead: named, not silently forgiven.
+                            // MEASURED low|rom SITES INCLUDED, and the
+                            // history of that decision is worth keeping.
+                            // These were excluded once, because thunking
+                            // the walker's three reads at $00:90AE-C4 puts
+                            // a JSL/RTL — some thirty cycles — in the
+                            // hottest loop the game has, and doing so
+                            // "broke" the behavioural verdict. It did not:
+                            // that failure was the tier calling a faster
+                            // conversion hung, and the evidence for the
+                            // exclusion evaporated with the tier fix.
+                            //
+                            // Including them is what makes the PHYSICS TREE
+                            // eligible. `$00:90AE` is the single line the
+                            // eligibility walk refuses $8EF1 over — an
+                            // unshifted low-mirror indexed long is the
+                            // SA-1's own I-RAM — and the thunk removes the
+                            // hazard by construction: its window arm is the
+                            // identity window (same bytes on both buses)
+                            // and its as-written arm only runs when the
+                            // index has already carried the address past
+                            // $2000. Thirty cycles at three sites against a
+                            // tree worth 48% utilisation down to ~17% is
+                            // not a close trade.
                             //
                             // Only the index is in question here. A long
                             // access carries its bank in the operand, so DBR
@@ -4692,7 +4740,12 @@ pub fn convertWholeGame(
     }
     // The LONG,X flavor, placed entirely in the far pool: `JSL` names its
     // own bank, so these thunks are free of the bank-local constraint that
-    // shapes everything above. Bodies are shared by (op, operand, bank).
+    // shapes everything above — and, unlike the `JSR` flavor, a copied
+    // tree member carries one unchanged. Bodies are shared by (op,
+    // operand, bank), and their addresses are handed to the offload
+    // eligibility walk so it can tell a thunk call from a tree member.
+    var lbodies: [64]u24 = undefined;
+    var n_lbodies: usize = 0;
     if (window and n_lthunks != 0) {
         const LSeen = struct { v: u16, op: u8, bank: u8, at: u32 };
         var lseen: [idx_thunk_max]LSeen = undefined;
@@ -4712,6 +4765,10 @@ pub fn convertWholeGame(
                 @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
                 lseen[n_lseen] = .{ .v = t.v, .op = t.op, .bank = t.bank, .at = at };
                 n_lseen += 1;
+                if (n_lbodies < lbodies.len) {
+                    lbodies[n_lbodies] = @intCast((at / 0x8000) << 16 | (0x8000 + (at % 0x8000)));
+                    n_lbodies += 1;
+                }
             }
             out[t.file] = 0x22; // JSL — the same 4-byte footprint
             std.mem.writeInt(u16, out[t.file + 1 ..][0..2], @as(u16, @intCast(0x8000 + (at % 0x8000))), .little);
@@ -4736,7 +4793,7 @@ pub fn convertWholeGame(
         // dispatcher's CRV feeds the shim below. The dispatcher and NMI
         // prologue live in this same bank-0 carve, after the shim slot.
         const boot: ?WinBoot = if (win_candidates.len != 0)
-            emitWindowOffloads(out, cov, site_evidence, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, &res)
+            emitWindowOffloads(out, cov, site_evidence, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, lbodies[0..n_lbodies], &res)
         else
             null;
 
