@@ -348,6 +348,33 @@ pub const Bus = struct {
         return self.read8(addr);
     }
 
+    /// Write a byte the way a cheat device does: straight into mapped RAM,
+    /// charging no clock and running no MMIO side effect. The clock is
+    /// deliberately untouched — a cheat that stole cycles would change the
+    /// timing it is meant to observe, and every determinism guarantee in
+    /// this codebase rests on the frame's cycle count.
+    ///
+    /// Returns false when the address is not plain writable memory: an
+    /// unmapped address or a hardware register is refused rather than poked
+    /// blind, since a register write has consequences a cheat cannot model.
+    pub inline fn poke8(self: *Bus, addr: u24, value: u8) bool {
+        if (self.page_write[addr >> 13]) |p| {
+            p[addr & (page_size - 1)] = value;
+            return true;
+        }
+        // BW-RAM is not fast-paged (its writes are arbitrated and SWEN-gated),
+        // so a cheat reaches it directly. Bypassing SWEN is deliberate: a
+        // cheat device sits outside the machine and does not ask the game's
+        // permission. This is the route that matters on an SA-1 window
+        // conversion, where the game's low WRAM now lives here.
+        const bank: u8 = @intCast(addr >> 16);
+        if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
+            self.sa1.bwram[(addr & 0xF_FFFF) & self.sa1.bwram_mask] = value;
+            return true;
+        }
+        return false;
+    }
+
     pub inline fn write8(self: *Bus, addr: u24, value: u8) void {
         self.mdr = value;
         const idx = addr >> 13;

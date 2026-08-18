@@ -11,8 +11,12 @@ const core = @import("snes_core");
 /// Input movies (TAS-style record/replay); see movie.zig.
 pub const movie = @import("movie.zig");
 
+/// Cheat pokes (Action-Replay-style held writes); see cheat.zig.
+pub const cheat = @import("cheat.zig");
+
 test {
     _ = movie;
+    _ = cheat;
 }
 
 /// Expand one RGB565 pixel to RGB888 by bit-replicating the 5/6-bit channels

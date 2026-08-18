@@ -74,6 +74,9 @@ const Args = struct {
     /// `--movie <file>`: replay a recorded playthrough (.ymv) from power-on;
     /// live input takes over when it ends. Needs an explicit ROM argument.
     movie: ?[]const u8 = null,
+    /// `--poke ADDR=VAL`: cheat writes held after every frame.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -240,6 +243,8 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .pokes = args.pokes,
+        .n_pokes = args.n_pokes,
         .patch_name = booted.patch_name,
     };
 }
@@ -568,6 +573,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             args.wide = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--poke")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.n_pokes = util.cheat.parseList(v, &args.pokes, args.n_pokes) catch
+                return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--movie")) {
             args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {

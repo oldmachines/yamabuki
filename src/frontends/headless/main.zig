@@ -112,6 +112,10 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// `--poke ADDR=VAL`: cheat writes held after every frame. Repeatable,
+    /// and each flag may carry a comma-separated list.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
     /// Verifier debugging (undocumented): run ONLY the behavioral tier —
     /// stock ROM as baseline, this converted image, the given movies —
     /// and print the verdict with its full accounting. Iterating the
@@ -262,6 +266,12 @@ pub fn main(init: std.process.Init) !void {
             \\                every surface must verify
             \\  --verify-behavioral  S4: on pixel divergence, accept a conversion whose logic
             \\                state matches at every tick (for timing-changing offloads)
+            \\  --poke a=v    hold byte v at CPU address a (both hex) after every frame,
+            \\                the way an Action Replay does; repeatable, comma-lists ok.
+            \\                The address is a BUS address, so it lands where that byte
+            \\                really lives in THIS image: a stock ROM takes the published
+            \\                address (7E0086); a window conversion takes its window
+            \\                address (006086) — the low 8 KiB moved into BW-RAM
             \\  --state f     resume from an SDL-player save state instead of power-on;
             \\                with --gen-sa1-patch, anchors the profile AND verify runs at
             \\                the state, so candidates come from a scene with real slowdown
@@ -466,6 +476,19 @@ pub fn main(init: std.process.Init) !void {
             con.setButtons(1, f[1]);
         }
         con.runFrame();
+        // AFTER the frame, so the value the next frame reads is the cheat's
+        // and not whatever the game just stored over it. Applied before the
+        // frame instead, the game wins every tie and the poke does nothing.
+        if (args.n_pokes != 0) {
+            const landed = util.cheat.apply(con, args.pokes[0..args.n_pokes]);
+            // Reported once: a poke at an address the bus does not map as
+            // plain memory silently does nothing, which reads exactly like a
+            // cheat that "did not work" and wastes a session chasing it.
+            if (i == 0) {
+                try out.print("poke: {} of {} landed (refused = not writable memory at that address)\n", .{ landed, args.n_pokes });
+                try out.flush();
+            }
+        }
         if (hash_stream) |*hs| try hs.append(core.console.hashFrame(con.framebuffer()));
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
@@ -4239,6 +4262,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hash_stream = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--s2-keep")) {
             out.s2_keep = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--poke")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.n_pokes = util.cheat.parseList(v, &out.pokes, out.n_pokes) catch
+                return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {

@@ -562,6 +562,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.joy.buttons[port] = buttons;
         }
 
+        /// Apply one cheat write; see `Bus.poke8`. False means the address
+        /// was not plain writable memory.
+        pub fn poke8(self: *Self, addr: u24, value: u8) bool {
+            return self.bus.poke8(addr, value);
+        }
+
         // --- save states ---------------------------------------------------
 
         /// Exact byte size of a save state (header + payload + cart RAM).
@@ -770,6 +776,12 @@ pub const AnyConsole = union(Accuracy) {
     pub fn enableAutoFastrom(self: *AnyConsole) void {
         switch (self.*) {
             inline else => |*c| c.bus.enableAutoFastrom(),
+        }
+    }
+
+    pub fn poke8(self: *AnyConsole, addr: u24, value: u8) bool {
+        switch (self.*) {
+            inline else => |*c| return c.poke8(addr, value),
         }
     }
 

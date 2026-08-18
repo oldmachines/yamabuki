@@ -88,6 +88,9 @@ pub const Options = struct {
     /// `--movie`: a validated recorded playthrough to replay from power-on.
     /// Live input takes over when it ends.
     movie: ?util.movie.Movie,
+    /// Cheat pokes held after every executed frame; see cheat.zig.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
     /// Basename of the soft-patch applied at load; null = playing as dumped.
     patch_name: ?[]const u8,
 };
@@ -707,6 +710,9 @@ pub fn run(
             con.runFrame();
             frames_run += 1;
             at_power_on = false;
+            // AFTER the frame: the value the next frame reads must be the
+            // cheat's, not whatever the game just stored over it.
+            if (opts.n_pokes != 0) _ = util.cheat.apply(con, opts.pokes[0..opts.n_pokes]);
             if (rec) |*r| r.append(feed) catch {};
             if (play_movie) |m| {
                 if (play_idx < m.frames.len) {
