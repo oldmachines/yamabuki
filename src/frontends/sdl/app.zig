@@ -394,6 +394,9 @@ pub fn run(
     // start until it runs out, then live input takes over; its end hashes
     // are checked right after the final frame's audio drain.
     var rec: ?std.array_list.Managed([2]u16) = null;
+    // Codes are loaded but NOT applied until asked for: a cheat held through
+    // the title screen can wedge a game that the same cheat plays fine in.
+    var cheats_on = false;
     // The machine the take started on, when that was not power-on: recording
     // captures it up front and the movie carries it, so a session can start a
     // recording deep into a game instead of replaying the road to get there.
@@ -665,6 +668,14 @@ pub fn run(
                         try err.flush();
                     }
                 },
+                .cheats => {
+                    if (opts.n_pokes == 0) {
+                        toast.set("NO CHEAT CODES LOADED", .{});
+                    } else {
+                        cheats_on = !cheats_on;
+                        if (cheats_on) toast.set("CHEATS ON", .{}) else toast.set("CHEATS OFF", .{});
+                    }
+                },
                 .info => {
                     info_open = !info_open;
                     if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
@@ -712,7 +723,7 @@ pub fn run(
             at_power_on = false;
             // AFTER the frame: the value the next frame reads must be the
             // cheat's, not whatever the game just stored over it.
-            if (opts.n_pokes != 0) _ = util.cheat.apply(con, opts.pokes[0..opts.n_pokes]);
+            if (cheats_on and opts.n_pokes != 0) _ = util.cheat.apply(con, opts.pokes[0..opts.n_pokes]);
             if (rec) |*r| r.append(feed) catch {};
             if (play_movie) |m| {
                 if (play_idx < m.frames.len) {

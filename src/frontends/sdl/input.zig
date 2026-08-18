@@ -259,6 +259,7 @@ pub const Hotkey = enum(u4) {
     screenshot,
     reset,
     record_movie,
+    cheats,
     info,
 };
 
@@ -339,6 +340,13 @@ pub const HotkeyStrings = struct {
     /// Toggle input-movie recording: starts with a repower (movies replay
     /// from power-on), stops by writing the .ymv into the movies directory.
     record_movie: []const u8 = "key:f10",
+    /// Toggle whether --cheat/--poke codes are being applied. Off by
+    /// default when any code is given: a code that is safe in play can wedge
+    /// the game if it is held through boot (measured: Gradius III's
+    /// published infinite-lives code freezes the title screen — on the stock
+    /// ROM too, so it is the code and not the emulator). Hardware cheat
+    /// devices have a switch for exactly this reason; this is the switch.
+    cheats: []const u8 = "key:f11",
     /// Toggle the session info palette: game, patch, volume, save states.
     /// `i` is free in the historical keyboard layout (the SNES buttons sit
     /// on z/x/a/s/q/w and the hotkeys on F-keys, Tab, and P).
@@ -459,6 +467,7 @@ pub const Action = union(enum) {
     screenshot,
     reset,
     record_movie,
+    cheats,
     info,
     /// A pad was assigned to a player slot — open it and keep the handle.
     pad_opened: struct { pad: u32, slot: u1 },
@@ -647,6 +656,7 @@ fn matchHotkey(r: *const Resolved, b: Binding) ?Action {
                 .screenshot => .screenshot,
                 .reset => .reset,
                 .record_movie => .record_movie,
+                .cheats => .cheats,
                 .info => .info,
                 .fast_forward, .rewind => unreachable,
             };
