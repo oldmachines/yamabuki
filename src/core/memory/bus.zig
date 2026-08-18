@@ -327,6 +327,32 @@ pub const Bus = struct {
         return null;
     }
 
+    /// Read an instruction byte for INSTRUMENTATION: no clock, no MDR, no
+    /// side effects, so emulation stays bit-identical whether or not anyone
+    /// is watching.
+    ///
+    /// `peek8` sees only the fast page table, and an SA-1 cart deliberately
+    /// keeps the $E000-$FFFF vector page of banks $00/$80 off it so a vector
+    /// PULL can be substituted. The profiler used `peek8` and treated a null
+    /// as "not an instruction", so every instruction living in that page was
+    /// invisible to the usage map — and code the rewriter never sees execute
+    /// is code it will never convert. Measured on Gradius III: coverage in
+    /// banks $00/$80 stopped dead at $DFFF, stranding real gameplay routines
+    /// at $E3xx across a dozen conversion rounds.
+    ///
+    /// This resolves that page the way the game itself sees it — as ROM,
+    /// which is the same distinction `slowRead` makes for a non-vector read.
+    /// Null still means "no instruction byte here", which is true only of
+    /// registers and open bus, and nothing is ever fetched from those.
+    pub fn peekCode8(self: *const Bus, addr: u24) ?u8 {
+        if (self.page_read[addr >> 13]) |p| return p[addr & (page_size - 1)];
+        const bank: u8 = @intCast(addr >> 16);
+        const a16: u16 = @truncate(addr);
+        if (self.cart.chip == .sa1 and a16 >= 0xE000 and bank & 0x7F == 0)
+            return self.sa1.romRead(addr);
+        return null;
+    }
+
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {

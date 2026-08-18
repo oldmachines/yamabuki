@@ -299,7 +299,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     kind = .nmi;
                 } else if (self.cpu.irq_line and (self.cpu.regs.p & CpuFlags.i) == 0) {
                     kind = .irq;
-                } else if (self.bus.peek8(pc)) |o| {
+                } else if (self.bus.peekCode8(pc)) |o| {
                     op = o;
                     kind = switch (o) {
                         0x20, 0x22, 0xFC => .call, // JSR abs / JSL / JSR (abs,X)

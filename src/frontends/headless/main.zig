@@ -112,6 +112,11 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// `--dump-ppu`: the display state as text after the run. For the
+    /// question a RAM dump cannot answer — a layer that is missing from
+    /// the picture is either disabled, pointed somewhere empty, or fed a
+    /// tilemap that never arrived, and those look identical in WRAM.
+    dump_ppu: ?[]const u8 = null,
     /// `--poke ADDR=VAL`: cheat writes held after every frame. Repeatable,
     /// and each flag may carry a comma-separated list.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
@@ -439,6 +444,59 @@ pub fn main(init: std.process.Init) !void {
     // Window debugging (undocumented --dump-ram): dump memories after the
     // run — WRAM (128K), BW-RAM's first 64K, VRAM — plus the CPU's resting
     // place. The tool that found every window-mode blocker so far.
+    // The display state, as text: what a layer is doing is a property of the
+    // PPU registers and of what actually reached VRAM, and neither shows up
+    // in a RAM dump. Per BG: is it on the main screen at all, where is its
+    // tilemap and character data, and — the question that separates "never
+    // uploaded" from "not displayed" — how much of that tilemap in VRAM is
+    // actually non-empty.
+    defer if (args.dump_ppu) |ppath| {
+        const p = &con.fast.bus.ppu;
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("bg_mode={d} force_blank={} brightness={d} main_screen(TM)=0x{x:0>2} sub_screen(TS)=0x{x:0>2}\n", .{
+            p.bg_mode, p.force_blank, p.brightness, p.main_screen, p.sub_screen,
+        }) catch {};
+        for (p.bg, 0..) |b, i| {
+            // A tilemap of all-zero entries renders as nothing even with the
+            // layer enabled, so count what is actually there.
+            const words: usize = switch (b.map_size) {
+                0 => 0x400, 1 => 0x800, 2 => 0x800, 3 => 0x1000,
+            };
+            var nonzero: usize = 0;
+            var k: usize = 0;
+            while (k < words) : (k += 1) {
+                const idx = (@as(usize, b.map_base) + k) & 0x7FFF;
+                if (p.vram[idx] != 0) nonzero += 1;
+            }
+            w.print("bg{d}: on_main={} map_base=0x{x:0>4} map_size={d} char_base=0x{x:0>4} tile16={} hofs={d} vofs={d} tilemap_nonzero={d}/{d}\n", .{
+                i + 1, (p.main_screen >> @intCast(i)) & 1 != 0,
+                b.map_base, b.map_size, b.char_base, b.tile16, b.hofs, b.vofs, nonzero, words,
+            }) catch {};
+        }
+        // HDMA: per-scanline effects read their table straight out of memory
+        // without the CPU issuing a single load, so a table left pointing at
+        // abandoned WRAM is invisible to the stale detector and shows up only
+        // as a missing effect. Top/bottom bands are exactly this shape.
+        const dma = &con.fast.bus.dma;
+        w.print("hdmaen=0x{x:0>2}\n", .{dma.hdmaen}) catch {};
+        for (dma.channels, 0..) |ch, i| {
+            if (dma.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const src: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
+            const dead = ch.a_bank == 0x7E or ch.a_bank == 0x7F or
+                ((ch.a_bank & 0x7F) < 0x40 and ch.a_addr < 0x2000);
+            w.print("  hdma{d}: src={x:0>6} bank={x:0>2}{s}\n", .{
+                i, src, ch.a_bank, if (dead) "  <-- ABANDONED MEMORY" else "",
+            }) catch {};
+        }
+        var vnz: usize = 0;
+        for (p.vram) |word| { if (word != 0) vnz += 1; }
+        w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = w.buffered() }) catch {};
+        out.print("wrote {s}\n", .{ppath}) catch {};
+        out.flush() catch {};
+    };
+
     defer if (args.dump_ram) |dpath| {
         const fc = &con.fast;
         const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
@@ -4270,6 +4328,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             out.n_pokes = util.cheat.parseList(v, &out.pokes, out.n_pokes) catch
                 return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--dump-ppu")) {
+            out.dump_ppu = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
