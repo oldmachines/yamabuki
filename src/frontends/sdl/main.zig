@@ -577,6 +577,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             args.wide = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--cheat")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.n_pokes = util.cheat.parseCodes(v, &args.pokes, args.n_pokes) catch
+                return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--poke")) {
             const v = it.next() orelse return error.MissingValue;
             args.n_pokes = util.cheat.parseList(v, &args.pokes, args.n_pokes) catch
