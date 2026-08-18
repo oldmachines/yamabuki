@@ -62,7 +62,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -86,6 +86,18 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// load that set it), or `none` once anything else touched X.
         x_src: if (cfg.profile) u32 else void,
         x_w: if (cfg.profile) u8 else void,
+        /// ROM source of the byte most recently PUSHED by PHA, when that
+        /// push immediately followed a one-byte A-load, else `none`. The
+        /// window is deliberately one instruction wide: anything else
+        /// touching the stack in between makes the pairing a guess, and a
+        /// wrong bank-byte rewrite corrupts silently.
+        pushed_src: if (cfg.profile) u32 else void,
+        /// ROM source of the byte PLB last pulled into DBR. A data access
+        /// that lands in $7E/$7F under this DBR proves that byte is a bank
+        /// byte naming WRAM — the `LDA #$7E / PHA / PLB` idiom, which the
+        /// pointer-cell tracking cannot see because the bank never passes
+        /// through a pointer in memory.
+        dbr_src: if (cfg.profile) u32 else void,
 
         region: timing.Region,
         /// Current scanline within the frame (0-based).
@@ -130,6 +142,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.prof = .init;
                 self.usage = null;
                 self.prev_load_end = usage_map.PtrBankEvidence.none;
+                self.pushed_src = usage_map.PtrBankEvidence.none;
+                self.dbr_src = usage_map.PtrBankEvidence.none;
                 self.prev_load_w = 0;
                 self.x_src = usage_map.PtrBankEvidence.none;
                 self.x_w = 0;
@@ -454,6 +468,44 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         if (src != none) pb.addProven(src) else pb.unresolved += 1;
                     }
                 }
+            }
+            // 2c. DBR carrying $7E/$7F, put there by `LDA #$7E / PHA / PLB`.
+            //    The bank never passes through a pointer in memory, so the
+            //    cell tracking above cannot see it; what proves the byte is
+            //    a data access under this DBR resolving into $7E/$7F. Long
+            //    addressing names its own bank and [dp] forms are case 2, so
+            //    both are excluded — otherwise an unrelated access would
+            //    credit whatever DBR happened to hold.
+            if (self.dbr_src != none and op & 0x0F != 0x07 and usage_map.mode(op) != .long and usage_map.mode(op) != .long_x) {
+                const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
+                if (tgt) |t| {
+                    const tb: u8 = @truncate(t >> 16);
+                    if ((tb == 0x7E or tb == 0x7F) and tb == self.cpu.regs.dbr) {
+                        pb.addProven(self.dbr_src);
+                        // Proven once is enough; keep it for the rest of the
+                        // routine so every access under the same DBR does not
+                        // re-add the same byte.
+                    }
+                }
+            }
+            // 2d. The push/pull chain that feeds the above. PHA right after a
+            //    one-byte A-load carries that load's source; PLB moves it into
+            //    DBR. Anything else touching the stack or DBR clears the
+            //    chain rather than guessing across it.
+            switch (op) {
+                0x48 => self.pushed_src = if (self.prev_load_w == 1) self.prev_load_end else none, // PHA
+                0xAB => { // PLB
+                    self.dbr_src = self.pushed_src;
+                    self.pushed_src = none;
+                },
+                // Other stack traffic and the bank-setting instructions make
+                // the single-slot model a guess: drop it.
+                0x08, 0x0B, 0x4B, 0x5A, 0x8B, 0xDA, 0x28, 0x2B, 0x68, 0x7A, 0xFA,
+                0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xD4, 0xF4 => {
+                    self.pushed_src = none;
+                    if (op == 0x40) self.dbr_src = none; // RTI restores a bank we did not track
+                },
+                else => {},
             }
             // 3. Remember THIS step if it was a plain A-load from ROM (or
             //    an immediate — its operand bytes are ROM): the candidate
