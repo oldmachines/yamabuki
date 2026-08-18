@@ -2073,7 +2073,17 @@ fn runSa1Gen(
         const tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
         defer gpa.free(tmp_ev);
         @memset(tmp_ev, 0);
-        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp, .sites = tmp_ev, .conv_window_homes = true };
+        // Bank-byte provenance from the conversion side too. Without this the
+        // harvest donated coverage and site class but not WHERE a $7E/$7F bank
+        // byte came from, so an idiom that only runs in a scene no stock-side
+        // movie reaches could never be proven — the same shape of blind spot as
+        // the vector page. A byte the previous conversion already re-banked
+        // reads $40 there and simply never triggers the tracker, so what this
+        // can surface is exactly the ones still unconverted.
+        const cover_pb = try gpa.create(core.usage_map.PtrBankEvidence);
+        defer gpa.destroy(cover_pb);
+        cover_pb.* = .init;
+        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp, .sites = tmp_ev, .conv_window_homes = true, .ptr_banks = cover_pb };
         const ccart = try core.Cartridge.load(gpa, ci);
         const ccon = try gpa.create(core.ProfilingConsole);
         ccon.init(ccart);
@@ -2106,7 +2116,22 @@ fn runSa1Gen(
                 site_ev[pc] |= tmp_ev[pc];
             }
         }
-        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev });
+        // Merge proven bank bytes under the same byte-identity guard the
+        // coverage merge uses: a ROM byte that differs between the images is
+        // this conversion's own scaffolding and proves nothing about stock.
+        var merged_pb: u32 = 0;
+        for (cover_pb.proven[0..cover_pb.n_proven]) |ca| {
+            const bank = (ca >> 16) & 0x7F;
+            const a16 = ca & 0xFFFF;
+            if (bank > 0x3F or a16 < 0x8000) continue;
+            const file = bank * 0x8000 + (a16 - 0x8000);
+            if (file >= image.len or file >= ci.len) continue;
+            if (image[file] != ci[file]) continue;
+            const before = ptr_ev.n_proven;
+            ptr_ev.addProven(ca);
+            if (ptr_ev.n_proven != before) merged_pb += 1;
+        }
+        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb });
         try out.flush();
     }
     for (dbg_site_ev[0..dbg_n_site_ev]) |p| {
