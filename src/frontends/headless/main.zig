@@ -163,8 +163,8 @@ const Args = struct {
     /// `--cover-movie` after it fills the same slot. One recording covers
     /// one scenario, and the defects live in the scenarios nobody
     /// profiled — so the harvest has to take as many as there are.
-    cover_image: [8]?[]const u8 = @splat(null),
-    cover_movie: [8]?[]const u8 = @splat(null),
+    cover_image: [16]?[]const u8 = @splat(null),
+    cover_movie: [16]?[]const u8 = @splat(null),
     n_cover: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
@@ -4262,6 +4262,10 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hash_stream = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--s2-keep")) {
             out.s2_keep = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--cheat")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.n_pokes = util.cheat.parseCodes(v, &out.pokes, out.n_pokes) catch
+                return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--poke")) {
             const v = it.next() orelse return error.MissingValue;
             out.n_pokes = util.cheat.parseList(v, &out.pokes, out.n_pokes) catch

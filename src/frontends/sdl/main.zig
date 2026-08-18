@@ -109,6 +109,10 @@ pub fn main(init: std.process.Init) !void {
                 "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
                 "  --wide N    widen the framebuffer by N columns on each side, e.g. 32 -> 320x224\n" ++
                 "              (fast core only; for widescreen game patches such as wide-snes)\n" ++
+                "  --cheat c   Action-Replay-style code (ADDRVV, join parts with +), held\n" ++
+                "              every frame; a WRAM code is also applied where relocation\n" ++
+                "              moved that byte, so cheat-list codes work on conversions\n" ++
+                "  --poke a=v  same, but exact: no relocation mirror\n" ++
                 "  --movie f   replay a recorded playthrough (.ymv) from power-on; live input\n" ++
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
