@@ -7,13 +7,14 @@ reference throughout is Vitor Vilela's hand-crafted SA-1 patch (v17), used as
 an answer key by byte-diffing, never as a source.
 
 The work lives on PR #115 (`claude/sa1-async-offload`). The entry point, in
-the shape that actually ships a two-tree patch:
+the shape that actually ships a four-tree patch:
 
 ```
 yamabuki-headless <rom> --gen-sa1-patch --window --wg-static --wg-fastrom \
     --verify-behavioral --state <gameplay.state> \
     --movie <surface1.ymv> ... --movie <surface5.ymv> \
-    --cover-image <prev-build.sfc> --cover-movie <recorded-on-it.ymv> \
+    --cover-image <prev-build.sfc> --cover-movie <recorded-on-it.ymv> ...×11 \
+    --wg-add 009bcd --wg-expand 1m --wg-copy-reserve 3600 \
     --conv-pad 1500 --wg-nmi-off 8ef1 --wg-drop 8c95 --out <patch.bps>
 ```
 
@@ -278,26 +279,29 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**Current, 2026-08-17.** The shipping patch is the two-tree window
-conversion: `$9BCD` (sequencer) and `$8EF1` (the 1,324-byte physics tree)
-both executing on the SA-1, plus FastROM, 121 index-split thunks, and
-`--wg-static`. Five verification surfaces, three cover harvests.
+**Current, 2026-08-20 — union68.** The shipping patch is the four-tree
+window conversion: `$9BCD` (the stage-1 sequencer), `$8EF1` (the
+1,324-byte physics tree), and `$9028`/`$9020` (the pair the two-scene
+intersection promoted, section 19), all executing on the SA-1, plus
+FastROM, a 1 MiB expansion (section 21), and 131 split-site thunks — 39
+of them through the cold dispatcher (section 22). Five verification
+surfaces, eleven cover harvests, state-anchored at a stage-2 scene.
 
-    combat surface   stock mean 58% / p95 100%  ->  18% / 63%
-    boss surface     stock mean 44% / p95  87%  ->  17% / 39%
-    dropped frames   237 -> 114
+    stage-2 scene (anchored)   stock mean 57%           ->  17%
+    boss surface (11,243f)     stock mean 44% / p95 87% ->  17% / 41%
+    dropped frames             237 -> 115
     (Vilela's hand-written v17, for scale: 12% mean)
 
 The **p95** column is the one that answers "does it still feel slow" —
-the heaviest five percent of frames no longer saturate the CPU. Live
-play: correct through stage 1, laser confirmed working, boss ARRIVES for
-the first time. Gates: all five surfaces behaviourally equivalent, zero
-stale sites across six recordings, 80k+40k soaks with every frame in the
-last ten thousand a distinct picture.
+the heaviest five percent of frames no longer saturate the CPU. Gates:
+all five surfaces behaviourally equivalent; the stale and DMA detectors
+report **zero stale reads and zero abandoned accesses** over the boss and
+full-game surfaces — union64's one residual defect (`$82:F97A`) is fixed
+by the very recording that observed it (section 22). Live play: stage 1
+and stage 2 both faster than stock, boss scroll-lock eyeballed clean.
 
-Open: the stage-1 boss renders garbled, traced to one uncovered
-instruction and fixed by a player recording that finally reaches it
-(section 17).
+Open: nothing on this line. The next distance to v17 is more coverage —
+and the ceiling that used to price coverage in refusals is gone.
 
 Everything below is how it got here, in the order the failures forced it,
 and several of the walls named as permanent turned out not to be.
@@ -1111,3 +1115,210 @@ so it takes a plain static shift at no runtime cost at all.
 **A recording is only written when it is STOPPED.** `F10` starts, `F10`
 again stops and flushes. Two round trips were lost to a recording that
 was never stopped and therefore never existed.
+
+## 18. Value provenance — bank bytes that travel as data
+
+The stage-1 décor rendered wrong on every window build (union57 and
+before), and the defect was invisible to the entire rewrite catalog,
+because the bytes at fault never sit in an instruction: the game builds
+DMA queue records by copying a ROM **table** through WRAM staging cells
+into `$43x4`. A `$7F` that lives in ROM as *data*, is loaded, parked,
+and forwarded, passes through no rewritable shape at all — and DMA then
+reads the abandoned bank. Six table bytes (`$7F`→`$41`) fixed the décor;
+union58 differs from union57 by sixteen bytes total.
+
+Proving those six took a provenance chain with three properties, each
+earned by a miss:
+
+- **The source map must cover all 128 KiB of WRAM** (it covered the low
+  8 KiB): the staging cell can be anywhere.
+- **Provenance must survive WRAM loads**: ROM byte → WRAM cell →
+  `$43x4` is two hops, and the evidence walk originally dropped the
+  chain at the first one. Reads go through the live bus (`peek8`), not
+  the WRAM array — on a converted image that array is a dead copy.
+- **On a conversion-side replay, BOTH homes are evidence.** The first
+  version accepted only `$40/$41` under conversion and thereby dropped
+  the `$00:92C3 LDA #$7E / PHA / PLB` proof. A *missed* reference on a
+  converted image still lands in `$7E/$7F` — which is exactly the class
+  being hunted. Filtering it out filtered out the bug.
+
+That last property is what lets **cover replays donate bank-byte
+provenance**: a recording played on a previous conversion now feeds the
+same chain the stock profile feeds.
+
+The companion blind spot, named while chasing this: **DMA bypasses the
+CPU.** The stale detector observes data reads and writes; what a DMA
+channel fetches never crosses it. `--dma-trace` (flags transfers whose
+source is an abandoned home) and `--dma-bank-pc` (which instruction
+handed the channel its bank byte) exist for that gap — and the latter's
+dedup key must include the VALUE, not just the PC: a site that hands
+over `$40` on one pass and `$7F` on another is exactly the bug being
+hunted, and a PC-only key reports only whichever came first.
+
+## 19. One state sees one scene — the intersection
+
+The anchored evidence pass profiles the scene its `--state` holds, and
+Gradius III's two slow scenes barely overlap: 98 routines executed only
+in the stage-1 anchor, 362 only in the stage-2 (bubble) anchor, 129 in
+both. A candidate set chosen from one scene optimizes that scene — the
+stage-1 builds left stage 2 at 19.8% lag.
+
+The fix was measurement, not guessing. A second state (extracted from a
+player's take with `--save-state-at <frame>=<path>`), a profile of each
+scene, and a per-routine complexity backend (`callgraph.zig`:
+instructions, branch count, cyclomatic complexity, callers — built after
+Vilela described using call-graph tooling for exactly this) joined into
+one ranking by combined slowdown share:
+
+    $8EF1  stage-1 heavy  AND  87% of stage-2 slow work
+    $9028  hot in both    (70%)
+    $9020  hot in both    (66%)
+    $9BCD  99.7% stage-1-only
+
+That table is why the shipping set is those four trees: the two-scene
+pair was promoted on numbers, and `$9BCD` retained for the scene it
+owns. Stage-2 lag fell 19.8% → 12.5% with stage 1 unharmed (114 → 115
+dropped).
+
+Two lessons from wiring `--wg-add` (offer a routine to the selector by
+hand):
+
+- The flag's code landed in the whole-game candidate block, not the
+  window one — and union62 came out **byte-identical** to union61, with
+  the flag's own log line never printing. A flag that lands in the wrong
+  branch still produces a plausible build; the header's warning about
+  reconstructed commands applies one level down, to the flags'
+  implementations. The byte-diff and the missing log line are what
+  caught it.
+- Offering a candidate is not enough: its CALL SITES must be covered,
+  or there is nothing to re-point at the stub.
+
+## 20. The bank seam — the PC wraps inside a bank
+
+A player's stage-1 recording froze or reset about a minute in, on
+union63 only. The 65816's program counter wraps WITHIN a bank: after
+`$xx:FFFF` comes `$xx:0000` — in LoROM's low half, the WRAM mirror. The
+offload tree copies needed 5,638 contiguous bytes; `findFreeSpace`
+guarantees only FILE contiguity; the span ran off the end of bank `$1E`,
+and the copy's tail executed abandoned memory until the console reset.
+
+The law: **anything that executes must be bank-contained.**
+`findFreeSpaceInBank` (top-down through the banks, never bank `$00`, a
+span never crosses a seam) now allocates every copy. Two footnotes worth
+their lines:
+
+- The 512 KiB image never showed the bug because its biggest padding run
+  happened to end exactly on a bank boundary. Expansion (section 21)
+  created the first run that didn't.
+- The same seam explained a standing mystery: `$9BCD` traced **zero
+  instructions** in unions 62–63. A copy past the seam cannot run, so
+  the auto-bisect silently dropped the tree. A tree that contributes
+  nothing is a symptom, not noise.
+
+## 21. Expansion, and what it cannot buy
+
+`--wg-expand 1m` grows the image to 1 MiB: new banks filled with `$FF`
+(the only byte the padding allocators treat as free), and the header's
+size byte (`0x17` = log2 of KiB) updated to agree with the file — or the
+loader masks the new banks straight back onto the old ones. 523,816
+bytes of padding, and the tree-copy space crisis ended permanently.
+
+What expansion cannot buy is bytes **in the banks the code lives in**.
+The scaffold needs bank `$00` (the reset vector, JSR reach); a split
+site needs stub bytes in its OWN bank (a JSR cannot leave the executing
+bank). Expansion adds empty banks at the top; the pressure is at the
+bottom, in banks that ship 149 bytes of slack. That pressure is section
+22's wall.
+
+## 22. The per-bank ceiling, and the cold dispatcher that removed it
+
+Unions 65, 66, and 67 — every attempt to add a twelfth cover pair or
+swap in a richer one — refused with "no padding run in bank $00 is large
+enough for the boot shim / needs 35 bytes". Both halves of that message
+were wrong (it is the shared `no_free_space` string): the 35 bytes were
+one PINNED index-split thunk, and the failing allocation was its 5-byte
+far stub in the SITE's own bank. `dbg_thunk_pad` named the real wall:
+
+    bank $02: 44 site(s), 31 distinct thunks
+    bodies need 1,284 bytes; stubs need 155; the bank has ONE run of 149
+
+The growth law behind it: an unmeasured tiny-base indexed site takes the
+full thunk *on principle* (`pin = e==0` — the laser lesson, section 11),
+and cover harvests grow coverage faster than evidence. So **five bytes
+per site is a ceiling that coverage itself walks into** — three refusals
+proved that adding evidence had begun to stop the patch existing.
+
+The fix inverts the cost for exactly the population that grows. Per
+bank, three tiers, decided before anything is written: bodies when they
+all fit; a far stub per thunk when at least those do; and when even one
+stub per thunk exceeds the bank, measured thunks keep their stubs and
+every UNMEASURED one shares **one** stub through the cold dispatcher —
+`JSR shared_stub` → `JSL dispatcher / RTS`. The dispatcher identifies
+the caller by the return address the site's own JSR pushed: binary
+search over a sorted (site → body−1) table of 8-byte records, then an
+`RTL` into the same RTL-tailed body a per-thunk stub would have named.
+The load-bearing tricks:
+
+- **The stack hole.** Three bytes reserved BELOW the saved registers at
+  entry; the body address is written into them mid-search with
+  stack-relative stores; scratch is dropped with `TSC/ADC/TCS`; the
+  registers are restored; `RTL` consumes the hole. No scratch memory
+  anywhere — reentrant against any NMI, including one that dispatches
+  through this same code.
+- **Frame identity.** The body enters seeing [3-byte JSL frame][2-byte
+  JSR return] — indistinguishable from the per-thunk far-stub path — so
+  every existing thunk template is reused unchanged, and the flags the
+  body's op sets survive (RTS/RTL do not touch P).
+- **`AND #$7F` on the pushed PBR**: a site executing from a fast mirror
+  (`$82`) must fold onto its file bank (`$02`) or the lookup misses.
+
+The price is ~150 cycles per call, paid only by sites that never
+executed once across ~100,000 profiled frames. The tier refusal now has
+its own reason (`wg_thunk_space`) and names the bank.
+
+union68 is the result: 39 sites through the dispatcher, boss-surface
+performance identical to union64 to the frame (mean 17%, slowdown 0.3%),
+and the ceiling gone — evidence is free to grow again.
+
+And the loop closed on the standing defect. union64's one residual stale
+read — `$82:F97A LDA $0010,Y`, DBR=`$01`, reading abandoned `$01:0250`
+once in 7,671 frames — was observed during a player's stage-2 take. That
+take, harvested as a cover pair, donated the site's evidence
+(`wram_low`, pure), and the generator fixed it with a plain static shift
+(`LDA $6010,Y`) at zero runtime cost. Same shape as the boss (section
+17): **the witness of a defect is the evidence that repairs it — record
+on the build where the defect shows.**
+
+## 23. `--save-attempt` saves the attempt, not the verdict
+
+Hours went into diagnosing a spectacular boot-time SA-1 runaway in
+`ship68.sfc`: a dispatch with every mailbox cell reading `$FF`, the tree
+entered in m8/x8 (whose real stream is m16/x16 — the width misparse
+turns `A0 FC FF 29 10 00` from `LDY #$FFFC / AND #$0010` into `LDY #$FC
+/ SBC $001029,X`), an open-bus walk through unmapped space, the watchdog
+abort, the scene heal. All real, all reproducible — **and all in an
+image the generator had already rejected.** The greedy pass tries the
+async (fire-and-forget) flavor after the sync config passes; async
+failed its own verification ("live state diverges and never heals") and
+the sync config was kept — but `--save-attempt` writes the LAST image
+generated, which was the async one. The BPS is the verdict; the attempt
+file is a crash dump of whatever died last. **Evaluate the BPS-applied
+image.** The generator's own gates had already caught everything the
+manual hunt rediscovered.
+
+The hunt paid its way in instruments, kept:
+
+- `[stale]` prints the clock, and **clk=0 means the SA-1 core** (its bus
+  has no clock) — one field answers "which CPU", the question that
+  reframed the whole episode.
+- `--stale-ring` keeps the SA-1's last 8,192 instructions and dumps them
+  at the first stale hit — the history a forward trace can never afford
+  to keep. 200,000 instructions of `--trace-sa1` ran out before the
+  episode; the ring caught the entire story in one run: service loop →
+  dispatch block → unmarshal reading `$FF`s → tree entry → misparse.
+- The width-misparse **signature**, worth recognizing on sight: a run of
+  stale reads at consecutive PCs with a constant stride and a constant
+  effective address is one wrong-width stream misdecoding a correct one.
+  (In the shipped sync flavor this cannot arise from a legitimate call —
+  the dispatch marshals the caller's true P, and no real caller enters
+  these trees narrow; stock itself would misparse.)

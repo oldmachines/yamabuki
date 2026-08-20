@@ -545,6 +545,22 @@ manual process (profile, transform, verify against the original), automated:
   its reason, and a game the generator cannot convert honestly is a game it
   hands to a human with the map already drawn.
 
+**Where the ladder got to (2026-08-20).** With commercial dumps in hand,
+the ground truth was collected and the rungs above were climbed, rebuilt,
+and in three cases discarded on a real cart. Four architectures were
+built and measured against Gradius III; the survivor — **uniform window
+relocation** (the game stays on the S-CPU, WRAM moves wholesale at
+identity offsets into BW-RAM, routine trees run verbatim on the SA-1) —
+is v17's own architecture, reached independently by elimination. Sixty-
+eight generated iterations later the machine-written patch runs four
+trees on the SA-1, holds a 1 MiB expansion, dispatches 131 evidence-split
+sites through thunks, and measures stage-2 mean utilisation 57%→17% with
+dropped frames 237→115 against v17's 12% mean — verified behaviourally
+over five surfaces and eleven cover harvests, with zero stale or
+abandoned accesses under the detectors. The full account — every rule,
+every refusal, and every instrument the failures forced — lives in
+[SA1_CONVERSION_LEARNINGS.md](SA1_CONVERSION_LEARNINGS.md).
+
 ### Two signals the third commercial game forced
 
 Measuring a third cart (a polygon racer) exposed a hole in the verdict
