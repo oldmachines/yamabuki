@@ -56,8 +56,9 @@ pub const Regs = struct {
 
 pub const ExecState = enum(u8) { running, waiting, stopped };
 
-/// TEMP calibration: print bus.clock at the first fetch of this bank-0 PC.
-pub var dbg_clock_pc: u16 = 0;
+/// TEMP calibration: print bus.clock at the first fetch of this PC
+/// (24-bit; the bank folds through $7F so fast mirrors match).
+pub var dbg_clock_pc: u24 = 0;
 pub var dbg_clock_fired: bool = false;
 /// TEMP diagnostics: log writes to this WRAM-offset range (banks $7E/$40).
 /// See `--dma-bank-pc`. Which instruction hands a DMA channel its A-bus bank
@@ -194,11 +195,12 @@ pub fn Cpu(comptime BusT: type) type {
             }
 
             if (dbg_clock_pc != 0 and !dbg_clock_fired and
-                self.regs.pbr == 0 and self.regs.pc == dbg_clock_pc and
+                (self.regs.pbr & 0x7F) == (dbg_clock_pc >> 16) and
+                self.regs.pc == @as(u16, @truncate(dbg_clock_pc)) and
                 @hasField(BusT, "clock"))
             {
                 dbg_clock_fired = true;
-                std.debug.print("[clk] pc=00:{x:0>4} clock={}\n", .{ self.regs.pc, self.bus.clock });
+                std.debug.print("[clk] pc={x:0>2}:{x:0>4} clock={}\n", .{ self.regs.pbr, self.regs.pc, self.bus.clock });
             }
             if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
                 const clk = self.bus.clock;

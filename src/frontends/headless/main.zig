@@ -4477,7 +4477,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.cover_movie[out.n_cover - 1] = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--clock-pc")) {
             const v = it.next() orelse return error.MissingValue;
-            core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u16, v, 16);
+            core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u24, v, 16);
         } else if (std.mem.eql(u8, a, "--conv-pad")) {
             const v = it.next() orelse return error.MissingValue;
             dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);

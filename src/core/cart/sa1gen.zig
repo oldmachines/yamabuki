@@ -2619,17 +2619,16 @@ fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
 /// stored exit P after the marshal. (PLB's N/Z clobber predates the
 /// watchdog and is measured non-load-bearing; I is not a flag to
 /// gamble on.)
-const win_block_len: u32 = 70;
+const win_block_len: u32 = 65;
 fn emitWinBlock(d: []u8, cur: *usize, id: u8, copy_addr: u16, copy_bank: u8, unm_addr: u16, mar_addr: u16, sig_addr: u16, dp_base: u16) void {
-    put(d, cur, &.{ 0xC9, id, 0xD0, 0x42 });
+    put(d, cur, &.{ 0xC9, id, 0xD0, win_block_len - 4 });
     put(d, cur, &.{0x8B}); // dispatcher DBR
     put(d, cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x5B }); // game D
     put(d, cur, &.{ 0xE2, 0x20 });
     put(d, cur, &.{ 0xAD, 0x86, 0x37, 0x29, 0x04, 0x8D, 0x8E, 0x37 }); // entry P's I bit -> $378E
     put(d, cur, &.{ 0x9C, 0x11, 0x22 }); // CTR: counters to zero
     put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // CIC: clear timer flag
-    put(d, cur, &.{ 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
-    putJsr(d, cur, unm_addr);
+    putJsr(d, cur, unm_addr); // loads X/Y, sets game DBR, loads A/P long
     put(d, cur, &.{0x58}); // CLI — the watchdog covers the copy whatever game P says
     put(d, cur, &.{ 0x22, @truncate(copy_addr), @truncate(copy_addr >> 8), copy_bank });
     put(d, cur, &.{0x78}); // SEI
@@ -2703,7 +2702,7 @@ const wg_window_shim_max = 33 + 48;
 const WinBoot = struct { crv: u16, civ: u16 };
 /// Bank-0 reservation for the window dispatcher: prologue + message loop
 /// + JMP + sig + unm + mar + abort + blocks + NMI prologue + mirror thunks.
-const win_disp_max: u32 = 51 + 12 + 3 + 19 + 21 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
+const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
 /// original 3-byte op (see the emission comment in convertWholeGame).
@@ -3431,7 +3430,7 @@ fn emitWindowOffloads(
     // IRQ line at once, and the first dispatch's PLP of a mainline
     // caller's P would take it instantly). CIV is programmed by the
     // S-CPU shim: $2207/8 is not writable from this side.
-    const abort_addr: u16 = base16 + @as(u16, @intCast(51 + 12 + n * win_block_len + 3 + 19 + 21 + 24));
+    const abort_addr: u16 = base16 + @as(u16, @intCast(51 + 12 + n * win_block_len + 3 + 19 + 29 + 24));
     put(d, &dc, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x9C, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
     put(d, &dc, &.{ 0xA9, win_watchdog_vcnt, 0x8D, 0x14, 0x22 }); // VCNT lo
     put(d, &dc, &.{ 0xA9, 0x00, 0x8D, 0x15, 0x22 }); // VCNT hi
@@ -3447,7 +3446,19 @@ fn emitWindowOffloads(
     const sig_addr: u16 = base16 + @as(u16, @intCast(dc));
     put(d, &dc, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x09, 0x22, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xD0, 0xF9, 0x9C, 0x09, 0x22, 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
     const unm_addr: u16 = base16 + @as(u16, @intCast(dc));
-    put(d, &dc, &.{ 0xAD, 0x86, 0x37, 0x48, 0xAD, 0x81, 0x37, 0xEB, 0xAD, 0x80, 0x37, 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37, 0x28, 0x60 });
+    // The unmarshal sets the GAME DBR itself, and the mailbox reads that
+    // follow it go LONG. Ordering is load-bearing: a caller pinned to
+    // BW-RAM marshals DBR=$40, and an absolute $37xx read under that
+    // bank lands in BW-RAM game data, not I-RAM — the tree then runs
+    // with garbage registers and a garbage P (measured: the async
+    // flavor's pinned caller entered the copy in m8/x8, misparsed the
+    // m16 stream, and ran away until the watchdog). X and Y load first,
+    // under the dispatcher's DBR, because LDX/LDY have no long form.
+    put(d, &dc, &.{ 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37 }); // REP #$10; LDX; LDY
+    put(d, &dc, &.{ 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
+    put(d, &dc, &.{ 0xAF, 0x86, 0x37, 0x00, 0x48 }); // P (long), pushed
+    put(d, &dc, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 }); // B, A (long)
+    put(d, &dc, &.{ 0x28, 0x60 }); // PLP; RTS
     const mar_addr: u16 = base16 + @as(u16, @intCast(dc));
     put(d, &dc, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
     // The watchdog's abort handler; the resume shape is bank 0 inside
@@ -6886,6 +6897,75 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
         try testing.expect(trace.total > 0);
         // (No port-idle assert: the caller loops hot, so a sampled
         // instant is legitimately mid-handshake.)
+    }
+}
+
+test "window offload: a BW-RAM-pinned caller's registers survive the dispatch" {
+    // The async flavor's runaway, reduced. A caller pinned to $7E
+    // (re-banked to $40) marshals DBR=$40 — and the dispatcher's
+    // unmarshal used to run AFTER the game DBR was set, so its absolute
+    // $37xx reads landed in BW-RAM game data instead of I-RAM: the tree
+    // ran with whatever bytes the game kept there. The caller here
+    // poisons exactly those BW-RAM shadows with $FF first ($7E:3780 and
+    // $7E:3786 — the A and P cells), then calls with A=$55 and carry
+    // set; the tree must see the REAL registers through both flavors.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x0024], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMITIMEN: NMI on
+        0xA9, 0xFF, 0x8F, 0x86, 0x37, 0x7E, // poison the P cell's BW-RAM shadow
+        0x8F, 0x80, 0x37, 0x7E, // and the A cell's
+        0xA9, 0x7E, 0x48, 0xAB, // pin DBR = $7E (re-banked to $40)
+        0xA9, 0x55, // the value the tree must see
+        0x38, // SEC — and the carry it must see
+        0x22, 0x80, 0x80, 0x00, // JSL $00:8080
+        0xA9, 0x00, 0x48, 0xAB, // back to the system bank
+        0x80, 0xEF, // BRA to the re-pin
+    });
+    @memcpy(rom[0x0040..0x0046], &[_]u8{ 0x48, 0xEE, 0x40, 0x00, 0x68, 0x40 }); // NMI: INC $0040
+    std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0x8040, .little);
+    // Long stores only: the tree's observations must not depend on the
+    // caller's DBR — the registers are what is under test here.
+    @memcpy(rom[0x0080..0x008D], &[_]u8{
+        0x8F, 0x00, 0x05, 0x7E, // STA $7E:0500 — the marshalled A, or the poison
+        0x90, 0x06, // BCC +6 — the marshalled carry
+        0xA9, 0xAA, 0x8F, 0x03, 0x05, 0x7E, // LDA #$AA / STA $7E:0503
+        0x6B,
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8006, 0x8009, 0x800B, 0x800F, 0x8013, 0x8015, 0x8016, 0x8017, 0x8019, 0x801A, 0x801E, 0x8020, 0x8021, 0x8022 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8040, 0x8041, 0x8044, 0x8045 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8080, 0x8084, 0x8086, 0x8088, 0x808C }) |a| markOp(bytes, a);
+
+    const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
+    for ([_]bool{ false, true }) |go_async| {
+        var ref: ?Refusal = null;
+        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, &ref);
+        defer gpa.free(res.image);
+        try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
+
+        const cart = try cartridge.Cartridge.load(gpa, res.image);
+        const con = try gpa.create(console.FastConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        for (0..5) |_| con.runFrame();
+        // The poison is really there — and the tree never read it.
+        try testing.expectEqual(@as(u8, 0xFF), con.bus.sa1.bwram[0x3786]);
+        try testing.expectEqual(@as(u8, 0xFF), con.bus.sa1.bwram[0x3780]);
+        try testing.expectEqual(@as(u8, 0x55), con.bus.sa1.bwram[0x0500]);
+        try testing.expectEqual(@as(u8, 0xAA), con.bus.sa1.bwram[0x0503]);
+        try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0500]);
     }
 }
 
