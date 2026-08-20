@@ -90,6 +90,45 @@ pub fn siteClass(addr: u24) u8 {
 /// stock. Used by the conversion-side evidence harvest — sites that only
 /// gameplay reachable on the conversion executes (a recorded run's boss
 /// arrival) get their evidence from the world they actually ran in.
+/// The WRAM byte an address names, as an offset into the full 128 KiB, or
+/// null when it names something else. `conv` selects the home layout: a
+/// cover replay runs on an image where the window conversion already moved
+/// WRAM into BW-RAM, so the same byte answers to $40/$41 and to $6000-$7FFF
+/// in the system banks.
+pub fn wramAnyOffset(addr: u24, conv: bool) ?u32 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (conv) {
+        if (bank == 0x40) return a16;
+        if (bank == 0x41) return 0x10000 | @as(u32, a16);
+        if ((bank & 0x7F) <= 0x3F and a16 >= 0x6000 and a16 < 0x8000) return a16 - 0x6000;
+        return null;
+    }
+    if (bank == 0x7E) return a16;
+    if (bank == 0x7F) return 0x10000 | @as(u32, a16);
+    if ((bank & 0x7F) <= 0x3F and a16 < 0x2000) return a16;
+    return null;
+}
+
+/// `siteClass` in whichever home layout the run uses.
+pub fn siteClassHomes(addr: u24, conv: bool) u8 {
+    return if (conv) siteClassConvWindow(addr) else siteClass(addr);
+}
+
+/// Is this access landing in WRAM, in whichever home this run's image uses?
+///
+/// A cover replay accepts BOTH homes, and must: $40/$41 is where a correctly
+/// re-banked reference lands, while $7E/$7F is where one the conversion MISSED
+/// still lands — and a missed one is precisely the evidence a cover replay
+/// exists to collect. Accepting only the relocated home throws away every
+/// proof of the bug being hunted (measured: it dropped the proof for
+/// `$00:92C3 LDA #$7E / PHA / PLB`, whose `($12),Y` writes take their bank
+/// straight from DBR).
+pub fn isWramBank(bank: u8, conv: bool) bool {
+    if (bank == 0x7E or bank == 0x7F) return true;
+    return conv and (bank == 0x40 or bank == 0x41);
+}
+
 pub fn siteClassConvWindow(addr: u24) u8 {
     const bank: u8 = @truncate(addr >> 16);
     const a16: u16 = @truncate(addr);
@@ -114,10 +153,18 @@ pub fn siteClassConvWindow(addr: u24) u8 {
 /// $A000+/$E000+/$7F buffers out of BW-RAM and every gameplay sprite
 /// vanished).
 pub const PtrBankEvidence = struct {
-    /// Per low-8K WRAM byte (dp slots live there): the ROM CPU address of
-    /// the byte that sourced the $7E/$7F value currently stored in it, or
-    /// `none`. Refreshed on every tracked write.
-    src: [0x2000]u32,
+    /// Per WRAM byte (bank $7E at 0..$FFFF, bank $7F above it; dp slots
+    /// live in the first 8 KiB): the ROM CPU address of the byte that
+    /// sourced the $7E/$7F value currently stored in it, or `none`.
+    /// Refreshed on every tracked write.
+    ///
+    /// The whole 128 KiB, not just the moved low 8 KiB: a bank byte that
+    /// reaches hardware through a RAM staging area is proven only if the
+    /// staging cell is tracked, and those live wherever the game put them
+    /// (measured: Gradius III stages its DMA jobs at $7E:2842, and six
+    /// stage-2 tilemap transfers kept bank $7F because nothing linked the
+    /// queue cell back to the ROM record it was copied from).
+    src: [0x20000]u32,
     /// Deduped ROM bytes proven to feed pointer bank bytes (or DMA A-bus
     /// bank registers) that carried $7E/$7F into an actual access.
     proven: [max_proven]u32,

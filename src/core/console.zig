@@ -380,7 +380,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     u.noteWrite(a, width);
                     if (op != null) u.noteSite(pc, a);
                 }
-                if (u.ptr_banks) |pb| self.trackPtrBanks(pb, pc, op, m8, x8, width);
+                if (u.ptr_banks) |pb| self.trackPtrBanks(pb, pc, op, m8, x8, width, u.conv_window_homes);
             }
         }
 
@@ -391,7 +391,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// Pointer-bank provenance (see `usage_map.PtrBankEvidence`): runs
         /// once per profiled step, after the usage map has recorded the
         /// step's accesses.
-        fn trackPtrBanks(self: *Self, pb: *usage_map.PtrBankEvidence, pc: u24, op_o: ?u8, m8: bool, x8: bool, width: u8) void {
+        fn trackPtrBanks(self: *Self, pb: *usage_map.PtrBankEvidence, pc: u24, op_o: ?u8, m8: bool, x8: bool, width: u8, conv: bool) void {
             const none = usage_map.PtrBankEvidence.none;
             const op = op_o orelse {
                 // Interrupt dispatch between the load and the store would
@@ -410,8 +410,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 var i: u8 = 0;
                 while (i < width) : (i += 1) {
                     const ad = a -% i;
-                    if (usage_map.wramLowOffset(ad)) |off| {
-                        const val = self.bus.wram.data[off];
+                    if (usage_map.wramAnyOffset(ad, conv)) |off| {
+                        // Through the bus, not `wram.data`: on a cover replay
+                        // this byte lives in BW-RAM, and reading the abandoned
+                        // WRAM would attribute provenance from a dead copy.
+                        const val = self.bus.peek8(ad) orelse continue;
                         pb.src[off] = if ((val == 0x7E or val == 0x7F) and
                             self.prev_load_end != none and self.prev_load_w == width)
                             self.prev_load_end -% i
@@ -458,7 +461,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
-                    if (tb == 0x7E or tb == 0x7F) {
+                    if (usage_map.isWramBank(tb, conv)) {
                         const src: u32 = blk: {
                             const operand = self.bus.peek8(pc +% 1) orelse break :blk none;
                             const slot = self.cpu.regs.d +% operand +% 2;
@@ -480,7 +483,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
-                    if ((tb == 0x7E or tb == 0x7F) and tb == self.cpu.regs.dbr) {
+                    if (usage_map.isWramBank(tb, conv) and tb == self.cpu.regs.dbr) {
                         pb.addProven(self.dbr_src);
                         // Proven once is enough; keep it for the rest of the
                         // routine so every access under the same DBR does not
@@ -518,9 +521,24 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     self.prev_load_end = (pc +% w) & 0x7F_FFFF;
                     self.prev_load_w = w;
                 } else if (dataAddr(self.bus.last_data_read)) |r| {
-                    if (usage_map.siteClass(r) == usage_map.site_rom) {
+                    if (usage_map.siteClassHomes(r, conv) == usage_map.site_rom) {
                         self.prev_load_end = r & 0x7F_FFFF;
                         self.prev_load_w = w;
+                    } else if (w == 1) {
+                        // A byte read back out of WRAM carries whatever ROM
+                        // byte put it there. Without this the chain breaks at
+                        // every value that reaches hardware through a RAM
+                        // staging area, and a DMA job queue is exactly that:
+                        // the bank byte is copied from a ROM record into the
+                        // queue, and only the queue is read when the channel
+                        // is armed.
+                        if (usage_map.wramAnyOffset(r, conv)) |off| {
+                            const staged = pb.src[off];
+                            if (staged != usage_map.PtrBankEvidence.none) {
+                                self.prev_load_end = staged;
+                                self.prev_load_w = 1;
+                            }
+                        }
                     }
                 }
             }

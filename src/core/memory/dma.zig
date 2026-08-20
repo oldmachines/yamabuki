@@ -48,6 +48,30 @@ pub const Channel = struct {
     hdma_do_transfer: bool = false,
 };
 
+/// See `--dma-trace`. A general-purpose DMA reads its source straight out of
+/// memory without the CPU issuing a load, so a transfer left pointing at
+/// memory the window conversion abandoned is invisible to the stale-access
+/// detector. It shows up only as graphics that never arrive.
+pub var dbg_dma: usize = 0;
+var dbg_dma_seen: [256]u64 = @splat(0);
+var dbg_dma_n: usize = 0;
+
+fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool) void {
+    const key: u64 = @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
+    for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
+    if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;
+    dbg_dma_seen[dbg_dma_n] = key;
+    dbg_dma_n += 1;
+    const bank: u8 = @intCast(src >> 16);
+    const off: u16 = @truncate(src);
+    const dead = bank == 0x7E or bank == 0x7F or ((bank & 0x7F) < 0x40 and off < 0x2000);
+    std.debug.print("[dma] ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s){s}{s}\n", .{
+        i, src, b_reg, bytes,
+        if (a_is_dest) " (READ FROM B-BUS)" else "",
+        if (dead) "  <-- ABANDONED MEMORY" else "",
+    });
+}
+
 pub const Dma = struct {
     channels: [8]Channel,
     hdmaen: u8, // $420C
@@ -183,6 +207,8 @@ pub const Dma = struct {
             const ch = &self.channels[i];
             self.last_gdma_src[i] = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             self.last_gdma_len[i] = if (ch.count == 0) 0x10000 else ch.count;
+            if (dbg_dma != 0)
+                noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0);
         }
         const start = bus.clock;
         var cost: u64 = dma_setup_cycles;
