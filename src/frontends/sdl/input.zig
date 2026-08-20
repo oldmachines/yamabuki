@@ -598,15 +598,7 @@ pub const State = struct {
             .pad_removed => |pr| {
                 const p = self.slotOf(pr.pad) orelse return .none;
                 self.slots[p] = null;
-                // Whatever it held goes with it — a mid-jump unplug must not
-                // leave the character running forever.
-                self.masks[p] = 0;
-                self.axis_on[p] = @splat(@splat(false));
-                self.ff_axis = self.anyFfAxisEngaged(r);
-                // Single flags cover both pads; releasing on any unplug is
-                // the safe direction for a held hotkey.
-                self.ff_pad = false;
-                self.rw_pad = false;
+                self.clearSlot(r, p);
                 return .{ .pad_closed = .{ .pad = pr.pad, .slot = p } };
             },
         }
@@ -631,6 +623,47 @@ pub const State = struct {
 
     fn setMask(self: *State, player: u1, btn: SnesButton, down: bool) void {
         if (down) self.masks[player] |= btn.mask() else self.masks[player] &= ~btn.mask();
+    }
+
+    /// Give back a slot `pad_added` handed out but the caller could not open.
+    /// Without this the slot stays held by a pad that can never send input —
+    /// and never a removal either, since a device SDL failed to open may
+    /// simply drop off the gamepad list. The next real pad then lands in the
+    /// other slot and silently plays as player two.
+    pub fn releaseSlot(self: *State, r: *const Resolved, slot: u1) void {
+        self.slots[slot] = null;
+        self.clearSlot(r, slot);
+    }
+
+    /// Move a lone surviving pad into the preferred slot. Plugging a pad in
+    /// while it is already connected wirelessly makes SDL announce the wired
+    /// instance before it retires the wireless one, so the pad takes the
+    /// second slot and the first frees a moment later — leaving the only
+    /// controller in the room playing as player two. Returns the handle move
+    /// the caller must mirror, or null if nothing moved.
+    pub fn compact(self: *State, r: *const Resolved) ?struct { from: u1, to: u1 } {
+        const want: u1 = if (r.swap_pads) 1 else 0;
+        const other: u1 = ~want;
+        if (self.slots[want] != null or self.slots[other] == null) return null;
+        self.slots[want] = self.slots[other];
+        self.slots[other] = null;
+        // The pad just changed transport underneath the player; anything it
+        // was holding belongs to the instance that went away.
+        self.clearSlot(r, want);
+        self.clearSlot(r, other);
+        return .{ .from = other, .to = want };
+    }
+
+    /// Drop everything one slot held. A mid-jump unplug must not leave the
+    /// character running forever.
+    fn clearSlot(self: *State, r: *const Resolved, slot: u1) void {
+        self.masks[slot] = 0;
+        self.axis_on[slot] = @splat(@splat(false));
+        self.ff_axis = self.anyFfAxisEngaged(r);
+        // Single flags cover both pads; releasing on any unplug is the safe
+        // direction for a held hotkey.
+        self.ff_pad = false;
+        self.rw_pad = false;
     }
 
     fn slotOf(self: *const State, pad: u32) ?u1 {
@@ -830,6 +863,58 @@ test "input: hotplug fills slots in order, frees on unplug, refills" {
 
     // The next pad lands in the freed slot 0, not slot 2-of-2.
     try testing.expectEqual(Action{ .pad_opened = .{ .pad = 8, .slot = 0 } }, st.handle(&r, .{ .pad_added = .{ .pad = 8 } }));
+}
+
+test "input: a slot given back after a failed open is free again" {
+    var r: Resolved = .{};
+    var st: State = .{};
+    // The half-enumerated instance SDL announces before a pad settles: it
+    // claims player one, then the open fails and it never sends a removal.
+    try std.testing.expectEqual(
+        @as(u1, 0),
+        (st.handle(&r, .{ .pad_added = .{ .pad = 3 } })).pad_opened.slot,
+    );
+    st.releaseSlot(&r, 0);
+    try std.testing.expectEqual(@as(?u32, null), st.slots[0]);
+    // The real pad must land on player one, not be pushed to player two.
+    const o = st.handle(&r, .{ .pad_added = .{ .pad = 4 } });
+    try std.testing.expectEqual(@as(u1, 0), o.pad_opened.slot);
+    try std.testing.expectEqual(@as(?u32, 4), st.slots[0]);
+}
+
+test "input: a lone pad left in slot two is promoted to player one" {
+    const r = defaultResolved();
+    var st: State = .{};
+    // Wireless pad on player one, then the same pad arrives over the cable
+    // before SDL retires the wireless instance.
+    _ = st.handle(&r, .{ .pad_added = .{ .pad = 1 } });
+    _ = st.handle(&r, .{ .pad_added = .{ .pad = 2 } });
+    try std.testing.expectEqual(@as(?u32, 2), st.slots[1]);
+    // No promotion while both slots are genuinely occupied.
+    try std.testing.expect(st.compact(&r) == null);
+    _ = st.handle(&r, .{ .pad_removed = .{ .pad = 1 } });
+    const mv = st.compact(&r).?;
+    try std.testing.expectEqual(@as(u1, 1), mv.from);
+    try std.testing.expectEqual(@as(u1, 0), mv.to);
+    try std.testing.expectEqual(@as(?u32, 2), st.slots[0]);
+    try std.testing.expectEqual(@as(?u32, null), st.slots[1]);
+    // Buttons now reach player one, which is the whole point.
+    _ = st.handle(&r, .{ .pad_button = .{ .pad = 2, .button = 0, .down = true } });
+    try testing.expectEqual(Button.b, st.masks[0]);
+    try testing.expectEqual(@as(u16, 0), st.masks[1]);
+}
+
+test "input: swap_pads promotes into the swapped preferred slot" {
+    const cfg: InputConfig = .{ .swap_pads = true };
+    var r: Resolved = .{ .swap_pads = cfg.swap_pads };
+    var st: State = .{};
+    _ = st.handle(&r, .{ .pad_added = .{ .pad = 1 } }); // takes slot 1
+    _ = st.handle(&r, .{ .pad_added = .{ .pad = 2 } }); // takes slot 0
+    _ = st.handle(&r, .{ .pad_removed = .{ .pad = 1 } });
+    const mv = st.compact(&r).?;
+    try std.testing.expectEqual(@as(u1, 0), mv.from);
+    try std.testing.expectEqual(@as(u1, 1), mv.to);
+    try std.testing.expectEqual(@as(?u32, 2), st.slots[1]);
 }
 
 test "input: swap_pads reverses slot assignment order" {

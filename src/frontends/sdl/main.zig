@@ -622,4 +622,10 @@ test {
     _ = @import("png.zig");
     _ = @import("rewind.zig");
     _ = @import("library.zig");
+    _ = @import("infopanel.zig");
+    _ = @import("dirpicker.zig");
+    _ = @import("patchfind.zig");
+    _ = @import("osd.zig");
+    _ = @import("preset.zig");
+    _ = @import("gl.zig");
 }

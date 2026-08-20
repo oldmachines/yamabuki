@@ -70,8 +70,14 @@ pub const Info = struct {
     title: []const u8,
     /// ROM file basename.
     rom_name: []const u8,
-    /// Soft-patch basename, null = as dumped.
+    /// Soft-patch basename, null = nothing applied when the image loaded.
+    /// That is NOT the same as "as dumped": an image that was patched
+    /// beforehand and handed to us whole loads with no patch of its own.
     patch_name: ?[]const u8,
+    /// Enhancement chip display name, null = plain cartridge. The one fact
+    /// on this panel that distinguishes a converted image from its dump
+    /// without trusting a file name.
+    chip: ?[]const u8 = null,
     core: []const u8,
     region: []const u8,
     /// Active shader preset, null = software blit.
@@ -90,6 +96,10 @@ const panel_x = 8;
 const panel_w = 240;
 const label_x = panel_x + 6;
 const value_x = label_x + 8 * ui.char_w; // labels up to 7 chars + a gap
+/// Characters that fit between `value_x` and the panel's right edge. Value
+/// buffers are sized to exactly this, so a string too long to fit fails to
+/// format and takes the caller's fallback instead of painting over the frame.
+pub const value_cols = (panel_x + panel_w - value_x) / ui.char_w;
 
 fn row(s: *const ui.Surface, y: i32, label: []const u8, value: []const u8, vcolor: u16) void {
     ui.drawText(s, label_x, y, label, ui.color.text_dim);
@@ -118,15 +128,26 @@ pub fn draw(s: *const ui.Surface, info: *const Info) void {
     y += ui.line_h;
     // The row this palette exists for: an applied patch is called out in
     // the accent color, an unpatched session in plain dim text.
+    var pbuf: [value_cols]u8 = undefined;
     if (info.patch_name) |p| {
         row(s, y, "PATCH", p, ui.color.accent);
+    } else if (info.chip) |c| {
+        // "No patch applied" is not "as dumped". An image that was patched
+        // beforehand loads with nothing of its own to report, and the only
+        // thing on this panel that tells it from a plain dump is the chip
+        // its header declares — so say so on the row people read for it.
+        row(s, y, "PATCH", std.fmt.bufPrint(&pbuf, "NONE (IMAGE CARRIES {s})", .{c}) catch
+            "NONE APPLIED AT LOAD", ui.color.text_dim);
     } else {
-        row(s, y, "PATCH", "NONE - PLAYING AS DUMPED", ui.color.text_dim);
+        row(s, y, "PATCH", "NONE APPLIED AT LOAD", ui.color.text_dim);
     }
     y += ui.line_h;
 
     var buf: [40]u8 = undefined;
-    const core_txt = std.fmt.bufPrint(&buf, "{s} - {s}", .{ info.core, info.region }) catch info.core;
+    const core_txt = if (info.chip) |c|
+        std.fmt.bufPrint(&buf, "{s} - {s} - {s}", .{ info.core, c, info.region }) catch info.core
+    else
+        std.fmt.bufPrint(&buf, "{s} - {s}", .{ info.core, info.region }) catch info.core;
     row(s, y, "CORE", core_txt, ui.color.text);
     y += ui.line_h;
     row(s, y, "SHADER", info.shader orelse "SOFTWARE", ui.color.text);
@@ -193,7 +214,7 @@ test "thumb: decode rejects wrong length and wrong magic" {
     try testing.expectEqual(@as(?Thumb, null), Thumb.decode(&file)); // zero magic
 }
 
-test "draw: patch row shows the name, no-patch shows the dumped notice" {
+test "draw: patch row shows the name, no-patch shows the not-applied notice" {
     var canvas: [256 * 224]u16 = @splat(0x1234);
     const s = ui.Surface.init(&canvas, 256, 224);
     var info: Info = .{
@@ -215,6 +236,42 @@ test "draw: patch row shows the name, no-patch shows the dumped notice" {
         if (p == ui.color.panel) panel_px += 1;
     }
     try testing.expect(panel_px > 1000);
+}
+
+test "draw: the patch row names the chip a pre-patched image carries" {
+    // The row has to fit the panel: `value_cols` is the budget, and a name
+    // too long must fall back rather than paint past the frame.
+    try testing.expect("NONE (IMAGE CARRIES SA-1)".len <= value_cols);
+    try testing.expect("NONE (IMAGE CARRIES SUPER FX)".len <= value_cols);
+    var buf: [value_cols]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, std.fmt.bufPrint(
+        &buf,
+        "NONE (IMAGE CARRIES {s})",
+        .{"A RIDICULOUSLY LONG CHIP NAME"},
+    ));
+}
+
+test "draw: an enhancement chip changes the core row" {
+    // A pre-patched image loads with no patch of its own, so the PATCH row
+    // cannot tell an SA-1 conversion from its dump. The chip can.
+    var plain: [256 * 224]u16 = @splat(0);
+    var withchip: [256 * 224]u16 = @splat(0);
+    var info: Info = .{
+        .title = "GRADIUS 3",
+        .rom_name = "U57.SFC",
+        .patch_name = null,
+        .core = "FAST",
+        .region = "NTSC",
+        .shader = null,
+        .audio_on = false,
+        .volume = 0,
+        .slot = 1,
+        .slots = @splat(.{}),
+    };
+    draw(&ui.Surface.init(&plain, 256, 224), &info);
+    info.chip = "SA-1";
+    draw(&ui.Surface.init(&withchip, 256, 224), &info);
+    try testing.expect(!std.mem.eql(u16, &plain, &withchip));
 }
 
 test "draw: thumbnail pixels land inside the panel" {

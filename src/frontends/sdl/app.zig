@@ -401,6 +401,17 @@ pub fn run(
     // captures it up front and the movie carries it, so a session can start a
     // recording deep into a game instead of replaying the road to get there.
     var rec_anchor: ?[]u8 = null;
+    // Frame count at which each slot's state was saved DURING the take in
+    // progress. Loading a marked slot rewinds the take to that frame instead
+    // of throwing it away, which is what makes recording a long playthrough
+    // survivable: die, reload, and the log rewinds with the machine.
+    var rec_marks: [9]?u32 = @splat(null);
+    // The audio hash is a running accumulator over every frame the take has
+    // played. Rewinding the input log without rewinding this leaves the movie
+    // claiming an audio stream that includes the frames it just deleted, and
+    // a clean replay of the same inputs then reports a desync that is not
+    // there. Snapshot it with the mark; restore it with the rewind.
+    var rec_audio: [9]u64 = @splat(0);
     // Whether the console is still exactly as it powered on. A take started
     // here needs no anchor, which keeps "boot and record" writing the small
     // version-1 file it always did.
@@ -443,6 +454,24 @@ pub fn run(
                 // enumeration and hotplug are one code path.
                 sdl3.event_gamepad_added => .{ .pad_added = .{ .pad = ev.gdevice.which } },
                 sdl3.event_gamepad_removed => .{ .pad_removed = .{ .pad = ev.gdevice.which } },
+                // A joystick SDL enumerates but has no gamepad mapping for
+                // raises this and never `gamepad_added`, so the pad silently
+                // does nothing. Reporting it is the difference between "the
+                // controller is broken" and "SDL does not know this device":
+                // the same DualShock 4 can be a gamepad over Bluetooth and a
+                // bare joystick over USB, because the two connections present
+                // different VID/PID and report descriptors.
+                sdl3.event_joystick_added => {
+                    if (pad_api) |papi| {
+                        const id = ev.gdevice.which;
+                        const nm = if (papi.SDL_GetJoystickNameForID(id)) |n| std.mem.span(n) else "(unnamed)";
+                        try err.print("joystick added: id={d} name='{s}' recognised_as_gamepad={}\n", .{
+                            id, nm, papi.SDL_IsGamepad(id),
+                        });
+                        try err.flush();
+                    }
+                    continue;
+                },
                 else => continue,
             };
 
@@ -457,6 +486,7 @@ pub fn run(
                             try err.print("gamepad: {s} is player {d}\n", .{ name, @as(u32, o.slot) + 1 });
                         } else {
                             try err.print("warning: SDL_OpenGamepad: {s}\n", .{sdl.SDL_GetError()});
+                            inp.releaseSlot(&binds, o.slot);
                         }
                         try err.flush();
                     },
@@ -464,6 +494,13 @@ pub fn run(
                         if (pads[c.slot]) |p| papi.SDL_CloseGamepad(p);
                         pads[c.slot] = null;
                         try err.print("gamepad: player {d} disconnected\n", .{@as(u32, c.slot) + 1});
+                        if (inp.compact(&binds)) |mv| {
+                            pads[mv.to] = pads[mv.from];
+                            pads[mv.from] = null;
+                            try err.print("gamepad: player {d} is now player {d}\n", .{
+                                @as(u32, mv.from) + 1, @as(u32, mv.to) + 1,
+                            });
+                        }
                         try err.flush();
                     },
                     else => {},
@@ -509,6 +546,10 @@ pub fn run(
                     .save_state => {
                         saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
                         if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                        if (rec) |r| {
+                            rec_marks[slot] = @intCast(r.items.len);
+                            rec_audio[slot] = audio_hash;
+                        }
                         toast.set("STATE SAVED - SLOT {d}", .{slot});
                         mnu = null;
                     },
@@ -520,9 +561,10 @@ pub fn run(
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
                             at_power_on = false;
-                            at_power_on = false;
-                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "load state", err);
-                            toast.set("STATE LOADED - SLOT {d}", .{slot});
+                            if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                                toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
+                            else
+                                toast.set("STATE LOADED - SLOT {d}", .{slot});
                         } else toast.set("NO STATE IN SLOT {d}", .{slot});
                         mnu = null;
                     },
@@ -589,6 +631,10 @@ pub fn run(
                 .save_state => {
                     saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
                     if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                    if (rec) |r| {
+                        rec_marks[slot] = @intCast(r.items.len);
+                        rec_audio[slot] = audio_hash;
+                    }
                     toast.set("STATE SAVED - SLOT {d}", .{slot});
                 },
                 .load_state => {
@@ -596,8 +642,10 @@ pub fn run(
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
                         at_power_on = false;
-                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "load state", err);
-                        toast.set("STATE LOADED - SLOT {d}", .{slot});
+                        if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                            toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
+                        else
+                            toast.set("STATE LOADED - SLOT {d}", .{slot});
                     } else toast.set("NO STATE IN SLOT {d}", .{slot});
                 },
                 .record_movie => {
@@ -609,6 +657,7 @@ pub fn run(
                         rec = null;
                         if (rec_anchor) |a| gpa.free(a);
                         rec_anchor = null;
+                        rec_marks = @splat(null);
                         toast.set("RECORDING SAVED", .{});
                     } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
                         try err.print("movie: cannot record during playback\n", .{});
@@ -623,6 +672,7 @@ pub fn run(
                         if (rw) |*r| r.clear();
                         audio_hash = core.console.audio_hash_init;
                         rec = .init(gpa);
+                        rec_marks = @splat(null);
                         try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
                         try err.flush();
                         toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
@@ -638,6 +688,7 @@ pub fn run(
                             if (rw) |*r| r.clear();
                             audio_hash = core.console.audio_hash_init;
                             rec = .init(gpa);
+                            rec_marks = @splat(null);
                             try err.print("movie: recording from here ({d} KiB start state carried; press again to stop and save)\n", .{anchor.len / 1024});
                             try err.flush();
                             toast.set("RECORDING FROM HERE - F10 STOPS", .{});
@@ -767,6 +818,15 @@ pub fn run(
                 .title = title,
                 .rom_name = std.fs.path.basename(opts.rom),
                 .patch_name = opts.patch_name,
+                .chip = switch (con.cartridge().chip) {
+                    .none => null,
+                    .dsp => "DSP",
+                    .sa1 => "SA-1",
+                    .superfx => "SUPER FX",
+                    .cx4 => "CX4",
+                    .sdd1 => "S-DD1",
+                    .other => "COPROC",
+                },
                 .core = @tagName(opts.accuracy),
                 .region = @tagName(con.region()),
                 .shader = if (glv) |g| g.names[g.index] else null,
@@ -1909,6 +1969,55 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
 /// cannot replay must not be written) and a replay in progress hands input
 /// back. Note this is about time travel *during* a recording — starting one
 /// from a loaded state is fine, and carries that state as the movie's anchor.
+/// A state load landed on `slot` while a take is recording.
+///
+/// If that slot holds a state saved during THIS take, the log is truncated
+/// back to the frame it was saved at: replaying the take from its start now
+/// reaches exactly the machine the state restored, so the recording stays
+/// valid and the player keeps their progress. Returns the frame rewound to.
+///
+/// Marks past the cut name a branch that no longer exists. Dropping them is
+/// what stops a later load from restoring a machine the truncated log cannot
+/// explain — the one way this feature could silently produce a desynced movie.
+///
+/// A slot with no mark cannot be rewound to (the take never passed through
+/// that machine), so the take is discarded as before; null says so.
+/// Forget every mark past `at`. Those states were saved on a branch the
+/// truncation just deleted: loading one would restore a machine the shortened
+/// input log cannot reach, and the movie would replay into a different game.
+fn cutMarks(marks: *[9]?u32, at: u32) void {
+    for (marks) |*m| {
+        if (m.*) |f| {
+            if (f > at) m.* = null;
+        }
+    }
+}
+
+fn rewindRecToSlot(
+    gpa: std.mem.Allocator,
+    rec: *?std.array_list.Managed([2]u16),
+    rec_anchor: *?[]u8,
+    play_movie: *?util.movie.Movie,
+    marks: *[9]?u32,
+    audio_marks: *const [9]u64,
+    audio_hash: *u64,
+    slot: u32,
+    err: *std.Io.Writer,
+) ?u32 {
+    if (rec.* == null) return null;
+    const at = marks[slot] orelse {
+        discardMovieModes(gpa, rec, rec_anchor, play_movie, "load of a state not saved in this take", err);
+        marks.* = @splat(null);
+        return null;
+    };
+    rec.*.?.shrinkRetainingCapacity(at);
+    audio_hash.* = audio_marks[slot];
+    cutMarks(marks, at);
+    err.print("recording rewound to frame {d} (slot {d})\n", .{ at, slot }) catch {};
+    err.flush() catch {};
+    return at;
+}
+
 fn discardMovieModes(
     gpa: std.mem.Allocator,
     rec: *?std.array_list.Managed([2]u16),
@@ -2192,4 +2301,18 @@ fn cycleShader(
         @tagName(g.chain().p.tier),
     }) catch {};
     err.flush() catch {};
+}
+
+test "rec marks: rewinding forgets the branch it deleted" {
+    // Slot 1 at frame 100, slot 2 at 500. Rewinding to 100 keeps slot 1 and
+    // drops slot 2 — after the cut the take never reaches frame 500, so a
+    // load of slot 2 could only desync the recording.
+    var marks: [9]?u32 = @splat(null);
+    marks[1] = 100;
+    marks[2] = 500;
+    marks[3] = 100; // exactly at the cut survives: the log still reaches it
+    cutMarks(&marks, 100);
+    try std.testing.expectEqual(@as(?u32, 100), marks[1]);
+    try std.testing.expectEqual(@as(?u32, null), marks[2]);
+    try std.testing.expectEqual(@as(?u32, 100), marks[3]);
 }
