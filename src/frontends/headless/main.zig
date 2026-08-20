@@ -79,6 +79,8 @@ const Args = struct {
     /// profiled run as a bsnes-plus `-usage.bin` file (DiztinGUIsh imports
     /// it). A `--sa1-report` modifier, like `--hot`.
     usage_map_out: ?[]const u8 = null,
+    /// --call-graph: where to write the routine graph (Graphviz DOT).
+    call_graph_out: ?[]const u8 = null,
     /// Stage S2: print the relocation plan — the WRAM -> I-RAM/BW-RAM
     /// allocation map for the conversion verdict's hot set.
     plan: bool = false,
@@ -117,6 +119,12 @@ const Args = struct {
     /// the picture is either disabled, pointed somewhere empty, or fed a
     /// tilemap that never arrived, and those look identical in WRAM.
     dump_ppu: ?[]const u8 = null,
+    /// --save-state-at: frame to stop at and the file to write the machine to.
+    /// A recording that carries its own anchor cannot be a window-mode
+    /// surface, but the machine it passes through CAN anchor a profile — this
+    /// is how a late-game scene reaches the generator without a power-on take.
+    save_state_at: ?u32 = null,
+    save_state_path: []const u8 = "",
     /// `--poke ADDR=VAL`: cheat writes held after every frame. Repeatable,
     /// and each flag may carry a comma-separated list.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
@@ -210,6 +218,16 @@ const Args = struct {
     /// discovered by recursive-descent disassembly seeded from coverage.
     /// Unprovable shapes in that code are counted, not refused over.
     wg_static: bool = false,
+    /// --wg-copy-reserve: bytes held at the tail of the biggest padding run
+    /// for offload tree copies. The default matches the generator's own.
+    wg_copy_reserve: u32 = core.sa1gen.copy_reserve,
+    /// --wg-expand: grow the converted image to this many bytes (0 = keep the
+    /// original size), handing the conversion room it does not otherwise have.
+    wg_expand_to: u32 = 0,
+    /// --wg-add: extra offload candidates (CPU addresses), for routines a
+    /// single-scene profile ranks too low to offer.
+    wg_add: [8]u24 = @splat(0),
+    n_wg_add: usize = 0,
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
@@ -547,6 +565,14 @@ pub fn main(init: std.process.Init) !void {
                 try out.flush();
             }
         }
+        if (args.save_state_at) |at| if (i + 1 == at) {
+            const buf = try gpa.alloc(u8, core.AnyConsole.state_size);
+            defer gpa.free(buf);
+            const n = con.saveState(buf);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args.save_state_path, .data = buf[0..n] });
+            try out.print("wrote {s} ({d} bytes) — the machine after frame {d}\n", .{ args.save_state_path, n, at });
+            try out.flush();
+        };
         if (hash_stream) |*hs| try hs.append(core.console.hashFrame(con.framebuffer()));
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
@@ -2187,6 +2213,17 @@ fn runSa1Gen(
             cands[n_cands] = .{ .entry = e };
             n_cands += 1;
         }
+        for (args.wg_add[0..args.n_wg_add]) |e| {
+            if (n_cands == cands.len) break;
+            const dup = for (cands[0..n_cands]) |c| {
+                if (c.entry == e) break true;
+            } else false;
+            if (dup) continue;
+            cands[n_cands] = .{ .entry = e };
+            n_cands += 1;
+            try out.print("  --wg-add: offering offload ${x:0>6} to the selector\n", .{e});
+            try out.flush();
+        }
         if (!args.verify_behavioral) {
             for (cands[0..n_cands]) |*c| c.no_async = true;
         }
@@ -2356,7 +2393,7 @@ fn runSa1Gen(
         }
         var refusal: ?core.sa1gen.Refusal = null;
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         if (converted) |cr| {
@@ -2394,6 +2431,7 @@ fn runSa1Gen(
                         .{ r.detail >> 16, r.detail & 0xFFFF },
                     ),
                     .no_free_space => try out.print("  needs {} bytes\n", .{r.detail}),
+                    .wg_thunk_space => try out.print("  bank ${x:0>2}\n", .{r.detail}),
                     else => {},
                 }
                 try out.flush();
@@ -3114,6 +3152,11 @@ fn reportSa1(
                 "  {} split site(s) dispatch through a thunk instead of a fixed operand:\n  {} on the runtime data bank, {} on the index register's magnitude\n  (tiny-base indexed absolutes — no single operand serves a data base\n  and a ROM walk); {} of them behind a far stub for want of bank room\n",
                 .{ res.stats.split_sites, res.stats.split_sites - res.stats.idx_split_sites, res.stats.idx_split_sites, res.stats.split_far },
             );
+        if (res.stats.disp_sites != 0)
+            try out.print(
+                "  {} unmeasured site(s) in full banks share one stub per bank through\n  the cold dispatcher (return-address lookup; ~150 cycles, never-seen code)\n",
+                .{res.stats.disp_sites},
+            );
         if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0)
             try out.print(
                 "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000 (addressing state travelling as\n  data — the idioms operand rewrites cannot reach)\n",
@@ -3431,7 +3474,7 @@ fn runReport(
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.
     var umap: core.usage_map.UsageMap = undefined;
-    if (args.usage_map_out != null) {
+    if (args.usage_map_out != null or args.call_graph_out != null) {
         const bytes = try gpa.alloc(u8, core.usage_map.cpu_map_len);
         @memset(bytes, 0);
         umap = .{ .bytes = bytes };
@@ -3448,6 +3491,55 @@ fn runReport(
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
         if (i >= args.skip) samples.appendAssumeCapacity(s);
+    }
+
+    if (args.call_graph_out) |path| {
+        var seeds: std.array_list.Managed(u24) = .init(gpa);
+        defer seeds.deinit();
+        for (&con.prof.routines) |*r| {
+            if (r.entry == profile.Routine.empty) continue;
+            try seeds.append(@intCast(r.entry & 0xFF_FFFF));
+        }
+        var g = try core.callgraph.analyze(gpa, cart.rom, umap.bytes, seeds.items);
+        defer g.deinit();
+
+        // Ranked by complexity: the routines whose bodies branch the most are
+        // where the frame goes and where a verbatim copy is hardest to prove.
+        const by_cx = try gpa.dupe(core.callgraph.Node, g.nodes);
+        defer gpa.free(by_cx);
+        std.mem.sort(core.callgraph.Node, by_cx, {}, struct {
+            fn lt(_: void, x: core.callgraph.Node, y: core.callgraph.Node) bool {
+                return x.complexity() > y.complexity();
+            }
+        }.lt);
+        try out.print("\n  call graph: {d} routine(s), {d} edge(s), {d} unresolved dispatch site(s)\n", .{ g.nodes.len, g.edges.len, g.unresolved });
+        try out.print("    entry     bytes  cx  callers  calls  indirect\n", .{});
+        var shown: usize = 0;
+        for (by_cx) |n| {
+            if (n.instrs == 0) continue;
+            if (shown == 16) break;
+            shown += 1;
+            try out.print("    ${x:0>6}  {d:>6}  {d:>3}  {d:>7}  {d:>5}  {d:>8}\n", .{ n.entry, n.bytes, n.complexity(), n.callers, n.calls_out, n.indirect });
+        }
+        // Every routine, tab-separated, for whatever wants to sort it.
+        var tsv: std.array_list.Managed(u8) = .init(gpa);
+        defer tsv.deinit();
+        try tsv.appendSlice("entry\tbytes\tinstrs\tcomplexity\tcallers\tcalls_out\tindirect\n");
+        for (g.nodes) |n| {
+            if (n.instrs == 0) continue;
+            const line = try std.fmt.allocPrint(gpa, "{x:0>6}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+                n.entry, n.bytes, n.instrs, n.complexity(), n.callers, n.calls_out, n.indirect,
+            });
+            defer gpa.free(line);
+            try tsv.appendSlice(line);
+        }
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tsv.items }) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            try out.flush();
+            std.process.exit(1);
+        };
+        try out.print("  wrote {s}\n", .{path});
+        try out.flush();
     }
 
     if (args.usage_map_out) |path| {
@@ -4321,6 +4413,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--call-graph")) {
+            out.call_graph_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--usage-map")) {
             out.usage_map_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--plan")) {
@@ -4407,12 +4501,26 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--trace-sa1")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_trace_sa1 = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--save-state-at")) {
+            // "<frame>=<path>": replay to that frame, then write the machine.
+            const v = it.next() orelse return error.MissingValue;
+            const eq = std.mem.indexOfScalar(u8, v, '=') orelse return error.MissingValue;
+            out.save_state_at = try std.fmt.parseInt(u32, v[0..eq], 10);
+            out.save_state_path = v[eq + 1 ..];
+        } else if (std.mem.eql(u8, a, "--dma-bank-pc")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_dmabank = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--dma-trace")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.dma.dbg_dma = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, a, "--stale")) {
             // "<max-sites>" or "<max-sites>:<from-clock>"
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, ':');
             core.wdc65816.dbg_stale = try std.fmt.parseInt(usize, pit.next().?, 10);
             if (pit.next()) |f| core.wdc65816.dbg_stale_from = try std.fmt.parseInt(u64, f, 10);
+        } else if (std.mem.eql(u8, a, "--stale-ring")) {
+            core.wdc65816.dbg_stale_ring = true;
         } else if (std.mem.eql(u8, a, "--watch-min")) {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_watch_val_min = try std.fmt.parseInt(u8, v, 16);
@@ -4441,6 +4549,21 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             // no candidates, no plan) with execution left on the S-CPU.
             out.window = true;
             out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--wg-add")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_add == out.wg_add.len) return error.TooManyAdds;
+            out.wg_add[out.n_wg_add] = try std.fmt.parseInt(u24, v, 16);
+            out.n_wg_add += 1;
+        } else if (std.mem.eql(u8, a, "--wg-expand")) {
+            // Accepts bytes, or "1m"/"2m" for whole megabytes.
+            const v = it.next() orelse return error.MissingValue;
+            const mb = v.len > 1 and (v[v.len - 1] == 'm' or v[v.len - 1] == 'M');
+            const n = try std.fmt.parseInt(u32, if (mb) v[0 .. v.len - 1] else v, 10);
+            out.wg_expand_to = if (mb) n * 1024 * 1024 else n;
+            if (!std.math.isPowerOfTwo(out.wg_expand_to)) return error.BadExpandSize;
+        } else if (std.mem.eql(u8, a, "--wg-copy-reserve")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wg_copy_reserve = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--wg-static")) {
             out.wg_static = true;
         } else if (std.mem.eql(u8, a, "--out")) {
@@ -4461,5 +4584,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
+    if (out.call_graph_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }
