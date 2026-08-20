@@ -305,6 +305,51 @@ fn refuse(refusal: *?Refusal, r: Refusal) Error {
 /// identical $00 or $FF bytes, kept at least 8 bytes clear of the run's start
 /// so an off-by-one in the neighbouring data's own length costs nothing.
 /// Returns the offset within `window`, or null.
+/// `findFreeSpace`, but the span returned never crosses a bank boundary.
+///
+/// File contiguity is NOT address contiguity in LoROM: each bank exposes
+/// only 32 KiB at $8000-$FFFF, and the 65816's program counter wraps WITHIN
+/// a bank — after $xx:FFFF comes $xx:0000, which is the WRAM mirror, not the
+/// next bank's ROM. Code placed across the seam therefore runs off the end
+/// of the bank and executes whatever the mirror holds; after a window
+/// conversion that is abandoned memory.
+///
+/// Measured: with the image expanded to 1 MiB, the offload tree copies were
+/// placed at file $F72B6 needing 5638 bytes while bank $1E had 3402 left.
+/// Execution ran off $1E:FFFF, wrapped to $1E:0000, and the game died about
+/// a minute into play — `$1E:0B9F`, deep in the mirror. The 512 KiB image
+/// never showed it because its biggest run ended exactly on the boundary.
+///
+/// Banks are searched from the top down and the span is taken at the run's
+/// tail, which keeps the copies out of the low banks whose padding the
+/// bank-local thunks need. Bank $00 is never offered: the boot shim and the
+/// scaffold's carve live there.
+pub fn findFreeSpaceInBank(image: []const u8, need: u32) ?u32 {
+    const margin = 8;
+    if (need == 0) return null;
+    var bank: u32 = @intCast(image.len / 0x8000);
+    while (bank > 1) {
+        bank -= 1;
+        const lo: usize = bank * 0x8000;
+        const hi: usize = @min(lo + 0x8000, image.len);
+        var i: usize = lo;
+        var best: ?u32 = null;
+        while (i < hi) {
+            const b = image[i];
+            if (b != 0x00 and b != 0xFF) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < hi and image[j] == b) j += 1;
+            if (j - i >= need + margin) best = @intCast(j - need);
+            i = j;
+        }
+        if (best) |at| return at;
+    }
+    return null;
+}
+
 pub fn findFreeSpace(window: []const u8, need: u32) ?u32 {
     const margin = 8;
     var best_off: u32 = 0;
@@ -356,6 +401,7 @@ fn pcToFileOffset(header: header_mod.Header, image_len: usize, pc: u24) ?u32 {
 /// mirroring repeats it (384 KiB = 256 + 2x128, and so on); if the size is
 /// too irregular even for that, the plain sum stands — the pair is still
 /// self-consistent, which is all the console ever checks.
+
 pub fn recomputeChecksum(image: []u8, header_offset: u32) void {
     const cs = header_offset + 0x1C;
     var sum: u32 = 0x1FE; // FF + FF + 00 + 00
@@ -567,4 +613,31 @@ test "recomputeChecksum: non-power-of-two weighting stays self-consistent" {
         want +%= if (i < 64 * 1024) b else @as(u32, b) * 2;
     }
     try testing.expectEqual(@as(u16, @truncate(want)), c);
+}
+
+test "findFreeSpaceInBank: a span never crosses the bank seam" {
+    const gpa = std.testing.allocator;
+    const image = try gpa.alloc(u8, 4 * 0x8000); // banks $00-$03
+    defer gpa.free(image);
+    @memset(image, 0x11); // occupied
+
+    // Free space straddling the $02/$03 seam: 3000 bytes before it, 3000
+    // after. `findFreeSpace` would happily hand back a span across the
+    // middle; this must not.
+    const seam: usize = 3 * 0x8000;
+    @memset(image[seam - 3000 .. seam + 3000], 0xFF);
+
+    // 5000 bytes cannot be placed: neither side of the seam holds it.
+    try std.testing.expectEqual(@as(?u32, null), findFreeSpaceInBank(image, 5000));
+
+    // 2000 fits on one side — and whichever side it picks, the whole span
+    // must live in one bank.
+    const at = findFreeSpaceInBank(image, 2000).?;
+    try std.testing.expectEqual(at / 0x8000, (at + 2000 - 1) / 0x8000);
+    for (image[at..][0..2000]) |b| try std.testing.expectEqual(@as(u8, 0xFF), b);
+
+    // Bank $00 is never offered: the boot shim's carve lives there.
+    @memset(image[0..0x8000], 0xFF);
+    @memset(image[0x8000..], 0x11);
+    try std.testing.expectEqual(@as(?u32, null), findFreeSpaceInBank(image, 100));
 }

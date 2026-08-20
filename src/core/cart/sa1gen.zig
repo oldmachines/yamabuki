@@ -80,6 +80,7 @@ pub const Reason = enum {
     wg_stack_dynamic,
     wg_blockmove_source,
     wg_split_overflow,
+    wg_thunk_space,
 
     pub fn describe(self: Reason) []const u8 {
         return switch (self) {
@@ -101,6 +102,7 @@ pub const Reason = enum {
             .wg_nmi_ambiguous => "native and emulation NMI handlers both ran and differ; the SA-1's CNV can point at only one",
             .wg_unsupported_op => "an executed instruction (block move, BRK/COP, STP) cannot run on the SA-1 side",
             .wg_split_overflow => "more context-split sites (measured under both a system DBR and a WRAM pin) than the thunk table holds",
+            .wg_thunk_space => "a bank's padding cannot hold even one JSR stub per MEASURED split-site thunk (the unmeasured ones already share the cold dispatcher's single stub)",
         };
     }
 };
@@ -121,6 +123,8 @@ pub const Stats = struct {
     /// Instructions the profile never executed that `--wg-static`'s
     /// recursive descent found anyway — the reach the audit is measuring.
     cov_static_added: u32 = 0,
+    /// Non-zero when `--wg-expand` grew the image: the new size in bytes.
+    expanded_to: u32 = 0,
     /// Non-zero when EVERY offload was abandoned because the tree copies
     /// needed this many contiguous bytes and no padding run was that big.
     /// A silent zero-offload patch is indistinguishable from a game with
@@ -144,6 +148,10 @@ pub const Stats = struct {
     /// because their own bank had no room left for a body.
     idx_split_sites: u16 = 0,
     split_far: u16 = 0,
+    /// Of `split_sites`, how many are UNMEASURED sites in a bank too full
+    /// for per-thunk stubs, routed through the shared cold-site
+    /// dispatcher (one 5-byte stub per such bank, however many sites).
+    disp_sites: u16 = 0,
     /// dp sites covered wholesale by the D=$3000 window move.
     dp_sites: u32 = 0,
     regions_moved: u8 = 0,
@@ -2787,6 +2795,34 @@ const PadAlloc = struct {
         return total;
     }
 
+    /// How many 5-byte far stubs the bank could hold if it held nothing
+    /// else. `freeBytes` cannot answer this: it nets one margin per run,
+    /// while `next` charges the margin only on OPENING a run and then
+    /// packs to its end — for a population of uniform 5-byte stubs the
+    /// per-run arithmetic here is exact.
+    fn stubCapacity(self: *const @This()) u32 {
+        var total: u32 = 0;
+        var i: usize = 0;
+        while (i < self.region.len) {
+            if (self.region[i] != 0xFF) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
+            var s = self.base + @as(u32, @intCast(i));
+            var e = self.base + @as(u32, @intCast(j));
+            i = j;
+            if (self.hi > self.lo and s < self.hi and e > self.lo) {
+                const left = if (self.lo > s) self.lo - s else 0;
+                const right = if (e > self.hi) e - self.hi else 0;
+                if (left >= right) e = s + left else s = e - right;
+            }
+            if (e > s + margin) total += (e - s - margin) / far_stub_len;
+        }
+        return total;
+    }
+
     fn next(self: *@This(), need: u32) ?u32 {
         if (self.cur + need <= self.end) {
             defer self.cur += need;
@@ -2896,7 +2932,7 @@ const FarPad = struct {
 /// copies. Gradius III's two trees are 397 and 1324 bytes plus their
 /// stubs and fence — a shade over 2 KB — and 2.5 KiB leaves headroom
 /// without starving the thunk bodies, which have the rest of the image.
-const copy_reserve: u32 = 2560;
+pub const copy_reserve: u32 = 2560;
 
 /// The single biggest $FF run outside bank $00 — the one `findFreeSpace`
 /// will hand the offload tree copies, and whose tail `FarPad` keeps back
@@ -2952,6 +2988,95 @@ fn placeThunk(out: []u8, local: *PadAlloc, far: *FarPad, near: []const u8, far_b
     out[stub + 3] = @intCast(body / 0x8000);
     out[stub + 4] = 0x60; // RTS
     return @intCast(0x8000 + (stub % 0x8000));
+}
+
+/// The cold-site dispatcher: ONE shared far-stub per pressured bank,
+/// however many unmeasured split sites the bank carries.
+///
+/// The per-thunk far stub already cut a body's bank cost from ~35 bytes
+/// to 5, and Gradius III still refused: bank $02 keeps its entire slack
+/// in one 149-byte run, and the population that needs stubs there is the
+/// UNMEASURED one — tiny-base indexed sites the profile never reached —
+/// which grows with every cover movie harvested. Five bytes per site is
+/// a ceiling coverage itself walks into.
+///
+/// So the unmeasured sites of a bank that cannot afford per-thunk stubs
+/// all `JSR` to one shared `JSL dispatcher / RTS` stub, and the
+/// dispatcher works out which site called by the return address the JSR
+/// itself pushed: binary search over a sorted (site -> body) table, then
+/// a jump into the same RTL-tailed body a per-thunk far stub would have
+/// named. The body cannot tell the difference — it sees the identical
+/// [3-byte JSL frame][2-byte JSR return] stack — so every thunk template
+/// is reused unchanged, flags set by the body's op included (RTS/RTL do
+/// not touch P).
+///
+/// The search runs with interrupts live and no memory scratch: state
+/// lives on the stack, the jump target is written into a 3-byte hole
+/// reserved BELOW the saved registers, and an `RTL` consumes it after
+/// the registers are restored — reentrant against any NMI, including one
+/// that dispatches through this same code.
+///
+/// The price is ~150 cycles per call, paid only by sites that never
+/// executed once across every profiled surface.
+const cold_disp_len: u32 = 106;
+fn coldDispatcherBody(table: u24, n_records: u16) [cold_disp_len]u8 {
+    const t0 = table;
+    const t2 = table + 2;
+    const t4 = table + 4;
+    const t6 = table + 6;
+    const end: u16 = n_records * 8;
+    // Stack during the search, from S: $01-$02 key (the site's address),
+    // $03-$04 hi, $05-$06 saved Y, $07-$08 X, $09-$0A A, $0B P,
+    // $0C-$0E the RTL hole, $0F-$11 the stub's JSL frame (PBR at $11 is
+    // the SITE's bank), $12-$13 the site's JSR return address.
+    return .{
+        0x4B, 0x4B, 0x4B, // PHK x3 — the RTL target's hole
+        0x08, // PHP
+        0xC2, 0x30, // REP #$30
+        0x48, 0xDA, 0x5A, // PHA / PHX / PHY
+        0xF4, 0x00, 0x00, // PEA 0 — hi
+        0xF4, 0x00, 0x00, // PEA 0 — key
+        0xA3, 0x12, // LDA $12,S — the JSR pushed site+2
+        0x3A, 0x3A, // DEC A x2 — the site itself
+        0x83, 0x01, // STA $01,S
+        0xA9, @truncate(end), @truncate(end >> 8), // LDA #records*8
+        0x83, 0x03, // STA $03,S — hi (exclusive)
+        0xA0, 0x00, 0x00, // LDY #0 — lo
+        // loop (29): mid = ((lo + hi) / 2) floored to a record
+        0x98, 0x18, 0x63, 0x03, // TYA / CLC / ADC $03,S
+        0x4A, // LSR
+        0x29, 0xF8, 0xFF, // AND #$FFF8
+        0xAA, // TAX
+        0xA3, 0x01, // LDA $01,S — key
+        0xDF, @truncate(t0), @truncate(t0 >> 8), @truncate(t0 >> 16), // CMP table,X — record.addr16
+        0xF0, 0x0F, // BEQ bank_cmp (61)
+        0x90, 0x08, // BCC go_left (56)
+        // right (48): lo = mid + 8
+        0x8A, 0x18, 0x69, 0x08, 0x00, 0xA8, // TXA / CLC / ADC #8 / TAY
+        0x80, 0xE5, // BRA loop
+        // go_left (56): hi = mid
+        0x8A, 0x83, 0x03, // TXA / STA $03,S
+        0x80, 0xE0, // BRA loop
+        // bank_cmp (61): addr16 matched; order by bank on ties
+        0xE2, 0x20, // SEP #$20
+        0xA3, 0x11, // LDA $11,S — the site's PBR
+        0x29, 0x7F, // AND #$7F — fast mirrors fold onto the file bank
+        0xDF, @truncate(t2), @truncate(t2 >> 8), @truncate(t2 >> 16), // CMP table+2,X — record.bank
+        0xC2, 0x20, // REP #$20 — Z and C survive the width change
+        0xF0, 0x04, // BEQ found (79)
+        0x90, 0xEB, // BCC go_left
+        0x80, 0xE1, // BRA right
+        // found (79): body-1 into the hole, drop scratch, restore, RTL
+        0xBF, @truncate(t4), @truncate(t4 >> 8), @truncate(t4 >> 16), // LDA table+4,X
+        0x83, 0x0C, // STA $0C,S — hole PC
+        0xE2, 0x20, // SEP #$20
+        0xBF, @truncate(t6), @truncate(t6 >> 8), @truncate(t6 >> 16), // LDA table+6,X
+        0x83, 0x0E, // STA $0E,S — hole PBR
+        0xC2, 0x20, // REP #$20
+        0x3B, 0x18, 0x69, 0x04, 0x00, 0x1B, // TSC / CLC / ADC #4 / TCS — drop hi+key
+        0x7A, 0xFA, 0x68, 0x28, // PLY / PLX / PLA / PLP
+        0x6B, // RTL — into the body; JSL frame and JSR return intact
+    };
 }
 
 /// The DBR-dispatch thunk body (see the emission comment in
@@ -3213,10 +3338,12 @@ fn emitWindowOffloads(
     // the physics tree eligible raised the requirement past what was left
     // and cost the sequencer tree too, 116 dropped frames back to 186,
     // with nothing in the log to say why. Disclose it.
-    const any_at = 0x8000 + (patchgen.findFreeSpace(out[0x8000 .. out.len - 1], any_len) orelse {
+    // Bank-contained: a copy that crosses $xx:FFFF executes into the WRAM
+    // mirror when the PC wraps, which after relocation is abandoned memory.
+    const any_at = patchgen.findFreeSpaceInBank(out, any_len) orelse {
         res.stats.offload_space_short = any_len;
         return null;
-    });
+    };
     var cur: u32 = any_at;
 
     // Copies first (their addresses feed the blocks and stubs).
@@ -3592,6 +3719,31 @@ pub fn convertWholeGame(
     /// Allow the fire-and-forget flavor (gated on the behavioral tier by
     /// the caller, as in the S3 path).
     win_allow_async: bool,
+    /// `--wg-expand`: grow the output image to this many bytes, filling the
+    /// new space with $FF. Zero keeps the image its original size.
+    ///
+    /// A conversion spends ROM it does not have: tree copies need one
+    /// CONTIGUOUS block, thunk bodies need runs in the site's own bank, and
+    /// the boot shim needs a few dozen bytes of bank $00. Gradius III ships
+    /// 6704 bytes of padding in all of 512 KiB, so the three compete and the
+    /// loser is silently dropped — measured: a 3410-byte tree set against a
+    /// 3907-byte run left the far pool too thin for a 35-byte shim, and the
+    /// conversion refused outright. SA-1 carts are routinely larger than
+    /// their originals for exactly this reason. Doubling the image hands
+    /// banks $10-$1F over as one unbroken run and the competition ends.
+    ///
+    /// The size must stay a LoROM-mappable power of two: the SA-1's MMC maps
+    /// in 1 MiB regions and `rom_mask` is `padded_len - 1`, so anything else
+    /// folds the new space back onto the old.
+    win_expand_to: u32,
+    /// How many bytes at the tail of the image's biggest padding run to keep
+    /// back for the offload tree copies. `copy_reserve` is the default; a
+    /// bigger candidate set needs a bigger reserve, and getting this wrong
+    /// does not shrink the conversion — it abandons EVERY offload, because
+    /// the copies need one contiguous block and the thunks have already
+    /// eaten the run (measured: a 3410-byte set against a 3907-byte run
+    /// reserved at 2560 shipped no offloads at all).
+    win_copy_reserve: u32,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -4206,10 +4358,22 @@ pub fn convertWholeGame(
         }
     }
 
-    const out = try gpa.dupe(u8, image);
+    const out = blk: {
+        if (win_expand_to <= image.len) break :blk try gpa.dupe(u8, image);
+        const grown = try gpa.alloc(u8, win_expand_to);
+        @memcpy(grown[0..image.len], image);
+        // $FF, because that is the only byte `PadAlloc` and `biggestRun`
+        // recognise as free.
+        @memset(grown[image.len..], 0xFF);
+        // The header must agree with the file, or the loader masks the new
+        // banks straight back onto the old ones.
+        grown[header.offset + 0x17] = @intCast(std.math.log2_int(u32, win_expand_to / 1024));
+        break :blk grown;
+    };
     errdefer gpa.free(out);
     var res: Result = .{ .image = out, .stats = .{}, .fate = @splat(.not_attempted) };
     res.stats.cov_static_added = cov_added;
+    res.stats.expanded_to = if (win_expand_to > image.len) win_expand_to else 0;
     {
         var ab: u32 = 0;
         while (ab < 0x40 and ab * 0x8000 < out.len) : (ab += 1) {
@@ -4758,7 +4922,7 @@ pub fn convertWholeGame(
     // once that bank runs dry (see placeThunk).
     var pad: PadAlloc = undefined;
     const big: BigRun = if (window) biggestRun(out, header.offset) else .{};
-    const keep: u32 = @min(copy_reserve, big.len -| PadAlloc.margin);
+    const keep: u32 = @min(win_copy_reserve, big.len -| PadAlloc.margin);
     var far: FarPad = .{
         .out = out,
         .header_off = header.offset,
@@ -4839,6 +5003,16 @@ pub fn convertWholeGame(
         }
     }
     var seen: [split_thunk_max + idx_thunk_max]struct { v: u16, op: u8, idx: bool, pin: bool, addr: u16 } = undefined;
+    // Cold-site dispatcher state (see coldDispatcherBody): sites routed
+    // through a bank's shared stub, their far bodies (dedup'd ACROSS
+    // banks — the dispatcher jumps long, so one RTL-tailed body serves
+    // every bank), and each pressured bank's one stub to backpatch.
+    var cold_sites: [idx_thunk_max]struct { site: u24, body: u24 } = undefined;
+    var n_cold: usize = 0;
+    var cold_bodies: [idx_thunk_max]struct { v: u16, op: u8, at: u24 } = undefined;
+    var n_cold_bodies: usize = 0;
+    var cold_stubs: [0x40]u32 = undefined;
+    var n_cold_stubs: usize = 0;
     if (window and n_all != 0) {
         var i: usize = 0;
         while (i < n_all) {
@@ -4853,6 +5027,8 @@ pub fn convertWholeGame(
             // bank $00 — 1.5 KiB of slack against a 2 KiB scaffold —
             // refused a conversion that fits comfortably.
             var need: u32 = 0;
+            var n_dist: u32 = 0;
+            var n_dist_hot: u32 = 0;
             var n_seen: usize = 0;
             for (all[i..j]) |t| {
                 var dup = false;
@@ -4863,13 +5039,62 @@ pub fn convertWholeGame(
                 seen[n_seen] = .{ .v = t.v, .op = t.op, .idx = t.idx, .pin = t.pin, .addr = 0 };
                 n_seen += 1;
                 need += t.len() + PadAlloc.margin;
+                n_dist += 1;
+                if (!(t.idx and t.pin)) n_dist_hot += 1;
             }
-            const ff = pad.freeBytes() < need;
+            // Three tiers, decided per bank BEFORE anything is written:
+            // bodies when they all fit; a far stub per thunk when at
+            // least those do; and when even one stub per thunk exceeds
+            // the bank, the MEASURED thunks keep their stubs and every
+            // unmeasured one shares the cold dispatcher's single stub —
+            // the population that grows with coverage is exactly the one
+            // that stops costing bank bytes.
+            const cap = pad.stubCapacity();
+            const tier: enum { bodies, stubs, shared } =
+                if (pad.freeBytes() >= need) .bodies
+                else if (cap >= n_dist) .stubs
+                else if (cap >= n_dist_hot + 1) .shared
+                else return refuse(refusal, .{ .reason = .wg_thunk_space, .detail = tbank });
+            const ff = tier != .bodies;
             if (dbg_thunk_pad)
-                std.debug.print("[thunkpad] bank {x:0>2}: {} site(s), {} distinct, need {} free {} far {}\n", .{ tbank, j - i, n_seen, need, pad.freeBytes(), ff });
+                std.debug.print("[thunkpad] bank {x:0>2}: {} site(s), {} distinct ({} hot), need {} free {} cap {} tier {s}\n", .{ tbank, j - i, n_dist, n_dist_hot, need, pad.freeBytes(), cap, @tagName(tier) });
+            var bank_stub: u32 = 0; // this bank's shared cold stub, once
             n_seen = 0;
             while (i < j) : (i += 1) {
                 const t = all[i];
+                if (tier == .shared and t.idx and t.pin) {
+                    var body: u24 = 0;
+                    for (cold_bodies[0..n_cold_bodies]) |cb| {
+                        if (cb.v == t.v and cb.op == t.op) body = cb.at;
+                    }
+                    if (body == 0) {
+                        const at = far.next(idx_thunk_len) orelse
+                            return refuse(refusal, .{ .reason = .no_free_space, .detail = idx_thunk_len });
+                        @memcpy(out[at..][0..idx_thunk_len], &idxThunkBody(t.op, t.v, 0x6B));
+                        body = @intCast((at / 0x8000) << 16 | (0x8000 + (at % 0x8000)));
+                        cold_bodies[n_cold_bodies] = .{ .v = t.v, .op = t.op, .at = body };
+                        n_cold_bodies += 1;
+                    }
+                    if (bank_stub == 0) {
+                        bank_stub = pad.next(far_stub_len) orelse
+                            return refuse(refusal, .{ .reason = .wg_thunk_space, .detail = tbank });
+                        out[bank_stub] = 0x22; // JSL — dispatcher patched in below
+                        out[bank_stub + 4] = 0x60; // RTS
+                        cold_stubs[n_cold_stubs] = bank_stub;
+                        n_cold_stubs += 1;
+                    }
+                    if (n_cold == idx_thunk_max)
+                        return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = @intCast(t.file) });
+                    cold_sites[n_cold] = .{
+                        .site = @intCast((t.file / 0x8000) << 16 | (0x8000 + (t.file % 0x8000))),
+                        .body = body,
+                    };
+                    n_cold += 1;
+                    out[t.file] = 0x20; // JSR — same 3-byte footprint
+                    std.mem.writeInt(u16, out[t.file + 1 ..][0..2], @intCast(0x8000 + (bank_stub % 0x8000)), .little);
+                    res.stats.disp_sites += 1;
+                    continue;
+                }
                 var taddr: u16 = 0;
                 var found = false;
                 for (seen[0..n_seen]) |s| {
@@ -4896,6 +5121,43 @@ pub fn convertWholeGame(
                 }
                 out[t.file] = 0x20; // JSR — same 3-byte footprint
                 std.mem.writeInt(u16, out[t.file + 1 ..][0..2], taddr, .little);
+            }
+        }
+        if (n_cold != 0) {
+            // The dispatcher's table, sorted the way its binary search
+            // descends: 16-bit address first, bank on ties. Records are
+            // 8 bytes — [addr16][bank][0][body-1 lo][body-1 hi][bank][0]
+            // — so `mid` floors with a single AND, and the stored target
+            // is body-1 because RTL lands one past what it pulls.
+            const Cold = @TypeOf(cold_sites[0]);
+            const S = struct {
+                fn lt(_: void, a: Cold, b: Cold) bool {
+                    const ka = (@as(u32, a.site) & 0xFFFF) << 8 | (a.site >> 16);
+                    const kb = (@as(u32, b.site) & 0xFFFF) << 8 | (b.site >> 16);
+                    return ka < kb;
+                }
+            };
+            std.mem.sort(Cold, cold_sites[0..n_cold], {}, S.lt);
+            const tbl = far.next(@intCast(8 * n_cold)) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(8 * n_cold) });
+            for (cold_sites[0..n_cold], 0..) |c, ci| {
+                const r = out[tbl + 8 * ci ..][0..8];
+                std.mem.writeInt(u16, r[0..2], @truncate(c.site), .little);
+                r[2] = @intCast(c.site >> 16);
+                r[3] = 0;
+                const tgt: u24 = c.body - 1;
+                std.mem.writeInt(u16, r[4..6], @truncate(tgt), .little);
+                r[6] = @intCast(tgt >> 16);
+                r[7] = 0;
+            }
+            const disp = far.next(cold_disp_len) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = cold_disp_len });
+            const tbl_cpu: u24 = @intCast((tbl / 0x8000) << 16 | (0x8000 + (tbl % 0x8000)));
+            @memcpy(out[disp..][0..cold_disp_len], &coldDispatcherBody(tbl_cpu, @intCast(n_cold)));
+            const disp_cpu: u24 = @intCast((disp / 0x8000) << 16 | (0x8000 + (disp % 0x8000)));
+            for (cold_stubs[0..n_cold_stubs]) |s| {
+                std.mem.writeInt(u16, out[s + 1 ..][0..2], @truncate(disp_cpu), .little);
+                out[s + 3] = @intCast(disp_cpu >> 16);
             }
         }
         res.stats.split_sites = @intCast(n_all);
@@ -6484,7 +6746,7 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     // Two plain abs, one indexed abs, one INC in the NMI handler; one long.
     try testing.expect(res.stats.rewritten_abs >= 3);
@@ -6532,7 +6794,7 @@ test "window: the BW-RAM window mirrors in banks $80-$BF like the hardware" {
     defer gpa.free(bytes);
     @memset(bytes, 0);
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
@@ -6589,7 +6851,7 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
     const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
     for ([_]bool{ false, true }) |go_async| {
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, &ref);
         defer gpa.free(res.image);
         try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
         try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
@@ -6702,7 +6964,7 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
 
         const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &cand, false, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &cand, false, 0, copy_reserve, &ref);
         defer gpa.free(res.image);
         if (!pinned) {
             // Control: the uncovered site with no pin is the I-RAM hazard.
@@ -6782,7 +7044,7 @@ test "window: a context-split site serves both caller classes through its thunk"
     sites[0x8103] = usage_map.site_wram_low | usage_map.site_wram_bank;
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the site
@@ -6898,7 +7160,7 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the store
@@ -6924,6 +7186,137 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     // the compare would have said about a byte it never fetched.
     try testing.expectEqual(@as(u8, 0x33), con.bus.sa1.bwram[0x0080]);
     // Carry survived the thunk every lap, and real WRAM saw none of it.
+    try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
+}
+
+test "window: cold sites in a full bank share one stub through the dispatcher" {
+    // The three-worlds scenario again, but the sites live in a bank
+    // whose entire padding is one 14-byte run: room for a single 5-byte
+    // stub and TWO distinct unmeasured thunks that want one. Per-thunk
+    // stubs refuse; the cold dispatcher routes both sites through the
+    // bank's one shared stub and finds each body by return address. The
+    // assertions are the same as the per-thunk test's — the dispatcher
+    // must be invisible: same cells, same carry, same flags.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(rom);
+    for (rom, 0..) |*b, i| b.* = @truncate(0x11 + i *% 7);
+    const h = rom[0x7FC0..][0..64];
+    @memcpy(h[0..21], "COLD DISPATCH TEST   ");
+    h[0x15] = 0x20;
+    h[0x16] = 0x00;
+    h[0x17] = 7; // 128 KiB
+    h[0x18] = 0;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0xFFFF, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0x0000, .little);
+    @memset(h[0x20..0x40], 0);
+    std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+    @memset(rom[0x1000..0x7FC0], 0xFF); // bank $00: the carve's space
+    @memset(rom[0xFF00..0xFF0E], 0xFF); // bank $01's ONLY padding: 14 bytes
+    @memset(rom[0x10000..0x20000], 0xFF); // banks $02/$03: the far pool
+    rom[0x0202] = 0x5A; // the ROM byte the huge-index walk must find
+
+    @memcpy(rom[0x0000..0x0018], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, 0xC2, 0x10, // CLC / XCE / SEP #$30 / REP #$10
+        0x22, 0x80, 0x80, 0x00, // system caller, small Y
+        0x22, 0xA0, 0x80, 0x00, // $7E-pinned caller
+        0x22, 0xC0, 0x80, 0x00, // system caller, huge X
+        0x22, 0xE0, 0x80, 0x00, // system caller in x8
+        0x80, 0xEE, // BRA back to the first JSL
+    });
+    @memcpy(rom[0x0080..0x0090], &[_]u8{
+        0xA0, 0x10, 0x01, // LDY #$0110
+        0xA9, 0x11, // LDA #$11
+        0x38, // SEC — the dispatcher must not eat it either
+        0x22, 0x00, 0x81, 0x01, // JSL $01:8100
+        0x90, 0x03, // BCC +3 (carry lost -> skip)
+        0xEE, 0x60, 0x01, // INC $0160
+        0x6B,
+    });
+    @memcpy(rom[0x00A0..0x00B2], &[_]u8{
+        0xA9, 0x7E, 0x48, 0xAB, // pin $7E (re-banked to $40)
+        0xA0, 0x10, 0x02, // LDY #$0210
+        0xA9, 0x22, // LDA #$22
+        0x22, 0x00, 0x81, 0x01, // JSL $01:8100
+        0xA9, 0x00, 0x48, 0xAB, // back to the system bank
+        0x6B,
+    });
+    @memcpy(rom[0x00C0..0x00C8], &[_]u8{
+        0xA2, 0x00, 0x82, // LDX #$8200 — past the mirror: a ROM walk
+        0x22, 0x10, 0x81, 0x01, // JSL $01:8110
+        0x6B,
+    });
+    @memcpy(rom[0x00E0..0x00ED], &[_]u8{
+        0xE2, 0x10, // SEP #$10 — 8-bit index
+        0xA0, 0x50, // LDY #$50
+        0xA9, 0x33, // LDA #$33
+        0x22, 0x00, 0x81, 0x01, // JSL $01:8100
+        0xC2, 0x10, // REP #$10
+        0x6B,
+    });
+    @memcpy(rom[0x8100..0x8104], &[_]u8{ 0x99, 0x30, 0x00, 0x6B }); // STA $0030,Y / RTL
+    @memcpy(rom[0x8110..0x8117], &[_]u8{
+        0xBD, 0x02, 0x00, // LDA $0002,X — the same shape, a load
+        0x8D, 0x70, 0x01, // STA $0170 (plain site: shifts to the window)
+        0x6B,
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8006, 0x800A, 0x800E, 0x8012, 0x8016 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8080, 0x8083, 0x8085, 0x8086, 0x808A, 0x808C, 0x808F }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80A0, 0x80A2, 0x80A3, 0x80A4, 0x80A7, 0x80A9, 0x80AD, 0x80AF, 0x80B0, 0x80B1 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x80C0, 0x80C3, 0x80C7 }) |a| markOpX16(bytes, a);
+    markOpX16(bytes, 0x80E0);
+    for ([_]u32{ 0x80E2, 0x80E4, 0x80E6, 0x80EA }) |a| markOp(bytes, a);
+    markOpX16(bytes, 0x80EC);
+    for ([_]u32{ 0x018100, 0x018103, 0x018110, 0x018113, 0x018116 }) |a| markOpX16(bytes, a);
+
+    // No evidence anywhere: both thunks are COLD.
+    const sites = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(sites);
+    @memset(sites, 0);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
+    try testing.expectEqual(@as(u16, 2), res.stats.disp_sites);
+    try testing.expectEqual(@as(u16, 0), res.stats.split_far);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x8100]); // JSR over the store
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x8110]); // and over the load
+    // Both sites name the SAME stub — the bank paid five bytes total.
+    try testing.expectEqual(
+        std.mem.readInt(u16, res.image[0x8101..0x8103], .little),
+        std.mem.readInt(u16, res.image[0x8111..0x8113], .little),
+    );
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..5) |_| con.runFrame();
+
+    // World 1: system bank, small index -> the window.
+    try testing.expectEqual(@as(u8, 0x11), con.bus.sa1.bwram[0x0140]);
+    // World 2: pinned to $40 -> that bank's own $0240, NOT $40:6240.
+    try testing.expectEqual(@as(u8, 0x22), con.bus.sa1.bwram[0x0240]);
+    try testing.expectEqual(@as(u8, 0), con.bus.sa1.bwram[0x6240]);
+    // World 3: system bank, huge index -> ROM, read and parked in the window.
+    try testing.expectEqual(@as(u8, 0x5A), con.bus.sa1.bwram[0x0170]);
+    // An 8-bit index over a tiny base stays in the low page.
+    try testing.expectEqual(@as(u8, 0x33), con.bus.sa1.bwram[0x0080]);
+    // Carry survived the whole dispatch chain every lap; WRAM saw nothing.
     try testing.expect(con.bus.sa1.bwram[0x0160] > 2);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
@@ -6969,7 +7362,7 @@ test "window: measured evidence drops the thunk's data-bank arm" {
     sites[0x8100] = usage_map.site_wram_low | usage_map.site_rom;
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]);
@@ -7048,7 +7441,7 @@ test "window: a NEGATIVE-base LONG,X site follows its wrap into the window" {
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL over the site
@@ -7138,7 +7531,7 @@ test "window: a tiny-base LONG,X site splits on its index through a JSL thunk" {
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL, same footprint
@@ -7230,7 +7623,7 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.offload_sites >= 14);
 
@@ -7260,6 +7653,53 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     try testing.expect(con.bus.wram.data[0x2100] >= frames - 2);
 }
 
+test "whole-game: --wg-expand grows the image and the new banks are usable padding" {
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    const usage = try gpa.alloc(u8, 0x100_0000);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    markOp(usage, 0x00_8000);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 128 * 1024, copy_reserve, &ref);
+    defer gpa.free(res.image);
+
+    // The image doubled, and the header says so — without that the loader's
+    // rom_mask folds the new banks straight back onto the old ones.
+    try testing.expectEqual(@as(usize, 128 * 1024), res.image.len);
+    try testing.expectEqual(@as(u32, 128 * 1024), res.stats.expanded_to);
+    const hdr = try header_mod.detect(res.image);
+    try testing.expectEqual(@as(u8, 7), res.image[hdr.offset + 0x17]); // log2(128 KiB / 1 KiB)
+
+    // The new space is $FF — the only byte the pad allocator recognises as
+    // free — so it shows up as one unbroken run, which is the whole point.
+    for (res.image[rom.len..]) |b| try testing.expectEqual(@as(u8, 0xFF), b);
+    const big = biggestRun(res.image, hdr.offset);
+    try testing.expect(big.len >= 0x7FF0);
+    try testing.expect(big.bank >= rom.len / 0x8000);
+
+    // A grown image is still a valid cartridge.
+    try testing.expectEqual(@as(u16, 0xFFFF), hdr.checksum ^ hdr.checksum_complement);
+}
+
+test "whole-game: --wg-expand of zero or less leaves the image alone" {
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    const usage = try gpa.alloc(u8, 0x100_0000);
+    defer gpa.free(usage);
+    @memset(usage, 0);
+    markOp(usage, 0x00_8000);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(rom.len, res.image.len);
+    try testing.expectEqual(@as(u32, 0), res.stats.expanded_to);
+}
+
 test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
     const gpa = testing.allocator;
     const console = @import("../console.zig");
@@ -7286,7 +7726,7 @@ test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
     usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
 
     var ref: ?Refusal = null;
-    const res = convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref) catch |e| {
+    const res = convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref) catch |e| {
         std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
         return e;
     };
@@ -7344,13 +7784,13 @@ test "whole-game: --wg-static rewrites code the profiled run never reached" {
     var ref: ?Refusal = null;
     // Without the static walk the uncovered store keeps its WRAM operand...
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x0902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
     }
     // ...with it, the operand moves into the window like the covered one.
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, true, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, true, false, &.{}, false, 0, copy_reserve, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, r.image[0x0009..0x000B], .little));
         try testing.expectEqual(@as(u16, 0x6902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
@@ -7372,7 +7812,7 @@ test "whole-game: refusals name their reasons" {
     for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
         @memset(usage, 0);
         usage[a] = usage_map.flag_write;
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
         defer gpa.free(r.image);
         try testing.expect(r.stats.d_moved);
     }
@@ -7383,7 +7823,7 @@ test "whole-game: refusals name their reasons" {
     usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
     try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
 
@@ -7398,7 +7838,7 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8104);
     usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
         defer gpa.free(r.image);
         // The immediate moved into the window with everything else.
         try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
@@ -7407,7 +7847,7 @@ test "whole-game: refusals name their reasons" {
     // was already shifted when it was pushed: allowed, and left alone.
     rom[0x0103] = 0xEA; // NOP where the push was
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
     }
@@ -7418,7 +7858,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x7B, 0x5B, 0x60 }); // TDC / TCD
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
 
     @memset(usage, 0);
@@ -7426,7 +7866,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
@@ -7434,7 +7874,7 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0x8100, .little);
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_uses_irq, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0, .little);
 
@@ -7446,7 +7886,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0060..0x0062], &[_]u8{ 0x68, 0x40 });
     markOp(usage, 0x00_8050);
     markOp(usage, 0x00_8060);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_nmi_ambiguous, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
@@ -7457,14 +7897,14 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // A long MMIO store: no room for the in-place JSR either.
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x8F, 0x00, 0x21, 0x00 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // An MMIO site executing outside bank $00 (this 64K image's bank $01).
@@ -7473,13 +7913,13 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     @memcpy(rom[0xFF00..0xFF03], &[_]u8{ 0x8D, 0x00, 0x21 });
     markOp(usage, 0x01_FF00);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_mmio_outside_bank0, ref.?.reason);
     @memset(usage, 0);
 
     // A block move.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x54, 0x00, 0x7E });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
 }
