@@ -73,11 +73,25 @@ pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 /// per-id trampoline carrying the displaced bytes, so neither path
 /// needs to know which CPU it is on. The game's own vblank wait,
 /// reading the mirror, becomes the frame fence.
+pub const SplitIo = struct {
+    entry: u16,
+    /// A pure-writer body runs on BOTH CPUs (its MMIO writes vanish on
+    /// the SA-1); a handshake body — one that READ-WAITS on an MMIO
+    /// echo — would spin forever on SA-1 open bus, so post-engage the
+    /// stub skips it and only the pump runs it. Pre-engage (the boot,
+    /// which must do its IO for real) the engaged cell routes every
+    /// caller through the body regardless.
+    deferred: bool = false,
+    /// The routine's return shape — RTL bodies are JSL-called, and the
+    /// deferred skip must pop the caller's frame with the matching op.
+    rtl: bool = false,
+};
+
 pub const SplitSpec = struct {
     /// Bank-$00 routines the pump replays (OAM/VRAM/CGRAM/APU writers).
     /// Each gets the enqueue prefix; its first 3 bytes must be whole
     /// instructions with no branch.
-    io_entries: []const u16,
+    io_entries: []const SplitIo,
     /// Address ranges (bank $00) whose absolute reads of $4212 and
     /// $4218-$421F swap to the I-RAM mirrors — the mainline's vblank
     /// wait and pad reads. Boot-path readers stay native.
@@ -97,6 +111,8 @@ const split_cell_p: u16 = 0x379D; // game P at engage
 const split_cell_s: u16 = 0x379E; // game S at engage (16-bit)
 const split_ring: u16 = 0x37A0; // 16 ids
 const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
+const split_scr_p: u16 = 0x37B1; // deferred-skip scratch (SA-1-exclusive: interrupt-free)
+const split_scr_a: u16 = 0x37B2;
 const split_pump_stack: u16 = 0x37F0;
 
 pub const Reason = enum {
@@ -3789,9 +3805,9 @@ fn emitSplit(
     // Anchor shapes first: nothing is written until every check holds.
     if (!splitPrefixOk(out, usage, spec.mainloop, 4))
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
-    for (spec.io_entries) |e| {
-        if (!splitPrefixOk(out, usage, e, 3))
-            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = e });
+    for (spec.io_entries) |io| {
+        if (!splitPrefixOk(out, usage, io.entry, 3))
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
     }
     if (spec.io_entries.len > 26)
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = 0 });
@@ -3889,21 +3905,47 @@ fn emitSplit(
 
     // --- per-IO: pump trampoline, enqueue stub; then the table --------
     var tramp_addrs: [26]u16 = undefined;
-    for (spec.io_entries, 0..) |e, i| {
+    for (spec.io_entries, 0..) |io, i| {
         tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
-        @memcpy(d[cur .. cur + 3], out[e - 0x8000 ..][0..3]);
+        @memcpy(d[cur .. cur + 3], out[io.entry - 0x8000 ..][0..3]);
         cur += 3;
-        put(d, &cur, &.{ 0x4C, @truncate(e + 3), @truncate((e + 3) >> 8) }); // JMP entry+3
+        if (io.rtl) {
+            // JSL bridge: the body's RTL lands back here, RTS to the pump.
+            put(d, &cur, &.{ 0x22, @truncate(io.entry + 3), @truncate((io.entry + 3) >> 8), 0x00, 0x60 });
+        } else {
+            put(d, &cur, &.{ 0x4C, @truncate(io.entry + 3), @truncate((io.entry + 3) >> 8) }); // JMP entry+3
+        }
     }
     var enq_addrs: [26]u16 = undefined;
-    for (spec.io_entries, 0..) |e, i| {
+    for (spec.io_entries, 0..) |io, i| {
         enq_addrs[i] = base16 + @as(u16, @intCast(cur));
         put(d, &cur, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
         put(d, &cur, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X (long: DBR-proof on a pinned mainline)
         put(d, &cur, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
         put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
+        if (io.deferred) {
+            // Post-engage this caller is the SA-1, whose open-bus read
+            // of the body's MMIO echo would spin forever: skip the body
+            // and pop the game caller's frame. Pre-engage (the S-CPU
+            // boot doing real IO) fall through to the body as usual.
+            put(d, &cur, &.{ 0xAF, @truncate(split_engaged), 0x37, 0x00 }); // engaged?
+            put(d, &cur, &.{ 0xF0, 0x1C }); // BEQ the replay tail (+28)
+            // SA-1-exclusive skip (interrupt-free, so scratch is safe):
+            // restore the caller completely, then drop our JSR frame by
+            // parking P and A-low around a known-width pull. B carries a
+            // 16-bit caller's A-high across the 8-bit stretch.
+            put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA — caller widths
+            put(d, &cur, &.{ 0x8F, @truncate(split_scr_a), 0x37, 0x00 }); // A aside (caller M)
+            put(d, &cur, &.{ 0x08, 0xE2, 0x20 }); // PHP; M8
+            put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_scr_p), 0x37, 0x00 }); // P aside
+            put(d, &cur, &.{ 0x68, 0x68 }); // drop our JSR frame
+            put(d, &cur, &.{ 0xAF, @truncate(split_scr_p), 0x37, 0x00, 0x48 }); // P back under
+            put(d, &cur, &.{ 0xAF, @truncate(split_scr_a), 0x37, 0x00 }); // A-low back
+            put(d, &cur, &.{0x28}); // PLP — caller P, M/X included
+            put(d, &cur, &.{if (io.rtl) @as(u8, 0x6B) else 0x60}); // pop the GAME frame
+        }
         put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
-        @memcpy(d[cur .. cur + 3], out[e - 0x8000 ..][0..3]);
+        @memcpy(d[cur .. cur + 3], out[io.entry - 0x8000 ..][0..3]);
         cur += 3;
         put(d, &cur, &.{0x60}); // RTS -> entry+3
     }
@@ -3915,9 +3957,9 @@ fn emitSplit(
     std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
 
     // --- displacements, last: everything they jump into now exists ----
-    for (spec.io_entries, 0..) |e, i| {
-        out[e - 0x8000] = 0x20; // JSR enq
-        std.mem.writeInt(u16, out[e - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
+    for (spec.io_entries, 0..) |io, i| {
+        out[io.entry - 0x8000] = 0x20; // JSR enq
+        std.mem.writeInt(u16, out[io.entry - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
     }
     out[spec.mainloop - 0x8000] = 0x5C; // JML engage
     std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
@@ -7538,7 +7580,7 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     const rom = try makeWgRom(gpa);
     defer gpa.free(rom);
     @memset(rom[0x8000..0x10000], 0xFF);
-    @memcpy(rom[0x0000..0x002A], &[_]u8{
+    @memcpy(rom[0x0000..0x002E], &[_]u8{
         0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
         0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
         0xA9, 0x10, 0x8D, 0x82, 0x21,
@@ -7548,15 +7590,20 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
         0xAD, 0x12, 0x42, // LDA $4212 (mirror-swapped)
         0x10, 0xFB, // BPL — wait for vblank
         0xEE, 0x00, 0x01, // INC $0100 — the logic counter (shifts to $6100)
-        0x20, 0x40, 0x80, // JSR $8040 — the IO routine
+        0x20, 0x40, 0x80, // JSR $8040 — the replay-flavor IO routine
+        0x22, 0x60, 0x80, 0x00, // JSL $00:8060 — the DEFERRED one
         0xAD, 0x12, 0x42, // LDA $4212 (mirror-swapped)
         0x30, 0xFB, // BMI — wait for vblank end
-        0x80, 0xEA, // BRA mainloop
+        0x80, 0xE6, // BRA mainloop
     });
     @memcpy(rom[0x0040..0x0047], &[_]u8{
         0xAD, 0x00, 0x01, // LDA $0100 — whole-instruction prefix (shifts)
         0x8D, 0x80, 0x21, // STA $2180 — WMDATA: real on the S-CPU only
         0x60,
+    });
+    @memcpy(rom[0x0060..0x0064], &[_]u8{
+        0xEE, 0x02, 0x01, // INC $0102 — whole-instruction prefix (shifts)
+        0x6B, // RTL — the JSL-called shape
     });
     @memcpy(rom[0x0050..0x0056], &[_]u8{ 0x48, 0xAD, 0x10, 0x42, 0x68, 0x40 }); // NMI ack
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0x8050, .little);
@@ -7564,11 +7611,11 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
     defer gpa.free(bytes);
     @memset(bytes, 0);
-    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8015, 0x8016, 0x8017, 0x8018, 0x801B, 0x801D, 0x8020, 0x8023, 0x8026, 0x8028 }) |a| markOp(bytes, a);
-    for ([_]u32{ 0x8040, 0x8043, 0x8046 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8015, 0x8016, 0x8017, 0x8018, 0x801B, 0x801D, 0x8020, 0x8023, 0x8027, 0x802A, 0x802C }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8040, 0x8043, 0x8046, 0x8060, 0x8063 }) |a| markOp(bytes, a);
     for ([_]u32{ 0x8050, 0x8051, 0x8054, 0x8055 }) |a| markOp(bytes, a);
 
-    const io = [_]u16{0x8040};
+    const io = [_]SplitIo{ .{ .entry = 0x8040 }, .{ .entry = 0x8060, .deferred = true, .rtl = true } };
     const vr = [_][2]u16{.{ 0x8014, 0x8040 }};
     var ref: ?Refusal = null;
     const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
@@ -7577,7 +7624,7 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
         .mainloop = 0x8014,
     }, &ref);
     defer gpa.free(res.image);
-    try testing.expectEqual(@as(u8, 1), res.stats.split_io);
+    try testing.expectEqual(@as(u8, 2), res.stats.split_io);
     try testing.expect(res.stats.split_engage_addr != 0);
     // The anchors wear their displacements.
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
@@ -7609,6 +7656,10 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     // pointer. The SA-1-side execution of the same store put nothing
     // there beyond what the pump wrote.
     try testing.expect(con.bus.wram.data[0x1000] != 0);
+    // The deferred routine's body ran ONLY via the pump: once per lap,
+    // never on the SA-1 (a double-run would race past the lap counter).
+    try testing.expect(con.bus.sa1.bwram[0x0102] >= 3);
+    try testing.expect(con.bus.sa1.bwram[0x0102] <= con.bus.sa1.bwram[0x0100]);
     // And the low-WRAM home of the counter stayed abandoned.
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
 }
