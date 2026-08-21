@@ -3931,7 +3931,7 @@ fn runReport(
     try out.flush();
 }
 
-const routine_rows_shown: usize = 16;
+var routine_rows_shown: usize = 16;
 
 /// Write a usage map in bsnes-plus's `-usage.bin` layout: the CPU block
 /// verbatim, then a zero-filled SMP block, then a zero-filled coprocessor
@@ -4417,6 +4417,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--routines-all")) {
+            // The full attribution table, for analyses that need every
+            // MMIO-touching routine rather than the hot sixteen.
+            out.routines = true;
+            routine_rows_shown = 100000;
         } else if (std.mem.eql(u8, a, "--call-graph")) {
             out.call_graph_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--usage-map")) {
