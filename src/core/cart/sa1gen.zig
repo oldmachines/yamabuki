@@ -1793,6 +1793,30 @@ fn emitFence(d: []u8, spec: PtrSpec) u32 {
     return @intCast(cur);
 }
 
+/// The NON-BLOCKING fence, for the NMI prologue. The blocking fence in
+/// the NMI moved every in-flight wait into vblank — the one place a
+/// wait costs a frame deadline — and the async flavor measured 290
+/// dropped frames against sync's 115 doing exactly that. This variant
+/// acks a COMPLETED call (the SA-1 answers from its sig-hold loop
+/// within microseconds) and SKIPS a still-running one; the next fence
+/// point collects it. Only the async stub's own fence must block — it
+/// is about to reuse the mailbox.
+const nb_fence_len: u32 = 39;
+fn emitNbFence(d: []u8) u32 {
+    var cur: usize = 0;
+    put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
+    put(d, &cur, &.{ 0xAF, 0x8A, 0x37, 0x00 }); // busy id, 0 = idle
+    put(d, &cur, &.{ 0xF0, 0x1E }); // BEQ done
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F }); // done echo?
+    put(d, &cur, &.{ 0xCF, 0x8A, 0x37, 0x00 });
+    put(d, &cur, &.{ 0xD0, 0x12 }); // BNE done — still running, skip
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // ack
+    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 }); // echo clears (bounded: the SA-1 is in its hold loop)
+    put(d, &cur, &.{ 0x8F, 0x8A, 0x37, 0x00 }); // busy = idle (A is 0)
+    put(d, &cur, &.{0x6B}); // done: RTL
+    return @intCast(cur);
+}
+
 /// Byte-exact length of an async stub (the emitter asserts).
 fn asyncStubLen(spec: PtrSpec) u32 {
     return 122 + 27 * @as(u32, @intCast(spec.n_slots));
@@ -3327,7 +3351,7 @@ fn emitWindowOffloads(
         any_len += c.spec.total_span;
         if (c.is_async) {
             has_async = true;
-            any_len += fenceLen(.{}) + win_async_stub_len;
+            any_len += fenceLen(.{}) + nb_fence_len + win_async_stub_len;
         } else any_len += win_stub_len + (if (c.nmi_off and nmi_sites != null) win_nmi_off_extra else 0);
     }
     // The copies need ONE contiguous run and cannot be split, which puts
@@ -3388,6 +3412,7 @@ fn emitWindowOffloads(
 
     // Fence for the async offload, then the stubs; re-point call sites.
     var fence24: u24 = 0;
+    var nb_fence24: u24 = 0;
     for (chosen[0..n], 0..) |c, i| {
         const id: u8 = @intCast(i + 1);
         if (c.is_async) {
@@ -3398,6 +3423,11 @@ fn emitWindowOffloads(
             res.stats.async_entry = c.entry;
             res.stats.async_fence = fence24;
             cur += flen;
+            const nblen = emitNbFence(out[cur..]);
+            std.debug.assert(nblen == nb_fence_len);
+            nb_fence24 = @as(u24, @intCast(cur / 0x8000)) << 16 |
+                @as(u24, @intCast(0x8000 + (cur % 0x8000)));
+            cur += nblen;
         }
         const stub_file = cur;
         const stub_wrap = c.nmi_off and nmi_sites != null;
@@ -3478,7 +3508,7 @@ fn emitWindowOffloads(
     if (has_async) {
         var nc = nmi_at;
         put(d, &nc, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B });
-        put(d, &nc, &.{ 0x22, @truncate(fence24), @truncate(fence24 >> 8), @truncate(fence24 >> 16) });
+        put(d, &nc, &.{ 0x22, @truncate(nb_fence24), @truncate(nb_fence24 >> 8), @truncate(nb_fence24 >> 16) });
         put(d, &nc, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 });
         put(d, &nc, &.{ 0x4C, @truncate(nmi_native), @truncate(nmi_native >> 8) });
         std.debug.assert(nc - nmi_at == nmi_prologue_len);
