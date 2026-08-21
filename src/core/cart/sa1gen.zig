@@ -61,6 +61,44 @@ const usage_map = @import("../usage_map.zig");
 
 pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 
+/// S5 — the mainline/NMI split (measured on v17: the architecture that
+/// takes the bubble stage from 12.1% lag to 0.0%). The S-CPU boots the
+/// game STOCK — init IO and the APU handshake stay real — and at the
+/// main loop's top a displaced JML engages the split: the SA-1 enters
+/// the mainline IN PLACE (both CPUs see the same post-relocation
+/// bytes; its writes to $21xx/$42xx/$43xx vanish harmlessly on its own
+/// bus), while the S-CPU falls into a pump loop that feeds the
+/// $4212/joypad mirror cells and replays enqueued IO routines for
+/// real. IO routines get a 3-byte enqueue prefix; the pump calls a
+/// per-id trampoline carrying the displaced bytes, so neither path
+/// needs to know which CPU it is on. The game's own vblank wait,
+/// reading the mirror, becomes the frame fence.
+pub const SplitSpec = struct {
+    /// Bank-$00 routines the pump replays (OAM/VRAM/CGRAM/APU writers).
+    /// Each gets the enqueue prefix; its first 3 bytes must be whole
+    /// instructions with no branch.
+    io_entries: []const u16,
+    /// Address ranges (bank $00) whose absolute reads of $4212 and
+    /// $4218-$421F swap to the I-RAM mirrors — the mainline's vblank
+    /// wait and pad reads. Boot-path readers stay native.
+    vbl_ranges: []const [2]u16,
+    /// Where the split engages: the main loop's top (bank $00). Its
+    /// first 4 bytes must be whole instructions with no branch.
+    mainloop: u16,
+};
+
+/// The split's I-RAM cells, clear of the offload mailbox ($3780-$378F).
+const split_ring_wr: u16 = 0x3790; // SA-1 appends
+const split_ring_rd: u16 = 0x3791; // S-CPU drains
+const split_vbl_mirror: u16 = 0x3792; // live $4212 image
+const split_pad_mirror: u16 = 0x3794; // $4218-$421F, 8 bytes
+const split_cell_d: u16 = 0x379C; // game D at engage
+const split_cell_p: u16 = 0x379D; // game P at engage
+const split_cell_s: u16 = 0x379E; // game S at engage (16-bit)
+const split_ring: u16 = 0x37A0; // 16 ids
+const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
+const split_pump_stack: u16 = 0x37F0;
+
 pub const Reason = enum {
     coprocessor,
     not_lorom,
@@ -81,6 +119,7 @@ pub const Reason = enum {
     wg_blockmove_source,
     wg_split_overflow,
     wg_thunk_space,
+    wg_split_shape,
 
     pub fn describe(self: Reason) []const u8 {
         return switch (self) {
@@ -103,6 +142,7 @@ pub const Reason = enum {
             .wg_unsupported_op => "an executed instruction (block move, BRK/COP, STP) cannot run on the SA-1 side",
             .wg_split_overflow => "more context-split sites (measured under both a system DBR and a WRAM pin) than the thunk table holds",
             .wg_thunk_space => "a bank's padding cannot hold even one JSR stub per MEASURED split-site thunk (the unmeasured ones already share the cold dispatcher's single stub)",
+            .wg_split_shape => "a mainline-split anchor's displaced prefix is not whole flow-free instructions (or split was combined with offload candidates)",
         };
     }
 };
@@ -142,6 +182,10 @@ pub const Stats = struct {
     /// becomes a JSR to a DBR-dispatching thunk that runs the original
     /// op with the right operand for the caller it actually has.
     split_sites: u16 = 0,
+    /// S5 mainline split: IO routines wearing the enqueue prefix, and
+    /// where the split engages (0 = split not requested).
+    split_io: u8 = 0,
+    split_engage_addr: u16 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
     /// of the DBR (tiny-base indexed absolutes, whose home is decided by
     /// magnitude), and how many of the whole population needed a far stub
@@ -3712,6 +3756,177 @@ fn extendCoverage(
 
 /// Convert for whole-game migration. Needs only the coverage map — no plan:
 /// state stays at its own addresses inside the identity window.
+/// A split anchor's displaced prefix must be whole instructions with no
+/// flow op: both the enqueue stub and the pump trampoline re-execute
+/// those bytes at a different address.
+fn splitPrefixOk(out: []const u8, usage: []const u8, entry: u16, need: u32) bool {
+    var pc: u32 = entry;
+    while (pc - entry < need) {
+        const op = out[pc - 0x8000];
+        switch (op) {
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x22 => return false,
+            else => {},
+        }
+        const m8 = usage[pc] & usage_map.flag_m != 0;
+        const x8 = usage[pc] & usage_map.flag_x != 0;
+        pc += usage_map.instrLen(op, m8, x8);
+    }
+    return pc - entry == need;
+}
+
+/// S5: emit the mainline/NMI split scaffold into the bank-$00 carve
+/// after the shim slot, swap the declared ranges' $4212/$421x reads to
+/// the I-RAM mirrors, and displace the anchors. See `SplitSpec`.
+fn emitSplit(
+    out: []u8,
+    usage: []const u8,
+    spec: SplitSpec,
+    d: []u8,
+    base16: u16,
+    refusal: *?Refusal,
+    res: *Result,
+) Error!void {
+    // Anchor shapes first: nothing is written until every check holds.
+    if (!splitPrefixOk(out, usage, spec.mainloop, 4))
+        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
+    for (spec.io_entries) |e| {
+        if (!splitPrefixOk(out, usage, e, 3))
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = e });
+    }
+    if (spec.io_entries.len > 26)
+        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = 0 });
+
+    // Mirror swaps: absolute reads of $4212 -> $3792 and $4218-$421F ->
+    // $3794+, inside the declared ranges only. The pump feeds the cells
+    // continuously post-engage; boot-path readers outside the ranges
+    // keep the real registers.
+    for (spec.vbl_ranges) |r| {
+        var pc: u32 = r[0];
+        while (pc < r[1]) {
+            const op = out[pc - 0x8000];
+            const m8 = usage[pc] & usage_map.flag_m != 0;
+            const x8 = usage[pc] & usage_map.flag_x != 0;
+            const len = usage_map.instrLen(op, m8, x8);
+            if (len == 3 and usage_map.mode(op) == .abs) {
+                const v = std.mem.readInt(u16, out[pc - 0x8000 + 1 ..][0..2], .little);
+                const nv: u16 = if (v == 0x4212)
+                    split_vbl_mirror
+                else if (v >= 0x4218 and v <= 0x421F)
+                    split_pad_mirror + (v - 0x4218)
+                else
+                    0;
+                if (nv != 0)
+                    std.mem.writeInt(u16, out[pc - 0x8000 + 1 ..][0..2], nv, .little);
+            }
+            pc += len;
+        }
+    }
+
+    var cur: usize = wg_window_shim_max;
+    // --- pump loop (S-CPU): feed the mirrors, drain the ring ----------
+    const pump16: u16 = base16 + @as(u16, @intCast(cur));
+    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
+    put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), @truncate(split_vbl_mirror >> 8) });
+    put(d, &cur, &.{ 0xC2, 0x20 }); // REP #$20 -- pads as words
+    var pi: u16 = 0;
+    while (pi < 8) : (pi += 2) {
+        put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pi), 0x42, 0x8D, @truncate(split_pad_mirror + pi), @truncate((split_pad_mirror + pi) >> 8) });
+    }
+    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
+    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
+    const beq_at = cur;
+    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ pump (patched below)
+    put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 }); // TAX / LDA ring,X / PHA
+    put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
+    put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // PLA / ASL / TAX
+    const jsr_tbl_at = cur;
+    put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) -- patched below
+    put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
+    d[beq_at + 1] = @bitCast(@as(i8, @intCast(@as(i32, pump16) - (@as(i32, base16) + @as(i32, @intCast(beq_at)) + 2))));
+
+    // --- engage (S-CPU, via the displaced JML from the mainloop) ------
+    const engage16: u16 = base16 + @as(u16, @intCast(cur));
+    // The anchor is SHARED: the S-CPU hits it once at engage, and the
+    // SA-1 passes through it on every mainloop lap thereafter. The
+    // engaged cell splits the two: zero exactly once, at first arrival.
+    // (Width-safe: a 16-bit LDA reads the zero neighbor into the high
+    // byte, and BEQ judges the pair.)
+    put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37, 0xF0, 0x04 }); // LDA engaged / BEQ first
+    const lap_jml_at = cur;
+    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML mainloop_tramp (patched below)
+    put(d, &cur, &.{ 0x4B, 0xAB, 0x08, 0xE2, 0x20 }); // PHK/PLB, PHP, SEP #$20
+    put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP: open I-RAM to the S-CPU — every cell store below bounces without this
+    put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
+    put(d, &cur, &.{0x68}); // PLA — the pushed game P
+    put(d, &cur, &.{ 0x8D, @truncate(split_cell_p), 0x37 }); // game P
+    put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 }); // ring reset: boot-phase enqueues are stale, drop them
+    put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8D, @truncate(split_cell_d), 0x37 }); // game D
+    put(d, &cur, &.{ 0x3B, 0x8D, @truncate(split_cell_s), 0x37 }); // game S
+    const prologue16: u16 = base16 + @as(u16, @intCast(cur)) + 26;
+    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, @truncate(prologue16), 0x8D, 0x03, 0x22 }); // CRV lo
+    put(d, &cur, &.{ 0xA9, @truncate(prologue16 >> 8), 0x8D, 0x04, 0x22 }); // CRV hi
+    put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
+    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_pump_stack), @truncate(split_pump_stack >> 8), 0x1B });
+    put(d, &cur, &.{ 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
+    std.debug.assert(base16 + @as(u16, @intCast(cur)) == prologue16);
+
+    // --- SA-1 prologue: gates, game S/D/P, into the mainline ----------
+    put(d, &cur, &.{ 0x78, 0x18, 0xFB }); // SEI / native
+    put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP: I-RAM writable
+    put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE: BW-RAM writes
+    put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0 -- the identity window
+    put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // game S
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // game D
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // game P
+    const tramp16: u16 = base16 + @as(u16, @intCast(cur)) + 4;
+    put(d, &cur, &.{ 0x5C, @truncate(tramp16), @truncate(tramp16 >> 8), 0x00 });
+    // --- mainloop trampoline: the displaced 4 bytes, then onward ------
+    std.debug.assert(base16 + @as(u16, @intCast(cur)) == tramp16);
+    std.mem.writeInt(u16, d[lap_jml_at + 1 ..][0..2], tramp16, .little);
+    @memcpy(d[cur .. cur + 4], out[spec.mainloop - 0x8000 ..][0..4]);
+    cur += 4;
+    put(d, &cur, &.{ 0x5C, @truncate(spec.mainloop + 4), @truncate((spec.mainloop + 4) >> 8), 0x00 });
+
+    // --- per-IO: pump trampoline, enqueue stub; then the table --------
+    var tramp_addrs: [26]u16 = undefined;
+    for (spec.io_entries, 0..) |e, i| {
+        tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
+        @memcpy(d[cur .. cur + 3], out[e - 0x8000 ..][0..3]);
+        cur += 3;
+        put(d, &cur, &.{ 0x4C, @truncate(e + 3), @truncate((e + 3) >> 8) }); // JMP entry+3
+    }
+    var enq_addrs: [26]u16 = undefined;
+    for (spec.io_entries, 0..) |e, i| {
+        enq_addrs[i] = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
+        put(d, &cur, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X (long: DBR-proof on a pinned mainline)
+        put(d, &cur, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
+        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
+        put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
+        @memcpy(d[cur .. cur + 3], out[e - 0x8000 ..][0..3]);
+        cur += 3;
+        put(d, &cur, &.{0x60}); // RTS -> entry+3
+    }
+    const tbl16: u16 = base16 + @as(u16, @intCast(cur));
+    for (spec.io_entries, 0..) |_, i| {
+        put(d, &cur, &.{ @truncate(tramp_addrs[i]), @truncate(tramp_addrs[i] >> 8) });
+    }
+    std.mem.writeInt(u16, d[jsr_tbl_at + 1 ..][0..2], tbl16, .little);
+    std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+
+    // --- displacements, last: everything they jump into now exists ----
+    for (spec.io_entries, 0..) |e, i| {
+        out[e - 0x8000] = 0x20; // JSR enq
+        std.mem.writeInt(u16, out[e - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
+    }
+    out[spec.mainloop - 0x8000] = 0x5C; // JML engage
+    std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
+    out[spec.mainloop - 0x8000 + 3] = 0x00;
+
+    res.stats.split_io = @intCast(spec.io_entries.len);
+    res.stats.split_engage_addr = engage16;
+}
+
 pub fn convertWholeGame(
     gpa: std.mem.Allocator,
     image: []const u8,
@@ -3785,6 +4000,10 @@ pub fn convertWholeGame(
     /// eaten the run (measured: a 3410-byte set against a 3907-byte run
     /// reserved at 2560 shipped no offloads at all).
     win_copy_reserve: u32,
+    /// S5: engage the mainline/NMI split (window mode only; excludes
+    /// offload candidates — the SA-1 runs everything, so there is
+    /// nothing to dispatch).
+    ml_split: ?SplitSpec,
     refusal: *?Refusal,
 ) Error!Result {
     if (image.len < 0x8000) return error.RomTooSmall;
@@ -4336,7 +4555,7 @@ pub fn convertWholeGame(
     // 4-byte `JML` trampoline in bank $00 for the sites' in-place `JSR` to
     // land on; the helper ends with `JML` back to a shared bank-$00 `RTS`.
     const scaffold: u32 = if (window)
-        wg_window_shim_max + (if (win_candidates.len != 0) win_disp_max else 0)
+        wg_window_shim_max + (if (win_candidates.len != 0 or ml_split != null) win_disp_max else 0)
     else
         wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
             wg_sa1_nmi_len + wg_scpu_nmi_len +
@@ -5266,7 +5485,7 @@ pub fn convertWholeGame(
         // Offloads first: eligibility walks the REWRITTEN image, and the
         // dispatcher's CRV feeds the shim below. The dispatcher and NMI
         // prologue live in this same bank-0 carve, after the shim slot.
-        const boot: ?WinBoot = if (win_candidates.len != 0)
+        const boot: ?WinBoot = if (ml_split == null and win_candidates.len != 0)
             emitWindowOffloads(out, cov, site_evidence, header.offset, win_candidates, win_allow_async, carve + wg_window_shim_max, lbodies[0..n_lbodies], &res)
         else
             null;
@@ -5302,6 +5521,7 @@ pub fn convertWholeGame(
         std.debug.assert(wn <= wg_window_shim_max);
         // Reset -> shim; the other vectors stay the game's own unless an
         // async offload injected its NMI prologue above.
+        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, refusal, &res);
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
@@ -6787,7 +7007,7 @@ test "window: the game keeps running on the S-CPU with its WRAM moved wholesale"
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     // Two plain abs, one indexed abs, one INC in the NMI handler; one long.
     try testing.expect(res.stats.rewritten_abs >= 3);
@@ -6835,7 +7055,7 @@ test "window: the BW-RAM window mirrors in banks $80-$BF like the hardware" {
     defer gpa.free(bytes);
     @memset(bytes, 0);
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
@@ -6892,7 +7112,7 @@ test "window offload: a tree runs on the SA-1 against the shared window, sync an
     const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
     for ([_]bool{ false, true }) |go_async| {
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, null, &ref);
         defer gpa.free(res.image);
         try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
         try testing.expectEqual(@as(u8, 1), res.stats.resident_offloads);
@@ -6978,7 +7198,7 @@ test "window offload: a BW-RAM-pinned caller's registers survive the dispatch" {
     const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
     for ([_]bool{ false, true }) |go_async| {
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &cand, go_async, 0, copy_reserve, null, &ref);
         defer gpa.free(res.image);
         try testing.expectEqual(@as(u8, 1), res.stats.offload_count);
 
@@ -7074,7 +7294,7 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
 
         const cand = [_]Candidate{.{ .entry = 0x00_8080 }};
         var ref: ?Refusal = null;
-        const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &cand, false, 0, copy_reserve, &ref);
+        const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &cand, false, 0, copy_reserve, null, &ref);
         defer gpa.free(res.image);
         if (!pinned) {
             // Control: the uncovered site with no pin is the I-RAM hazard.
@@ -7154,7 +7374,7 @@ test "window: a context-split site serves both caller classes through its thunk"
     sites[0x8103] = usage_map.site_wram_low | usage_map.site_wram_bank;
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the site
@@ -7270,7 +7490,7 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]); // JSR over the store
@@ -7300,6 +7520,97 @@ test "window: an unmeasured tiny-base indexed site serves all three of its world
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0140]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0080]);
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0170]);
+}
+
+test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
+    // S5's contract end to end. A game whose mainline waits on $4212,
+    // advances a counter, and calls an IO routine that writes the
+    // counter through WMDATA. After the split: the SA-1 executes that
+    // loop in place (its WMDATA write vanishes on its own bus, its
+    // $4212 read comes from the pump-fed mirror), enqueueing the IO id;
+    // the S-CPU pump drains the ring and replays the routine with the
+    // write REAL. The S-CPU never runs the mainline again, so counter
+    // advancement in BW-RAM is the SA-1's own work.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x002A], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
+        0xA9, 0x10, 0x8D, 0x82, 0x21,
+        0x9C, 0x83, 0x21,
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
+        0xEA, 0xEA, 0xEA, 0xEA, // mainloop ($8014): the displaced anchor
+        0xAD, 0x12, 0x42, // LDA $4212 (mirror-swapped)
+        0x10, 0xFB, // BPL — wait for vblank
+        0xEE, 0x00, 0x01, // INC $0100 — the logic counter (shifts to $6100)
+        0x20, 0x40, 0x80, // JSR $8040 — the IO routine
+        0xAD, 0x12, 0x42, // LDA $4212 (mirror-swapped)
+        0x30, 0xFB, // BMI — wait for vblank end
+        0x80, 0xEA, // BRA mainloop
+    });
+    @memcpy(rom[0x0040..0x0047], &[_]u8{
+        0xAD, 0x00, 0x01, // LDA $0100 — whole-instruction prefix (shifts)
+        0x8D, 0x80, 0x21, // STA $2180 — WMDATA: real on the S-CPU only
+        0x60,
+    });
+    @memcpy(rom[0x0050..0x0056], &[_]u8{ 0x48, 0xAD, 0x10, 0x42, 0x68, 0x40 }); // NMI ack
+    std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0x8050, .little);
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8015, 0x8016, 0x8017, 0x8018, 0x801B, 0x801D, 0x8020, 0x8023, 0x8026, 0x8028 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8040, 0x8043, 0x8046 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8050, 0x8051, 0x8054, 0x8055 }) |a| markOp(bytes, a);
+
+    const io = [_]u16{0x8040};
+    const vr = [_][2]u16{.{ 0x8014, 0x8040 }};
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
+        .io_entries = &io,
+        .vbl_ranges = &vr,
+        .mainloop = 0x8014,
+    }, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 1), res.stats.split_io);
+    try testing.expect(res.stats.split_engage_addr != 0);
+    // The anchors wear their displacements.
+    try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0040]); // JSR enq
+    // The mainloop's $4212 reads look at the mirror now.
+    try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x0019..0x001B], .little));
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    // Watch the SA-1 execute the game's own mainloop bytes in place.
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x00_8014);
+    con.bus.sa1.trace = trace;
+    for (0..8) |_| con.runFrame();
+
+    // The SA-1 ran the mainline: the trace saw it, and the counter it
+    // keeps lives in BW-RAM, advanced well past what the S-CPU's single
+    // pre-engage pass could account for.
+    try testing.expect(trace.total > 0);
+    try testing.expect(con.bus.sa1.bwram[0x0100] >= 3);
+    // The pump replayed the IO routine with the WMDATA write REAL: the
+    // counter's values landed in true WRAM at the auto-incrementing
+    // pointer. The SA-1-side execution of the same store put nothing
+    // there beyond what the pump wrote.
+    try testing.expect(con.bus.wram.data[0x1000] != 0);
+    // And the low-WRAM home of the counter stayed abandoned.
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
 }
 
 test "window: cold sites in a full bank share one stub through the dispatcher" {
@@ -7395,7 +7706,7 @@ test "window: cold sites in a full bank share one stub through the dispatcher" {
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.split_sites);
     try testing.expectEqual(@as(u16, 2), res.stats.disp_sites);
@@ -7472,7 +7783,7 @@ test "window: measured evidence drops the thunk's data-bank arm" {
     sites[0x8100] = usage_map.site_wram_low | usage_map.site_rom;
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x0100]);
@@ -7551,7 +7862,7 @@ test "window: a NEGATIVE-base LONG,X site follows its wrap into the window" {
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 1), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL over the site
@@ -7641,7 +7952,7 @@ test "window: a tiny-base LONG,X site splits on its index through a JSL thunk" {
     @memset(sites, 0);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, sites, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u16, 2), res.stats.idx_split_sites);
     try testing.expectEqual(@as(u8, 0x22), res.image[0x0100]); // JSL, same footprint
@@ -7733,7 +8044,7 @@ test "whole-game: the migrated game runs on the SA-1, MMIO crosses the mailbox, 
     }
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expect(res.stats.offload_sites >= 14);
 
@@ -7773,7 +8084,7 @@ test "whole-game: --wg-expand grows the image and the new banks are usable paddi
     markOp(usage, 0x00_8000);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 128 * 1024, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 128 * 1024, copy_reserve, null, &ref);
     defer gpa.free(res.image);
 
     // The image doubled, and the header says so — without that the loader's
@@ -7804,7 +8115,7 @@ test "whole-game: --wg-expand of zero or less leaves the image alone" {
     markOp(usage, 0x00_8000);
 
     var ref: ?Refusal = null;
-    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 0, copy_reserve, &ref);
+    const res = try convertWholeGame(gpa, rom, usage, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
     try testing.expectEqual(rom.len, res.image.len);
     try testing.expectEqual(@as(u32, 0), res.stats.expanded_to);
@@ -7836,7 +8147,7 @@ test "whole-game: a set too big for I-RAM migrates through the BW-RAM window" {
     usage[0x00_0900] = usage_map.flag_write; // beyond I-RAM: selects BW-RAM
 
     var ref: ?Refusal = null;
-    const res = convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref) catch |e| {
+    const res = convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref) catch |e| {
         std.debug.print("refused: {s}\n", .{ref.?.reason.describe()});
         return e;
     };
@@ -7894,13 +8205,13 @@ test "whole-game: --wg-static rewrites code the profiled run never reached" {
     var ref: ?Refusal = null;
     // Without the static walk the uncovered store keeps its WRAM operand...
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x0902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
     }
     // ...with it, the operand moves into the window like the covered one.
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, true, false, &.{}, false, 0, copy_reserve, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, true, false, &.{}, false, 0, copy_reserve, null, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0x6900), std.mem.readInt(u16, r.image[0x0009..0x000B], .little));
         try testing.expectEqual(@as(u16, 0x6902), std.mem.readInt(u16, r.image[0x000E..0x0010], .little));
@@ -7922,7 +8233,7 @@ test "whole-game: refusals name their reasons" {
     for ([_]u32{ 0x00_0900, 0x7E_07F4, 0x7F_8000 }) |a| {
         @memset(usage, 0);
         usage[a] = usage_map.flag_write;
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref);
         defer gpa.free(r.image);
         try testing.expect(r.stats.d_moved);
     }
@@ -7933,7 +8244,7 @@ test "whole-game: refusals name their reasons" {
     usage[0x00_0900] = usage_map.flag_write; // select the BW-RAM window
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xAD, 0x00, 0x44 }); // LDA $4400
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_wram_beyond_bwram, ref.?.reason);
     try testing.expectEqual(@as(u32, 0x00_8100), ref.?.detail);
 
@@ -7948,7 +8259,7 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8104);
     usage[0x00_8100] &= ~usage_map.flag_x; // the LDX ran 16-bit
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref);
         defer gpa.free(r.image);
         // The immediate moved into the window with everything else.
         try testing.expectEqual(@as(u16, wg_bw_window), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
@@ -7957,7 +8268,7 @@ test "whole-game: refusals name their reasons" {
     // was already shifted when it was pushed: allowed, and left alone.
     rom[0x0103] = 0xEA; // NOP where the push was
     {
-        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref);
+        const r = try convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref);
         defer gpa.free(r.image);
         try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, r.image[0x0101..0x0103], .little));
     }
@@ -7968,7 +8279,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x7B, 0x5B, 0x60 }); // TDC / TCD
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_dp_dynamic, ref.?.reason);
 
     @memset(usage, 0);
@@ -7976,7 +8287,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x3B, 0x1B, 0x60 }); // TSC / TCS
     markOp(usage, 0x00_8100);
     markOp(usage, 0x00_8101);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_stack_dynamic, ref.?.reason);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0xEA, 0xEA, 0xEA });
 
@@ -7984,7 +8295,7 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0x8100, .little);
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_uses_irq, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2E ..][0..2], 0, .little);
 
@@ -7996,7 +8307,7 @@ test "whole-game: refusals name their reasons" {
     @memcpy(rom[0x0060..0x0062], &[_]u8{ 0x68, 0x40 });
     markOp(usage, 0x00_8050);
     markOp(usage, 0x00_8060);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_nmi_ambiguous, ref.?.reason);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0, .little);
     std.mem.writeInt(u16, rom[0x7FC0 + 0x3A ..][0..2], 0, .little);
@@ -8007,14 +8318,14 @@ test "whole-game: refusals name their reasons" {
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x1E, 0x00, 0x21 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // A long MMIO store: no room for the in-place JSR either.
     @memset(usage, 0);
     @memcpy(rom[0x0100..0x0104], &[_]u8{ 0x8F, 0x00, 0x21, 0x00 });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_mmio_shape, ref.?.reason);
 
     // An MMIO site executing outside bank $00 (this 64K image's bank $01).
@@ -8023,13 +8334,13 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     @memcpy(rom[0xFF00..0xFF03], &[_]u8{ 0x8D, 0x00, 0x21 });
     markOp(usage, 0x01_FF00);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_mmio_outside_bank0, ref.?.reason);
     @memset(usage, 0);
 
     // A block move.
     @memcpy(rom[0x0100..0x0103], &[_]u8{ 0x54, 0x00, 0x7E });
     markOp(usage, 0x00_8100);
-    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, &ref));
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
 }
