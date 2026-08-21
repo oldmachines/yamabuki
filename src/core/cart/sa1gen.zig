@@ -202,6 +202,12 @@ pub const Stats = struct {
     /// where the split engages (0 = split not requested).
     split_io: u8 = 0,
     split_engage_addr: u16 = 0,
+    /// S5: multiply sites rewritten to the engaged-discriminated helper,
+    /// and covered hazards the audit found (WAI/STP, or an MMIO read the
+    /// split leaves unhandled) — each a 24-bit CPU address, capped.
+    split_mul: u8 = 0,
+    split_hazards: [8]u24 = @splat(0),
+    n_split_hazards: u8 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
     /// of the DBR (tiny-base indexed absolutes, whose home is decided by
     /// magnitude), and how many of the whole population needed a far stub
@@ -3838,7 +3844,86 @@ fn emitSplit(
         }
     }
 
+    // The S-CPU-multiplier idiom: a 16-bit STA $4202 (both multiplicands,
+    // the high write triggering), the 8-cycle NOP wait, LDA $4216 for the
+    // product. On the SA-1 those registers are open bus, so the span is
+    // displaced with a JSL to a helper the engaged cell splits: the
+    // original sequence pre-engage and on the pump, the SA-1's own
+    // arithmetic unit ($2251+, immediate) on the mainline. Strict shape
+    // only — anything looser is a named refusal, not a guess.
+    var mul_sites: [4]u32 = undefined;
+    var n_mul: usize = 0;
+    {
+        var bank: u32 = 0;
+        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
+            var aa: u32 = 0x8000;
+            while (aa < 0xFFF6) : (aa += 1) {
+                const ac = (bank << 16) | aa;
+                if ((usage[ac] | usage[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
+                const file = bank * 0x8000 + (aa - 0x8000);
+                if (!std.mem.eql(u8, out[file..][0..3], &.{ 0x8D, 0x02, 0x42 })) continue;
+                if (!std.mem.eql(u8, out[file + 3 ..][0..4], &.{ 0xEA, 0xEA, 0xEA, 0xEA }) or
+                    !std.mem.eql(u8, out[file + 7 ..][0..3], &.{ 0xAD, 0x16, 0x42 }))
+                    return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                if (n_mul == mul_sites.len)
+                    return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                mul_sites[n_mul] = file;
+                n_mul += 1;
+            }
+        }
+    }
+
     var cur: usize = wg_window_shim_max;
+    if (n_mul != 0) {
+        // The helper, in the carve (JSL-reachable from every bank).
+        const mul16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0x48, 0xAF, @truncate(split_engaged), 0x37, 0x00 }); // PHA / LDA engaged (16-bit; the scratch neighbor masks off)
+        put(d, &cur, &.{ 0x29, 0xFF, 0x00 }); // AND #$00FF
+        put(d, &cur, &.{ 0xD0, 0x0C }); // BNE sa1 path
+        put(d, &cur, &.{ 0x68, 0x8D, 0x02, 0x42 }); // PLA / STA $4202 — the original
+        put(d, &cur, &.{ 0xEA, 0xEA, 0xEA, 0xEA }); // the hardware's 8 cycles
+        put(d, &cur, &.{ 0xAD, 0x16, 0x42, 0x6B }); // LDA $4216 / RTL
+        // sa1: the arithmetic unit — MA = low byte, MB = high byte.
+        put(d, &cur, &.{ 0x68, 0x48, 0x29, 0xFF, 0x00 }); // PLA / PHA / AND #$00FF
+        put(d, &cur, &.{ 0x8F, 0x51, 0x22, 0x00 }); // MA
+        put(d, &cur, &.{ 0x68, 0xEB, 0x29, 0xFF, 0x00 }); // PLA / XBA / AND #$00FF
+        put(d, &cur, &.{ 0x8F, 0x53, 0x22, 0x00 }); // MB — the $2254 write triggers
+        put(d, &cur, &.{ 0xAF, 0x06, 0x23, 0x00, 0x6B }); // product / RTL
+        for (mul_sites[0..n_mul]) |file| {
+            out[file] = 0x22; // JSL helper
+            std.mem.writeInt(u16, out[file + 1 ..][0..2], mul16, .little);
+            out[file + 3] = 0x00;
+            @memset(out[file + 4 ..][0..6], 0xEA);
+        }
+        res.stats.split_mul = @intCast(n_mul);
+    }
+
+    // The audit: covered WAI/STP (the SA-1 gets no interrupts, so a
+    // mainline WAI never wakes), and any covered absolute MMIO read the
+    // split leaves unhandled — open bus on the SA-1. Report, capped;
+    // verification arbitrates what the operator accepts.
+    {
+        var bank: u32 = 0;
+        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
+            var aa: u32 = 0x8000;
+            while (aa < 0x10000) : (aa += 1) {
+                const ac = (bank << 16) | aa;
+                if ((usage[ac] | usage[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
+                const file = bank * 0x8000 + (aa - 0x8000);
+                const op = out[file];
+                var hazard = op == 0xCB or op == 0xDB;
+                if (!hazard and (op == 0xAD or op == 0xAC or op == 0xAE or op == 0x2C or op == 0xCD)) {
+                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    hazard = (v >= 0x2100 and v <= 0x21FF) or (v >= 0x4200 and v <= 0x43FF);
+                }
+                if (hazard and res.stats.n_split_hazards < res.stats.split_hazards.len) {
+                    res.stats.split_hazards[res.stats.n_split_hazards] = @intCast(ac);
+                    res.stats.n_split_hazards += 1;
+                }
+            }
+        }
+    }
+
     // --- pump loop (S-CPU): feed the mirrors, drain the ring ----------
     const pump16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
@@ -3891,6 +3976,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP: I-RAM writable
     put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE: BW-RAM writes
     put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0 -- the identity window
+    put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply mode, for the helper
     put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // game S
     put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // game D
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // game P

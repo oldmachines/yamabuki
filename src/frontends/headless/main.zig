@@ -221,6 +221,12 @@ const Args = struct {
     /// --wg-copy-reserve: bytes held at the tail of the biggest padding run
     /// for offload tree copies. The default matches the generator's own.
     wg_copy_reserve: u32 = core.sa1gen.copy_reserve,
+    /// S5 mainline split: the engage anchor; zero = split off.
+    wg_split_mainloop: u16 = 0,
+    wg_split_io: [26]core.sa1gen.SplitIo = undefined,
+    n_wg_split_io: usize = 0,
+    wg_split_vbl: [8][2]u16 = undefined,
+    n_wg_split_vbl: usize = 0,
     /// --wg-expand: grow the converted image to this many bytes (0 = keep the
     /// original size), handing the conversion room it does not otherwise have.
     wg_expand_to: u32 = 0,
@@ -2396,11 +2402,27 @@ fn runSa1Gen(
             try out.flush();
         }
         var refusal: ?core.sa1gen.Refusal = null;
+        const split_spec: ?core.sa1gen.SplitSpec = if (args.wg_split_mainloop != 0) .{
+            .io_entries = args.wg_split_io[0..args.n_wg_split_io],
+            .vbl_ranges = args.wg_split_vbl[0..args.n_wg_split_vbl],
+            .mainloop = args.wg_split_mainloop,
+        } else null;
+        if (split_spec != null) {
+            try out.print("  --wg-split: engaging the mainline/NMI split at $00:{x:0>4} ({} IO routine(s), {} reader range(s))\n", .{ args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
+            try out.flush();
+        }
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, if (split_spec != null) &.{} else act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, split_spec, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         if (converted) |cr| {
+            if (cr.stats.split_engage_addr != 0) {
+                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} multiply site(s) through the arithmetic helper\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_mul });
+                var hi: usize = 0;
+                while (hi < cr.stats.n_split_hazards) : (hi += 1)
+                    try out.print("  split HAZARD (open bus or dead wait on the SA-1): ${x:0>2}:{x:0>4}\n", .{ cr.stats.split_hazards[hi] >> 16, cr.stats.split_hazards[hi] & 0xFFFF });
+                try out.flush();
+            }
             if (cr.stats.offload_space_short != 0)
                 try out.print(
                     "  offloads ABANDONED: the tree copies need {} contiguous byte(s) and no\n  padding run is that big — the thunk bodies are in the same padding\n",
@@ -4563,6 +4585,31 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             if (out.n_wg_add == out.wg_add.len) return error.TooManyAdds;
             out.wg_add[out.n_wg_add] = try std.fmt.parseInt(u24, v, 16);
             out.n_wg_add += 1;
+        } else if (std.mem.eql(u8, a, "--wg-split")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wg_split_mainloop = try std.fmt.parseInt(u16, v, 16);
+        } else if (std.mem.eql(u8, a, "--wg-split-io")) {
+            // "<hex4>[:d][:l]" — d = deferred (handshake body, pump-only
+            // post-engage), l = RTL-shaped (JSL-called).
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_split_io == out.wg_split_io.len) return error.TooManyAdds;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            var io: core.sa1gen.SplitIo = .{ .entry = try std.fmt.parseInt(u16, pit.next().?, 16) };
+            while (pit.next()) |f| {
+                if (std.mem.eql(u8, f, "d")) io.deferred = true;
+                if (std.mem.eql(u8, f, "l")) io.rtl = true;
+            }
+            out.wg_split_io[out.n_wg_split_io] = io;
+            out.n_wg_split_io += 1;
+        } else if (std.mem.eql(u8, a, "--wg-split-vbl")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_split_vbl == out.wg_split_vbl.len) return error.TooManyAdds;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            out.wg_split_vbl[out.n_wg_split_vbl] = .{
+                try std.fmt.parseInt(u16, pit.next().?, 16),
+                try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16),
+            };
+            out.n_wg_split_vbl += 1;
         } else if (std.mem.eql(u8, a, "--wg-expand")) {
             // Accepts bytes, or "1m"/"2m" for whole megabytes.
             const v = it.next() orelse return error.MissingValue;
