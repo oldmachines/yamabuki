@@ -97,8 +97,23 @@ pub const SplitSpec = struct {
     /// wait and pad reads. Boot-path readers stay native.
     vbl_ranges: []const [2]u16,
     /// Where the split engages: the main loop's top (bank $00). Its
-    /// first 4 bytes must be whole instructions with no branch.
-    mainloop: u16,
+    /// first 4 bytes must be whole instructions with no branch. Ignored
+    /// when `tail` is set.
+    mainloop: u16 = 0,
+    /// NMI-TAIL flavor (the shape Gradius III actually has: the whole
+    /// engine runs inside the NMI handler). `tail` is the boundary in
+    /// the handler — the vblank-timed upload cluster before it stays on
+    /// the S-CPU; the logic chain from it to `tail_epilogue` (the
+    /// handler's pull/RTI sequence) runs on the SA-1's generated frame
+    /// loop, entered through a faked handler frame so the game's own
+    /// RTI returns into the loop. The S-CPU's NMI, reaching the
+    /// boundary, feeds the mirrors (stock's own auto-joy wait), bumps
+    /// the frame token, drains the ring, and jumps to the epilogue.
+    /// `tail` must begin with a 4-byte JSL, carried whole.
+    tail: u16 = 0,
+    tail_epilogue: u16 = 0,
+    /// The DBR the handler establishes before the boundary.
+    tail_dbr: u8 = 0,
 };
 
 /// The split's I-RAM cells, clear of the offload mailbox ($3780-$378F).
@@ -113,6 +128,9 @@ const split_ring: u16 = 0x37A0; // 16 ids
 const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
 const split_scr_p: u16 = 0x37B1; // deferred-skip scratch (SA-1-exclusive: interrupt-free)
 const split_scr_a: u16 = 0x37B2;
+const split_token: u16 = 0x37B3; // the S-CPU NMI increments; the SA-1 frame loop edges on it
+const split_last: u16 = 0x37B4; // the SA-1's copy of the last token it ran
+const split_sa1_stack: u16 = 0x3778; // the old dispatcher stack slot, free in split mode
 const split_pump_stack: u16 = 0x37F0;
 
 pub const Reason = enum {
@@ -3781,19 +3799,21 @@ fn extendCoverage(
 /// A split anchor's displaced prefix must be whole instructions with no
 /// flow op: both the enqueue stub and the pump trampoline re-execute
 /// those bytes at a different address.
-fn splitPrefixOk(out: []const u8, usage: []const u8, entry: u16, need: u32) bool {
+fn splitPrefixSpan(out: []const u8, usage: []const u8, entry: u16, need: u32) u32 {
     var pc: u32 = entry;
     while (pc - entry < need) {
         const op = out[pc - 0x8000];
         switch (op) {
-            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x22 => return false,
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x22 => return 0,
             else => {},
         }
         const m8 = usage[pc] & usage_map.flag_m != 0;
         const x8 = usage[pc] & usage_map.flag_x != 0;
         pc += usage_map.instrLen(op, m8, x8);
     }
-    return pc - entry == need;
+    // Anything past `need` is NOP-filled at the site, so the enqueue
+    // stub's RTS (landing at entry+3) walks fill until the boundary.
+    return if (pc - entry <= 6) pc - entry else 0;
 }
 
 /// S5: emit the mainline/NMI split scaffold into the bank-$00 carve
@@ -3809,10 +3829,14 @@ fn emitSplit(
     res: *Result,
 ) Error!void {
     // Anchor shapes first: nothing is written until every check holds.
-    if (!splitPrefixOk(out, usage, spec.mainloop, 4))
-        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
+    if (spec.tail == 0) {
+        if (splitPrefixSpan(out, usage, spec.mainloop, 4) != 4)
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
+    } else if (out[spec.tail - 0x8000] != 0x22 or spec.tail_epilogue == 0) {
+        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail });
+    }
     for (spec.io_entries) |io| {
-        if (!splitPrefixOk(out, usage, io.entry, 3))
+        if (splitPrefixSpan(out, usage, io.entry, 3) == 0)
             return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
     }
     if (spec.io_entries.len > 26)
@@ -3924,6 +3948,94 @@ fn emitSplit(
         }
     }
 
+    if (spec.tail != 0) {
+        // === NMI-TAIL FLAVOR (see SplitSpec.tail) =====================
+        // --- tok stub: the S-CPU boundary, once per frame in vblank ---
+        const tok16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20 (the handler is m16 here)
+        put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37 });
+        const bne_at = cur;
+        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE engaged (patched)
+        put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP open
+        put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 });
+        put(d, &cur, &.{ 0x9C, @truncate(split_token), 0x37, 0x9C, @truncate(split_last), 0x37 });
+        const crv_ref = cur;
+        put(d, &cur, &.{ 0xA9, 0x00, 0x8D, 0x03, 0x22, 0xA9, 0x00, 0x8D, 0x04, 0x22 }); // CRV (patched)
+        put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
+        put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
+        d[bne_at + 1] = @intCast(cur - (bne_at + 2));
+        // engaged: stock's own auto-joy wait, then the mirror feed — the
+        // cost the game already paid here every frame.
+        put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x29, 0x01, 0xD0, 0xF9 });
+        put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), 0x37 });
+        put(d, &cur, &.{ 0xC2, 0x20 });
+        var pj: u16 = 0;
+        while (pj < 8) : (pj += 2) {
+            put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pj), 0x42, 0x8D, @truncate(split_pad_mirror + pj), 0x37 });
+        }
+        put(d, &cur, &.{ 0xE2, 0x20 });
+        put(d, &cur, &.{ 0xEE, @truncate(split_token), 0x37 }); // token++
+        // drain the ring (the deferred replays), then the epilogue
+        const drain16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
+        const beq2_at = cur;
+        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
+        put(d, &cur, &.{ 0xE2, 0x10 }); // X8 for the ring walk
+        put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
+        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
+        put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
+        const jsr2_at = cur;
+        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
+        put(d, &cur, &.{ 0xC2, 0x10 }); // X wide again
+        put(d, &cur, &.{ 0x4C, @truncate(drain16), @truncate(drain16 >> 8) });
+        d[beq2_at + 1] = @intCast(cur - (beq2_at + 2));
+        put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue), @truncate(spec.tail_epilogue >> 8) });
+
+        // --- SA-1 prologue: gates, own I-RAM stack ---------------------
+        const prologue16: u16 = base16 + @as(u16, @intCast(cur));
+        d[crv_ref + 1] = @truncate(prologue16);
+        d[crv_ref + 6] = @truncate(prologue16 >> 8);
+        put(d, &cur, &.{ 0x78, 0x18, 0xFB }); // SEI / native
+        put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE
+        put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0
+        put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply, for the helper
+        put(d, &cur, &.{ 0xC2, 0x30 }); // REP #$30
+        put(d, &cur, &.{ 0xA9, @truncate(split_sa1_stack), @truncate(split_sa1_stack >> 8), 0x1B });
+
+        // --- the SA-1 frame loop --------------------------------------
+        const sloop16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
+        put(d, &cur, &.{ 0xAF, @truncate(split_token), 0x37, 0x00 });
+        put(d, &cur, &.{ 0xCF, @truncate(split_last), 0x37, 0x00 });
+        put(d, &cur, &.{ 0xF0, 0xF4 }); // BEQ sloop (-12)
+        put(d, &cur, &.{ 0x8F, @truncate(split_last), 0x37, 0x00 });
+        // Fake the handler frame the epilogue unwinds: the RTI comes
+        // back HERE. RTI pulls P, PC, PBR — push PBR, PCH, PCL, P.
+        put(d, &cur, &.{ 0xA9, 0x00, 0x48 }); // PBR
+        put(d, &cur, &.{ 0xA9, @truncate(sloop16 >> 8), 0x48, 0xA9, @truncate(sloop16), 0x48 }); // PC
+        put(d, &cur, &.{ 0xA9, 0x34, 0x48 }); // P: M8/X8/I
+        // the pulls' dummies: A, X, Y (16-bit each), D = 0
+        put(d, &cur, &.{ 0xC2, 0x30, 0xA9, 0x00, 0x00, 0x48, 0x48, 0x48, 0x48 });
+        put(d, &cur, &.{ 0xE2, 0x20, 0xA9, spec.tail_dbr, 0x48 }); // the PLB's byte
+        // live context, as the handler set it: DBR and D
+        put(d, &cur, &.{ 0xA9, spec.tail_dbr, 0x48, 0xAB }); // DBR
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, 0x00, 0x00, 0x5B, 0xE2, 0x20 }); // D = 0
+        // the displaced boundary JSL, whole, then into the tail
+        @memcpy(d[cur .. cur + 4], out[spec.tail - 0x8000 ..][0..4]);
+        cur += 4;
+        put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 });
+
+        // --- displace the boundary on the S-CPU side ------------------
+        out[spec.tail - 0x8000] = 0x4C; // JMP tok (the JSL's 4th byte is unreachable)
+        std.mem.writeInt(u16, out[spec.tail - 0x8000 + 1 ..][0..2], tok16, .little);
+        res.stats.split_engage_addr = tok16;
+
+        try emitSplitIo(out, usage, spec, d, &cur, base16, jsr2_at, refusal, res);
+        std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+        return;
+    }
+
     // --- pump loop (S-CPU): feed the mirrors, drain the ring ----------
     const pump16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
@@ -3989,17 +4101,46 @@ fn emitSplit(
     cur += 4;
     put(d, &cur, &.{ 0x5C, @truncate(spec.mainloop + 4), @truncate((spec.mainloop + 4) >> 8), 0x00 });
 
-    // --- per-IO: pump trampoline, enqueue stub; then the table --------
+    try emitSplitIo(out, usage, spec, d, &cur, base16, jsr_tbl_at, refusal, res);
+
+    std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+
+    // --- displace the mainloop anchor, last -----------------------------
+    out[spec.mainloop - 0x8000] = 0x5C; // JML engage
+    std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
+    out[spec.mainloop - 0x8000 + 3] = 0x00;
+    res.stats.split_engage_addr = engage16;
+}
+
+/// The shared IO machinery: per-routine drain trampolines, enqueue
+/// stubs (span-generalized: sites whose whole-instruction prefix runs
+/// past 3 bytes are NOP-filled so the stub's RTS lands in fill), the
+/// dispatch table, and the site displacements. `jsr_patch_at` is the
+/// draining `JSR (tbl,X)` whose operand this fills in.
+fn emitSplitIo(
+    out: []u8,
+    usage: []const u8,
+    spec: SplitSpec,
+    d: []u8,
+    curp: *usize,
+    base16: u16,
+    jsr_patch_at: usize,
+    refusal: *?Refusal,
+    res: *Result,
+) Error!void {
+    var cur = curp.*;
     var tramp_addrs: [26]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
+        const span = splitPrefixSpan(out, usage, io.entry, 3);
+        if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
         tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
-        @memcpy(d[cur .. cur + 3], out[io.entry - 0x8000 ..][0..3]);
-        cur += 3;
+        @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
+        cur += span;
         if (io.rtl) {
-            // JSL bridge: the body's RTL lands back here, RTS to the pump.
-            put(d, &cur, &.{ 0x22, @truncate(io.entry + 3), @truncate((io.entry + 3) >> 8), 0x00, 0x60 });
+            // JSL bridge: the body's RTL lands back here, RTS to the drain.
+            put(d, &cur, &.{ 0x22, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8), 0x00, 0x60 });
         } else {
-            put(d, &cur, &.{ 0x4C, @truncate(io.entry + 3), @truncate((io.entry + 3) >> 8) }); // JMP entry+3
+            put(d, &cur, &.{ 0x4C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8) });
         }
     }
     var enq_addrs: [26]u16 = undefined;
@@ -4031,28 +4172,28 @@ fn emitSplit(
             put(d, &cur, &.{if (io.rtl) @as(u8, 0x6B) else 0x60}); // pop the GAME frame
         }
         put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
-        @memcpy(d[cur .. cur + 3], out[io.entry - 0x8000 ..][0..3]);
-        cur += 3;
-        put(d, &cur, &.{0x60}); // RTS -> entry+3
+        {
+            const span = splitPrefixSpan(out, usage, io.entry, 3);
+            @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
+            cur += span;
+        }
+        put(d, &cur, &.{0x60}); // RTS -> entry+3 (fill, when the span ran long)
     }
     const tbl16: u16 = base16 + @as(u16, @intCast(cur));
     for (spec.io_entries, 0..) |_, i| {
         put(d, &cur, &.{ @truncate(tramp_addrs[i]), @truncate(tramp_addrs[i] >> 8) });
     }
-    std.mem.writeInt(u16, d[jsr_tbl_at + 1 ..][0..2], tbl16, .little);
-    std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+    std.mem.writeInt(u16, d[jsr_patch_at + 1 ..][0..2], tbl16, .little);
 
     // --- displacements, last: everything they jump into now exists ----
     for (spec.io_entries, 0..) |io, i| {
+        const span = splitPrefixSpan(out, usage, io.entry, 3);
         out[io.entry - 0x8000] = 0x20; // JSR enq
         std.mem.writeInt(u16, out[io.entry - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
+        if (span > 3) @memset(out[io.entry - 0x8000 + 3 ..][0 .. span - 3], 0xEA);
     }
-    out[spec.mainloop - 0x8000] = 0x5C; // JML engage
-    std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
-    out[spec.mainloop - 0x8000 + 3] = 0x00;
-
     res.stats.split_io = @intCast(spec.io_entries.len);
-    res.stats.split_engage_addr = engage16;
+    curp.* = cur;
 }
 
 pub fn convertWholeGame(

@@ -223,6 +223,9 @@ const Args = struct {
     wg_copy_reserve: u32 = core.sa1gen.copy_reserve,
     /// S5 mainline split: the engage anchor; zero = split off.
     wg_split_mainloop: u16 = 0,
+    wg_split_tail: u16 = 0,
+    wg_split_epi: u16 = 0,
+    wg_split_dbr: u8 = 0,
     wg_split_io: [26]core.sa1gen.SplitIo = undefined,
     n_wg_split_io: usize = 0,
     wg_split_vbl: [8][2]u16 = undefined,
@@ -2402,13 +2405,16 @@ fn runSa1Gen(
             try out.flush();
         }
         var refusal: ?core.sa1gen.Refusal = null;
-        const split_spec: ?core.sa1gen.SplitSpec = if (args.wg_split_mainloop != 0) .{
+        const split_spec: ?core.sa1gen.SplitSpec = if (args.wg_split_mainloop != 0 or args.wg_split_tail != 0) .{
             .io_entries = args.wg_split_io[0..args.n_wg_split_io],
             .vbl_ranges = args.wg_split_vbl[0..args.n_wg_split_vbl],
             .mainloop = args.wg_split_mainloop,
+            .tail = args.wg_split_tail,
+            .tail_epilogue = args.wg_split_epi,
+            .tail_dbr = args.wg_split_dbr,
         } else null;
         if (split_spec != null) {
-            try out.print("  --wg-split: engaging the mainline/NMI split at $00:{x:0>4} ({} IO routine(s), {} reader range(s))\n", .{ args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
+            try out.print("  --wg-split: engaging the split (anchor $00:{x:0>4}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) args.wg_split_tail else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
             try out.flush();
         }
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
@@ -4588,6 +4594,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wg-split")) {
             const v = it.next() orelse return error.MissingValue;
             out.wg_split_mainloop = try std.fmt.parseInt(u16, v, 16);
+        } else if (std.mem.eql(u8, a, "--wg-split-tail")) {
+            // "<tail>:<epilogue>:<dbr>" — the NMI-tail flavor.
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.wg_split_tail = try std.fmt.parseInt(u16, pit.next().?, 16);
+            out.wg_split_epi = try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16);
+            out.wg_split_dbr = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
         } else if (std.mem.eql(u8, a, "--wg-split-io")) {
             // "<hex4>[:d][:l]" — d = deferred (handshake body, pump-only
             // post-engage), l = RTL-shaped (JSL-called).
