@@ -2176,7 +2176,7 @@ fn runSa1Gen(
     // the candidate FILTER changes across bisect attempts.
     var conv: profile.Conversion = undefined;
     var plan: profile.Plan = undefined;
-    var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+    var cands: [profile.conversion_set_max + 12]core.sa1gen.Candidate = undefined;
     var n_cands: usize = 0;
     var neighbours: []const core.sa1gen.Candidate = &.{};
     var dma_pages: profile.WramPages = @splat(0);
@@ -2214,7 +2214,11 @@ fn runSa1Gen(
             n_cands += 1;
         }
         for (args.wg_add[0..args.n_wg_add]) |e| {
-            if (n_cands == cands.len) break;
+            if (n_cands == cands.len) {
+                try out.print("  --wg-add: ${x:0>6} DROPPED — candidate list full ({d} slots)\n", .{ e, cands.len });
+                try out.flush();
+                continue;
+            }
             const dup = for (cands[0..n_cands]) |c| {
                 if (c.entry == e) break true;
             } else false;
