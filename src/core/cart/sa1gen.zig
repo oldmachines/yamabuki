@@ -130,6 +130,7 @@ const split_scr_p: u16 = 0x37B1; // deferred-skip scratch (SA-1-exclusive: inter
 const split_scr_a: u16 = 0x37B2;
 const split_token: u16 = 0x37B3; // the S-CPU NMI increments; the SA-1 frame loop edges on it
 const split_last: u16 = 0x37B4; // the SA-1's copy of the last token it ran
+const split_done: u16 = 0x37B5; // the last token whose tail COMPLETED — the head's gate
 const split_sa1_stack: u16 = 0x3778; // the old dispatcher stack slot, free in split mode
 const split_pump_stack: u16 = 0x37F0;
 
@@ -3886,9 +3887,13 @@ fn emitSplit(
                 if ((usage[ac] | usage[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
                 const file = bank * 0x8000 + (aa - 0x8000);
                 if (!std.mem.eql(u8, out[file..][0..3], &.{ 0x8D, 0x02, 0x42 })) continue;
+                // Only the FULL idiom is claimed. A bare STA $4202 (the
+                // boot's register-clear sweep has eleven of them) is a
+                // write that vanishes harmlessly on the SA-1; a product
+                // READ without this shape shows up in the audit instead.
                 if (!std.mem.eql(u8, out[file + 3 ..][0..4], &.{ 0xEA, 0xEA, 0xEA, 0xEA }) or
                     !std.mem.eql(u8, out[file + 7 ..][0..3], &.{ 0xAD, 0x16, 0x42 }))
-                    return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                    continue;
                 if (n_mul == mul_sites.len)
                     return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
                 mul_sites[n_mul] = file;
@@ -3952,7 +3957,14 @@ fn emitSplit(
         // === NMI-TAIL FLAVOR (see SplitSpec.tail) =====================
         // --- tok stub: the S-CPU boundary, once per frame in vblank ---
         const tok16: u16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20 (the handler is m16 here)
+        // The boundary is reachable along MORE than the vectored head —
+        // a transition path arrives with its own D (measured: D=0, three
+        // frames into a stage banner) — and the drain's replayed bodies
+        // are dp users. Pin the window D for the stub's whole span and
+        // hand back whatever the caller had.
+        put(d, &cur, &.{ 0x0B, 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // PHD; D = the window
+        put(d, &cur, &.{ 0x8B, 0x4B, 0xAB }); // PHB; DBR = $00 (a pinned arrival's $40 would send the cells into BW-RAM)
+        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20 (M widths per the handler)
         put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37 });
         const bne_at = cur;
         put(d, &cur, &.{ 0xD0, 0x00 }); // BNE engaged (patched)
@@ -3977,18 +3989,31 @@ fn emitSplit(
         put(d, &cur, &.{ 0xEE, @truncate(split_token), 0x37 }); // token++
         // drain the ring (the deferred replays), then the epilogue
         const drain16: u16 = base16 + @as(u16, @intCast(cur));
+        // Widths are forced EVERY lap: a replayed body returns with
+        // whatever REP it last executed (measured: $86E1 left m16, the
+        // 8-bit ring compare read the vbl mirror as a high byte, and the
+        // drain spun forever).
+        put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
         put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
         const beq2_at = cur;
         put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
-        put(d, &cur, &.{ 0xE2, 0x10 }); // X8 for the ring walk
         put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
         put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
         put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
         const jsr2_at = cur;
         put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
-        put(d, &cur, &.{ 0xC2, 0x10 }); // X wide again
         put(d, &cur, &.{ 0x4C, @truncate(drain16), @truncate(drain16 >> 8) });
         d[beq2_at + 1] = @intCast(cur - (beq2_at + 2));
+        put(d, &cur, &.{ 0xC2, 0x10 }); // X wide again for the epilogue's pulls
+        // The done-gate, at the EXIT: the S-CPU does not resume the
+        // mainline while the SA-1 still runs the tail. Stock had no
+        // concurrency at all (the NMI preempted atomically), and the
+        // transition mainline — the decompressor — shares flags with the
+        // tail; letting them overlap diverged the logo fade from tick 3.
+        // Sequential-but-fast is the contract: the wait costs the tail's
+        // SA-1 duration, a quarter of what stock paid to run it here.
+        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37, 0xD0, 0xF9 });
+        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the caller's context back
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue), @truncate(spec.tail_epilogue >> 8) });
 
         // --- SA-1 prologue: gates, own I-RAM stack ---------------------
@@ -4006,21 +4031,30 @@ fn emitSplit(
         // --- the SA-1 frame loop --------------------------------------
         const sloop16: u16 = base16 + @as(u16, @intCast(cur));
         put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
-        put(d, &cur, &.{ 0xAF, @truncate(split_token), 0x37, 0x00 });
+        // publish: the RTI lands here, so `last` is a COMPLETED tail now
+        put(d, &cur, &.{ 0xAF, @truncate(split_last), 0x37, 0x00 });
+        put(d, &cur, &.{ 0x8F, @truncate(split_done), 0x37, 0x00 });
+        put(d, &cur, &.{ 0xAF, @truncate(split_token), 0x37, 0x00 }); // wait:
         put(d, &cur, &.{ 0xCF, @truncate(split_last), 0x37, 0x00 });
-        put(d, &cur, &.{ 0xF0, 0xF4 }); // BEQ sloop (-12)
+        put(d, &cur, &.{ 0xF0, 0xF6 }); // BEQ the wait (-10)
         put(d, &cur, &.{ 0x8F, @truncate(split_last), 0x37, 0x00 });
         // Fake the handler frame the epilogue unwinds: the RTI comes
         // back HERE. RTI pulls P, PC, PBR — push PBR, PCH, PCL, P.
         put(d, &cur, &.{ 0xA9, 0x00, 0x48 }); // PBR
         put(d, &cur, &.{ 0xA9, @truncate(sloop16 >> 8), 0x48, 0xA9, @truncate(sloop16), 0x48 }); // PC
         put(d, &cur, &.{ 0xA9, 0x34, 0x48 }); // P: M8/X8/I
-        // the pulls' dummies: A, X, Y (16-bit each), D = 0
-        put(d, &cur, &.{ 0xC2, 0x30, 0xA9, 0x00, 0x00, 0x48, 0x48, 0x48, 0x48 });
+        // the pulls' dummies: A, X, Y (16-bit each), then D — which is
+        // NOT the stock handler's zero: the window relocation's dp
+        // scheme exists because the CONVERTED handler establishes
+        // D=$6000, and a zero here sends every tail dp access into the
+        // SA-1's I-RAM instead of the window (measured: the first boot
+        // probe wrote $00:005C where the game meant window $605C).
+        put(d, &cur, &.{ 0xC2, 0x30, 0xA9, 0x00, 0x00, 0x48, 0x48, 0x48 });
+        put(d, &cur, &.{ 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x48 }); // the PLD's word
         put(d, &cur, &.{ 0xE2, 0x20, 0xA9, spec.tail_dbr, 0x48 }); // the PLB's byte
-        // live context, as the handler set it: DBR and D
+        // live context, as the CONVERTED handler set it: DBR and D
         put(d, &cur, &.{ 0xA9, spec.tail_dbr, 0x48, 0xAB }); // DBR
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, 0x00, 0x00, 0x5B, 0xE2, 0x20 }); // D = 0
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // D = the window
         // the displaced boundary JSL, whole, then into the tail
         @memcpy(d[cur .. cur + 4], out[spec.tail - 0x8000 ..][0..4]);
         cur += 4;
@@ -4089,7 +4123,10 @@ fn emitSplit(
     put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE: BW-RAM writes
     put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0 -- the identity window
     put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply mode, for the helper
-    put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // game S
+    // The SA-1's OWN I-RAM stack, in this flavor too: the stack page is
+    // the CPU discriminator everywhere, and two CPUs sharing the game
+    // stack was never sound anyway.
+    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_sa1_stack), @truncate(split_sa1_stack >> 8), 0x1B });
     put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // game D
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // game P
     const tramp16: u16 = base16 + @as(u16, @intCast(cur)) + 4;
@@ -4155,8 +4192,15 @@ fn emitSplitIo(
             // of the body's MMIO echo would spin forever: skip the body
             // and pop the game caller's frame. Pre-engage (the S-CPU
             // boot doing real IO) fall through to the body as usual.
-            put(d, &cur, &.{ 0xAF, @truncate(split_engaged), 0x37, 0x00 }); // engaged?
-            put(d, &cur, &.{ 0xF0, 0x1C }); // BEQ the replay tail (+28)
+            // WHICH CPU, not whether engaged: the S-CPU calls this from
+            // its own paths post-engage too (measured: the loader's
+            // mainline pumps the sound while the NMI legitimately skips
+            // its full path — deferring THOSE calls starved the loader's
+            // wait and froze the logo). The stack page discriminates
+            // deterministically: the SA-1 runs on I-RAM $37xx, the S-CPU
+            // on the window $61xx.
+            put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
+            put(d, &cur, &.{ 0xD0, 0x1C }); // BNE the replay tail (+28): not the SA-1
             // SA-1-exclusive skip (interrupt-free, so scratch is safe):
             // restore the caller completely, then drop our JSR frame by
             // parking P and A-low around a known-width pull. B carries a
