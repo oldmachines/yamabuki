@@ -135,6 +135,7 @@ const Args = struct {
     /// tier's rules against a preserved failing rung in minutes instead
     /// of re-running the whole generation ladder.
     behavioral_probe: ?[]const u8 = null,
+    iram_dump: bool = false,
     /// Window debugging (undocumented): write each verification attempt's
     /// converted image to this path (last attempt wins).
     save_attempt: ?[]const u8 = null,
@@ -614,6 +615,12 @@ pub fn main(init: std.process.Init) !void {
     try out.print("{s}: {} frames, {}x{}, hash={x:0>16}, audio={x:0>16} (peak {})\n", .{
         args.rom, frames, width, fb.len / width, hash, audio_hash, audio_peak,
     });
+    if (args.iram_dump and con.* == .fast and con.fast.bus.cart.chip == .sa1) {
+        try out.print("sa1 pc={x:0>2}:{x:0>4} resb={} iram $3780-$37BF:", .{ con.fast.bus.sa1.cpu.regs.pbr, con.fast.bus.sa1.cpu.regs.pc, con.fast.bus.sa1.sa1_resb });
+        var di: usize = 0x380;
+        while (di < 0x3C0) : (di += 1) try out.print(" {x:0>2}", .{con.fast.bus.sa1.iram[di]});
+        try out.print("\n", .{});
+    }
     try out.flush();
 
     if (args.hash_stream) |path| {
@@ -4556,6 +4563,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             var pit = std.mem.splitScalar(u8, v, ':');
             core.wdc65816.dbg_stale = try std.fmt.parseInt(usize, pit.next().?, 10);
             if (pit.next()) |f| core.wdc65816.dbg_stale_from = try std.fmt.parseInt(u64, f, 10);
+        } else if (std.mem.eql(u8, a, "--iram-dump")) {
+            out.iram_dump = true;
         } else if (std.mem.eql(u8, a, "--stale-ring")) {
             core.wdc65816.dbg_stale_ring = true;
         } else if (std.mem.eql(u8, a, "--watch-min")) {

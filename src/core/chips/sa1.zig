@@ -382,6 +382,7 @@ pub const Sa1 = struct {
     /// SNES read of IRAM at $3000-$37FF.
     pub fn iramReadSnes(self: *Sa1, clock: u64, a16: u16) u8 {
         self.catchUp(clock);
+        if (a16 == 0x37B3) std.debug.print("[ir] v={x}\n", .{self.iram[a16 & 0x7FF]});
         return self.iram[a16 & 0x7FF];
     }
 
@@ -714,7 +715,9 @@ pub const Sa1 = struct {
                 self.sw46 = value & 0x80 != 0;
             },
             0x2227 => self.cwen = value & 0x80 != 0,
-            0x222A => self.ciwp = value,
+            0x222A => {
+                self.ciwp = value;
+            },
             0x2230 => { // DCNT
                 self.sd = @truncate(value);
                 self.dd = @intCast((value >> 2) & 1);

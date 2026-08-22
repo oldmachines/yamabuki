@@ -3854,7 +3854,8 @@ fn emitSplit(
             const m8 = usage[pc] & usage_map.flag_m != 0;
             const x8 = usage[pc] & usage_map.flag_x != 0;
             const len = usage_map.instrLen(op, m8, x8);
-            if (len == 3 and usage_map.mode(op) == .abs) {
+            const md = usage_map.mode(op);
+            if (len == 3 and (md == .abs or md == .abs_x or md == .abs_y)) {
                 const v = std.mem.readInt(u16, out[pc - 0x8000 + 1 ..][0..2], .little);
                 const nv: u16 = if (v == 0x4212)
                     split_vbl_mirror
@@ -3963,8 +3964,13 @@ fn emitSplit(
         // are dp users. Pin the window D for the stub's whole span and
         // hand back whatever the caller had.
         put(d, &cur, &.{ 0x0B, 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // PHD; D = the window
-        put(d, &cur, &.{ 0x8B, 0x4B, 0xAB }); // PHB; DBR = $00 (a pinned arrival's $40 would send the cells into BW-RAM)
+        put(d, &cur, &.{0x8B}); // PHB
         put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20 (M widths per the handler)
+        // DBR = $00 EXPLICITLY — not PHK: under fastrom the boundary
+        // executes from PBR=$80, and a PHK'd DBR sends every absolute
+        // $37xx at a mirror whose I-RAM mapping is nobody's contract.
+        // The offload stubs always went long for exactly this reason.
+        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB }); // LDA #$00 / PHA / PLB
         put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37 });
         const bne_at = cur;
         put(d, &cur, &.{ 0xD0, 0x00 }); // BNE engaged (patched)
@@ -7933,6 +7939,95 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     try testing.expect(con.bus.sa1.bwram[0x0102] <= con.bus.sa1.bwram[0x0100]);
     // And the low-WRAM home of the counter stayed abandoned.
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
+}
+
+test "split tail: the token round-trip drives the SA-1's frame loop" {
+    // The NMI-tail flavor's protocol, isolated: a game whose engine
+    // lives in its NMI handler (head work, a boundary JSL, a tail
+    // routine, the pull/RTI epilogue) and whose mainline just spins.
+    // After the split: the head still runs on the S-CPU every frame,
+    // the tok stub bumps the token, and the SA-1's frame loop runs the
+    // tail once per token through the faked handler frame.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memset(rom[0x8000..0x10000], 0xFF);
+    @memcpy(rom[0x0000..0x000C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
+        0xEA, // mainline
+        0x80, 0xFD, // BRA the NOP — idle forever
+    });
+    // The NMI engine, stock-shaped: save, D-establish, head work,
+    // boundary JSL, post, epilogue pulls, RTI.
+    @memcpy(rom[0x0100..0x0125], &[_]u8{
+        0xC2, 0x20, 0xC2, 0x10, // REP
+        0x48, 0xDA, 0x5A, 0x0B, 0x8B, // PHA PHX PHY PHD PHB
+        0xA2, 0x00, 0x00, 0xDA, 0x2B, // LDX #0 / PHX / PLD — the D-establish the rewriter moves
+        0xE2, 0x20, // SEP #$20
+        0xEE, 0x00, 0x02, // INC $0200 — head work (shifts to the window)
+        0xC2, 0x20, // REP #$20
+        0x22, 0x40, 0x81, 0x00, // the BOUNDARY: JSL $00:8140
+        0xE2, 0x20, // SEP #$20
+        0x64, 0x50, // STZ $50 — tail-side post, still the tail's span
+        0xC2, 0x30, // the epilogue: REP #$30
+        0xAB, 0x2B, 0x7A, 0xFA, 0x68, // PLB PLD PLY PLX PLA
+        0x40, // RTI
+    });
+    @memcpy(rom[0x0140..0x0144], &[_]u8{
+        0xEE, 0x04, 0x01, // INC $0104 — the tail's logic counter
+        0x6B, // RTL
+    });
+    std.mem.writeInt(u16, rom[0x7FC0 + 0x2A ..][0..2], 0x8100, .little);
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8009, 0x800A }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8100, 0x8102 }) |a| markOp(bytes, a);
+    for ([_]u32{ 0x8104, 0x8105, 0x8106, 0x8107, 0x8108, 0x8109, 0x810C, 0x810D }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x810E, 0x8110, 0x8113, 0x8115, 0x8119, 0x811B, 0x811D, 0x811F, 0x8120, 0x8121, 0x8122, 0x8123, 0x8124 }) |a| markOpX16(bytes, a);
+    for ([_]u32{ 0x8140, 0x8143 }) |a| markOpX16(bytes, a);
+
+    var ref: ?Refusal = null;
+    const res = convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
+        .io_entries = &.{},
+        .vbl_ranges = &.{},
+        .tail = 0x8115,
+        .tail_epilogue = 0x811D,
+        .tail_dbr = 0x00,
+    }, &ref) catch |e| {
+        if (ref) |r| std.debug.print("[tailtest] REFUSED: {s} detail={x}\n", .{ @tagName(r.reason), r.detail });
+        return e;
+    };
+    defer gpa.free(res.image);
+    try testing.expect(res.stats.split_engage_addr != 0);
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x0115]); // JMP tok over the boundary
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x00_8140);
+    con.bus.sa1.trace = trace;
+    for (0..8) |_| con.runFrame();
+
+    // The head ran every frame on the S-CPU; the tail ran every frame
+    // on the SA-1 (the trace watched it); the token round-trip is the
+    // only thing that could have driven it.
+    std.debug.print("[tailtest] hd200={} tail104={} trace={} eng={x} tok={x} last={x} done={x} scpu={x}:{x} sa1={x}:{x} resb={}\n", .{ con.bus.sa1.bwram[0x0200], con.bus.sa1.bwram[0x0104], trace.total, con.bus.sa1.iram[0x3B0], con.bus.sa1.iram[0x3B3], con.bus.sa1.iram[0x3B4], con.bus.sa1.iram[0x3B5], con.cpu.regs.pbr, con.cpu.regs.pc, con.bus.sa1.cpu.regs.pbr, con.bus.sa1.cpu.regs.pc, con.bus.sa1.sa1_resb });
+    try testing.expect(con.bus.sa1.bwram[0x0200] >= 6);
+    try testing.expect(trace.total > 0);
+    try testing.expect(con.bus.sa1.bwram[0x0104] >= 5);
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0104]);
 }
 
 test "window: cold sites in a full bank share one stub through the dispatcher" {
