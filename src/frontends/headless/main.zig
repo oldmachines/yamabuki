@@ -617,8 +617,8 @@ pub fn main(init: std.process.Init) !void {
     });
     if (args.iram_dump and con.* == .fast and con.fast.bus.cart.chip == .sa1) {
         try out.print("sa1 pc={x:0>2}:{x:0>4} resb={} iram $3780-$37BF:", .{ con.fast.bus.sa1.cpu.regs.pbr, con.fast.bus.sa1.cpu.regs.pc, con.fast.bus.sa1.sa1_resb });
-        var di: usize = 0x380;
-        while (di < 0x3C0) : (di += 1) try out.print(" {x:0>2}", .{con.fast.bus.sa1.iram[di]});
+        var di: usize = 0x780;
+        while (di < 0x7C0) : (di += 1) try out.print(" {x:0>2}", .{con.fast.bus.sa1.iram[di]});
         try out.print("\n", .{});
     }
     try out.flush();
@@ -846,7 +846,7 @@ const Behavioral = struct {
     /// Baseline wall frame of the first diverging tick (forensics anchor).
     first_bad_frame: u32,
     /// Sample of diverging addresses for the report.
-    sample: [6]u32,
+    sample: [24]u32,
     n_sample: usize,
     /// Set when a persistence failure carries the RNG-FORK signature: the
     /// killer run was still open at surface end, the conversion never
@@ -1109,6 +1109,16 @@ fn verifyBehavioral(
                 out.exit = .conversion_ran_out;
                 break;
             }
+            // A long no-poll SPAN is only a hang while input remains. A
+            // conversion that has consumed every input edge is simply
+            // AHEAD — it finished the movie's logic early (the removed
+            // slowdown, i.e. the point of the patch) and now sits in
+            // whatever no-poll state the story ends in (a load, a fade)
+            // while the baseline still chews through its lag.
+            if (conv.epoch(edges) >= edges.len) {
+                out.exit = .conversion_ran_out;
+                break;
+            }
             out.verdict = .{ .fail = .persistence };
             out.exit = .conversion_hung;
             return out;
@@ -1146,7 +1156,7 @@ fn verifyBehavioral(
                         // differential — so any timing change (FastROM, a
                         // tree, a thunk) could flip a verdict without
                         // touching correctness.
-                        if (conv.span >= hang_frames) {
+                        if (conv.span >= hang_frames and conv.epoch(edges) < edges.len) {
                             out.verdict = .{ .fail = .persistence };
                             out.exit = .conversion_hung;
                             return out;
@@ -1243,7 +1253,7 @@ fn verifyBehavioral(
         if (n_bad > 0 and out.stats.first_bad == null) {
             out.first_bad_frame = prev_frame;
             out.n_sample = @min(out.sample.len, n_bad);
-            for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr;
+            for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr | (@as(u32, b.delta) << 16);
         }
         if (out.ticks_base - 2 < tick_walls.len) {
             tick_walls[out.ticks_base - 2] = prev_frame;
@@ -2782,7 +2792,7 @@ fn runBehavioralProbe(
         });
         if (bv.n_sample > 0) {
             try out.print("  first-bad sample:", .{});
-            for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}", .{adr & 0xFFFF});
+            for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}(d{X:0>2})", .{ adr & 0xFFFF, (adr >> 16) & 0xFF });
             try out.print("\n", .{});
         }
         if (bv.fork_wall) |fw| if (fw > 600 and fw + 120 < total) {
@@ -4620,6 +4630,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             while (pit.next()) |f| {
                 if (std.mem.eql(u8, f, "d")) io.deferred = true;
                 if (std.mem.eql(u8, f, "l")) io.rtl = true;
+                if (std.mem.eql(u8, f, "f")) io.ff = true;
             }
             out.wg_split_io[out.n_wg_split_io] = io;
             out.n_wg_split_io += 1;
