@@ -85,6 +85,10 @@ pub const SplitIo = struct {
     /// The routine's return shape — RTL bodies are JSL-called, and the
     /// deferred skip must pop the caller's frame with the matching op.
     rtl: bool = false,
+    /// Fire-and-forget: enqueued on ring 2, replayed at the mini-tok
+    /// (frame exit — stock's own phase for the trailing sound call);
+    /// the SA-1 does not wait. For calls whose results nothing reads.
+    ff: bool = false,
 };
 
 pub const SplitSpec = struct {
@@ -130,7 +134,14 @@ const split_scr_p: u16 = 0x37B1; // deferred-skip scratch (SA-1-exclusive: inter
 const split_scr_a: u16 = 0x37B2;
 const split_token: u16 = 0x37B3; // the S-CPU NMI increments; the SA-1 frame loop edges on it
 const split_last: u16 = 0x37B4; // the SA-1's copy of the last token it ran
-const split_done: u16 = 0x37B5; // the last token whose tail COMPLETED — the head's gate
+const split_done: u16 = 0x37B5;
+const split_cell_dbr: u16 = 0x37B6;
+const split_rpc_ack: u16 = 0x37B7; // bumped AFTER a replayed body returns — the RPC release (rd consumes EARLY so nested drains cannot re-enter an in-service call) // the RPC caller's DBR (one call in flight, ever) // the last token whose tail COMPLETED — the head's gate
+const split_cell_pw: u16 = 0x37BA; // the RPC caller's P — replays must enter with the caller's M/X widths (a width-agnostic appender ran X8 and truncated its 16-bit cursor)
+const split_in_replay: u16 = 0x37BB; // nonzero while a drain's replay is in flight: a nested NMI's mini-tok must not start another (a multi-frame sample stream nested 25 bytes deeper every frame)
+const split_ring2_wr: u16 = 0x37B8; // fire-and-forget ring (sound family): slot index 0-11
+const split_ring2_rd: u16 = 0x37B9;
+const split_ring2: u16 = 0x3680; // 24 records of [id][D.lo][D.hi][pad] — bursts (a boss-area SFX barrage) lapped a 12-slot ring and the drain replayed a blank record
 const split_sa1_stack: u16 = 0x3778; // the old dispatcher stack slot, free in split mode
 const split_pump_stack: u16 = 0x37F0;
 
@@ -2811,6 +2822,10 @@ const wg_window_shim_max = 33 + 48;
 const WinBoot = struct { crv: u16, civ: u16 };
 /// Bank-0 reservation for the window dispatcher: prologue + message loop
 /// + JMP + sig + unm + mar + abort + blocks + NMI prologue + mirror thunks.
+/// The split flavor's carve budget: tok + mini-tok + sloop + the mul
+/// helper + up to 26 stub/trampoline pairs. Bank $00's whole padding
+/// run must cover shim + this.
+const split_disp_max: u32 = 1100;
 const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
@@ -3826,6 +3841,7 @@ fn emitSplit(
     spec: SplitSpec,
     d: []u8,
     base16: u16,
+    far: *FarPad,
     refusal: *?Refusal,
     res: *Result,
 ) Error!void {
@@ -3977,23 +3993,59 @@ fn emitSplit(
         put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP open
         put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 });
         put(d, &cur, &.{ 0x9C, @truncate(split_token), 0x37, 0x9C, @truncate(split_last), 0x37 });
+        put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 });
         const crv_ref = cur;
         put(d, &cur, &.{ 0xA9, 0x00, 0x8D, 0x03, 0x22, 0xA9, 0x00, 0x8D, 0x04, 0x22 }); // CRV (patched)
         put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
         put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
         d[bne_at + 1] = @intCast(cur - (bne_at + 2));
-        // engaged: stock's own auto-joy wait, then the mirror feed — the
-        // cost the game already paid here every frame.
-        put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x29, 0x01, 0xD0, 0xF9 });
-        put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), 0x37 });
-        put(d, &cur, &.{ 0xC2, 0x20 });
-        var pj: u16 = 0;
-        while (pj < 8) : (pj += 2) {
-            put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pj), 0x42, 0x8D, @truncate(split_pad_mirror + pj), 0x37 });
-        }
+        // The boundary is ALSO reachable on the SA-1: the hazard audit
+        // proves the tail re-enters the handler head ($8237's $4210 ack
+        // is in its static reach), and that walk ends here. Without a
+        // CPU test the SA-1 spins in the auto-joy wait on open bus — or
+        // worse, bumps the token and wedges the gate arithmetic. The
+        // SA-1 branch unwinds the pins and does exactly what the stock
+        // boundary did: the displaced JSL, then the tail.
+        put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
+        const tok_sa1_at = cur;
+        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the SA-1 island (patched)
         put(d, &cur, &.{ 0xE2, 0x20 });
+        // engaged: run the displaced boundary instruction — JSL $892B —
+        // NATIVELY. The S-CPU polls the real pads at the game's own
+        // cadence (the verifier pairs runs poll-for-poll, and a mirror
+        // diet here left the baseline ~246 polls ahead through the
+        // loader), and the results land in window dp cells the SA-1
+        // tail reads directly. No pad mirrors at all.
+        @memcpy(d[cur .. cur + 4], out[spec.tail - 0x8000 ..][0..4]);
+        cur += 4;
+        // M=8 FORCED after the replay: $892B returns wide, and a 16-bit
+        // INC on the token treats token+last as one word — fine for 255
+        // crossings, then the FF->00 carry clobbers `last` in the same
+        // cycle and no edge ever reaches the SA-1 (measured: the wedge
+        // at exactly the 256th crossing, frame 455).
+        put(d, &cur, &.{ 0xE2, 0x20 });
+        // REENTRANT full path: the transition runs as a multi-frame NMI
+        // ($3C is stock's own nesting guard and the transition handler
+        // clears it mid-flight), so a real per-frame NMI can take the
+        // full path while a tail — or a parked replay — is still in
+        // flight beneath us. The SA-1 is busy then; dispatching a second
+        // token deadlocks the nested gate on top of the very replay it
+        // suspends (measured: tok=3/done=2, frame ~714). Stock ran the
+        // nested tail on the S-CPU — so do exactly that: unpin and run
+        // the chain natively; the stubs run bodies directly for S-CPU
+        // callers, and the shared window makes the state evolution
+        // identical.
+        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37 });
+        const tok_nest_at = cur;
+        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE the nested-native branch (patched)
+        // Dispatch, then PUMP until the tail lands. A pure exit-wait
+        // deadlocked (the SA-1's enqueued uploads starve without the
+        // drain); pure non-blocking let the mainline overlap the tail
+        // and the shared fade cells ($3A/$3E/$1280) diverged from tick
+        // 3. The wait body IS the pump: each lap re-feeds the vbl
+        // mirror live (stock's $892B reads $4212 live too) and replays
+        // one ring entry, so the gate cannot starve what it waits on.
         put(d, &cur, &.{ 0xEE, @truncate(split_token), 0x37 }); // token++
-        // drain the ring (the deferred replays), then the epilogue
         const drain16: u16 = base16 + @as(u16, @intCast(cur));
         // Widths are forced EVERY lap: a replayed body returns with
         // whatever REP it last executed (measured: $86E1 left m16, the
@@ -4002,25 +4054,89 @@ fn emitSplit(
         put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
         put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
         const beq2_at = cur;
-        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
+        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the done-check (patched)
+        // rd consumes EARLY — a nested NMI's drain must see this entry
+        // gone (re-entering an in-service call regressed forever); the
+        // RPC release is the ACK bump after the body instead.
         put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
         put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
         put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
+        // The pump's pinned DBR=$00 is the body's contract too: the
+        // relocation shifts low-absolute operands into the $6000 window,
+        // which every bank $00-$3F maps identically. The replay borrows
+        // the CALLER's D (see the far stub's capture) — the body's dp
+        // rewrites were made against it — then the pump's pins return.
+        // The replay runs on a SCRATCH STACK (real WRAM — unused under
+        // the relocation). RE-ENTRANT: a nested NMI's drain that arrives
+        // already on the scratch page must NOT reset S to the top — that
+        // trampled the outer replay's frames and the nested RTI popped
+        // garbage (measured: P=$F5/PC=$02:8553, frame ~1131). Old S rides
+        // on the stack either way, so the restore is uniform.
+        // (original note follows)
+        // the relocation, and a $1xxx page keeps the far stubs' CPU
+        // discriminator honest). The game writes transition records into
+        // its own FREED stack bytes; stock survives because its frames
+        // sit below them, and our extra gate/trampoline depth moved a
+        // return frame into the write zone (measured: an $A77B record
+        // shredded the $7DE8 frame, frame ~714). Old S rides ON the
+        // scratch stack, so nested drains unwind naturally.
+        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 });
+        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B, 0xE2, 0x20 });
+        // WIDTHS ONLY (AND #$30): the SA-1's P carries I=1 — it runs masked
+        // by design — and PLPing it whole masked NMI on the S-CPU for the
+        // replay's span; a multi-frame sample stream then lost every nested
+        // frame its APU handshake depends on (measured: $9A68 spinning at
+        // p=$04 with no NMI for 400K cycles, frame 745).
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // the caller's widths for the body
         const jsr2_at = cur;
         put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
+        put(d, &cur, &.{ 0xE2, 0x30 }); // widths again — the body's REPs leak
+        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB });
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 });
+        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
+        put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
         put(d, &cur, &.{ 0x4C, @truncate(drain16), @truncate(drain16 >> 8) });
         d[beq2_at + 1] = @intCast(cur - (beq2_at + 2));
+        // Ring-2 backpressure: at half-full, drain it here — the frame
+        // exits that normally drain it don't happen while a multi-frame
+        // transition keeps this gate closed.
+        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_wr), 0x37, 0x38, 0xED, @truncate(split_ring2_rd), 0x37 });
+        put(d, &cur, &.{ 0xB0, 0x02, 0x69, 0x18 }); // mod-24 distance
+        put(d, &cur, &.{ 0xC9, 0x0C });
+        const r2bp_at = cur;
+        put(d, &cur, &.{ 0x90, 0x03 }); // BCC past the call
+        put(d, &cur, &.{ 0x20, 0x00, 0x00 }); // JSR r2 drain (patched)
+        // Stock's overrun release, performed by the gate: $86CD parks a
+        // waiter on $3C's bit7, and on stock the NEXT NMI's overrun path
+        // rewrites $3C:=1 to release it. While the S-CPU is gated here
+        // no such NMI can run — but the gate IS the NMI in progress, so
+        // when the tail itself is the waiter (the SA-1 runs $86CD
+        // natively), the gate makes stock's write for it.
+        put(d, &cur, &.{ 0xA5, 0x3C, 0x10, 0x0A }); // dp via pinned D — BPL past the release
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, 0x01, 0x00, 0x85, 0x3C, 0xE2, 0x30, 0xEA });
+        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37 });
+        // BEQ-over-BRL: the pump body outgrew a short branch's reach
+        // (the Debug build panicked on the cast; ReleaseFast would have
+        // emitted a silently wrong offset).
+        put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ done: fall out of the gate
+        const back = @as(i32, @intCast(drain16)) - (@as(i32, @intCast(base16)) + @as(i32, @intCast(cur)) + 3);
+        put(d, &cur, &.{ 0x82, @truncate(@as(u32, @bitCast(back))), @truncate(@as(u32, @bitCast(back)) >> 8) }); // BRL the pump head
         put(d, &cur, &.{ 0xC2, 0x10 }); // X wide again for the epilogue's pulls
-        // The done-gate, at the EXIT: the S-CPU does not resume the
-        // mainline while the SA-1 still runs the tail. Stock had no
-        // concurrency at all (the NMI preempted atomically), and the
-        // transition mainline — the decompressor — shares flags with the
-        // tail; letting them overlap diverged the logo fade from tick 3.
-        // Sequential-but-fast is the contract: the wait costs the tail's
-        // SA-1 duration, a quarter of what stock paid to run it here.
-        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37, 0xD0, 0xF9 });
         put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the caller's context back
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue), @truncate(spec.tail_epilogue >> 8) });
+        // The nested-native branch: unpin, run the tail on THIS CPU (the
+        // displaced boundary JSL above already made this frame's poll).
+        d[tok_nest_at + 1] = @intCast(cur - (tok_nest_at + 2));
+        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the head's context
+        put(d, &cur, &.{ 0x4C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8) });
+        // The SA-1 island: unwind the pins (the head's own D/B come
+        // back) and run the tail. The displaced JSL $892B is SKIPPED on
+        // this CPU — the SA-1 cannot poll pads, and the S-CPU's poll
+        // this frame already filled the window cells the routine feeds.
+        d[tok_sa1_at + 1] = @intCast(cur - (tok_sa1_at + 2));
+        put(d, &cur, &.{ 0xE2, 0x20 }); // M=8, as stock's boundary had it
+        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD
+        put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 }); // JML the tail proper
 
         // --- SA-1 prologue: gates, own I-RAM stack ---------------------
         const prologue16: u16 = base16 + @as(u16, @intCast(cur));
@@ -4061,18 +4177,130 @@ fn emitSplit(
         // live context, as the CONVERTED handler set it: DBR and D
         put(d, &cur, &.{ 0xA9, spec.tail_dbr, 0x48, 0xAB }); // DBR
         put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // D = the window
-        // the displaced boundary JSL, whole, then into the tail
-        @memcpy(d[cur .. cur + 4], out[spec.tail - 0x8000 ..][0..4]);
-        cur += 4;
+        // into the tail — the displaced JSL $892B is the S-CPU's now
+        // (it polls the real pads in the tok; the results are already
+        // in the window when the token arrives here)
         put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 });
+
+        // --- mini-tok: unconditional per-frame service ----------------
+        // The load-skip path never reaches the boundary, yet the SA-1's
+        // loader waits on replays only the drain provides. All paths
+        // converge on the epilogue, so its head is displaced onto this:
+        // pins, mirror feed, drain, the displaced bytes, onward.
+        const epi_span = splitPrefixSpan(out, usage, spec.tail_epilogue, 3);
+        if (epi_span == 0)
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail_epilogue });
+        const mini16: u16 = base16 + @as(u16, @intCast(cur));
+
+        // Both CPUs arrive here: every S-CPU handler exit, and the SA-1's
+        // faked-frame return through the same epilogue. Only the S-CPU
+        // feeds mirrors and drains; the SA-1 skips straight to the
+        // displaced bytes (a pair of REPs -- harmless to repeat).
+        put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
+        // BNE-over-BRL: the ring-2 drain pushed the target past a short
+        // branch's +127 reach, and the u8 cast wrapped it into a silent
+        // BACKWARD branch (measured: the SA-1 flew into BW-RAM-as-code).
+        put(d, &cur, &.{ 0xD0, 0x03 }); // BNE past the BRL — the S-CPU path
+        const msa1_at = cur;
+        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the displaced epilogue (patched)
+        put(d, &cur, &.{ 0x0B, 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // PHD; D = the window
+        put(d, &cur, &.{ 0x8B, 0xE2, 0x20, 0xA9, 0x00, 0x48, 0xAB }); // PHB; DBR = $00
+        // A nested NMI over an in-flight replay must not start another:
+        // a sample stream replay spans frames, and per-frame nested
+        // drains stacked streams 25 bytes deeper each frame until a
+        // frame was corrupt (measured: $00:FFBC once per frame, S
+        // 1b45/1b2c/1b13/1afa). The outer drain loops take the backlog.
+        const mdrain16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0xE2, 0x30 });
+        put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
+        const mbeq_at = cur;
+        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
+        put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
+        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 }); // rd consumes EARLY (see the tok drain)
+        put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
+        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 }); // scratch stack (see the tok drain)
+        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B, 0xE2, 0x20 }); // caller D (see the far stub's capture)
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // caller P
+        const mjsr_at = cur;
+        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
+        put(d, &cur, &.{ 0xE2, 0x30 });
+        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB }); // pump DBR back
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // pump D back
+        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
+        put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
+        put(d, &cur, &.{ 0x4C, @truncate(mdrain16), @truncate(mdrain16 >> 8) });
+        d[mbeq_at + 1] = @intCast(cur - (mbeq_at + 2));
+        // Ring 2 — the fire-and-forget sound calls — drains HERE and
+        // only here: the frame exit is stock's own phase for the
+        // trailing sound dispatch, and pacing it anywhere earlier
+        // skewed the APU echo family for hundreds of ticks.
+        // Emitted as a SUBROUTINE: the mini-tok calls it at every frame
+        // exit, and the GATE calls it under backpressure — a multi-frame
+        // gated transition has no frame exits, and 24 slots overwrote
+        // (measured: dropped sound dispatches overfilled the command
+        // queue and its cursor walked into the dp floor at $46).
+        const r2skip_at = cur;
+        put(d, &cur, &.{ 0x80, 0x00 }); // BRA past the sub (patched)
+        const r2_16: u16 = base16 + @as(u16, @intCast(cur));
+        put(d, &cur, &.{ 0xE2, 0x30 });
+        // Nesting guard, RING 2 ONLY: a sound stream spans frames and a
+        // nested NMI starting another stacked them 25 bytes/frame. Ring
+        // 1 (uploads) must still drain from a nested frame — each is
+        // short and the scratch frame is stack-safe — or the uploads
+        // land a frame late (measured: 1,476 divergent ticks from the
+        // one 2-frame stream at frame 1126 when both rings were gated).
+        put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 });
+        const r2nest_at = cur;
+        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE out (patched)
+        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_rd), 0x37, 0xCD, @truncate(split_ring2_wr), 0x37 });
+        const r2beq_at = cur;
+        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
+        put(d, &cur, &.{ 0x0A, 0x0A, 0xAA }); // slot*4 -> X
+        put(d, &cur, &.{ 0xBD, @truncate(split_ring2), @truncate(split_ring2 >> 8), 0x48 }); // id pushed
+        put(d, &cur, &.{ 0xC2, 0x20, 0xBD, @truncate(split_ring2 + 1), @truncate((split_ring2 + 1) >> 8), 0x5B, 0xE2, 0x20 }); // D := record.D
+        put(d, &cur, &.{ 0xBD, @truncate(split_ring2 + 3), @truncate((split_ring2 + 3) >> 8), 0x8D, @truncate(split_cell_pw), 0x37 }); // record.P parked in the cell
+        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_rd), 0x37, 0x1A, 0xC9, 0x18, 0xD0, 0x02, 0xA9, 0x00 });
+        put(d, &cur, &.{ 0x8D, @truncate(split_ring2_rd), 0x37 }); // rd2 bumped EARLY (nested-safe)
+        put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // id*2 -> X
+        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 }); // scratch stack
+        put(d, &cur, &.{ 0xEE, @truncate(split_in_replay), 0x37 }); // in flight
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // caller P
+        const r2jsr_at = cur;
+        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched below
+        put(d, &cur, &.{ 0xE2, 0x30 });
+        put(d, &cur, &.{ 0xCE, @truncate(split_in_replay), 0x37 }); // landed
+        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB });
+        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
+        put(d, &cur, &.{ 0x4C, @truncate(r2_16), @truncate(r2_16 >> 8) });
+        d[r2beq_at + 1] = @intCast(cur - (r2beq_at + 2));
+        d[r2nest_at + 1] = @intCast(cur - (r2nest_at + 2));
+        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // pump D back
+        put(d, &cur, &.{0x60}); // RTS — the drain sub's exit
+        d[r2skip_at + 1] = @intCast(cur - (r2skip_at + 2));
+        put(d, &cur, &.{ 0x20, @truncate(r2_16), @truncate(r2_16 >> 8) }); // the mini-tok's own call
+        std.mem.writeInt(u16, d[r2bp_at + 3 ..][0..2], r2_16, .little); // the gate's backpressure call
+        put(d, &cur, &.{ 0xC2, 0x10, 0xAB, 0x2B }); // X wide, PLB, PLD
+        std.mem.writeInt(u16, d[msa1_at + 1 ..][0..2], @intCast(cur - (msa1_at + 3)), .little);
+        @memcpy(d[cur .. cur + epi_span], out[spec.tail_epilogue - 0x8000 ..][0..epi_span]);
+        cur += epi_span;
+        put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue + @as(u16, @intCast(epi_span))), @truncate((spec.tail_epilogue + @as(u16, @intCast(epi_span))) >> 8) });
 
         // --- displace the boundary on the S-CPU side ------------------
         out[spec.tail - 0x8000] = 0x4C; // JMP tok (the JSL's 4th byte is unreachable)
         std.mem.writeInt(u16, out[spec.tail - 0x8000 + 1 ..][0..2], tok16, .little);
+        // ... and the epilogue onto the mini-tok.
+        out[spec.tail_epilogue - 0x8000] = 0x4C;
+        std.mem.writeInt(u16, out[spec.tail_epilogue - 0x8000 + 1 ..][0..2], mini16, .little);
+        if (epi_span > 3) @memset(out[spec.tail_epilogue - 0x8000 + 3 ..][0 .. epi_span - 3], 0xEA);
         res.stats.split_engage_addr = tok16;
 
-        try emitSplitIo(out, usage, spec, d, &cur, base16, jsr2_at, refusal, res);
-        std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+        try emitSplitIo(out, usage, spec, d, &cur, base16, jsr2_at, far, refusal, res);
+        std.mem.writeInt(u16, d[mjsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
+        std.mem.writeInt(u16, d[r2jsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
+        // A real refusal, not an assert: ReleaseFast strips asserts, and
+        // an overflowing emission wrote through the shim and vectors.
+        if (cur > wg_window_shim_max + split_disp_max)
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
         return;
     }
 
@@ -4094,6 +4322,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // PLA / ASL / TAX
     const jsr_tbl_at = cur;
     put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) -- patched below
+    put(d, &cur, &.{ 0xE2, 0x30, 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release (the stubs spin on the ack now)
     put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
     d[beq_at + 1] = @bitCast(@as(i8, @intCast(@as(i32, pump16) - (@as(i32, base16) + @as(i32, @intCast(beq_at)) + 2))));
 
@@ -4144,9 +4373,10 @@ fn emitSplit(
     cur += 4;
     put(d, &cur, &.{ 0x5C, @truncate(spec.mainloop + 4), @truncate((spec.mainloop + 4) >> 8), 0x00 });
 
-    try emitSplitIo(out, usage, spec, d, &cur, base16, jsr_tbl_at, refusal, res);
+    try emitSplitIo(out, usage, spec, d, &cur, base16, jsr_tbl_at, far, refusal, res);
 
-    std.debug.assert(cur <= wg_window_shim_max + win_disp_max);
+    if (cur > wg_window_shim_max + split_disp_max)
+        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
 
     // --- displace the mainloop anchor, last -----------------------------
     out[spec.mainloop - 0x8000] = 0x5C; // JML engage
@@ -4168,66 +4398,124 @@ fn emitSplitIo(
     curp: *usize,
     base16: u16,
     jsr_patch_at: usize,
+    far: *FarPad,
     refusal: *?Refusal,
     res: *Result,
 ) Error!void {
     var cur = curp.*;
+    // Drain trampolines stay in the carve: the drains' `JSR (tbl,X)`
+    // fetches its pointer from PBR's bank, and they are small.
+    //
+    // The call frame is pushed BEFORE the displaced prefix runs: a
+    // prefix may open with PHP (the screen family does), and the body's
+    // closing PLP must find that P on top — with the old layout the
+    // bridge's frame sat between them, the PLP ate the frame's PCL, and
+    // the RTL flew into bank $34 padding (measured: an IRQ-storming
+    // wild march at clk 70.37M).
     var tramp_addrs: [26]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
         if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
         tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
+        if (io.rtl) {
+            const helper = tramp_addrs[i] + 5;
+            put(d, &cur, &.{ 0x22, @truncate(helper), @truncate(helper >> 8), 0x00, 0x60 });
+        } else {
+            const helper = tramp_addrs[i] + 4;
+            put(d, &cur, &.{ 0x20, @truncate(helper), @truncate(helper >> 8), 0x60 });
+        }
         @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
         cur += span;
-        if (io.rtl) {
-            // JSL bridge: the body's RTL lands back here, RTS to the drain.
-            put(d, &cur, &.{ 0x22, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8), 0x00, 0x60 });
-        } else {
-            put(d, &cur, &.{ 0x4C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8) });
-        }
+        put(d, &cur, &.{ 0x4C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8) });
     }
+    // Enqueue stubs live in the FAR pool — seventeen of them overran
+    // the carve, and a stripped assert let the overflow eat the shim.
+    // Bank $00 keeps a 4-byte JML hop per entry; an RTS-shaped deferred
+    // return needs its pop to happen with PBR=$00, so its hop carries
+    // one RTS byte the far stub JMLs back to.
     var enq_addrs: [26]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
         enq_addrs[i] = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
-        put(d, &cur, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X (long: DBR-proof on a pinned mainline)
-        put(d, &cur, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
-        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
-        if (io.deferred) {
-            // Post-engage this caller is the SA-1, whose open-bus read
-            // of the body's MMIO echo would spin forever: skip the body
-            // and pop the game caller's frame. Pre-engage (the S-CPU
-            // boot doing real IO) fall through to the body as usual.
-            // WHICH CPU, not whether engaged: the S-CPU calls this from
-            // its own paths post-engage too (measured: the loader's
-            // mainline pumps the sound while the NMI legitimately skips
-            // its full path — deferring THOSE calls starved the loader's
-            // wait and froze the logo). The stack page discriminates
-            // deterministically: the SA-1 runs on I-RAM $37xx, the S-CPU
-            // on the window $61xx.
-            put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
-            put(d, &cur, &.{ 0xD0, 0x1C }); // BNE the replay tail (+28): not the SA-1
-            // SA-1-exclusive skip (interrupt-free, so scratch is safe):
-            // restore the caller completely, then drop our JSR frame by
-            // parking P and A-low around a known-width pull. B carries a
-            // 16-bit caller's A-high across the 8-bit stretch.
-            put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA — caller widths
-            put(d, &cur, &.{ 0x8F, @truncate(split_scr_a), 0x37, 0x00 }); // A aside (caller M)
-            put(d, &cur, &.{ 0x08, 0xE2, 0x20 }); // PHP; M8
-            put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_scr_p), 0x37, 0x00 }); // P aside
-            put(d, &cur, &.{ 0x68, 0x68 }); // drop our JSR frame
-            put(d, &cur, &.{ 0xAF, @truncate(split_scr_p), 0x37, 0x00, 0x48 }); // P back under
-            put(d, &cur, &.{ 0xAF, @truncate(split_scr_a), 0x37, 0x00 }); // A-low back
-            put(d, &cur, &.{0x28}); // PLP — caller P, M/X included
-            put(d, &cur, &.{if (io.rtl) @as(u8, 0x6B) else 0x60}); // pop the GAME frame
+        const hop_jml_at = cur;
+        put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML far stub (patched)
+        var rts_hop16: u16 = 0;
+        if (io.deferred and !io.rtl) {
+            rts_hop16 = base16 + @as(u16, @intCast(cur));
+            put(d, &cur, &.{0x60});
         }
-        put(d, &cur, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
+        const need: u32 = 144;
+        const at = far.next(need) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
+        var fb = out[at .. at + need];
+        var fc: usize = 0;
+        const fbank: u8 = @intCast(at / 0x8000);
+        const fbase: u16 = @intCast(0x8000 + (at % 0x8000));
+        put(fb, &fc, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
+        put(fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
+        const not_sa1_at = fc;
+        put(fb, &fc, &.{ 0xD0, 0x00 }); // BNE the common tail (patched)
+        if (io.ff) {
+            // Fire-and-forget (ring 2): record [id][caller D], bump the
+            // slot cursor mod 12, restore, return. No spin — the replay
+            // happens at the mini-tok, the frame-exit phase where stock
+            // ran its trailing sound call anyway.
+            put(fb, &fc, &.{ 0xAF, @truncate(split_ring2_wr), 0x37, 0x00, 0x0A, 0x0A, 0xAA });
+            put(fb, &fc, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring2), @truncate(split_ring2 >> 8), 0x00 });
+            put(fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x9F, @truncate(split_ring2 + 1), @truncate((split_ring2 + 1) >> 8), 0x00, 0xE2, 0x20 });
+            put(fb, &fc, &.{ 0xA3, 0x01, 0x9F, @truncate(split_ring2 + 3), @truncate((split_ring2 + 3) >> 8), 0x00 }); // caller P -> record[3]
+            put(fb, &fc, &.{ 0xAF, @truncate(split_ring2_wr), 0x37, 0x00, 0x1A, 0xC9, 0x18, 0xD0, 0x02, 0xA9, 0x00 });
+            put(fb, &fc, &.{ 0x8F, @truncate(split_ring2_wr), 0x37, 0x00 });
+            put(fb, &fc, &.{ 0x28, 0xFA, 0x68 });
+            if (io.rtl) {
+                put(fb, &fc, &.{0x6B});
+            } else {
+                put(fb, &fc, &.{ 0x5C, @truncate(rts_hop16), @truncate(rts_hop16 >> 8), 0x00 });
+            }
+        }
+        // Carry the CALLER's D and DBR to the replay: the body's dp and
+        // absolute rewrites were made against them (the APU-stream
+        // feeder runs D=$7A00 — its count under the pump's $6000 pin
+        // read a different page and the ring-copy scan ran unbounded).
+        // RPC serializes — one call in flight — so one cell pair holds.
+        put(fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00, 0xE2, 0x20 });
+        put(fb, &fc, &.{ 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
+        put(fb, &fc, &.{ 0xA3, 0x01, 0x8F, @truncate(split_cell_pw), 0x37, 0x00 }); // caller P (pushed at stub entry)
+        put(fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00, 0x8F, @truncate(split_scr_a), 0x37, 0x00 }); // old ack
+        put(fb, &fc, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X
+        put(fb, &fc, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
+        put(fb, &fc, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
+        if (io.deferred) {
+            // RPC, not fire-and-forget: the body's SHARED-STATE writes
+            // must land in program order, so wait for the replay. The
+            // release is the ACK bump (after the body), NOT the ring
+            // cursor: rd consumes the entry BEFORE the body runs, so a
+            // NESTED NMI's drain sees an empty ring and falls through to
+            // the displaced epilogue — which is exactly the overrun
+            // release a body parked on the $3C handshake is waiting for.
+            // Spinning on rd==wr instead made every releasing NMI
+            // re-enter the in-service call: infinite regress (measured
+            // at the demo transition, frame ~714).
+            put(fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00 }); // spin: ack
+            put(fb, &fc, &.{ 0xCF, @truncate(split_scr_a), 0x37, 0x00 }); // still the old one?
+            put(fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
+            put(fb, &fc, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
+            if (io.rtl) {
+                put(fb, &fc, &.{0x6B}); // pop the GAME frame — RTL is bank-safe anywhere
+            } else {
+                put(fb, &fc, &.{ 0x5C, @truncate(rts_hop16), @truncate(rts_hop16 >> 8), 0x00 }); // the hop's RTS pops with PBR=$00
+            }
+        }
+        fb[not_sa1_at + 1] = @intCast(fc - (not_sa1_at + 2));
+        put(fb, &fc, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
         {
             const span = splitPrefixSpan(out, usage, io.entry, 3);
-            @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
-            cur += span;
+            @memcpy(fb[fc .. fc + span], out[io.entry - 0x8000 ..][0..span]);
+            fc += span;
+            put(fb, &fc, &.{ 0x5C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8), 0x00 }); // JML back into the body
         }
-        put(d, &cur, &.{0x60}); // RTS -> entry+3 (fill, when the span ran long)
+        if (fc > need) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        std.mem.writeInt(u16, d[hop_jml_at + 1 ..][0..2], fbase, .little);
+        d[hop_jml_at + 3] = fbank;
     }
     const tbl16: u16 = base16 + @as(u16, @intCast(cur));
     for (spec.io_entries, 0..) |_, i| {
@@ -4238,7 +4526,7 @@ fn emitSplitIo(
     // --- displacements, last: everything they jump into now exists ----
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
-        out[io.entry - 0x8000] = 0x20; // JSR enq
+        out[io.entry - 0x8000] = 0x4C; // JMP enq — frameless, so pushes in the prefix are legal
         std.mem.writeInt(u16, out[io.entry - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
         if (span > 3) @memset(out[io.entry - 0x8000 + 3 ..][0 .. span - 3], 0xEA);
     }
@@ -4874,7 +5162,7 @@ pub fn convertWholeGame(
     // 4-byte `JML` trampoline in bank $00 for the sites' in-place `JSR` to
     // land on; the helper ends with `JML` back to a shared bank-$00 `RTS`.
     const scaffold: u32 = if (window)
-        wg_window_shim_max + (if (win_candidates.len != 0 or ml_split != null) win_disp_max else 0)
+        wg_window_shim_max + (if (ml_split != null) split_disp_max else if (win_candidates.len != 0) win_disp_max else 0)
     else
         wg_prologue_len + (if (bwram) @as(u32, wg_prologue_bw_extra) else 0) +
             wg_sa1_nmi_len + wg_scpu_nmi_len +
@@ -5840,7 +6128,7 @@ pub fn convertWholeGame(
         std.debug.assert(wn <= wg_window_shim_max);
         // Reset -> shim; the other vectors stay the game's own unless an
         // async offload injected its NMI prologue above.
-        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, refusal, &res);
+        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, &far, refusal, &res);
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
@@ -7905,7 +8193,7 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     try testing.expect(res.stats.split_engage_addr != 0);
     // The anchors wear their displacements.
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
-    try testing.expectEqual(@as(u8, 0x20), res.image[0x0040]); // JSR enq
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x0040]); // JMP enq
     // The mainloop's $4212 reads look at the mirror now.
     try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x0019..0x001B], .little));
 
@@ -8016,14 +8304,16 @@ test "split tail: the token round-trip drives the SA-1's frame loop" {
     con.init(cart);
     const trace = try gpa.create(sa1_trace.Trace);
     defer gpa.destroy(trace);
-    trace.* = sa1_trace.Trace.init(0x00_8140);
+    // The displaced boundary JSL runs on the S-CPU now (it is the pad
+    // poll); the SA-1 enters at tail+4, so THAT is what the trace
+    // watches for proof the frame loop drove the tail.
+    trace.* = sa1_trace.Trace.init(0x00_8119);
     con.bus.sa1.trace = trace;
     for (0..8) |_| con.runFrame();
 
     // The head ran every frame on the S-CPU; the tail ran every frame
     // on the SA-1 (the trace watched it); the token round-trip is the
     // only thing that could have driven it.
-    std.debug.print("[tailtest] hd200={} tail104={} trace={} eng={x} tok={x} last={x} done={x} scpu={x}:{x} sa1={x}:{x} resb={}\n", .{ con.bus.sa1.bwram[0x0200], con.bus.sa1.bwram[0x0104], trace.total, con.bus.sa1.iram[0x3B0], con.bus.sa1.iram[0x3B3], con.bus.sa1.iram[0x3B4], con.bus.sa1.iram[0x3B5], con.cpu.regs.pbr, con.cpu.regs.pc, con.bus.sa1.cpu.regs.pbr, con.bus.sa1.cpu.regs.pc, con.bus.sa1.sa1_resb });
     try testing.expect(con.bus.sa1.bwram[0x0200] >= 6);
     try testing.expect(trace.total > 0);
     try testing.expect(con.bus.sa1.bwram[0x0104] >= 5);
