@@ -119,6 +119,8 @@ const Args = struct {
     /// the picture is either disabled, pointed somewhere empty, or fed a
     /// tilemap that never arrived, and those look identical in WRAM.
     dump_ppu: ?[]const u8 = null,
+    /// `--dump-vram`: raw VRAM (64 KiB) then OAM (544 B) after the run.
+    dump_vram: ?[]const u8 = null,
     /// --save-state-at: frame to stop at and the file to write the machine to.
     /// A recording that carries its own anchor cannot be a window-mode
     /// surface, but the machine it passes through CAN anchor a profile — this
@@ -177,8 +179,8 @@ const Args = struct {
     /// `--cover-movie` after it fills the same slot. One recording covers
     /// one scenario, and the defects live in the scenarios nobody
     /// profiled — so the harvest has to take as many as there are.
-    cover_image: [16]?[]const u8 = @splat(null),
-    cover_movie: [16]?[]const u8 = @splat(null),
+    cover_image: [24]?[]const u8 = @splat(null),
+    cover_movie: [24]?[]const u8 = @splat(null),
     n_cover: usize = 0,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
@@ -478,6 +480,13 @@ pub fn main(init: std.process.Init) !void {
     // tilemap and character data, and — the question that separates "never
     // uploaded" from "not displayed" — how much of that tilemap in VRAM is
     // actually non-empty.
+    defer if (args.dump_vram) |vpath| {
+        const p = &con.fast.bus.ppu;
+        var blob: [0x10000 + 0x220]u8 = undefined;
+        @memcpy(blob[0..0x10000], std.mem.sliceAsBytes(p.vram[0..]));
+        @memcpy(blob[0x10000..], &p.oam);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = vpath, .data = &blob }) catch {};
+    };
     defer if (args.dump_ppu) |ppath| {
         const p = &con.fast.bus.ppu;
         var buf: [4096]u8 = undefined;
@@ -2140,6 +2149,9 @@ fn runSa1Gen(
         const ccon = try gpa.create(core.ProfilingConsole);
         ccon.init(ccart);
         ccon.usage = &cover_map;
+        // SA-1-side coverage too: on a conversion image the tail's code
+        // executes on the SA-1, and this harvest exists to see it.
+        if (ccon.bus.cart.chip == .sa1) ccon.bus.sa1.usage = &cover_map;
         // The harvest replays a recording on the very image it was made on,
         // so an anchor restores exactly the machine it describes — this is
         // the path that lets a LATE-GAME recording donate coverage at all.
@@ -4501,6 +4513,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             out.n_pokes = util.cheat.parseList(v, &out.pokes, out.n_pokes) catch
                 return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--dump-vram")) {
+            out.dump_vram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ppu")) {
             out.dump_ppu = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {

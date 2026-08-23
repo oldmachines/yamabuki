@@ -329,6 +329,11 @@ pub fn Cpu(comptime BusT: type) type {
                     a16
                 else if ((bank & 0x7F) < 0x40 and a16 >= 0x6000 and a16 < 0x8000)
                     a16 - 0x6000
+                    // MMIO passes through as itself: a --watch range above
+                    // $2000 names PPU/DMA registers (the VRAM address, a
+                    // DMA channel), which no WRAM home could alias.
+                else if ((bank & 0x7F) < 0x40 and a16 >= 0x2100 and a16 < 0x4400)
+                    a16
                 else
                     null;
                 if (off) |o| if (o >= dbg_watch_lo and o <= dbg_watch_hi and dbg_watch_n < 4096 and

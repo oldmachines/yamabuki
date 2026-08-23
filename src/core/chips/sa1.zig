@@ -29,9 +29,10 @@
 const std = @import("std");
 const wdc65816 = @import("../cpu/wdc65816.zig");
 const sa1_trace = @import("../sa1_trace.zig");
+const usage_map = @import("../usage_map.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat", "trace" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat", "trace", "usage" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -47,6 +48,13 @@ pub const Sa1 = struct {
     /// frontend (see sa1_trace.zig); null in every shipped path, where it
     /// costs one predictable test per SA-1 instruction and nothing else.
     trace: ?*sa1_trace.Trace,
+    /// Stage-S1 coverage from the SA-1 side, attached only by the cover
+    /// harvest (null in every shipped path; init()'s memset nulls it). On
+    /// a conversion image the game's own logic executes HERE — an
+    /// S-CPU-only harvest is blind to exactly the code a split moved (the
+    /// stage-2 boss loader's bank-immediate went unrewritten because the
+    /// only recording that reaches it runs it on this core).
+    usage: ?*const usage_map.UsageMap,
     iram: [0x800]u8,
     mdr: u8,
 
@@ -228,6 +236,18 @@ pub const Sa1 = struct {
             if (self.trace) |t| {
                 const r = &self.cpu.regs;
                 t.note(@as(u24, r.pbr) << 16 | r.pc, r.c, r.x, r.y, r.d, r.dbr, r.p);
+            }
+            if (self.usage) |u| {
+                const r = &self.cpu.regs;
+                // ROM-window pcs only, folded through the fast mirrors —
+                // and peeked without touching budget or MDR.
+                if (r.pc >= 0x8000 and (r.pbr & 0x7F) < 0x40) {
+                    const pc = @as(u24, @as(u24, r.pbr & 0x7F) << 16) | r.pc;
+                    const op = self.rom[self.mmcTranslate(squashLo(pc), true)];
+                    const m8 = r.e or (r.p & 0x20) != 0;
+                    const x8 = r.e or (r.p & 0x10) != 0;
+                    u.noteInstr(pc, op, m8, x8);
+                }
             }
             const before = self.budget;
             self.cpu.step();
