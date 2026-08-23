@@ -4294,6 +4294,42 @@ fn emitSplit(
         if (epi_span > 3) @memset(out[spec.tail_epilogue - 0x8000 + 3 ..][0 .. epi_span - 3], 0xEA);
         res.stats.split_engage_addr = tok16;
 
+        // --- the DMA-queue bank-slot translator -----------------------
+        // The game's upload records carry their source bank as DATA — ROM
+        // templates copied whole into the queue (the stage-2 boss's
+        // sprite strips live at $01:90CB/D6/E3 with src bank $7F). No
+        // static rewrite reaches a template only late-game code copies,
+        // and no S-CPU harvest ever executes the SA-1-side builder — so
+        // the CONSUMER translates: $8E00's one bank-slot store becomes a
+        // thunk mapping $7E->$40, $7F->$41 at run time, correct for
+        // every template the game will ever build a record from. The
+        // site is M8 (the walker SEPs first), stores leave flags dead
+        // (the next op is an immediate load), and the caller's DBR=$01
+        // reaches the same $4304 mirror the store always hit.
+        {
+            const pat = [_]u8{ 0xBF, 0x08, 0x00, 0x40, 0x8D, 0x04, 0x43 };
+            var site: ?usize = null;
+            var sp: usize = 0;
+            while (sp + pat.len <= 0x8000) : (sp += 1) {
+                if (std.mem.eql(u8, out[sp .. sp + pat.len], &pat)) {
+                    site = sp + 4;
+                    break;
+                }
+            }
+            if (site) |st| {
+                const th16: u16 = base16 + @as(u16, @intCast(cur));
+                put(d, &cur, &.{ 0xC9, 0x7E }); // CMP #$7E
+                put(d, &cur, &.{ 0x90, 0x08 }); // BCC store
+                put(d, &cur, &.{ 0xC9, 0x80 }); // CMP #$80
+                put(d, &cur, &.{ 0xB0, 0x04 }); // BCS store
+                put(d, &cur, &.{ 0x38, 0xE9, 0x3E }); // SEC / SBC #$3E
+                put(d, &cur, &.{ 0xEA }); // pad: both branches land on the store
+                put(d, &cur, &.{ 0x8D, 0x04, 0x43, 0x60 }); // STA $4304 / RTS
+                out[st] = 0x20; // JSR thunk over the 3-byte STA
+                std.mem.writeInt(u16, out[st + 1 ..][0..2], th16, .little);
+            }
+        }
+
         try emitSplitIo(out, usage, spec, d, &cur, base16, jsr2_at, far, refusal, res);
         std.mem.writeInt(u16, d[mjsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
         std.mem.writeInt(u16, d[r2jsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
