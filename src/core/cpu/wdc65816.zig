@@ -205,7 +205,7 @@ pub fn Cpu(comptime BusT: type) type {
             if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
                 const clk = self.bus.clock;
                 if (clk >= dbg_trace_from and clk < dbg_trace_to)
-                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p, clk });
+                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} s={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.s, self.regs.d, self.regs.dbr, self.regs.p, clk });
             }
             if (dbg_stale_ring and !@hasField(BusT, "clock")) {
                 dbg_ring[dbg_ring_n % dbg_ring.len] = .{ .pbr = self.regs.pbr, .pc = self.regs.pc, .c = self.regs.c, .x = self.regs.x, .y = self.regs.y, .d = self.regs.d, .dbr = self.regs.dbr, .p = self.regs.p };

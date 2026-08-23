@@ -382,7 +382,6 @@ pub const Sa1 = struct {
     /// SNES read of IRAM at $3000-$37FF.
     pub fn iramReadSnes(self: *Sa1, clock: u64, a16: u16) u8 {
         self.catchUp(clock);
-        if (a16 == 0x37B3) std.debug.print("[ir] v={x}\n", .{self.iram[a16 & 0x7FF]});
         return self.iram[a16 & 0x7FF];
     }
 
@@ -542,6 +541,7 @@ pub const Sa1 = struct {
     }
 
     fn writeIoCpu(self: *Sa1, a16: u16, value: u8) void {
+
         switch (a16) {
             0x2200 => { // CCNT: SA-1 control
                 if (self.sa1_resb and value & 0x20 == 0) {
