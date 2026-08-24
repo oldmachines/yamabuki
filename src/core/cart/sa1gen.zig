@@ -137,6 +137,10 @@ const split_last: u16 = 0x37B4; // the SA-1's copy of the last token it ran
 const split_done: u16 = 0x37B5;
 const split_cell_dbr: u16 = 0x37B6;
 const split_rpc_ack: u16 = 0x37B7; // bumped AFTER a replayed body returns — the RPC release (rd consumes EARLY so nested drains cannot re-enter an in-service call) // the RPC caller's DBR (one call in flight, ever) // the last token whose tail COMPLETED — the head's gate
+const split_cell_a: u16 = 0x37BC; // RPC caller A (16-bit)
+const split_cell_x: u16 = 0x37BE; // RPC caller X — $9231 takes its VRAM fill target HERE
+const split_cell_y: u16 = 0x37C0; // RPC caller Y — and its word count here
+const split_cell_t: u16 = 0x37C2; // drain scratch: the dispatch pointer, so the caller's X can be restored before the call
 const split_cell_pw: u16 = 0x37BA; // the RPC caller's P — replays must enter with the caller's M/X widths (a width-agnostic appender ran X8 and truncated its 16-bit cursor)
 const split_in_replay: u16 = 0x37BB; // nonzero while a drain's replay is in flight: a nested NMI's mini-tok must not start another (a multi-frame sample stream nested 25 bytes deeper every frame)
 const split_ring2_wr: u16 = 0x37B8; // fire-and-forget ring (sound family): slot index 0-11
@@ -2825,7 +2829,7 @@ const WinBoot = struct { crv: u16, civ: u16 };
 /// The split flavor's carve budget: tok + mini-tok + sloop + the mul
 /// helper + up to 26 stub/trampoline pairs. Bank $00's whole padding
 /// run must cover shim + this.
-const split_disp_max: u32 = 1100;
+const split_disp_max: u32 = 1200;
 const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
@@ -4087,9 +4091,21 @@ fn emitSplit(
         // replay's span; a multi-frame sample stream then lost every nested
         // frame its APU handshake depends on (measured: $9A68 spinning at
         // p=$04 with no NMI for 400K cycles, frame 745).
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // the caller's widths for the body
+        // The dispatch pointer is fetched FIRST (it needs the drain's X),
+        // then the caller's registers come back — A, X, Y from the stub's
+        // capture, widths via P — and the call goes through the scratch
+        // pointer, PEA giving it a JSR-shaped frame.
+        put(d, &cur, &.{ 0xC2, 0x30 });
         const jsr2_at = cur;
-        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
+        put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl,X — patched by emitSplitIo
+        put(d, &cur, &.{ 0x8D, @truncate(split_cell_t), 0x37 });
+        put(d, &cur, &.{ 0xAE, @truncate(split_cell_x), 0x37, 0xAC, @truncate(split_cell_y), 0x37 });
+        put(d, &cur, &.{ 0xE2, 0x20 });
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48 });
+        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_a), 0x37, 0x28 });
+        const ret1: u16 = base16 + @as(u16, @intCast(cur)) + 6;
+        put(d, &cur, &.{ 0xF4, @truncate(ret1 - 1), @truncate((ret1 - 1) >> 8) }); // PEA return-1
+        put(d, &cur, &.{ 0x6C, @truncate(split_cell_t), 0x37 }); // JMP (cell_t)
         put(d, &cur, &.{ 0xE2, 0x30 }); // widths again — the body's REPs leak
         put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB });
         put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 });
@@ -4220,9 +4236,17 @@ fn emitSplit(
         put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
         put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 }); // scratch stack (see the tok drain)
         put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B, 0xE2, 0x20 }); // caller D (see the far stub's capture)
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // caller P
+        put(d, &cur, &.{ 0xC2, 0x30 }); // registers + dispatch: see the tok drain
         const mjsr_at = cur;
-        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched by emitSplitIo
+        put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl,X — patched by emitSplitIo
+        put(d, &cur, &.{ 0x8D, @truncate(split_cell_t), 0x37 });
+        put(d, &cur, &.{ 0xAE, @truncate(split_cell_x), 0x37, 0xAC, @truncate(split_cell_y), 0x37 });
+        put(d, &cur, &.{ 0xE2, 0x20 });
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48 });
+        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_a), 0x37, 0x28 });
+        const mret1: u16 = base16 + @as(u16, @intCast(cur)) + 6;
+        put(d, &cur, &.{ 0xF4, @truncate(mret1 - 1), @truncate((mret1 - 1) >> 8) }); // PEA return-1
+        put(d, &cur, &.{ 0x6C, @truncate(split_cell_t), 0x37 }); // JMP (cell_t)
         put(d, &cur, &.{ 0xE2, 0x30 });
         put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB }); // pump DBR back
         put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // pump D back
@@ -4479,13 +4503,23 @@ fn emitSplitIo(
             rts_hop16 = base16 + @as(u16, @intCast(cur));
             put(d, &cur, &.{0x60});
         }
-        const need: u32 = 144;
+        const need: u32 = 192;
         const at = far.next(need) orelse
             return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
         var fb = out[at .. at + need];
         var fc: usize = 0;
         const fbank: u8 = @intCast(at / 0x8000);
         const fbase: u16 = @intCast(0x8000 + (at % 0x8000));
+        // Caller A/X/Y captured whole before anything is disturbed —
+        // $9231 takes its VRAM fill target in X and its count in Y, and
+        // a replay entering with the drain's registers zero-filled VRAM
+        // at (dispatch index * 2) instead: the title menu's gridlines.
+        put(fb, &fc, &.{ 0x08, 0xC2, 0x30 }); // PHP / REP #$30
+        put(fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
+        put(fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
+        put(fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
+        put(fb, &fc, &.{ 0xAF, @truncate(split_cell_a), 0x37, 0x00 }); // A back
+        put(fb, &fc, &.{0x28}); // PLP — caller state fully intact
         put(fb, &fc, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
         put(fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
         const not_sa1_at = fc;
