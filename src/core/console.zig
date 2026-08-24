@@ -38,11 +38,12 @@ pub const state_magic: [4]u8 = .{ 'Y', 'M', 'B', 'K' };
 /// or rewind press wiped the game. Version-7 states still load (their
 /// cart RAM is simply not restored — it was never saved).
 // v7: the header's spare bytes carry a structural fingerprint of the layout.
-pub const state_version: u32 = 8;
+pub const state_version: u32 = 9;
+const state_version_no_rom_crc: u32 = 8;
 const state_version_no_cart_ram: u32 = 7;
 pub const state_header_size: usize = 16;
 
-pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt };
+pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt, WrongRom };
 
 pub const Accuracy = enum { fast, accurate };
 
@@ -645,7 +646,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// libretro's retro_serialize_size must report.
         pub const state_size: usize = blk: {
             @setEvalBranchQuota(100_000);
-            break :blk state_header_size + serialize.byteSize(Self) + cart_mod.max_sram;
+            break :blk state_header_size + serialize.byteSize(Self) + cart_mod.max_sram + 4;
         };
         const state_payload_size: usize = blk: {
             @setEvalBranchQuota(100_000);
@@ -673,6 +674,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // Cart RAM after the payload: battery SRAM on a plain cart,
             // the game's whole working state on an SA-1 conversion.
             @memcpy(out[state_header_size + state_payload_size ..][0..cart_mod.max_sram], &self.bus.cart.sram);
+            // The loaded image's identity rides at the tail (version 9): a
+            // state restores the WHOLE machine, and on a conversion image
+            // that machine is meaningful only on the exact build it was
+            // saved from — a different union's relocation era and SA-1
+            // state deserialize as total garbage. Measured: a five-day-old
+            // pre-split state loaded onto the split image garbled the
+            // entire game.
+            std.mem.writeInt(u32, out[state_header_size + state_payload_size + cart_mod.max_sram ..][0..4], self.bus.cart.rom_crc, .little);
             return state_size;
         }
 
@@ -684,10 +693,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (in.len < state_header_size) return error.WrongSize;
             if (!std.mem.eql(u8, in[0..4], &state_magic)) return error.BadMagic;
             const ver = std.mem.readInt(u32, in[4..8], .little);
-            if (ver != state_version and ver != state_version_no_cart_ram)
+            if (ver != state_version and ver != state_version_no_rom_crc and
+                ver != state_version_no_cart_ram)
                 return error.UnsupportedVersion;
-            const with_cart_ram = ver == state_version;
-            const expect: usize = if (with_cart_ram) state_size else state_size - cart_mod.max_sram;
+            const with_cart_ram = ver != state_version_no_cart_ram;
+            const with_rom_crc = ver == state_version;
+            const expect: usize = if (with_rom_crc)
+                state_size
+            else if (with_cart_ram)
+                state_size - 4
+            else
+                state_size - 4 - cart_mod.max_sram;
             const payload = in[state_header_size..@min(in.len, state_header_size + state_payload_size)];
             if (std.mem.readInt(u32, in[8..12], .little) != state_payload_size or
                 in.len != expect)
@@ -699,6 +715,13 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // reorder from deserializing garbage into the wrong fields.
             if (std.mem.readInt(u24, in[13..16], .little) != state_fingerprint)
                 return error.UnsupportedVersion;
+            // Image identity (version 9+): refuse BEFORE touching the
+            // machine — restoring another image's state is never partial
+            // damage, it is a different machine entirely. Pre-9 states
+            // carry no identity and load on trust, as they always did.
+            if (with_rom_crc and
+                std.mem.readInt(u32, in[state_header_size + state_payload_size + cart_mod.max_sram ..][0..4], .little) != self.bus.cart.rom_crc)
+                return error.WrongRom;
             _ = serialize.read(Self, self, payload) catch return error.Corrupt;
             // Cart RAM rides after the payload since version 8; an older
             // state simply never saved it, and the machine keeps what it

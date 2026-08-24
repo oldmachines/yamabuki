@@ -26,10 +26,15 @@ pub const Error = error{ NoHeader, RomTooSmall, OutOfMemory };
 pub const Cartridge = struct {
     // Derived/immutable data is rebuilt or re-supplied at load; only SRAM is
     // console state worth saving.
-    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask", "rom_crc" };
 
     /// Power-of-two padded ROM image, owned by the loading allocator.
     rom: []const u8,
+    /// CRC32 of the loaded (stripped, unpadded) image — the identity a
+    /// save state binds to (a state restores the WHOLE machine, which on
+    /// a conversion image is meaningful only on the exact build it was
+    /// saved from).
+    rom_crc: u32,
     rom_mask: u32,
     sram: [max_sram]u8,
     /// sram_size - 1, or 0 when the cart has no SRAM.
@@ -45,6 +50,7 @@ pub const Cartridge = struct {
         if (image.len < 0x8000) return error.RomTooSmall;
         const header = try header_mod.detect(image);
 
+        const rom_crc = std.hash.Crc32.hash(image);
         const padded_len = std.math.ceilPowerOfTwoAssert(usize, image.len);
         const rom = try allocator.alloc(u8, padded_len);
         // Cyclic mirror by doubling: each pass copies the (whole multiple of
@@ -61,6 +67,7 @@ pub const Cartridge = struct {
 
         var cart: Cartridge = .{
             .rom = rom,
+            .rom_crc = rom_crc,
             .rom_mask = @intCast(padded_len - 1),
             .sram = @splat(0),
             .sram_mask = 0,

@@ -1951,7 +1951,10 @@ fn loadStateFrom(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32,
         err.flush() catch {};
         return true;
     } else |e| {
-        err.print("state load failed: {s}\n", .{@errorName(e)}) catch {};
+        if (e == error.WrongRom)
+            err.print("state load refused: slot {d} was saved on a different ROM or patch build (loading it would garble the whole machine)\n", .{slot}) catch {}
+        else
+            err.print("state load failed: {s}\n", .{@errorName(e)}) catch {};
         err.flush() catch {};
         return false;
     }
