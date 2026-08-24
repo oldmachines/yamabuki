@@ -229,6 +229,9 @@ const Args = struct {
     wg_split_tail: u16 = 0,
     wg_split_epi: u16 = 0,
     wg_split_dbr: u8 = 0,
+    wg_split_mode_cell: u8 = 0,
+    wg_split_mode_value: u8 = 0,
+    wg_split_mode: bool = false,
     wg_split_io: [26]core.sa1gen.SplitIo = undefined,
     n_wg_split_io: usize = 0,
     wg_split_vbl: [8][2]u16 = undefined,
@@ -1092,6 +1095,7 @@ fn verifyBehavioral(
     @memset(home, 0);
 
     var bad: [util.Persistence.max_addrs + 1]util.Persistence.Bad = undefined;
+    var prev_n_bad: usize = 0;
     // The lag differential at the previous tick pair: how many more wall
     // frames the baseline has spent than the conversion to reach the same
     // logic tick. Wall-coupled state (NMI counters, anything seeded from
@@ -1264,6 +1268,20 @@ fn verifyBehavioral(
             out.n_sample = @min(out.sample.len, n_bad);
             for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr | (@as(u32, b.delta) << 16);
         }
+        // Forensics on stderr: each bad-run START with both machines' wall
+        // frames and cell values — the tick<->wall mapping is nonlinear
+        // (loads stretch hundreds of wall frames per tick) and chasing a
+        // tick-domain divergence with wall-domain probes wastes hours.
+        if (n_bad > 0 and prev_n_bad == 0) {
+            std.debug.print("[bfx] run start tick={} base_wall={} conv_wall={} n_bad={}:", .{ out.ticks_base, base.frame, conv.frame, n_bad });
+            for (bad[0..@min(8, n_bad)]) |b| {
+                const cv = b.addr; // conv value recomputed below for the print
+                _ = cv;
+                std.debug.print(" ${X:0>4}(d{X:0>2})", .{ b.addr, b.delta });
+            }
+            std.debug.print("\n", .{});
+        }
+        prev_n_bad = n_bad;
         if (out.ticks_base - 2 < tick_walls.len) {
             tick_walls[out.ticks_base - 2] = prev_frame;
             n_tick_walls = @max(n_tick_walls, out.ticks_base - 1);
@@ -2441,6 +2459,9 @@ fn runSa1Gen(
             .tail = args.wg_split_tail,
             .tail_epilogue = args.wg_split_epi,
             .tail_dbr = args.wg_split_dbr,
+            .mode_cell = args.wg_split_mode_cell,
+            .mode_value = args.wg_split_mode_value,
+            .mode_gate = args.wg_split_mode,
         } else null;
         if (split_spec != null) {
             try out.print("  --wg-split: engaging the split (anchor $00:{x:0>4}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) args.wg_split_tail else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
@@ -4634,6 +4655,15 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wg_split_tail = try std.fmt.parseInt(u16, pit.next().?, 16);
             out.wg_split_epi = try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16);
             out.wg_split_dbr = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+        } else if (std.mem.eql(u8, a, "--wg-split-mode")) {
+            // "<cell>:<value>" (hex) — gameplay-mode gate: the tail goes
+            // to the SA-1 only while dp <cell> holds <value>; menus and
+            // transitions run nested-native (the stock shape).
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.wg_split_mode_cell = try std.fmt.parseInt(u8, pit.next().?, 16);
+            out.wg_split_mode_value = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+            out.wg_split_mode = true;
         } else if (std.mem.eql(u8, a, "--wg-split-io")) {
             // "<hex4>[:d][:l]" — d = deferred (handshake body, pump-only
             // post-engage), l = RTL-shaped (JSL-called).

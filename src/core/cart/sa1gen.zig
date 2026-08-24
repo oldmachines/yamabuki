@@ -118,6 +118,20 @@ pub const SplitSpec = struct {
     tail_epilogue: u16 = 0,
     /// The DBR the handler establishes before the boundary.
     tail_dbr: u8 = 0,
+    /// Mode gate (tail flavor): dispatch the tail to the SA-1 only while
+    /// the game-mode dp cell `mode_cell` (read under the pinned window D,
+    /// so both CPUs see the BW-RAM home) holds `mode_value`; any other
+    /// mode runs the tail nested-native on the S-CPU — the stock shape.
+    /// The split exists to remove GAMEPLAY slowdown; menus, option
+    /// screens and mode transitions have none, and they are exactly the
+    /// eras whose producer/consumer handshakes assume one CPU (measured:
+    /// the menu-entry upload burst funneled through in-NMI ring replays,
+    /// starved the mainline's staging sweep mid-list, and the unterminated
+    /// list wedged the options screen black — while the verified stages
+    /// never touch those paths).
+    mode_cell: u8 = 0,
+    mode_value: u8 = 0,
+    mode_gate: bool = false,
 };
 
 /// The split's I-RAM cells, clear of the offload mailbox ($3780-$378F).
@@ -4011,8 +4025,9 @@ fn emitSplit(
         // SA-1 branch unwinds the pins and does exactly what the stock
         // boundary did: the displaced JSL, then the tail.
         put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
+        put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the BRL (not the SA-1)
         const tok_sa1_at = cur;
-        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the SA-1 island (patched)
+        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the SA-1 island (patched; past the pump's reach)
         put(d, &cur, &.{ 0xE2, 0x20 });
         // engaged: run the displaced boundary instruction — JSL $892B —
         // NATIVELY. The S-CPU polls the real pads at the game's own
@@ -4028,6 +4043,23 @@ fn emitSplit(
         // cycle and no edge ever reaches the SA-1 (measured: the wedge
         // at exactly the 256th crossing, frame 455).
         put(d, &cur, &.{ 0xE2, 0x20 });
+        // MODE GATE: outside gameplay the tail runs nested-native (the
+        // branch below unpins and runs the chain on this CPU). The dp
+        // read goes through the pinned window D, the single home both
+        // CPUs share. The token freezes across the era; the SA-1 idles
+        // at its edge-gate and wakes when gameplay returns.
+        // BEQ-over-BRL: the nested-native branch sits past the whole pump
+        // loop (166 bytes measured), out of a short branch's reach — the
+        // original BNE truncated to $A6 and jumped BACKWARD into the tok's
+        // own bytes. It was never taken on a verified path; the mode gate
+        // takes it every menu frame and wedged at engage (frame 232).
+        var tok_mode_at: usize = 0;
+        if (spec.mode_gate) {
+            put(d, &cur, &.{ 0xA5, spec.mode_cell, 0xC9, spec.mode_value });
+            put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ over the BRL
+            tok_mode_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the nested-native branch (patched)
+        }
         // REENTRANT full path: the transition runs as a multi-frame NMI
         // ($3C is stock's own nesting guard and the transition handler
         // clears it mid-flight), so a real per-frame NMI can take the
@@ -4040,8 +4072,9 @@ fn emitSplit(
         // callers, and the shared window makes the state evolution
         // identical.
         put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37 });
+        put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ over the BRL (done == token: dispatch)
         const tok_nest_at = cur;
-        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE the nested-native branch (patched)
+        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the nested-native branch (patched)
         // Dispatch, then PUMP until the tail lands. A pure exit-wait
         // deadlocked (the SA-1's enqueued uploads starve without the
         // drain); pure non-blocking let the mainline overlap the tail
@@ -4142,14 +4175,22 @@ fn emitSplit(
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue), @truncate(spec.tail_epilogue >> 8) });
         // The nested-native branch: unpin, run the tail on THIS CPU (the
         // displaced boundary JSL above already made this frame's poll).
-        d[tok_nest_at + 1] = @intCast(cur - (tok_nest_at + 2));
+        std.mem.writeInt(u16, d[tok_nest_at + 1 ..][0..2], @intCast(cur - (tok_nest_at + 3)), .little);
+        if (spec.mode_gate) std.mem.writeInt(u16, d[tok_mode_at + 1 ..][0..2], @intCast(cur - (tok_mode_at + 3)), .little);
+        // The game's P first — the SA-1 path enters the tail with the P
+        // captured at engage, and so must this CPU: the tok's own widths
+        // (M8 for the token INC, X as the pins left it) leaked into the
+        // chain, and $9231's 16-bit fill count in Y truncated to 8 bits
+        // (measured: the option screen cleared 256 of each map's 1024
+        // words and the menu logo stayed behind the text).
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // LDA cell_p / PHA / PLP
         put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the head's context
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8) });
         // The SA-1 island: unwind the pins (the head's own D/B come
         // back) and run the tail. The displaced JSL $892B is SKIPPED on
         // this CPU — the SA-1 cannot poll pads, and the S-CPU's poll
         // this frame already filled the window cells the routine feeds.
-        d[tok_sa1_at + 1] = @intCast(cur - (tok_sa1_at + 2));
+        std.mem.writeInt(u16, d[tok_sa1_at + 1 ..][0..2], @intCast(cur - (tok_sa1_at + 3)), .little);
         put(d, &cur, &.{ 0xE2, 0x20 }); // M=8, as stock's boundary had it
         put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD
         put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 }); // JML the tail proper
@@ -4503,7 +4544,7 @@ fn emitSplitIo(
             rts_hop16 = base16 + @as(u16, @intCast(cur));
             put(d, &cur, &.{0x60});
         }
-        const need: u32 = 192;
+        const need: u32 = 200;
         const at = far.next(need) orelse
             return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
         var fb = out[at .. at + need];
@@ -4520,7 +4561,12 @@ fn emitSplitIo(
         put(fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
         put(fb, &fc, &.{ 0xAF, @truncate(split_cell_a), 0x37, 0x00 }); // A back
         put(fb, &fc, &.{0x28}); // PLP — caller state fully intact
-        put(fb, &fc, &.{ 0x48, 0xDA, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHP/SEP #$30
+        // PHY too: SEP #$30 ZEROES the high bytes of X and Y on the 65816.
+        // X rode the stack; Y only rode the cell the replay restores from,
+        // so every S-CPU-native call left with Y's high byte gone
+        // (measured: the option screen's map clear entered with Y=$0FFF
+        // and filled $00FF words — the menu logo stayed behind the text).
+        put(fb, &fc, &.{ 0x48, 0xDA, 0x5A, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHY/PHP/SEP #$30
         put(fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
         const not_sa1_at = fc;
         put(fb, &fc, &.{ 0xD0, 0x00 }); // BNE the common tail (patched)
@@ -4535,7 +4581,7 @@ fn emitSplitIo(
             put(fb, &fc, &.{ 0xA3, 0x01, 0x9F, @truncate(split_ring2 + 3), @truncate((split_ring2 + 3) >> 8), 0x00 }); // caller P -> record[3]
             put(fb, &fc, &.{ 0xAF, @truncate(split_ring2_wr), 0x37, 0x00, 0x1A, 0xC9, 0x18, 0xD0, 0x02, 0xA9, 0x00 });
             put(fb, &fc, &.{ 0x8F, @truncate(split_ring2_wr), 0x37, 0x00 });
-            put(fb, &fc, &.{ 0x28, 0xFA, 0x68 });
+            put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 });
             if (io.rtl) {
                 put(fb, &fc, &.{0x6B});
             } else {
@@ -4568,7 +4614,7 @@ fn emitSplitIo(
             put(fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00 }); // spin: ack
             put(fb, &fc, &.{ 0xCF, @truncate(split_scr_a), 0x37, 0x00 }); // still the old one?
             put(fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
-            put(fb, &fc, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
+            put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
             if (io.rtl) {
                 put(fb, &fc, &.{0x6B}); // pop the GAME frame — RTL is bank-safe anywhere
             } else {
@@ -4576,7 +4622,7 @@ fn emitSplitIo(
             }
         }
         fb[not_sa1_at + 1] = @intCast(fc - (not_sa1_at + 2));
-        put(fb, &fc, &.{ 0x28, 0xFA, 0x68 }); // PLP/PLX/PLA
+        put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
         {
             const span = splitPrefixSpan(out, usage, io.entry, 3);
             @memcpy(fb[fc .. fc + span], out[io.entry - 0x8000 ..][0..span]);

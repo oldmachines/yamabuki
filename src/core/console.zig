@@ -371,7 +371,22 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // opcode the table calls access-free) still factually touched
             // its last byte, so at least one byte is marked.
             if (self.usage) |u| {
-                if (op) |o| u.noteInstr(pc, o, m8, x8);
+                // A BRK/COP/STP/WDM execution is a wedge, not evidence: no
+                // shippable image runs one, so reaching one means this core
+                // walked off the rails — a cover take whose anchor carries
+                // another image's machine state resumes at a pc that means
+                // nothing here and marks a misaligned death rattle (operand
+                // bytes at $847B and $A3C3 read back as covered BRKs and
+                // refused good splits). Stop donating from the wedge onward;
+                // a game that really uses BRK ships past the refusal scan
+                // and fails S4 verification instead, which gates everything.
+                if (op) |o| {
+                    if (o == 0x00 or o == 0x02 or o == 0xDB or o == 0x42) {
+                        self.usage = null;
+                        return;
+                    }
+                    u.noteInstr(pc, o, m8, x8);
+                }
                 const width: u8 = if (op) |o| @max(1, usage_map.dataWidth(o, m8, x8)) else 1;
                 if (dataAddr(self.bus.last_data_read)) |a| {
                     u.noteRead(a, width);

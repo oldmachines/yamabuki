@@ -246,7 +246,17 @@ pub const Sa1 = struct {
                     const op = self.rom[self.mmcTranslate(squashLo(pc), true)];
                     const m8 = r.e or (r.p & 0x20) != 0;
                     const x8 = r.e or (r.p & 0x10) != 0;
-                    u.noteInstr(pc, op, m8, x8);
+                    // A BRK/COP/STP/WDM opcode is a wedge, not evidence: no
+                    // shippable image runs one (the generator refuses them),
+                    // so reaching one means this core walked off the rails —
+                    // a take whose anchor carries another image's SA-1 state
+                    // resumes at a pc that means nothing here and marks a
+                    // misaligned death rattle (an operand byte at $847B once
+                    // read back as a covered BRK and refused a good split).
+                    // Stop donating from the wedge onward.
+                    if (op == 0x00 or op == 0x02 or op == 0xDB or op == 0x42) {
+                        self.usage = null;
+                    } else u.noteInstr(pc, op, m8, x8);
                 }
             }
             const before = self.budget;
