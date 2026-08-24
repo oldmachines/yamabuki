@@ -3790,6 +3790,11 @@ fn runReport(
     try out.print("  slowdown          {} of {} frames ({d:.1}%)\n", .{
         sum.slow_frames, sum.frames, sum.slowRatio() * 100,
     });
+    if (sum.n_slow_runs > 0) {
+        try out.print("    at frame(s):", .{});
+        for (sum.slow_runs[0..sum.n_slow_runs]) |r| try out.print(" {}(x{})", .{ r.start, r.len });
+        try out.print("\n", .{});
+    }
     if (sum.stalls > 0) {
         try out.print("  stalls            {} ({} frames) — loads or transitions, not slowdown\n", .{
             sum.stalls, sum.stall_frames,

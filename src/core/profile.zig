@@ -1328,10 +1328,18 @@ pub const Verdict = enum {
 
 /// A run of frames, folded down. Nothing here is a guess: every field is either
 /// counted or measured.
+/// One short lag run: where slowdown was, and how long.
+pub const SlowRun = struct { start: u64, len: u32 };
+
 pub const Summary = struct {
     frames: u64,
     /// Every frame in which the game never polled the controller.
     lag_frames: u64,
+    /// Where the slowdown was: the first few short lag runs (frame of the
+    /// first dropped frame, run length), so a 0.1% verdict can be placed
+    /// in the take — a boss burst and a transition are different findings.
+    slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8,
+    n_slow_runs: u8 = 0,
     /// Lag in short runs: genuine frame-rate slowdown. This is the number the
     /// verdict is based on. See `stall_run_max`.
     slow_frames: u64,
@@ -1898,9 +1906,32 @@ pub fn summarise(samples: []const FrameSample, util_scratch: []f64) Summary {
     const slow_ratio = @as(f64, @floatFromInt(slow_frames)) / @as(f64, @floatFromInt(n));
     const p95 = percentile(utils, 95);
 
+    // Second pass: place the short runs.
+    var slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8;
+    var n_slow_runs: u8 = 0;
+    {
+        var r: u32 = 0;
+        var r_start: u64 = 0;
+        for (samples, 0..) |s, i| {
+            if (s.lag) {
+                if (r == 0) r_start = s.frame;
+                r += 1;
+            }
+            if (!s.lag or i + 1 == samples.len) {
+                if (r != 0 and r <= stall_run_max and n_slow_runs < slow_runs.len) {
+                    slow_runs[n_slow_runs] = .{ .start = r_start, .len = r };
+                    n_slow_runs += 1;
+                }
+                r = 0;
+            }
+        }
+    }
+
     return .{
         .frames = samples.len,
         .lag_frames = lag_frames,
+        .slow_runs = slow_runs,
+        .n_slow_runs = n_slow_runs,
         .slow_frames = slow_frames,
         .stall_frames = stall_frames,
         .stalls = stalls,
