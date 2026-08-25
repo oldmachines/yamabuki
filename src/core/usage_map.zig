@@ -221,6 +221,14 @@ pub const PtrBankEvidence = struct {
     /// intro played silent, 52 frames early. Rewritten -$20.
     hi_proven: [max_proven]u32,
     n_hi: usize,
+    /// Bank VALUES $A0-$BF proven to mediate data access: stock LoROM maps
+    /// them to MB1, the conversion's FXB parks MB2 there — the de-mirror
+    /// operand map's -$80, applied to values (measured: Super Metroid's
+    /// file-select tile transfers, 2x8 KiB from $B6:8000/C000 via the
+    /// inline-param launcher — conv read the wrong megabyte and the
+    /// SAMUS DATA screen tiles arrived as garbage).
+    a0_proven: [max_proven]u32,
+    n_a0: usize,
 
     pub const none: u32 = 0xFFFF_FFFF;
     pub const max_proven = 256;
@@ -241,6 +249,8 @@ pub const PtrBankEvidence = struct {
         .n_dma_addr = 0,
         .hi_proven = undefined,
         .n_hi = 0,
+        .a0_proven = undefined,
+        .n_a0 = 0,
     };
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
@@ -280,6 +290,19 @@ pub const PtrBankEvidence = struct {
         }
         self.idx_proven[self.n_idx] = a;
         self.n_idx += 1;
+    }
+
+    pub fn addA0Proven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.a0_proven[0..self.n_a0]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_a0 == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.a0_proven[self.n_a0] = a;
+        self.n_a0 += 1;
     }
 
     pub fn addHiProven(self: *PtrBankEvidence, addr: u32) void {

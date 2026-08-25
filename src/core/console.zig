@@ -515,6 +515,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         if (lv == 0x7E or lv == 0x7F) {
                             pb.addProven(lo_src);
                             self.dma_a1t_src[ch5] = none;
+                        } else if (lv >= 0xC0 and lv <= 0xDF) {
+                            pb.addHiProven(lo_src);
+                            self.dma_a1t_src[ch5] = none;
+                        } else if (lv >= 0xA0 and lv <= 0xBF) {
+                            pb.addA0Proven(lo_src);
+                            self.dma_a1t_src[ch5] = none;
                         } else if (lv <= 0x3F) {
                             const pending = self.dma_a1t_src[ch5];
                             self.dma_a1t_src[ch5] = none;
@@ -549,6 +555,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     const pending = self.dma_a1t_src[ch];
                     self.dma_a1t_src[ch] = none;
                     if (self.bus.mdr <= 0x3F and pending != none) pb.addDmaAddrProven(pending);
+                    if ((self.bus.mdr >= 0xA0 and self.bus.mdr <= 0xDF) and
+                        self.prev_load_end != none and self.prev_load_w == 1)
+                    {
+                        // The misfit-mirror banks prove on the store too.
+                        if (self.bus.mdr >= 0xC0)
+                            pb.addHiProven(self.prev_load_end)
+                        else
+                            pb.addA0Proven(self.prev_load_end);
+                    }
                     if (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F) {
                         // The bank can ride A or X: Super Metroid's palette
                         // uploader is `LDX #$7E / STX $4314` (measured:
@@ -640,6 +655,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
+                    if (tb == self.cpu.regs.dbr and tb >= 0xA0 and tb <= 0xBF) {
+                        pb.addA0Proven(self.dbr_src);
+                    }
                     if (tb == self.cpu.regs.dbr and tb >= 0xC0 and tb <= 0xDF) {
                         // The MMC-misfit banks: data under a $C0-$DF DBR
                         // reads content the conversion parks $20 banks
@@ -689,6 +707,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         self.dbr_src != none)
                     {
                         pb.addHiProven(self.dbr_src);
+                    }
+                    if (self.cpu.regs.dbr >= 0xA0 and self.cpu.regs.dbr <= 0xBF and
+                        self.dbr_src != none)
+                    {
+                        pb.addA0Proven(self.dbr_src);
                     }
                 },
                 // Other stack traffic and the bank-setting instructions make
