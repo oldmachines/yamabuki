@@ -3073,7 +3073,15 @@ const FarPad = struct {
     keep_hi: u32 = 0,
 
     fn next(self: *@This(), need: u32) ?u32 {
-        if (self.bank == 0) self.bank = @intCast((self.out.len + 0x7FFF) / 0x8000 - 1);
+        if (self.bank == 0) {
+            // >2 MiB: file banks $40+ live at CPU $A0-$BF through the
+            // Super MMC — a far body placed there and addressed by its
+            // FILE bank fetches the wrong megabyte (measured: a context
+            // thunk at $10:B6C8 called $5F:D777, marched the DXB fade
+            // tables, and BRK'd into the crash trap). The far pool stays
+            // in the identity banks.
+            self.bank = @intCast(@min((self.out.len + 0x7FFF) / 0x8000, 0x40) - 1);
+        }
         while (self.bank >= 1) {
             if (self.pad == null) self.pad = if (self.bank == self.keep_bank)
                 padAllocFor(self.out, self.header_off, self.bank, self.keep_lo, self.keep_hi - self.keep_lo)
