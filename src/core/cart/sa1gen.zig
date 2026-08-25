@@ -6491,6 +6491,26 @@ pub fn convertWholeGame(
                 }
             }
             if (!found) {
+                // The body's bank byte rides the SAME de-mirror map the
+                // covered-code pass applies: the site's stock operand names
+                // a mirror ($B4 = MB1's $34) that the shim-programmed map
+                // no longer honors — region 3 carries MB2 — so a body that
+                // keeps the stock byte reads the wrong megabyte (measured:
+                // the music loader's terminator probe `LDA $B4:0000,X` at
+                // X=$921C read far-pool bytes as $1231 instead of $FFFF,
+                // walked a phantom chunk into mirror WRAM, and the door
+                // faded to black). <= 2 MiB images keep the byte — the
+                // fold really is a mirror there.
+                const tbank: u8 = if (image.len <= 0x20_0000)
+                    t.bank
+                else if (t.bank >= 0xA0 and t.bank <= 0xBF)
+                    t.bank - 0x80
+                else if (t.bank >= 0xC0 and t.bank <= 0xDF)
+                    t.bank - 0x20
+                else if (t.bank >= 0x40 and t.bank <= 0x5F)
+                    t.bank + 0x60
+                else
+                    t.bank;
                 // A base at or above $FF00 wraps forward into the NEXT
                 // bank's low page and needs the two-compare body; a tiny
                 // base stays in its own bank and needs the ceiling one.
@@ -6500,16 +6520,16 @@ pub fn convertWholeGame(
                 // a CPX #$0000 whose BCC-rom is never taken, sending EVERY
                 // large index down the low arm (measured: the $38:8204/$82D0/
                 // $8336 bodies read bank+1's stale mirror instead of ROM).
-                const wrap_ok = !neg and t.v != 0 and (t.bank & 0x7F) < 0x3F;
+                const wrap_ok = !neg and t.v != 0 and (tbank & 0x7F) < 0x3F;
                 const want: u32 = if (neg) long_neg_thunk_len else if (wrap_ok) long_wrap_thunk_len else long_thunk_len;
                 at = far.next(want) orelse
                     return refuse(refusal, .{ .reason = .no_free_space, .detail = want });
                 if (neg)
-                    @memcpy(out[at..][0..long_neg_thunk_len], &longNegThunkBody(t.op, t.v, t.bank))
+                    @memcpy(out[at..][0..long_neg_thunk_len], &longNegThunkBody(t.op, t.v, tbank))
                 else if (wrap_ok)
-                    @memcpy(out[at..][0..long_wrap_thunk_len], &longThunkBodyWrap(t.op, t.v, t.bank))
+                    @memcpy(out[at..][0..long_wrap_thunk_len], &longThunkBodyWrap(t.op, t.v, tbank))
                 else
-                    @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
+                    @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, tbank));
                 lseen[n_lseen] = .{ .v = t.v, .op = t.op, .bank = t.bank, .at = at };
                 n_lseen += 1;
                 if (n_lbodies < lbodies.len) {
