@@ -3288,6 +3288,38 @@ fn longThunkBody(op: u8, v: u16, bank: u8) [long_thunk_len]u8 {
     };
 }
 
+/// The tiny-base `long,X` thunk WITH the forward-wrap arm. The ceiling
+/// body's guard asks only `X < $2000 - v` — but a huge X wraps the
+/// 24-bit sum into the NEXT bank's low page, the same mirror the
+/// negative-base body was built for (measured: the door-transition
+/// loader called `LDA $A0:003E,X` with X=$FFCF — effective $A1:000D,
+/// WRAM $0D — and the ceiling guard sent it down the ROM arm, so the
+/// room state loaded stale and the screen faded to black for good).
+/// No third read arm: `long,X` carries into bank+1 in hardware, so the
+/// shifted operand serves both low windows — the guard just routes
+/// X >= $10000 - v to it. Emitted only when bank+1 carries a window
+/// ((bank & $7F) < $3F); a $3F/$BF/$7D base keeps the ceiling body.
+///
+///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
+///   CPX #($2000-v)  / BCC low   ; small index: this bank's mirror
+///   CPX #($10000-v) / BCC rom   ; big but unwrapped: ROM
+///   low: PLA / PLP / op b:v+$6000,X / RTL   ; wrap carries to b+1
+///   rom: PLA / PLP / op b:v,X       / RTL
+const long_wrap_thunk_len: u32 = 34;
+fn longThunkBodyWrap(op: u8, v: u16, bank: u8) [long_wrap_thunk_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    const wl: u16 = @intCast(0x10000 - @as(u32, v));
+    return .{
+        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
+        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x0A, // LDA $02,S / BIT #$10 / BNE low
+        0xE0, @truncate(lim), @truncate(lim >> 8), 0x90, 0x05, // CPX #lim / BCC low
+        0xE0, @truncate(wl),  @truncate(wl >> 8),  0x90, 0x07, // CPX #wl / BCC rom
+        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
+        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  bank, 0x6B, // rom
+    };
+}
+
 /// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
 /// already served: an LDA shape whose measured evidence is low|rom. Those
 /// five sites in Gradius III are the level-script walker, they are hot,
@@ -5811,7 +5843,9 @@ pub fn convertWholeGame(
                         res.stats.rewritten_long += 1;
                     }
                 },
-                .abs, .abs_x, .abs_y => if (bwram and dbr_bw) {
+                .abs, .abs_x, .abs_y => if (bwram and dbr_bw and
+                    (if (site_evidence) |s| (s[cpu_addr] | s[0x80_0000 | cpu_addr]) & usage_map.site_wram_low == 0 else true))
+                {
                     // Skipped because the data bank is provably BW-RAM
                     // here. Audited rather than silent: the pin comes from
                     // a static tracker, and a wrong pin leaves a live site
@@ -5847,8 +5881,18 @@ pub fn convertWholeGame(
                     // tree outright. The `long,X` flavor escapes this
                     // because JSL names its own bank; this one needs
                     // copy-local thunk emission first.
+                    // ... and a site the static pin CLAIMS is BW-RAM-banked
+                    // but whose measured traffic includes the system mirror is
+                    // the same split, proven from the other side: the pin
+                    // holds on one path, the mirror evidence on another, and
+                    // only the runtime DBR can tell them apart (measured:
+                    // Super Metroid's room loader reads its state cells via
+                    // `LDA $0000,X` under a mirror DBR at the door
+                    // transition; the pin left the sites stock and the room
+                    // state loaded stale — black screen, input dead).
                     if (window and v < 0x2000 and
-                        e == usage_map.site_wram_low | usage_map.site_wram_bank)
+                        (e == usage_map.site_wram_low | usage_map.site_wram_bank or
+                            (dbr_bw and e & usage_map.site_wram_low != 0)))
                     {
                         if (n_thunks == split_thunk_max)
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
@@ -6442,11 +6486,19 @@ pub fn convertWholeGame(
                 // bank's low page and needs the two-compare body; a tiny
                 // base stays in its own bank and needs the ceiling one.
                 const neg = t.v >= 0xFF00;
-                const want: u32 = if (neg) long_neg_thunk_len else long_thunk_len;
+                // v == 0 is excluded: a 16-bit X cannot carry a zero base past
+                // $FFFF, so no wrap window exists — and $10000-v truncates to
+                // a CPX #$0000 whose BCC-rom is never taken, sending EVERY
+                // large index down the low arm (measured: the $38:8204/$82D0/
+                // $8336 bodies read bank+1's stale mirror instead of ROM).
+                const wrap_ok = !neg and t.v != 0 and (t.bank & 0x7F) < 0x3F;
+                const want: u32 = if (neg) long_neg_thunk_len else if (wrap_ok) long_wrap_thunk_len else long_thunk_len;
                 at = far.next(want) orelse
                     return refuse(refusal, .{ .reason = .no_free_space, .detail = want });
                 if (neg)
                     @memcpy(out[at..][0..long_neg_thunk_len], &longNegThunkBody(t.op, t.v, t.bank))
+                else if (wrap_ok)
+                    @memcpy(out[at..][0..long_wrap_thunk_len], &longThunkBodyWrap(t.op, t.v, t.bank))
                 else
                     @memcpy(out[at..][0..long_thunk_len], &longThunkBody(t.op, t.v, t.bank));
                 lseen[n_lseen] = .{ .v = t.v, .op = t.op, .bank = t.bank, .at = at };
