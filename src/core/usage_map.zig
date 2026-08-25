@@ -230,9 +230,20 @@ pub const PtrBankEvidence = struct {
     a0_proven: [max_proven]u32,
     n_a0: usize,
 
+    /// DBR-pin SITES whose runtime bank landed in the misfit ranges
+    /// ($A0-$DF): the PLB's own cpu address. The generator back-matches
+    /// the idiom bytes and patches the whole sequence with a translate-in
+    /// thunk — the TABLE bytes stay stock, because one byte can be a bank
+    /// for one consumer and an address for another (measured: $0F:E818,
+    /// Super Metroid's music table, bank of one track AND addr-hi of the
+    /// next — no value rewrite can serve both).
+    xl_sites: [max_xl]u32,
+    n_xl: usize,
+
     pub const none: u32 = 0xFFFF_FFFF;
     pub const max_proven = 256;
     pub const max_unres = 48;
+    pub const max_xl = 32;
     pub const UnresSite = struct { pc: u24, slot: u16, hits: u32 };
     pub const init: PtrBankEvidence = .{
         .src = @splat(none),
@@ -251,6 +262,8 @@ pub const PtrBankEvidence = struct {
         .n_hi = 0,
         .a0_proven = undefined,
         .n_a0 = 0,
+        .xl_sites = undefined,
+        .n_xl = 0,
     };
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
@@ -290,6 +303,19 @@ pub const PtrBankEvidence = struct {
         }
         self.idx_proven[self.n_idx] = a;
         self.n_idx += 1;
+    }
+
+    pub fn addXlSite(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.xl_sites[0..self.n_xl]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_xl == max_xl) {
+            self.unresolved += 1;
+            return;
+        }
+        self.xl_sites[self.n_xl] = a;
+        self.n_xl += 1;
     }
 
     pub fn addA0Proven(self: *PtrBankEvidence, addr: u32) void {

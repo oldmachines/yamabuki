@@ -77,7 +77,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc" };
 
         cart: Cartridge,
         bus: Bus,
@@ -113,6 +113,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// low), so the second PLB of a `PEI ($dp)/PLB/PLB` pin pulls the
         /// HIGH byte — the bank, staged in memory, never in A.
         pushed_hi_src: if (cfg.profile) u32 else void,
+        /// The last PLB's own pc — where a misfit-bank pin would be
+        /// patched with a translate-in thunk.
+        plb_pc: if (cfg.profile) u32 else void,
         /// When the previous step was a 16-bit A-load out of TRACKED WRAM:
         /// the staged source (`PtrBankEvidence.src`) of the load's HIGH
         /// byte, else `none`. A DMA queue drain stores that word straight
@@ -184,6 +187,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.dma_a1t_src = @splat(usage_map.PtrBankEvidence.none);
                 self.prev_load_hi_src = usage_map.PtrBankEvidence.none;
                 self.pushed_hi_src = usage_map.PtrBankEvidence.none;
+                self.plb_pc = usage_map.PtrBankEvidence.none;
             }
         }
 
@@ -660,18 +664,25 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
-                    if (tb == self.cpu.regs.dbr and tb >= 0xA0 and tb <= 0xBF and
-                        self.bus.peek8(@intCast(self.dbr_src)) == tb)
+                    if (tb == self.cpu.regs.dbr and tb >= 0xA0 and tb <= 0xDF and
+                        self.plb_pc != none)
                     {
-                        pb.addA0Proven(self.dbr_src);
-                    }
-                    if (tb == self.cpu.regs.dbr and tb >= 0xC0 and tb <= 0xDF and
-                        self.bus.peek8(@intCast(self.dbr_src)) == tb)
-                    {
-                        // The MMC-misfit banks: data under a $C0-$DF DBR
-                        // reads content the conversion parks $20 banks
-                        // lower — prove the PLB'd byte for the -$20 family.
-                        pb.addHiProven(self.dbr_src);
+                        const ppc = self.plb_pc;
+                        const dp_op = self.bus.peek8(@intCast(ppc -% 2)) orelse 0xFF;
+                        const shp = ((self.bus.peek8(@intCast(ppc -% 1)) orelse 0) == 0x48 and
+                            (self.bus.peek8(@intCast(ppc -% 3)) orelse 0) == 0xA5) or
+                            ((self.bus.peek8(@intCast(ppc -% 1)) orelse 0) == 0xAB and
+                                (self.bus.peek8(@intCast(ppc -% 3)) orelse 0) == 0xD4);
+                        if (shp and dp_op < 0x10) {
+                            pb.addXlSite(ppc);
+                        } else if (self.dbr_src != none and
+                            self.bus.peek8(@intCast(self.dbr_src)) == tb)
+                        {
+                            if (tb >= 0xC0)
+                                pb.addHiProven(self.dbr_src)
+                            else
+                                pb.addA0Proven(self.dbr_src);
+                        }
                     }
                     if (usage_map.isWramBank(tb, conv) and tb == self.cpu.regs.dbr) {
                         pb.addProven(self.dbr_src);
@@ -703,6 +714,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 },
                 0xAB => { // PLB — a second PLB pulls PEI's high byte
                     const transient = self.pushed_hi_src != none;
+                    self.plb_pc = pc;
                     self.dbr_src = if (transient) none else self.pushed_src;
                     self.pushed_src = self.pushed_hi_src;
                     self.pushed_hi_src = none;
@@ -714,17 +726,27 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     // music upload pins $D0, spins the handshake for ~1M
                     // clks, and the NMIs' RTIs wiped dbr_src before the
                     // first non-long access).
-                    if (self.cpu.regs.dbr >= 0xC0 and self.cpu.regs.dbr <= 0xDF and
-                        self.dbr_src != none and
-                        self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
-                    {
-                        pb.addHiProven(self.dbr_src);
-                    }
-                    if (self.cpu.regs.dbr >= 0xA0 and self.cpu.regs.dbr <= 0xBF and
-                        self.dbr_src != none and
-                        self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
-                    {
-                        pb.addA0Proven(self.dbr_src);
+                    if (self.cpu.regs.dbr >= 0xA0 and self.cpu.regs.dbr <= 0xDF and !transient) {
+                        // Tight-dp pins (the music walker) translate: their
+                        // table bytes are dual-role. Wider-dp pins (the
+                        // decompressor's 3-byte param blocks, single-role)
+                        // value-prove instead — their fire rate makes a
+                        // thunk cost ~a frame across a load.
+                        const dp_op = self.bus.peek8(pc -% 2) orelse 0xFF;
+                        const shape_lda = (self.bus.peek8(pc -% 1) orelse 0) == 0x48 and
+                            (self.bus.peek8(pc -% 3) orelse 0) == 0xA5;
+                        const shape_pei = (self.bus.peek8(pc -% 1) orelse 0) == 0xAB and
+                            (self.bus.peek8(pc -% 3) orelse 0) == 0xD4;
+                        if ((shape_lda or shape_pei) and dp_op < 0x10) {
+                            pb.addXlSite(pc);
+                        } else if (self.dbr_src != none and
+                            self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
+                        {
+                            if (self.cpu.regs.dbr >= 0xC0)
+                                pb.addHiProven(self.dbr_src)
+                            else
+                                pb.addA0Proven(self.dbr_src);
+                        }
                     }
                 },
                 // Other stack traffic and the bank-setting instructions make

@@ -2452,6 +2452,9 @@ fn runSa1Gen(
             for (ptr_ev.proven[0..ptr_ev.n_proven]) |pa| {
                 try out.print("    proven bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
             }
+            for (ptr_ev.xl_sites[0..ptr_ev.n_xl]) |pa| {
+                try out.print("    misfit-bank pin site at ${x:0>2}:{x:0>4} (translate-in)\n", .{ pa >> 16, pa & 0xFFFF });
+            }
             for (ptr_ev.a0_proven[0..ptr_ev.n_a0]) |pa| {
                 try out.print("    proven $A0-$BF bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
             }

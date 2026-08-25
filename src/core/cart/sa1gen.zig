@@ -255,6 +255,10 @@ pub const Stats = struct {
     rewritten_hi_banks: u32 = 0,
     /// Measured $A0-$BF bank values re-banked -$80 (>2 MiB window mode).
     rewritten_a0_banks: u32 = 0,
+    /// Misfit-bank DBR-pin sites patched with a translate-in thunk
+    /// (window mode): the pinned bank maps -$20/-$80 at runtime, the
+    /// table byte stays stock.
+    xl_pins: u32 = 0,
     /// Context-split sites (window mode): absolutes below $2000 whose
     /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
     /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
@@ -6078,6 +6082,69 @@ pub fn convertWholeGame(
             }
         }
     };
+    // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
+    // $A0-$BF -> -$80 (MB1's home), $C0-$DF -> -$20 (MB2's home), else
+    // untouched. Both idioms span 4 bytes at the site.
+    if (bwram) if (ptr_ev) |pe| {
+        const map_body = [_]u8{
+            0xC9, 0xA0, 0x90, 0x08, // CMP #$A0 / BCC set
+            0xC9, 0xC0, 0x90, 0x04, // CMP #$C0 / BCC a0
+            0xE9, 0x20, 0x80, 0x02, // SBC #$20 / BRA set
+            0xE9, 0x7F, // a0: SBC #$7F (carry clear: -$80)
+        };
+        for (pe.xl_sites[0..pe.n_xl]) |sa| {
+            const sbank: u32 = (sa >> 16) & 0x7F;
+            const sa16: u32 = sa & 0xFFFF;
+            if (sa16 < 0x8003) continue;
+            const plb = sbank * 0x8000 + (sa16 - 0x8000);
+            if (plb + 1 > out.len) continue;
+            var body: [32]u8 = undefined;
+            var bl: usize = 0;
+            var site: u32 = 0;
+            if (out[plb] == 0xAB and out[plb - 1] == 0x48 and out[plb - 3] == 0xA5) {
+                // LDA dp / PHA / PLB
+                site = plb - 3;
+                body[0] = 0x08; // PHP
+                body[1] = 0xE2;
+                body[2] = 0x20; // SEP #$20
+                body[3] = 0xD8; // CLD
+                body[4] = 0xA5;
+                body[5] = out[plb - 2]; // LDA dp
+                @memcpy(body[6..][0..map_body.len], &map_body);
+                bl = 6 + map_body.len;
+                body[bl] = 0x48; // set: PHA
+                body[bl + 1] = 0xAB; // PLB
+                body[bl + 2] = 0x28; // PLP
+                body[bl + 3] = 0x60; // RTS
+                bl += 4;
+            } else if (out[plb] == 0xAB and out[plb - 1] == 0xAB and out[plb - 3] == 0xD4) {
+                // PEI (dp) / PLB / PLB — A preserved, DBR = mapped hi byte
+                site = plb - 3;
+                body[0] = 0x08; // PHP
+                body[1] = 0xE2;
+                body[2] = 0x20; // SEP #$20
+                body[3] = 0xD8; // CLD
+                body[4] = 0x48; // PHA (save A)
+                body[5] = 0xA5;
+                body[6] = out[plb - 2] +% 1; // LDA dp+1 (the bank byte)
+                @memcpy(body[7..][0..map_body.len], &map_body);
+                bl = 7 + map_body.len;
+                body[bl] = 0x48; // PHA
+                body[bl + 1] = 0xAB; // PLB
+                body[bl + 2] = 0x68; // PLA (restore A)
+                body[bl + 3] = 0x28; // PLP
+                body[bl + 4] = 0x60; // RTS
+                bl += 5;
+            } else continue;
+            var xpad = padAllocFor(out, header.offset, sbank, 0, 0);
+            const at = xpad.next(@intCast(bl)) orelse continue;
+            @memcpy(out[at..][0..bl], body[0..bl]);
+            out[site] = 0x20; // JSR body
+            std.mem.writeInt(u16, out[site + 1 ..][0..2], @intCast(0x8000 + (at % 0x8000)), .little);
+            out[site + 3] = 0xEA; // NOP
+            res.stats.xl_pins += 1;
+        }
+    };
     // D and S follow their memory into the window.
     for (moves[0..n_moves]) |off| {
         const imm = std.mem.readInt(u16, out[off..][0..2], .little);
@@ -9591,12 +9658,17 @@ test "window: a $C0-$DF table bank byte proves through the dp-staged PLB pin" {
         con.usage = &map;
         for (0..2) |_| con.runFrame();
     }
-    try testing.expectEqual(@as(usize, 1), pe.n_hi);
-    try testing.expectEqual(@as(u32, 0x8022), pe.hi_proven[0]);
+    // The tight-dp pin records a TRANSLATE site — the table byte may be
+    // dual-role (a bank for one consumer, an address for another), so it
+    // stays stock and the pin itself maps at runtime.
+    try testing.expectEqual(@as(usize, 0), pe.n_hi);
+    try testing.expectEqual(@as(usize, 1), pe.n_xl);
+    try testing.expectEqual(@as(u32, 0x8012), pe.xl_sites[0]);
 
     var ref: ?Refusal = null;
     const res = try convertWholeGame(gpa, rom, bytes, null, pe, false, true, &.{}, false, 0, copy_reserve, null, &ref);
     defer gpa.free(res.image);
-    try testing.expectEqual(@as(u32, 1), res.stats.rewritten_hi_banks);
-    try testing.expectEqual(@as(u8, 0xB0), res.image[0x0022]);
+    try testing.expectEqual(@as(u32, 1), res.stats.xl_pins);
+    try testing.expectEqual(@as(u8, 0xD0), res.image[0x0022]); // byte stays stock
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x000F]); // site is a JSR thunk
 }
