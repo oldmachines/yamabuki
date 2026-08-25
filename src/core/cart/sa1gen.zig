@@ -223,6 +223,9 @@ pub const Stats = struct {
     shim_addr: u16 = 0,
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
+    /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
+    /// is not a mirror on the Super MMC's flat map).
+    rewritten_demirror: u32 = 0,
     /// Battery-SRAM sites re-banked into BW-RAM $20000+ (bank $42), offsets
     /// normalized by the chip's mirror mask.
     rewritten_sram: u32 = 0,
@@ -4766,6 +4769,7 @@ pub fn convertWholeGame(
     // Executed flags are merged across the $80-$BF fast mirrors throughout:
     // the same ROM byte, the same file offset, possibly only ever executed
     // through the mirror.
+
     // IRQ vectors with executed targets = the game takes IRQs. Window mode
     // does not care: the S-CPU keeps its own vectors and handlers, and an
     // interrupt's stack traffic follows S into the window like any push.
@@ -5188,7 +5192,17 @@ pub fn convertWholeGame(
                 if (!dbrSurvives(image, cov, file, op)) dbr_bw = false;
                 if (op == 0xAB) {
                     dbr_bw = false;
-                    if (file >= 3 and image[file - 3] == 0xA9 and image[file - 1] == 0x48) {
+                    // Three shapes feed PLB a static bank, and all three
+                    // carry the bank byte at file-2: LDA #$7E/PHA/PLB; PLB
+                    // directly after PEA (pulls the LOW immediate); the
+                    // SECOND PLB of a PEA/PLB/PLB pair (pulls the HIGH —
+                    // Super Metroid's boot pins DBR=$7E with PEA $7E00/
+                    // PLB/PLB before its eight-stride WRAM clear). The
+                    // recorded position re-banks with the other pins.
+                    const pinned = (file >= 3 and image[file - 3] == 0xA9 and image[file - 1] == 0x48) or
+                        (file >= 4 and
+                            (image[file - 3] == 0xF4 or (image[file - 1] == 0xAB and image[file - 4] == 0xF4)));
+                    if (pinned) {
                         const b = image[file - 2];
                         if (b == 0x7E or b == 0x7F) {
                             if (n_dbrs == wg_moves_max)
@@ -5378,6 +5392,50 @@ pub fn convertWholeGame(
     errdefer gpa.free(out);
     var res: Result = .{ .image = out, .stats = .{}, .fate = @splat(.not_attempted) };
     res.stats.cov_static_added = cov_added;
+    // DE-MIRROR (images past 2 MiB): on the Super MMC's power-on flat map,
+    // the $80-$BF fold lands in image quarters 2/3 — a cyclic MIRROR for a
+    // padded <=2 MiB image (why Gradius never noticed), REAL DATA for a
+    // 3 MiB one. Super Metroid's own FastROM entry (`JML $80:8573`) fetched
+    // quarter-2 bytes and BRK-stormed the boot. Every covered ROM-half
+    // reference naming a bank whose content moved is re-banked to where it
+    // lives on the SHIM-PROGRAMMED map (region 2 := MB0 restores the
+    // $80-$9F mirror; region 3 := MB2): $A0-$BF (mirror-of-MB1 intent) ->
+    // $20-$3F; $C0-$DF and $40-$5F (both MB2) -> $A0-$BF. addr16 never
+    // changes; $80-$9F references stay native on the genuine mirror.
+    var n_demirror: u32 = 0;
+    if (image.len > 0x20_0000) {
+        var db: u32 = 0;
+        while (db < 0x40) : (db += 1) {
+            const db_file = db * 0x8000;
+            if (db_file >= image.len) break;
+            var da: u32 = 0x8000;
+            while (da < 0x1_0000) : (da += 1) {
+                const dca = (db << 16) | da;
+                if ((cov[dca] | cov[0x80_0000 | dca]) & usage_map.flag_opcode == 0) continue;
+                const df = db_file + (da - 0x8000);
+                const dop = image[df];
+                const is_long = usage_map.mode(dop) == .long or usage_map.mode(dop) == .long_x or
+                    dop == 0x22 or dop == 0x5C;
+                if (!is_long or df + 3 >= image.len) continue;
+                const dv = std.mem.readInt(u16, image[df + 1 ..][0..2], .little);
+                if (dv < 0x8000) continue; // ROM half only; WRAM mirrors keep their arms
+                const dbk = image[df + 3];
+                const nb: ?u8 = if (dbk >= 0xA0 and dbk <= 0xBF)
+                    dbk - 0x80 // mirror-of-MB1 intent: region 3 holds MB2 now
+                else if (dbk >= 0xC0 and dbk <= 0xDF)
+                    dbk - 0x20 // stock's mirror of $40-$5F: MB2 lives at $A0-$BF
+                else if (dbk >= 0x40 and dbk <= 0x5F)
+                    dbk + 0x60 // MB2 direct: same relocation
+                else
+                    null;
+                if (nb) |v| {
+                    out[df + 3] = v;
+                    n_demirror += 1;
+                }
+            }
+        }
+    }
+    res.stats.rewritten_demirror = n_demirror;
     res.stats.expanded_to = if (win_expand_to > image.len) win_expand_to else 0;
     {
         var ab: u32 = 0;
@@ -5470,7 +5528,9 @@ pub fn convertWholeGame(
                 }
                 if (!dbrSurvives(out, cov, pf, pop)) p_dbr_bw = false;
                 if (pop == 0xAB) {
-                    p_dbr_bw = pf >= 3 and out[pf - 3] == 0xA9 and out[pf - 1] == 0x48 and
+                    p_dbr_bw = ((pf >= 3 and out[pf - 3] == 0xA9 and out[pf - 1] == 0x48) or
+                        (pf >= 4 and
+                            (out[pf - 3] == 0xF4 or (out[pf - 1] == 0xAB and out[pf - 4] == 0xF4)))) and
                         (out[pf - 2] == 0x7E or out[pf - 2] == 0x7F);
                 } else if (pop == 0x44 or pop == 0x54) {
                     const d0 = out[pf + 1];
@@ -5549,8 +5609,17 @@ pub fn convertWholeGame(
                 }
                 if (!dbrSurvives(out, cov, file, op)) dbr_bw = false;
                 if (op == 0xAB) {
-                    dbr_bw = file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
-                        (out[file - 2] == 0x7E or out[file - 2] == 0x7F);
+                    // Three idioms feed PLB a WRAM bank: LDA #$7E/PHA/PLB;
+                    // PLB directly after PEA (pulls the LOW immediate byte);
+                    // and the SECOND PLB of a PEA/PLB/PLB pair (pulls the
+                    // HIGH byte — Super Metroid's boot: PEA $7E00/PLB/PLB
+                    // before its eight-stride WRAM clear). Both PEA shapes
+                    // test the same operand index.
+                    dbr_bw = (file >= 3 and out[file - 3] == 0xA9 and out[file - 1] == 0x48 and
+                        (out[file - 2] == 0x7E or out[file - 2] == 0x7F)) or
+                        (file >= 4 and
+                            (out[file - 3] == 0xF4 or (out[file - 1] == 0xAB and out[file - 4] == 0xF4)) and
+                            (out[file - 2] == 0x7E or out[file - 2] == 0x7F));
                 } else if (op == 0x44 or op == 0x54) {
                     // Only a move whose destination becomes BW-RAM leaves
                     // DBR there; the ROM-source shape keeps bank $00.
@@ -6257,6 +6326,21 @@ pub fn convertWholeGame(
         d[wn] = 0x78; // SEI
         wn += 1;
         wn = emitStore(d, wn, 0x2224, 0x00); // SBM: S-CPU window = block 0
+        if (image.len > 0x20_0000) {
+            // Super MMC regions for a >2 MiB image: power-on FLAT maps the
+            // $80-$BF fold onto image quarters 2/3 — real data, not the
+            // mirror the game's FastROM code assumes. Region 2 (banks
+            // $80-$9F, where a map-$30 game runs almost everything) banks
+            // to megabyte 0: the mirror is genuine again and stock's own
+            // MEMSEL write gives it stock's fast timing. Region 3 (banks
+            // $A0-$BF) banks to megabyte 2, keeping the third megabyte
+            // reachable at stable addresses — the de-mirror pass re-banks
+            // stock's $40-$5F and $C0-$DF references there (addr16
+            // preserved), and its $A0-$BF (mirror-of-MB1) references down
+            // to $20-$3F.
+            wn = emitStore(d, wn, 0x2222, 0x80); // EXB: $80-$9F = MB 0
+            wn = emitStore(d, wn, 0x2223, 0x82); // FXB: $A0-$BF = MB 2
+        }
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
         if (boot) |b| {
