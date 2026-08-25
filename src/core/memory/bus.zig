@@ -226,7 +226,7 @@ pub const Bus = struct {
     /// Wire the SA-1 to the cartridge's ROM and BW-RAM (after init or load).
     fn attachSa1(self: *Bus) void {
         if (self.cart.chip != .sa1) return;
-        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
+        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask, &self.cart.sram_hi, self.cart.sram_hi_mask);
     }
 
     /// Wire the Cx4 to the cartridge's ROM (after init or load).
@@ -395,7 +395,11 @@ pub const Bus = struct {
         // conversion, where the game's low WRAM now lives here.
         const bank: u8 = @intCast(addr >> 16);
         if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
-            self.sa1.bwram[(addr & 0xF_FFFF) & self.sa1.bwram_mask] = value;
+            const off = addr & 0x3_FFFF;
+            if (self.sa1.bwram_hi_mask != 0 and off & 0x2_0000 != 0)
+                self.sa1.bwram_hi[off & self.sa1.bwram_hi_mask] = value
+            else
+                self.sa1.bwram[off & self.sa1.bwram_mask] = value;
             return true;
         }
         return false;

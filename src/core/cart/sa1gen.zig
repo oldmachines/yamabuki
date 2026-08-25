@@ -223,6 +223,9 @@ pub const Stats = struct {
     shim_addr: u16 = 0,
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
+    /// Battery-SRAM sites re-banked into BW-RAM $20000+ (bank $42), offsets
+    /// normalized by the chip's mirror mask.
+    rewritten_sram: u32 = 0,
     rewritten_abs: u32 = 0,
     /// Instructions the profile never executed that `--wg-static`'s
     /// recursive descent found anyway — the reach the audit is measuring.
@@ -4733,7 +4736,18 @@ pub fn convertWholeGame(
     const header = try header_mod.detect(image);
     if (cartridge.identifyChip(header) != .none) return refuse(refusal, .{ .reason = .coprocessor });
     if (header.mapping != .lorom) return refuse(refusal, .{ .reason = .not_lorom });
-    if (header.sramBytes() != 0) return refuse(refusal, .{ .reason = .has_sram });
+    // Battery SRAM: liftable in window mode. The 256 KiB BW-RAM holds the
+    // relocated WRAM image in its first half; the game's save RAM relocates
+    // to offset $20000 — bank $42 on both buses — and every executed
+    // long-addressed $70-$7D site re-banks there with its offset NORMALIZED
+    // by the original chip's mirror mask. Normalization is what preserves
+    // aliasing: Super Metroid's boot probes the 8 KiB chip by writing a
+    // pattern at $70:2000,X and reading it back at $70:0000,X — both
+    // normalize to $42:0000, so the probe still sees the mirror. Non-window
+    // (SA-1-execution) mode keeps refusing: bank $70 is open bus there.
+    const game_sram: u32 = header.sramBytes();
+    if (game_sram != 0 and !(window and game_sram <= 32 * 1024))
+        return refuse(refusal, .{ .reason = .has_sram });
     if (image.len > 4 << 20) return refuse(refusal, .{ .reason = .rom_too_big });
     const reset = header.reset_vector;
     if (reset < 0x8000) return refuse(refusal, .{ .reason = .reset_vector_not_rom });
@@ -4933,6 +4947,14 @@ pub fn convertWholeGame(
                     if (!bwram) return refuse(refusal, .{ .reason = .wg_unsupported_op, .detail = cpu_addr });
                     const dst = image[file + 1];
                     const src = image[file + 2];
+                    // A move naming the SRAM banks would need the same
+                    // normalize-and-rebank treatment with a provable index;
+                    // no executed move does it (SM's save code is all
+                    // long-addressed), so it refuses rather than guesses.
+                    if (game_sram != 0 and
+                        ((dst & 0x7F) >= 0x70 and (dst & 0x7F) <= 0x7D or
+                            (src & 0x7F) >= 0x70 and (src & 0x7F) <= 0x7D))
+                        return refuse(refusal, .{ .reason = .wg_blockmove_source, .detail = cpu_addr });
                     // Destination first, and it is the easy half: bank $00's
                     // only writable memory is WRAM below $2000, so a move
                     // that writes bank $00 is writing WRAM whatever X and Y
@@ -5560,6 +5582,24 @@ pub fn convertWholeGame(
                             // wraps into $40 the same distance.
                             out[file + 3] = 0x3F;
                             res.stats.rewritten_long += 1;
+                            auditNote(&res.audit, file, op, v, le, .rebanked);
+                        } else if (game_sram != 0 and (b & 0x7F) >= 0x70 and
+                            (b & 0x7F) <= 0x7D and v < 0x8000)
+                        {
+                            // Battery SRAM relocates above the WRAM image:
+                            // BW-RAM offset $20000 = bank $42. The offset is
+                            // normalized by the chip's own mirror mask, so
+                            // the distinct-looking bases the game aims at
+                            // one mirrored chip ($70:0000 vs $70:2000)
+                            // still alias after the move. An indexed site's
+                            // reach past the mirror is not reproduced —
+                            // the observed idiom keeps its index inside one
+                            // image (SM's probe loop counts $1FFE down) and
+                            // S4 verification arbitrates the rest.
+                            const off = ((@as(u32, b & 0x0F) << 15) | v) & (game_sram - 1);
+                            std.mem.writeInt(u16, out[file + 1 ..][0..2], @intCast(off), .little);
+                            out[file + 3] = 0x42;
+                            res.stats.rewritten_sram += 1;
                             auditNote(&res.audit, file, op, v, le, .rebanked);
                         } else if ((b & 0x7F) <= 0x3F and v < 0x2000 and
                             (usage_map.mode(op) == .long or blk: {
@@ -6248,7 +6288,11 @@ pub fn convertWholeGame(
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
-        out[header.offset + 0x18] = 0x07; // 128 KiB BW-RAM: all of WRAM
+        // 128 KiB BW-RAM holds all of WRAM; a relocated battery cart needs
+        // the second 128 KiB for its save RAM at offset $20000 (bank $42).
+        // (.srm persistence for the relocated region is a follow-up — in-
+        // session saves and save states carry it meanwhile.)
+        out[header.offset + 0x18] = if (game_sram != 0) 0x08 else 0x07;
         patchgen.recomputeChecksum(out, header.offset);
         res.stats.shim_addr = base16;
         res.stats.park_addr = if (boot) |b| b.crv else 0;
@@ -9166,4 +9210,118 @@ test "whole-game: refusals name their reasons" {
     markOp(usage, 0x00_8100);
     try testing.expectError(error.Refused, convertWholeGame(gpa, rom, usage, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_unsupported_op, ref.?.reason);
+}
+
+test "window: a battery cart's SRAM relocates above the WRAM image, mirrors normalized" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    rom[0x7FC0 + 0x16] = 0x02; // ROM + RAM + battery
+    rom[0x7FC0 + 0x18] = 3; // 8 KiB SRAM, mirrored through $70:0000-$7FFF
+    // Long store to $70:0000, then an INDEXED long store through the
+    // MIRROR base $70:2000 — Super Metroid's boot probes its chip exactly
+    // this way (pattern at $70:2000,X read back at $70:0000,X), so the
+    // relocation must keep the two bases aliasing. Normalization by the
+    // chip's own mask is what does it: both rewrite to $42:0000.
+    @memcpy(rom[0x0000..0x0016], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA9, 0x5A, 0x8F, 0x00, 0x00, 0x70, // STA $70:0000
+        0xA2, 0x05, // LDX #$05
+        0xA9, 0xA5, 0x9F, 0x00, 0x20, 0x70, // STA $70:2000,X — the mirror
+        0x80, 0xFE, 0xEA, 0xEA, // spin
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const map: usage_map.UsageMap = .{ .bytes = bytes };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..3) |_| con.runFrame();
+        // Stock semantics first: the 8 KiB chip mirrors, so the $70:2000
+        // store lands at offset 5 of the same image the $70:0000 store hit.
+        try testing.expectEqual(@as(u8, 0x5A), con.bus.cart.sram[0]);
+        try testing.expectEqual(@as(u8, 0xA5), con.bus.cart.sram[5]);
+    }
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u32, 2), res.stats.rewritten_sram);
+    // Both operands normalized AND re-banked: $70:0000 -> $42:0000,
+    // $70:2000 -> $42:0000. The aliasing survives as identity.
+    try testing.expectEqualSlices(u8, &.{ 0x8F, 0x00, 0x00, 0x42 }, res.image[0x0006..0x000A]);
+    try testing.expectEqualSlices(u8, &.{ 0x9F, 0x00, 0x00, 0x42 }, res.image[0x000E..0x0012]);
+    // The header declares the second BW-RAM bank.
+    try testing.expectEqual(@as(u8, 0x08), res.image[0x7FC0 + 0x18]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    try testing.expectEqual(cartridge.ChipKind.sa1, cart.chip);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..3) |_| con.runFrame();
+    // Both stores land in the second bank — still aliased — and the
+    // relocated WRAM image below is untouched by them.
+    try testing.expectEqual(@as(u8, 0x5A), con.bus.cart.sram_hi[0]);
+    try testing.expectEqual(@as(u8, 0xA5), con.bus.cart.sram_hi[5]);
+    try testing.expectEqual(@as(u8, 0), con.bus.cart.sram[0]);
+    try testing.expectEqual(@as(u8, 0), con.bus.cart.sram[5]);
+
+    // Non-window (SA-1-execution) mode still refuses: bank $70 would be
+    // open bus on the SA-1.
+    ref = null;
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, bytes, null, null, false, false, &.{}, false, 0, copy_reserve, null, &ref));
+    try testing.expectEqual(Reason.has_sram, ref.?.reason);
+}
+
+test "window: a block move naming the SRAM banks refuses rather than guesses" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    rom[0x7FC0 + 0x16] = 0x02;
+    rom[0x7FC0 + 0x18] = 3;
+    // MVN with the SRAM bank as destination: normalize-and-rebank would
+    // need a provable index; no executed move in the measured corpus does
+    // this (SM's save code is all long-addressed), so it refuses.
+    @memcpy(rom[0x0000..0x0014], &[_]u8{
+        0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+        0xA2, 0x00, 0x00, // LDX #$0000
+        0xA0, 0x00, 0x00, // LDY #$0000
+        0xA9, 0x00, 0x00, // LDA #$0000 (move 1 byte)
+        0x54, 0x70, 0x7E, // MVN dst=$70, src=$7E
+        0x80, 0xFE, 0xEA, 0xEA,
+    });
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const map: usage_map.UsageMap = .{ .bytes = bytes };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..2) |_| con.runFrame();
+    }
+    var ref: ?Refusal = null;
+    try testing.expectError(error.Refused, convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref));
+    try testing.expectEqual(Reason.wg_blockmove_source, ref.?.reason);
 }

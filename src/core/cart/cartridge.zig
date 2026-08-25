@@ -20,13 +20,21 @@ pub const ChipKind = enum(u8) {
 };
 
 pub const max_sram = 0x2_0000; // 128 KiB covers all base-console carts
+/// The second BW-RAM bank (offset $20000+ = bank $42), used only by window
+/// conversions of battery carts: the first 128 KiB is the relocated WRAM
+/// image, the game's own save RAM relocates above it. A separate array —
+/// NOT a bigger `sram` — because `sram` rides inside the serialized state
+/// payload, and growing it would orphan every existing save state and every
+/// movie anchor. `sram_hi` is serialize-skipped and travels in the state's
+/// version-sized cart-RAM tail instead.
+pub const max_sram_hi = 0x2_0000;
 
 pub const Error = error{ NoHeader, RomTooSmall, OutOfMemory };
 
 pub const Cartridge = struct {
     // Derived/immutable data is rebuilt or re-supplied at load; only SRAM is
     // console state worth saving.
-    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask", "rom_crc" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask", "rom_crc", "sram_hi", "sram_hi_mask" };
 
     /// Power-of-two padded ROM image, owned by the loading allocator.
     rom: []const u8,
@@ -37,6 +45,8 @@ pub const Cartridge = struct {
     rom_crc: u32,
     rom_mask: u32,
     sram: [max_sram]u8,
+    sram_hi: [max_sram_hi]u8,
+    sram_hi_mask: u32,
     /// sram_size - 1, or 0 when the cart has no SRAM.
     sram_mask: u32,
     header: Header,
@@ -69,12 +79,17 @@ pub const Cartridge = struct {
             .rom = rom,
             .rom_crc = rom_crc,
             .rom_mask = @intCast(padded_len - 1),
-            .sram = @splat(0),
+            .sram = @splat(0),            .sram_hi = @splat(0),
             .sram_mask = 0,
+            .sram_hi_mask = 0,
             .header = header,
             .chip = identifyChip(header),
         };
-        var sram_bytes: u32 = @min(header.sramBytes(), max_sram);
+        var sram_bytes: u32 = @min(header.sramBytes(), max_sram + max_sram_hi);
+        if (sram_bytes > max_sram) {
+            cart.sram_hi_mask = sram_bytes - max_sram - 1;
+            sram_bytes = max_sram;
+        }
         if (cart.chip == .superfx) {
             // Super FX carts declare their shared work RAM in the extended
             // header's expansion-RAM byte ($xxBD, log2 KiB); it lives in the
