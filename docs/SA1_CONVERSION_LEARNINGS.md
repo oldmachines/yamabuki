@@ -6,16 +6,26 @@ fix the rule → regenerate*. Each rule cites the failure that forced it. The
 reference throughout is Vitor Vilela's hand-crafted SA-1 patch (v17), used as
 an answer key by byte-diffing, never as a source.
 
-The work lives on PR #115 (`claude/sa1-async-offload`). The entry point, in
-the shape that actually ships a four-tree patch:
+The work lives on PR #115 (`claude/sa1-async-offload`). **The architecture
+pivoted twice.** Sections 1–23 record the per-call *offload-tree* pipeline
+(hot routines run on the SA-1, called from stubs) — it works, verifies, and
+tops out near v17's utilisation but never its *result*: a residual dispatch
+toll no rule can remove (§9, §22). Sections 24–30 record the pivot that
+closed the gap — the **NMI-tail split (S5)**, which is v17's actual
+architecture: the game's whole per-frame logic runs on the SA-1 *in place*,
+the S-CPU keeps only the IO, and there is no per-call toll because there is
+no per-call. That pipeline reaches **0.0% observed slowdown on real
+gameplay takes — parity with v17** (§30). The current entry point:
 
 ```
 yamabuki-headless <rom> --gen-sa1-patch --window --wg-static --wg-fastrom \
     --verify-behavioral --state <gameplay.state> \
     --movie <surface1.ymv> ... --movie <surface5.ymv> \
-    --cover-image <prev-build.sfc> --cover-movie <recorded-on-it.ymv> ...×11 \
-    --wg-add 009bcd --wg-expand 1m --wg-copy-reserve 3600 \
-    --conv-pad 1500 --wg-nmi-off 8ef1 --wg-drop 8c95 --out <patch.bps>
+    --cover-image <prev-build.sfc> --cover-movie <recorded-on-it.ymv> ...×17 \
+    --wg-expand 1m --wg-copy-reserve 3600 --conv-pad 1500 \
+    --wg-split-tail 8298:82bc:01 --wg-split-mode 94:01 \
+    --wg-split-io 86e1:d:l --wg-split-io 9a68:d:l:f ...×20 \
+    --out <patch.bps> --save-attempt <ship.sfc>
 ```
 
 **Do not reconstruct this command from prose.** Three separate
@@ -279,7 +289,14 @@ premise was checked. Verify the premise; keep the regression test either way.
 
 ## 8. Where it stands
 
-**Current, 2026-08-20 — union68.** The shipping patch is the four-tree
+> **Superseded — the offload-tree plateau.** This section records the
+> high-water mark of the *per-call* architecture (union68, 2026-08-20).
+> It was never beaten on its own terms; it was abandoned for a different
+> architecture that removed the toll it describes. For the current state
+> — the NMI-tail split at **0.0% observed slowdown, parity with v17** —
+> see §30. Read this section as the ceiling that forced the pivot.
+
+**union68 (2026-08-20).** The shipping patch is the four-tree
 window conversion: `$9BCD` (the stage-1 sequencer), `$8EF1` (the
 1,324-byte physics tree), and `$9028`/`$9020` (the pair the two-scene
 intersection promoted, section 19), all executing on the SA-1, plus
@@ -453,6 +470,12 @@ measured evidence, and verification.** The profiler closed most of that gap
 by harvesting the knowledge from execution instead of approximating it from
 bytes; coverage closes most of the rest; the residue is what the behavioral
 tier is for.
+
+> **The residue turned out to be architectural, not evidential** — no amount
+> of harvested knowledge closes a *dispatch toll* the offload architecture
+> pays on every call. The last ~5 points is what §24 confronts by copying
+> v17's architecture wholesale rather than approaching it: run the mainline
+> in place, pay nothing per call, reach 0.0%.
 
 ## 10. The concurrency arc — earning the third tree
 
@@ -1322,3 +1345,319 @@ The hunt paid its way in instruments, kept:
   (In the shipped sync flavor this cannot arise from a legitimate call —
   the dispatch marshals the caller's true P, and no real caller enters
   these trees narrow; stock itself would misparse.)
+
+---
+
+## 24. The ceiling, and re-reading the answer key
+
+The offload-tree pipeline was measured against v17 one more time, on a real
+bubble-stage take rather than the anchored profile — and the gap was not
+what the utilisation columns implied:
+
+    v17 (hand-written), bubble take   0.0% slowdown (1 of 8,986 frames), mean 19%, max 88%
+    union76 (best offload tree)       12.1% slowdown at the same stage
+
+12% is not 0%, and the difference is not evidence the profiler could harvest.
+It is **structural**. Every offload pays a dispatch toll — marshal the
+caller's registers into the mailbox, cross to the SA-1, run, cross back,
+unmarshal — and the S-CPU spins across the call, so nothing overlaps the
+compute it paid to move. Measured, that toll is ~77% of union76's residual
+slowdown. No rule removes it, because the toll *is* the architecture: a
+per-call offload is a per-call round trip.
+
+So the answer key was re-read, not for byte values this time but for
+**shape** — and the shape was different from everything the pipeline had
+built. v17 does not offload routines. Its call sites are *unchanged*: both
+CPUs execute the same bytes at the same addresses (§1), and v17 simply lets
+the **SA-1 run the game's per-frame logic in place** while the S-CPU keeps
+the IO. There is no marshal because there is no second copy. There is no
+dispatch toll because there is no dispatch — the logic never "returns" to
+the S-CPU; it runs to the end of the frame on the fast chip and the IO
+overlaps it. That is why v17 is 0% and 12% was a ceiling: the pipeline was
+paying, per call, for a boundary v17 never crosses.
+
+The pivot was to build that. Everything from §25 on is the machine reaching,
+by construction and 52 measured failures, the architecture it had already
+proved was the only survivor (§1) — but now applied to the *whole mainline*
+instead of a handful of trees.
+
+## 25. The NMI-tail split (S5) — the architecture
+
+Gradius III has no main loop worth splitting: the entire engine runs inside
+the **NMI handler**, once per frame. So the boundary is drawn *inside the
+handler*. The map, disassembled:
+
+    $8223  handler head     guards + the vblank-timed upload cluster (DMA to VRAM/OAM/CGRAM)
+    $8298  JSL $892B        the boundary — auto-joy wait + pad read
+    $829C  chain            the frame's game logic ($878E/$8EF1/$9D7E/$9768/$9F19/$9265/$86E1)
+    $82BA  STZ $3C          clears the in-NMI overrun guard
+    $82BC  epilogue         C2 10 C2 20 AB 2B 7A FA 68 40  (pulls + RTI)
+
+The split (`--wg-split-tail 8298:82bc:01`): the **S-CPU keeps the head**
+($8223–$8297) — its uploads are vblank-timed and must hit real hardware on
+the S-CPU's clock — and the **SA-1 runs the tail** ($8298 through the
+epilogue), the frame's whole logic chain, on a generated frame loop.
+
+The SA-1 side is a carve that: publishes `done := last`, spins until the
+S-CPU bumps a **frame token** (`token ≠ last`), runs the tail, and exits
+through a **faked handler frame** so the game's own `RTI` returns into the
+loop rather than off the stack. It re-enters its own anchor every lap; the
+`engaged` cell gates the laps until the S-CPU opens the split (~frame 200,
+the first boundary crossing after the logo load — every earlier probe window
+was pre-engage and lied).
+
+The S-CPU side is two displaced instructions:
+
+- **`tok`** replaces the boundary JSL. It pins `D=$6000`/`DBR=$01` (alternate
+  transition paths arrive with them dirty), runs the displaced `JSL $892B`
+  **natively** (see the poll-lockstep law, §27), bumps the token, then enters
+  the **pumping gate**: a loop that re-feeds the `$4212` vblank mirror live,
+  drains one queued IO entry, and checks `done == token`. The wait body *is*
+  the pump — a pure exit-wait starved the SA-1's own queued uploads; pure
+  non-blocking let the mainline overlap the tail and the shared fade cells
+  diverged. Two escape branches leave the gate: **nested-native** (`done ≠
+  token`: a real per-frame NMI arrived while a tail is still in flight — unpin
+  and run the chain on the S-CPU, exactly as stock's nested NMI did) and the
+  **SA-1 island** (the SA-1's own faked frame reaching the tok — unwind, JML
+  the tail proper).
+- **`mini-tok`** replaces the epilogue, so every handler exit — full path,
+  overrun, load-skip — drains the queues before the pulls.
+
+The token is the proof-of-life instrument: when it advances once per frame
+with `done` trailing by one, the SA-1 is dispatched and completing the tail
+every frame; when it freezes, the split has fallen back to nested-native.
+(§30's take analysis leans on exactly this.)
+
+## 26. The IO that stays on the S-CPU — two queues
+
+The head keeps its uploads, but 20 IO routines are reached from the *tail*
+(`--wg-split-io`, 20 of them) — sound, screen-enable handshakes, extra VRAM
+fills. The SA-1 cannot touch MMIO, so each is replayed on the S-CPU through
+one of two disciplines, chosen per routine:
+
+- **RPC (ring 1), ordered.** A far stub captures the caller's A/X/Y/D/P,
+  enqueues an id, and **spins until the S-CPU acks**. The drain fetches the
+  dispatch pointer, restores the caller's registers, replays the body, then
+  bumps the ack. Ordered because the bodies write *shared state* (the screen
+  family sets `$3C`/`$3E`) that must land in program order. Release is the ack
+  bump *after* the body — not the ring cursor: `rd` consumes the entry
+  *before* the body runs, so a nested NMI's drain sees an empty ring and falls
+  through to the overrun release the parked body is waiting on. Spinning on
+  `rd==wr` instead made every releasing NMI re-enter the in-service call —
+  infinite regress at the demo transition, frame ~714.
+- **Fire-and-forget (ring 2).** Six APU port pumps (`:f`) that need no
+  ordering: record `[id][D][P]`, bump a mod-24 cursor, return with no spin.
+  They replay at the mini-tok — the frame-exit phase where stock ran its
+  trailing sound call anyway.
+
+Two laws fixed the boundary between them:
+
+> **Queue-interleave law.** `$86E1` *looks* fire-and-forget (a sound call) but
+> appends to a queue the tail flushes per frame; batching it into ring 2
+> overfilled that queue into the dp floor, armed the HDMA walker with a junk
+> id, and swept the SA-1 register file as a dead-row `dp,X` store. It stays
+> RPC. A routine's discipline is decided by what its body *touches*, not what
+> it looks like.
+
+> **Bus-map fidelity law.** The game makes dead-row `dp,X` writes whose ROM
+> target, under stock `D=0`, is harmless — but under the relocation's
+> `D=$6000` they wrap into `$221F–$222E`, the live SA-1 register file on the
+> S-CPU bus (benign on the SA-1 bus). So logic dispatchers that do this
+> (`$A216`, `$82C6`) must stay **native**; only genuine IO leaves are
+> replayed. Replaying a dispatcher because it "writes MMIO" corrupts the very
+> registers it was only grazing.
+
+## 27. The split's law ledger — 52 failures, condensed
+
+Landing the split on the real cartridge took 52 generate→fail→dump→fix laps
+(union69–77). The full ledger is in the commit history; the load-bearing
+laws, each earned from a measured wedge:
+
+> **Poll-lockstep law.** The behavioral verifier pairs the two runs
+> *poll-for-poll* on `$4218`/`$4016` bus reads. Any generated poll (a mirror
+> feed) or suppressed poll (a mirror-swapped pad read) breaks the pairing — a
+> mini-tok feed once produced 246 extra polls and 675 phantom divergences.
+> Fix: **no pad mirrors anywhere.** The tok replays the displaced `JSL $892B`
+> natively on the S-CPU, at the game's own cadence; the SA-1 enters at
+> `tail+4`, skipping it, and reads the results from the window cells the poll
+> filled.
+
+> **Token-wrap law.** The token INC runs 8-bit (`E2 20` forced after the
+> replay). A 16-bit INC treats `token`+`last` as one word; the `$FF→$00`
+> carry clobbers `last` in the same cycle and no edge ever reaches the SA-1 —
+> the wedge lands at *exactly* the 256th crossing, frame 455.
+
+> **Scratch-stack re-entrancy.** Replayed bodies run on a scratch stack in
+> real WRAM (freed by the relocation). A nested NMI's drain that arrives
+> *already on the scratch page* must NOT reset S to the top — that trampled
+> the outer replay's frames and the nested `RTI` popped garbage (`P=$F5`,
+> frame ~1131). Old S rides on the stack, so nested drains unwind naturally.
+
+> **Widths-only caller P (`AND #$30`).** The SA-1's P carries `I=1` — it runs
+> interrupt-masked by design — and `PLP`-ing a whole captured P onto the
+> S-CPU masked NMI for the replay's span; a multi-frame sample stream then
+> lost every nested frame its APU handshake depended on (`$9A68` spinning at
+> `p=$04`, no NMI for 400K cycles, frame 745). Restore *widths only*.
+
+> **Every reachable stub needs the stack-page CPU test.** The tail can
+> re-enter *anything* — it re-enters the handler head, which reaches the tok
+> itself. Each generated stub discriminates "am I the SA-1 or the S-CPU"
+> by the stack page ($1Bxx = the SA-1's I-RAM stack); without it, an S-CPU
+> caller double-runs a body or the SA-1 replays one on open bus.
+
+> **Branch-reach is not free (union79).** Taking the tok's nested-native and
+> SA-1-island branches for the *first time* (the mode gate, §28) revealed
+> both were **short** branches truncated from a ~166-byte forward distance
+> ($A6 = −90) — they jumped *backward* into the tok's own bytes. They had
+> simply never been taken on a verified path. Both are `BEQ`/`BNE`-over-`BRL`
+> now. A branch that "can't happen yet" is a latent wild jump.
+
+Two union78 fixes rode the same loop: the **stage-2 boss's missing tiles**
+(a DMA record carried its source bank as *data* the window rewriter never
+sees — fixed by a consumer-side runtime thunk at the `STA $4304`, §12's law
+applied to bank bytes) and the **play-menu gridlines** (an RPC replay of the
+VRAM-fill `$9231` entered with the drain's dispatch index in X instead of
+the caller's fill target — the far stub now captures A/X/Y whole).
+
+## 28. The mode gate — menus are not gameplay (union79)
+
+The split verified on every gameplay surface and then came up **black on the
+option screen**. The trace was unambiguous: the split stayed engaged through
+the menu and the mode transition, where it buys nothing (there is no
+slowdown to remove) and where the game's producer/consumer handshakes assume
+one CPU. At menu entry, the transition's multi-KB upload burst — which stock
+runs as re-entrant multi-frame NMIs — funneled through the in-NMI ring
+replays, **starved the mainline's staging sweep mid-list**, and the tail's
+list consumer spun on the unterminated list forever. The menu still drew (it
+is all NMI-side); the mainline never ran again; the option screen, which
+needs it, stayed black with the menu's HDMA still armed.
+
+The fix is to engage the split only where it earns its keep:
+
+> **Mode gate (`--wg-split-mode 94:01`).** The tok dispatches the tail to the
+> SA-1 only while the game-mode dp cell `$94` holds the gameplay value (`1`
+> on Gradius III; menus and options are `2`, transitions `0`). Every other
+> mode runs the tail **nested-native** — the stock shape — with the token
+> frozen and the SA-1 idling at its edge-gate. Gameplay, the only era with
+> slowdown to remove and the only era every 0.0% take exercises, is
+> untouched. The cost is honest and disclosed: transitions now run at stock's
+> (irrelevant, IO-bound) timing.
+
+Taking the gate path also exposed two more latent bugs (beyond the branch
+reach of §27): the nested-native path entered the tail with the tok's own
+widths and had to restore the game's engage-time P from the cell; and the
+far stub's `SEP #$30` **zeroes the high bytes of X *and* Y** on the 65816 —
+X rode the stack but Y rode only the replay cell, so every S-CPU-native call
+returned with Y's high byte gone (`$9231`'s 16-bit fill count truncated from
+`$0FFF` to `$00FF`: the option screen cleared 256 words of each 1024-word map
+and the menu logo stayed behind the text). `PHY`/`PLY` around the test.
+
+Two verification laws fell out of chasing this to ground:
+
+> **Surface-reach law.** A gate is only as good as what its movie actually
+> *reaches*. The first "options" surface was built from a one-`Down` movie —
+> which lands on **weapon select**, not OPTION MODE — so the gate "verified
+> the option screen" without the option-init at `$B41x` ever executing. That
+> init (it writes the `NORMAL`/`STEREO` defaults, and is reached only through
+> a bank-`$06` task pointer the static walk cannot follow) stayed
+> **unrewritten**, and its writes landed in the wrong RAM home:
+> `EASY`/`MONAURAL` defaults on the converted image. Confirm a surface
+> reaches its screen (`--clock-pc <pc>` on the movie) before trusting a green
+> gate.
+
+> **Home-learning blind spot.** The tick verifier learns each WRAM cell's
+> home (real WRAM vs BW-RAM window) from the ticks where it *agrees* with the
+> baseline — so a wrong-home write that happens to match stock's value passes
+> silently. Split-home bugs are invisible to the tier by construction; catch
+> them with free-run screenshots and a `--dump-ram` home compare (WRAM[x] vs
+> BWRAM[x]), not the gate.
+
+## 29. Verifying a machine that removes lag
+
+The split's whole point is that it produces **different pictures than
+stock** — removed slowdown means different frame timing — so the pixel gate
+is *expected* to diverge, and a lag-driven surface cannot be judged
+frame-for-frame at all:
+
+> **Lag-driven surfaces are unjudgeable by pixels.** The boss-phase timer
+> `$78` is `INC`'d once per *executed* pass; a conversion that executes more
+> passes per wall-second advances the fight faster and every downstream byte
+> forks. v17 fails a frame-identity check against stock *identically*. The
+> boss and full-game movies are therefore returned as **cover pairs**
+> (`--cover-image`/`--cover-movie`) — they donate coverage, they do not
+> verify — while the gate proper runs on deterministic surfaces plus the
+> behavioral tier.
+
+The **behavioral tier** (`--verify-behavioral`) runs both images tick-locked
+(a tick = the frame's first controller poll, the one phase-aligned instant
+two differently-lagged runs share) and compares the game's logic state at
+each tick, masking wall-coupled cells. Its governing constraint took a full
+day to see:
+
+> **Comparable-region law.** The tier's comparison ends when the *conversion*
+> exhausts its wall budget — and the budget is the movie length. A
+> load-heavy prefix spends it before the first input edge, so **every
+> menu-era gate before union79 compared only the passive title screen**
+> (`menu-ud` never reached its own button presses). The options surface is
+> now a **6,800-frame** movie whose comparable region covers the entire
+> enter-options→exit sequence; lengthening the movie with an idle tail is how
+> you buy verification depth. It was the surface that finally *failed* on
+> union78's construction and passes on union79.
+
+Instruments the arc left behind, kept in the tree:
+
+- `--behavioral-probe <conv.sfc> --movie X` runs the tier standalone,
+  stock-vs-image, in minutes instead of a full generation — the iteration
+  loop for tier rules and for placing a divergence.
+- `[bfx]` stderr lines print each bad-run *start* (tick, both wall frames,
+  the diverging cells). The tick↔wall map is nonlinear — a load stretches
+  one tick over hundreds of wall frames — and chasing a tick-domain
+  divergence with wall-domain probes wastes hours.
+- `--sa1-report` now lists **where** slowdown fell (`at frame(s):
+  18251(x1) 22463(x2)`), not just the count: a boss burst and a transition
+  are different findings and the aggregate hid which.
+
+> **Stale-anchor harvest poison.** A cover take whose anchor carries a
+> *different* image's machine state resumes, on the new image, at a PC that
+> means nothing — and marks a misaligned "death rattle" into the usage map.
+> Operand bytes at `$847B` and `$A3C3` read back as executed `BRK`s and
+> refused otherwise-good splits ("a block move cannot run on the SA-1 side").
+> Both cores' harvest hooks now stop donating from the first `BRK`/`COP`/
+> `STP`/`WDM` they execute.
+
+## 30. Where it stands — parity
+
+**Current, 2026-08-25 — union79.** The shipping patch is the NMI-tail split:
+the game's per-frame logic tail runs on the SA-1, gated to gameplay mode; the
+S-CPU keeps the handler head and 20 IO routines (14 RPC, 6 fire-and-forget);
+FastROM, a 1 MiB expansion, the DMA bank-slot translator, and the far-stub
+pool behind bank-`$00` hops. Five verification surfaces (`fg3000`,
+`full-cycle`, `menu-ud`, `options`, `wsel`), seventeen cover harvests,
+state-anchored at a stage-2 scene. The full invocation is in
+`<patch>.bps.cmd`; the load-bearing new flags are
+`--wg-split-tail 8298:82bc:01 --wg-split-mode 94:01` and the twenty
+`--wg-split-io` entries.
+
+Measured on the surfaces that correspond to actual play — the player's own
+F10 recordings, replayed on the build they were recorded on:
+
+    stage-2 bubble take (u79)   0.0% slowdown   (0 of 6,059 frames)
+    stage-2 boss take (u79)     0.0% slowdown   (0 of 8,309 frames)
+    full stage-2 run (u79)      0.1% slowdown   (3 of 5,747 frames), mean 67%, p95 100%
+    v17 (hand-written)          0.0% slowdown   (1 of 8,986 frames), mean 19%, max 88%
+
+**This is parity.** The machine reaches v17's result because it now uses
+v17's architecture — the whole mainline on the SA-1, in place, no per-call
+toll — arrived at not by copying bytes but by eliminating the alternatives
+(§1) and then eliminating, one measured wedge at a time (§27), every reason
+the boundary could not fall inside the NMI handler. The residual 0.1% on the
+densest take is the SA-1 momentarily saturating at a genuine gameplay peak
+(the boss's red-vein burst, p95 = 100%), with the split engaged and the token
+advancing every frame — the same order of residue v17 itself shows, on a
+harder frame.
+
+Gates: the deterministic surfaces are behaviorally equivalent; the option
+screen is PPU-identical to stock in free-run with correct defaults; the
+suite is 463/463. What remains is not a slowdown gap but the standing costs
+the gate discloses — transitions run stock-shape by design, and any surface
+must be confirmed to reach its screen before its green is believed.
