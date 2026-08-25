@@ -2447,8 +2447,17 @@ fn runSa1Gen(
             }
         }
 
-        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0) {
-            try out.print("  value provenance: {} pointer-bank byte(s) ({} unresolved), {} dp,X word(s) ({} unresolved)\n", .{ ptr_ev.n_proven, ptr_ev.unresolved, ptr_ev.n_idx, ptr_ev.idx_unresolved });
+        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0 or ptr_ev.n_dma_addr != 0) {
+            try out.print("  value provenance: {} pointer-bank byte(s) ({} unresolved), {} dp,X word(s) ({} unresolved), {} dma-addr word(s)\n", .{ ptr_ev.n_proven, ptr_ev.unresolved, ptr_ev.n_idx, ptr_ev.idx_unresolved, ptr_ev.n_dma_addr });
+            for (ptr_ev.proven[0..ptr_ev.n_proven]) |pa| {
+                try out.print("    proven bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.dma_addr_proven[0..ptr_ev.n_dma_addr]) |pa| {
+                try out.print("    proven dma-addr word at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.unres_sites[0..ptr_ev.n_unres]) |s_| {
+                try out.print("    unresolved site ${x:0>2}:{x:0>4} bank cell ${x:0>4} (x{})\n", .{ s_.pc >> 16, s_.pc & 0xFFFF, s_.slot, s_.hits });
+            }
             try out.flush();
         }
         var refusal: ?core.sa1gen.Refusal = null;
@@ -3239,10 +3248,10 @@ fn reportSa1(
                 "  {} unmeasured site(s) in full banks share one stub per bank through\n  the cold dispatcher (return-address lookup; ~150 cycles, never-seen code)\n",
                 .{res.stats.disp_sites},
             );
-        if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0)
+        if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0 or res.stats.rewritten_dma_addrs != 0)
             try out.print(
-                "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000 (addressing state travelling as\n  data — the idioms operand rewrites cannot reach)\n",
-                .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words },
+                "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000, {} dma-addr word(s) pre-shifted\n  +$6000 (addressing state travelling as data — the idioms operand\n  rewrites cannot reach)\n",
+                .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words, res.stats.rewritten_dma_addrs },
             );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});

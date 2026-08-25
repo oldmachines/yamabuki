@@ -245,6 +245,10 @@ pub const Stats = struct {
     rewritten_ptr_banks: u32 = 0,
     /// Measured dp,X pointer table words rewritten −$6000 (window mode).
     rewritten_idx_words: u32 = 0,
+    /// Measured DMA A-bus address words rewritten +$6000 (window mode):
+    /// staged transfer sources naming the moved low 8 KiB through a
+    /// system bank.
+    rewritten_dma_addrs: u32 = 0,
     /// Context-split sites (window mode): absolutes below $2000 whose
     /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
     /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
@@ -5987,6 +5991,23 @@ pub fn convertWholeGame(
                 res.stats.rewritten_idx_words += 1;
             }
         }
+        // DMA A-bus address words: staged transfer sources naming the
+        // moved low 8 KiB through a system bank. The recorded address
+        // names the word's LAST byte; only a word still below $2000
+        // moves — pre-shifted +$6000 so the fired channel follows its
+        // buffer into the window.
+        for (pe.dma_addr_proven[0..pe.n_dma_addr]) |ca| {
+            const src_bank: u32 = (ca >> 16) & 0x7F;
+            const a16: u32 = ca & 0xFFFF;
+            if (a16 < 0x8001) continue;
+            const f = src_bank * 0x8000 + (a16 - 0x8000);
+            if (f >= out.len or f == 0) continue;
+            const word = std.mem.readInt(u16, out[f - 1 ..][0..2], .little);
+            if (word < 0x2000) {
+                std.mem.writeInt(u16, out[f - 1 ..][0..2], word +% wg_bw_window, .little);
+                res.stats.rewritten_dma_addrs += 1;
+            }
+        }
     };
     // D and S follow their memory into the window.
     for (moves[0..n_moves]) |off| {
@@ -9408,4 +9429,51 @@ test "window: a block move naming the SRAM banks refuses rather than guesses" {
     var ref: ?Refusal = null;
     try testing.expectError(error.Refused, convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref));
     try testing.expectEqual(Reason.wg_blockmove_source, ref.?.reason);
+}
+
+test "window: a DMA bank byte riding X is proven and re-banked" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // Super Metroid's palette uploader: the A-bus bank rides X, not A —
+    // `LDX #$7E / STX $4314` (measured: 8,372 events from that one site,
+    // and wrong colours from the first visible frame). The provenance
+    // chain proves the X-load's immediate byte; the conversion re-banks
+    // it so the DMA follows the relocated WRAM into BW-RAM.
+    @memcpy(rom[0x0000..0x000C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xA2, 0x7E, // LDX #$7E — the byte to prove ($00:8005)
+        0x8E, 0x14, 0x43, // STX $4314
+        0x80, 0xFE, 0xEA, // spin
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const pe = try gpa.create(usage_map.PtrBankEvidence);
+    defer gpa.destroy(pe);
+    pe.* = .init;
+    const map: usage_map.UsageMap = .{ .bytes = bytes, .ptr_banks = pe };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..2) |_| con.runFrame();
+    }
+    try testing.expectEqual(@as(usize, 1), pe.n_proven);
+    try testing.expectEqual(@as(u32, 0x8005), pe.proven[0]);
+    try testing.expectEqual(@as(u32, 0), pe.unresolved);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, pe, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u32, 1), res.stats.rewritten_ptr_banks);
+    try testing.expectEqual(@as(u8, 0x40), res.image[0x0005]);
 }

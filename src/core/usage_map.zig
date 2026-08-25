@@ -165,6 +165,12 @@ pub const PtrBankEvidence = struct {
     /// stage-2 tilemap transfers kept bank $7F because nothing linked the
     /// queue cell back to the ROM record it was copied from).
     src: [0x20000]u32,
+    /// The same staging memory WITHOUT the $7E/$7F value gate: per WRAM
+    /// byte, the ROM address of whatever byte an attributed write last put
+    /// there, or `none`. What the two-byte-pointer family needs — a (dp)
+    /// pointer WORD carries an address, not a bank, so no value filter
+    /// applies; the consumer proves both bytes and demands contiguity.
+    src_any: [0x20000]u32,
     /// Deduped ROM bytes proven to feed pointer bank bytes (or DMA A-bus
     /// bank registers) that carried $7E/$7F into an actual access.
     proven: [max_proven]u32,
@@ -172,6 +178,13 @@ pub const PtrBankEvidence = struct {
     /// Accesses whose bank byte had no attributable source — torn traffic
     /// the conversion cannot repair; a verdict input, not just a counter.
     unresolved: u32,
+    /// The unresolved accesses' SITES, deduped by pc — the campaign's
+    /// worklist. Each row: one instruction whose bank byte had no source,
+    /// the dp slot (or $43x4 register) it read the bank from, and how
+    /// often it fired. The counter above says how sick the image is; this
+    /// says where to operate.
+    unres_sites: [max_unres]UnresSite,
+    n_unres: usize,
 
     /// Direct-page INDEX provenance — the same disease through the other
     /// register: `LDX $0000,Y / STA $00,X` with X = $4370 reaches the DMA
@@ -188,17 +201,48 @@ pub const PtrBankEvidence = struct {
     n_idx: usize,
     idx_unresolved: u32,
 
+    /// DMA A-bus ADDRESS words naming the moved low 8 KiB through a
+    /// system bank ($00-$3F) — the third family: `LDA #$0370 / STA $4302`
+    /// stages the OAM upload's source, the bank write says $00, and the
+    /// window move leaves the fired DMA reading abandoned memory
+    /// (measured: Super Metroid's boot splash text — black, because OAM
+    /// uploaded zeros). ROM addresses of the LAST byte of the staged
+    /// word; each is rewritten +$6000 so the channel follows its buffer
+    /// into the window.
+    dma_addr_proven: [max_proven]u32,
+    n_dma_addr: usize,
+
     pub const none: u32 = 0xFFFF_FFFF;
     pub const max_proven = 256;
+    pub const max_unres = 48;
+    pub const UnresSite = struct { pc: u24, slot: u16, hits: u32 };
     pub const init: PtrBankEvidence = .{
         .src = @splat(none),
+        .src_any = @splat(none),
         .proven = undefined,
         .n_proven = 0,
         .unresolved = 0,
+        .unres_sites = undefined,
+        .n_unres = 0,
         .idx_proven = undefined,
         .n_idx = 0,
         .idx_unresolved = 0,
+        .dma_addr_proven = undefined,
+        .n_dma_addr = 0,
     };
+
+    pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
+        self.unresolved += 1;
+        for (self.unres_sites[0..self.n_unres]) |*s| {
+            if (s.pc == pc) {
+                s.hits += 1;
+                return;
+            }
+        }
+        if (self.n_unres == max_unres) return;
+        self.unres_sites[self.n_unres] = .{ .pc = pc, .slot = slot, .hits = 1 };
+        self.n_unres += 1;
+    }
 
     pub fn addProven(self: *PtrBankEvidence, addr: u32) void {
         const a = addr & 0x7F_FFFF; // fast mirrors carry the same byte
@@ -224,6 +268,19 @@ pub const PtrBankEvidence = struct {
         }
         self.idx_proven[self.n_idx] = a;
         self.n_idx += 1;
+    }
+
+    pub fn addDmaAddrProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.dma_addr_proven[0..self.n_dma_addr]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_dma_addr == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.dma_addr_proven[self.n_dma_addr] = a;
+        self.n_dma_addr += 1;
     }
 };
 

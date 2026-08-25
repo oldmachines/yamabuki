@@ -77,7 +77,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -101,6 +101,21 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// load that set it), or `none` once anything else touched X.
         x_src: if (cfg.profile) u32 else void,
         x_w: if (cfg.profile) u8 else void,
+        /// Per-DMA-channel pending A-bus ADDRESS source: the ROM address
+        /// of the 16-bit word most recently staged into $43x2 whose VALUE
+        /// named the moved low 8 KiB (< $2000), waiting for the channel's
+        /// bank write to say which bus it reads. A system bank ($00-$3F —
+        /// the WRAM mirror the window moved) promotes it; $7E/$7F drops
+        /// it (the bank-byte family re-banks those to $40, where the
+        /// image's own layout already answers); anything else drops it.
+        dma_a1t_src: if (cfg.profile) [8]u32 else void,
+        /// When the previous step was a 16-bit A-load out of TRACKED WRAM:
+        /// the staged source (`PtrBankEvidence.src`) of the load's HIGH
+        /// byte, else `none`. A DMA queue drain stores that word straight
+        /// into $43x3, where the high byte is the A-bus bank — the one
+        /// byte whose provenance matters and the one the byte-wide chains
+        /// cannot see.
+        prev_load_hi_src: if (cfg.profile) u32 else void,
         /// ROM source of the byte most recently PUSHED by PHA, when that
         /// push immediately followed a one-byte A-load, else `none`. The
         /// window is deliberately one instruction wide: anything else
@@ -162,6 +177,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.prev_load_w = 0;
                 self.x_src = usage_map.PtrBankEvidence.none;
                 self.x_w = 0;
+                self.dma_a1t_src = @splat(usage_map.PtrBankEvidence.none);
+                self.prev_load_hi_src = usage_map.PtrBankEvidence.none;
             }
         }
 
@@ -445,25 +462,100 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         // this byte lives in BW-RAM, and reading the abandoned
                         // WRAM would attribute provenance from a dead copy.
                         const val = self.bus.peek8(ad) orelse continue;
-                        pb.src[off] = if ((val == 0x7E or val == 0x7F) and
-                            self.prev_load_end != none and self.prev_load_w == width)
+                        const attributed = self.prev_load_end != none and self.prev_load_w == width;
+                        pb.src[off] = if ((val == 0x7E or val == 0x7F) and attributed)
                             self.prev_load_end -% i
                         else
                             none;
+                        pb.src_any[off] = if (attributed) self.prev_load_end -% i else none;
                     }
                 }
                 // DMA A-bus bank registers ($43x4): a $7E/$7F written there
                 // is a bank VALUE naming WRAM for the hardware — same
                 // provenance, proven directly.
                 const a16: u16 = @truncate(a);
+                // Third family: the A-bus ADDRESS. A 16-bit word staged
+                // into $43x2 that names the moved low 8 KiB (< $2000)
+                // becomes the channel's pending source; the bank write
+                // below arbitrates it.
+                if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4303 and a16 <= 0x4373 and
+                    (a16 & 0xF) == 3)
+                {
+                    const ch: u3 = @truncate(a16 >> 4);
+                    self.dma_a1t_src[ch] = blk: {
+                        if (width != 2) break :blk none;
+                        if (self.prev_load_end == none or self.prev_load_w != 2) break :blk none;
+                        // The register itself is MMIO — off peek8's page
+                        // table. The store's value is byte-for-byte the
+                        // load's, and the load's source IS peekable.
+                        const lo = self.bus.peek8(@intCast(self.prev_load_end -% 1)) orelse break :blk none;
+                        const hi = self.bus.peek8(@intCast(self.prev_load_end)) orelse break :blk none;
+                        const val = (@as(u16, hi) << 8) | lo;
+                        break :blk if (val < 0x2000) self.prev_load_end else none;
+                    };
+                }
+                // 16-bit store to $43x4: the BANK rides the LOW byte and
+                // DAS-lo the high — Super Metroid's inline-param DMA
+                // launcher (`JSL $80:91A9` + an 8-byte param block in the
+                // caller's own bank; `LDA $0006,Y / STA $4304,X`). The
+                // write's HIGH byte lands on $43x5, so this window keys on
+                // &0xF == 5; the bank's source is the load's LOW byte.
+                if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4305 and a16 <= 0x4375 and
+                    (a16 & 0xF) == 5 and width == 2 and
+                    self.prev_load_end != none and self.prev_load_w == 2)
+                {
+                    const ch5: u3 = @truncate(a16 >> 4);
+                    const lo_src: u32 = self.prev_load_end -% 1;
+                    if (self.bus.peek8(@intCast(lo_src))) |lv| {
+                        if (lv == 0x7E or lv == 0x7F) {
+                            pb.addProven(lo_src);
+                            self.dma_a1t_src[ch5] = none;
+                        } else if (lv <= 0x3F) {
+                            const pending = self.dma_a1t_src[ch5];
+                            self.dma_a1t_src[ch5] = none;
+                            if (pending != none) pb.addDmaAddrProven(pending);
+                        }
+                    }
+                }
+                if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4304 and a16 <= 0x4374 and
+                    (a16 & 0xF) == 4 and width == 2 and
+                    (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F))
+                {
+                    // 16-bit store to $43x3: A1T-hi rides the low byte and
+                    // the BANK rides the high — Super Metroid's DMA queue
+                    // drain (`LDA $0345,X / STA $4313`, 16 KiB of boot
+                    // tiles from $7F:5000). The high byte is mdr; its
+                    // source is the load's high byte — an immediate/ROM
+                    // read directly, a staged WRAM word through the queue
+                    // cell it was built into.
+                    const ch2: u3 = @truncate(a16 >> 4);
+                    self.dma_a1t_src[ch2] = none;
+                    if (self.prev_load_end != none and self.prev_load_w == 2)
+                        pb.addProven(self.prev_load_end)
+                    else if (self.prev_load_hi_src != none)
+                        pb.addProven(self.prev_load_hi_src)
+                    else
+                        pb.noteUnresolved(pc, a16);
+                }
                 if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4304 and a16 <= 0x4374 and
                     (a16 & 0xF) == 4 and width == 1)
                 {
+                    const ch: u3 = @truncate(a16 >> 4);
+                    const pending = self.dma_a1t_src[ch];
+                    self.dma_a1t_src[ch] = none;
+                    if (self.bus.mdr <= 0x3F and pending != none) pb.addDmaAddrProven(pending);
                     if (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F) {
-                        if (self.prev_load_end != none and self.prev_load_w == 1)
+                        // The bank can ride A or X: Super Metroid's palette
+                        // uploader is `LDX #$7E / STX $4314` (measured:
+                        // 8,372 events from that one site, and the wrong
+                        // colours from the first visible frame).
+                        const via_x = op == 0x86 or op == 0x8E; // STX dp/abs
+                        if (via_x and self.x_src != none and self.x_w == 1)
+                            pb.addProven(self.x_src)
+                        else if (!via_x and self.prev_load_end != none and self.prev_load_w == 1)
                             pb.addProven(self.prev_load_end)
                         else
-                            pb.unresolved += 1;
+                            pb.noteUnresolved(pc, a16);
                     }
                 }
             }
@@ -492,13 +584,37 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
                     if (usage_map.isWramBank(tb, conv)) {
-                        const src: u32 = blk: {
-                            const operand = self.bus.peek8(pc +% 1) orelse break :blk none;
-                            const slot = self.cpu.regs.d +% operand +% 2;
-                            if (slot >= 0x2000) break :blk none;
-                            break :blk pb.src[slot];
-                        };
-                        if (src != none) pb.addProven(src) else pb.unresolved += 1;
+                        const operand = self.bus.peek8(pc +% 1) orelse 0;
+                        const slot = self.cpu.regs.d +% operand +% 2;
+                        const src: u32 = if (slot < 0x2000) pb.src[slot] else none;
+                        if (src != none) pb.addProven(src) else pb.noteUnresolved(pc, slot);
+                    }
+                }
+            }
+            // 2e. A (dp)/(dp),Y access whose TARGET is the moved low 8 KiB
+            //    through a data-bank mirror: the two-byte pointer carries
+            //    no bank, so there is no bank byte to re-bank — the
+            //    pointer WORD itself must move +$6000. Prove the word's
+            //    staged source when both bytes attribute contiguously
+            //    (measured: the NMI OAM high-table walker, `STA ($1C)`
+            //    under DB=$8C — four bytes of sprite size bits landing in
+            //    the abandoned home while the DMA reads the window).
+            if (op & 0x1F == 0x12 or op & 0x1F == 0x11) {
+                const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
+                if (tgt) |t| {
+                    const tb: u8 = @truncate(t >> 16);
+                    const ta: u16 = @truncate(t);
+                    if ((tb & 0x7F) <= 0x3F and ta < 0x2000) {
+                        const operand = self.bus.peek8(pc +% 1) orelse 0;
+                        const slot = self.cpu.regs.d +% operand;
+                        if (slot < 0x1FFF) {
+                            const lo = pb.src_any[slot];
+                            const hi = pb.src_any[slot + 1];
+                            if (lo != none and hi == lo +% 1)
+                                pb.addDmaAddrProven(hi)
+                            else
+                                pb.noteUnresolved(pc, slot);
+                        }
                     }
                 }
             }
@@ -545,6 +661,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             //    source for the next step's store.
             self.prev_load_end = none;
             self.prev_load_w = 0;
+            self.prev_load_hi_src = none;
             if (usage_map.loadASource(op)) {
                 const w: u8 = if (m8) 1 else 2;
                 if (op == 0xA9) {
@@ -569,6 +686,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                                 self.prev_load_w = 1;
                             }
                         }
+                    } else if (usage_map.wramAnyOffset(r, conv)) |off| {
+                        // The 16-bit flavour of the same: remember only the
+                        // HIGH byte's staged source — the half a $43x3
+                        // queue drain turns into an A-bus bank.
+                        self.prev_load_hi_src = pb.src[off];
                     }
                 }
             }
