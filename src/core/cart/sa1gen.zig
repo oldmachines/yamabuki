@@ -5900,7 +5900,23 @@ pub fn convertWholeGame(
                 .none => if (bwram) switch (op) {
                     0x6C, 0x7C, 0xFC, 0xDC => {
                         const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                        if (v < 0x2000) {
+                        // The INDEXED forms carry the same disease as
+                        // indexed data: `JSR ($0000,X)` with X holding a
+                        // full ROM param pointer reads its vector from ROM
+                        // (measured: Super Metroid's intro-script spawner,
+                        // $8B:9517 — the blind shift sent every spawn
+                        // through garbage and the intro never started).
+                        // Evidence decides the indexed forms: a site whose
+                        // measured pointer reads were ROM stays put;
+                        // WRAM-low or unmeasured shifts (the measured
+                        // unindexed idiom is a WRAM word for certain).
+                        const e: u8 = if (op == 0x6C or op == 0xDC)
+                            0
+                        else if (site_evidence) |s|
+                            s[cpu_addr] | s[0x80_0000 | cpu_addr]
+                        else
+                            0;
+                        if (v < 0x2000 and (e == 0 or e & usage_map.site_rom == 0)) {
                             std.mem.writeInt(u16, out[file + 1 ..][0..2], v + wg_bw_window, .little);
                             res.stats.rewritten_abs += 1;
                         }
