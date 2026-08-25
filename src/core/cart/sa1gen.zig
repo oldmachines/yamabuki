@@ -6098,50 +6098,46 @@ pub fn convertWholeGame(
             if (sa16 < 0x8003) continue;
             const plb = sbank * 0x8000 + (sa16 - 0x8000);
             if (plb + 1 > out.len) continue;
-            var body: [32]u8 = undefined;
+            var body: [40]u8 = undefined;
             var bl: usize = 0;
             var site: u32 = 0;
             if (out[plb] == 0xAB and out[plb - 1] == 0x48 and out[plb - 3] == 0xA5) {
-                // LDA dp / PHA / PLB
+                // LDA dp / PHA / PLB: body keeps the same +1/-1 stack use.
                 site = plb - 3;
-                body[0] = 0x08; // PHP
-                body[1] = 0xE2;
-                body[2] = 0x20; // SEP #$20
-                body[3] = 0xD8; // CLD
-                body[4] = 0xA5;
-                body[5] = out[plb - 2]; // LDA dp
-                @memcpy(body[6..][0..map_body.len], &map_body);
-                bl = 6 + map_body.len;
+                body[0] = 0xA5;
+                body[1] = out[plb - 2]; // LDA dp
+                @memcpy(body[2..][0..map_body.len], &map_body);
+                bl = 2 + map_body.len;
                 body[bl] = 0x48; // set: PHA
                 body[bl + 1] = 0xAB; // PLB
-                body[bl + 2] = 0x28; // PLP
-                body[bl + 3] = 0x60; // RTS
-                bl += 4;
+                bl += 2;
             } else if (out[plb] == 0xAB and out[plb - 1] == 0xAB and out[plb - 3] == 0xD4) {
-                // PEI (dp) / PLB / PLB — A preserved, DBR = mapped hi byte
+                // PEI (dp) / PLB / PLB: same +2/-2 sequence; the pulled
+                // HIGH byte maps through A (the measured consumers reload
+                // A immediately; S4 arbitrates).
                 site = plb - 3;
-                body[0] = 0x08; // PHP
-                body[1] = 0xE2;
-                body[2] = 0x20; // SEP #$20
-                body[3] = 0xD8; // CLD
-                body[4] = 0x48; // PHA (save A)
-                body[5] = 0xA5;
-                body[6] = out[plb - 2] +% 1; // LDA dp+1 (the bank byte)
-                @memcpy(body[7..][0..map_body.len], &map_body);
-                bl = 7 + map_body.len;
+                body[0] = 0xD4;
+                body[1] = out[plb - 2]; // PEI (dp)
+                body[2] = 0xAB; // PLB — the transient low pull, as stock
+                body[3] = 0x68; // PLA — the high byte, into A (m8)
+                @memcpy(body[4..][0..map_body.len], &map_body);
+                bl = 4 + map_body.len;
                 body[bl] = 0x48; // PHA
                 body[bl + 1] = 0xAB; // PLB
-                body[bl + 2] = 0x68; // PLA (restore A)
-                body[bl + 3] = 0x28; // PLP
-                body[bl + 4] = 0x60; // RTS
-                bl += 5;
+                bl += 2;
             } else continue;
+            const back: u32 = (sbank << 16) | (sa16 + 1);
+            body[bl] = 0x5C; // JML site+4
+            body[bl + 1] = @truncate(back);
+            body[bl + 2] = @truncate(back >> 8);
+            body[bl + 3] = @truncate((back >> 16) | 0x80);
+            bl += 4;
             var xpad = padAllocFor(out, header.offset, sbank, 0, 0);
             const at = xpad.next(@intCast(bl)) orelse continue;
             @memcpy(out[at..][0..bl], body[0..bl]);
-            out[site] = 0x20; // JSR body
+            out[site] = 0x5C; // JML body
             std.mem.writeInt(u16, out[site + 1 ..][0..2], @intCast(0x8000 + (at % 0x8000)), .little);
-            out[site + 3] = 0xEA; // NOP
+            out[site + 3] = @intCast((at / 0x8000) | 0x80);
             res.stats.xl_pins += 1;
         }
     };
@@ -9670,5 +9666,5 @@ test "window: a $C0-$DF table bank byte proves through the dp-staged PLB pin" {
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u32, 1), res.stats.xl_pins);
     try testing.expectEqual(@as(u8, 0xD0), res.image[0x0022]); // byte stays stock
-    try testing.expectEqual(@as(u8, 0x20), res.image[0x000F]); // site is a JSR thunk
+    try testing.expectEqual(@as(u8, 0x5C), res.image[0x000F]); // site is a JML thunk
 }
