@@ -2447,10 +2447,13 @@ fn runSa1Gen(
             }
         }
 
-        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0 or ptr_ev.n_dma_addr != 0) {
+        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0 or ptr_ev.n_dma_addr != 0 or ptr_ev.n_hi != 0) {
             try out.print("  value provenance: {} pointer-bank byte(s) ({} unresolved), {} dp,X word(s) ({} unresolved), {} dma-addr word(s)\n", .{ ptr_ev.n_proven, ptr_ev.unresolved, ptr_ev.n_idx, ptr_ev.idx_unresolved, ptr_ev.n_dma_addr });
             for (ptr_ev.proven[0..ptr_ev.n_proven]) |pa| {
                 try out.print("    proven bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.hi_proven[0..ptr_ev.n_hi]) |pa| {
+                try out.print("    proven $C0-$DF bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
             }
             for (ptr_ev.dma_addr_proven[0..ptr_ev.n_dma_addr]) |pa| {
                 try out.print("    proven dma-addr word at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });

@@ -212,6 +212,16 @@ pub const PtrBankEvidence = struct {
     dma_addr_proven: [max_proven]u32,
     n_dma_addr: usize,
 
+    /// Bank VALUES $C0-$DF proven to mediate data access (PLB'd data
+    /// banks, [dp] pointer banks): the Super MMC cannot stride $C0-$DF
+    /// LoROM-style, but the de-mirror map's home for the same content is
+    /// $20 banks lower ($CF -> $AF under FXB=MB2). Measured: Super
+    /// Metroid's music engine walks its data through dp $02 = $CF..$DE —
+    /// the upload read a zero header from the wrong megabyte and the
+    /// intro played silent, 52 frames early. Rewritten -$20.
+    hi_proven: [max_proven]u32,
+    n_hi: usize,
+
     pub const none: u32 = 0xFFFF_FFFF;
     pub const max_proven = 256;
     pub const max_unres = 48;
@@ -229,6 +239,8 @@ pub const PtrBankEvidence = struct {
         .idx_unresolved = 0,
         .dma_addr_proven = undefined,
         .n_dma_addr = 0,
+        .hi_proven = undefined,
+        .n_hi = 0,
     };
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
@@ -268,6 +280,19 @@ pub const PtrBankEvidence = struct {
         }
         self.idx_proven[self.n_idx] = a;
         self.n_idx += 1;
+    }
+
+    pub fn addHiProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.hi_proven[0..self.n_hi]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_hi == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.hi_proven[self.n_hi] = a;
+        self.n_hi += 1;
     }
 
     pub fn addDmaAddrProven(self: *PtrBankEvidence, addr: u32) void {

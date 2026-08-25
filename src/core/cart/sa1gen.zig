@@ -249,6 +249,10 @@ pub const Stats = struct {
     /// staged transfer sources naming the moved low 8 KiB through a
     /// system bank.
     rewritten_dma_addrs: u32 = 0,
+    /// Measured $C0-$DF bank values re-banked -$20 (>2 MiB window mode):
+    /// the Super MMC cannot stride those banks LoROM-style; the de-mirror
+    /// map parks the content $20 banks lower.
+    rewritten_hi_banks: u32 = 0,
     /// Context-split sites (window mode): absolutes below $2000 whose
     /// measured traffic is BOTH system-DBR (needs the +$6000 shift) and
     /// WRAM-pinned (pin re-banked to $40/$41 — needs the operand
@@ -6005,6 +6009,19 @@ pub fn convertWholeGame(
             if (word >= 0x2000) {
                 std.mem.writeInt(u16, out[f - 1 ..][0..2], word -% wg_bw_window, .little);
                 res.stats.rewritten_idx_words += 1;
+            }
+        }
+        // $C0-$DF bank values: the Super MMC misfit banks — content lives
+        // $20 lower in the converted image (the de-mirror map's home).
+        for (pe.hi_proven[0..pe.n_hi]) |ca| {
+            const src_bank: u32 = (ca >> 16) & 0x7F;
+            const a16: u32 = ca & 0xFFFF;
+            if (a16 < 0x8000) continue;
+            const f = src_bank * 0x8000 + (a16 - 0x8000);
+            if (f >= out.len) continue;
+            if (out[f] >= 0xC0 and out[f] <= 0xDF) {
+                out[f] -= 0x20;
+                res.stats.rewritten_hi_banks += 1;
             }
         }
         // DMA A-bus address words: staged transfer sources naming the

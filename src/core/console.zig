@@ -583,6 +583,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
+                    if (tb >= 0xC0 and tb <= 0xDF) {
+                        const operand = self.bus.peek8(pc +% 1) orelse 0;
+                        const slot = self.cpu.regs.d +% operand +% 2;
+                        if (slot < 0x2000 and pb.src_any[slot] != none)
+                            pb.addHiProven(pb.src_any[slot]);
+                    }
                     if (usage_map.isWramBank(tb, conv)) {
                         const operand = self.bus.peek8(pc +% 1) orelse 0;
                         const slot = self.cpu.regs.d +% operand +% 2;
@@ -629,6 +635,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
+                    if (tb == self.cpu.regs.dbr and tb >= 0xC0 and tb <= 0xDF) {
+                        // The MMC-misfit banks: data under a $C0-$DF DBR
+                        // reads content the conversion parks $20 banks
+                        // lower — prove the PLB'd byte for the -$20 family.
+                        pb.addHiProven(self.dbr_src);
+                    }
                     if (usage_map.isWramBank(tb, conv) and tb == self.cpu.regs.dbr) {
                         pb.addProven(self.dbr_src);
                         // Proven once is enough; keep it for the rest of the
@@ -680,7 +692,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         // queue, and only the queue is read when the channel
                         // is armed.
                         if (usage_map.wramAnyOffset(r, conv)) |off| {
-                            const staged = pb.src[off];
+                            const staged = pb.src_any[off];
                             if (staged != usage_map.PtrBankEvidence.none) {
                                 self.prev_load_end = staged;
                                 self.prev_load_w = 1;
