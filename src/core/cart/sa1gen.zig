@@ -5947,7 +5947,16 @@ pub fn convertWholeGame(
                     // shifts to follow even when its own measured class
                     // says "stay" (distinct sites carried the two
                     // classes; the collection pass above unioned them).
-                    const cell_move = window and usage_map.mode(op) == .abs and v < 0x2000 and blk: {
+                    // ... except a site whose OWN traffic is bank-mediated:
+                    // its unshifted operand under the re-banked DBR ($40/$41)
+                    // already resolves to the BW-RAM home — shifting it lands
+                    // on window+$6000, a different byte entirely (measured:
+                    // $01:811D `STA $078B` under a $7E-pulled bank, shifted to
+                    // $678B by this pass, zeroed the projectile slot-list
+                    // words every frame; the door transition then indexed its
+                    // room table with garbage and the screen faded for good).
+                    const cell_move = window and usage_map.mode(op) == .abs and v < 0x2000 and
+                        e & usage_map.site_wram_bank == 0 and blk: {
                         const ce = cell_ev[v] | e;
                         const has_low = ce & usage_map.site_wram_low != 0;
                         const has_bank = ce & usage_map.site_wram_bank != 0 or cell_pinned[v];
