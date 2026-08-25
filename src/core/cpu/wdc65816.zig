@@ -313,9 +313,11 @@ pub fn Cpu(comptime BusT: type) type {
             });
         }
 
-        pub inline fn write8(self: *Self, addr: u24, value: u8) void {
-            if (dbg_stale != 0) self.noteStale(addr, 'w');
-            if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
+        /// The --watch write hook, shared by data writes AND stack
+        /// pushes (pushes bypass the data wrapper by design — they must
+        /// not pollute last_data_write — but the WATCH must see them:
+        /// a corrupted pushed byte was invisible for a whole campaign).
+        fn dbgWatchWrite(self: *Self, addr: u24, value: u8) void {
             if (dbg_watch_lo != 0) {
                 if (@hasField(BusT, "clock") and self.bus.clock >= dbg_watch_from) dbg_watch_armed = true;
                 const bank: u8 = @intCast(addr >> 16);
@@ -348,6 +350,12 @@ pub fn Cpu(comptime BusT: type) type {
                     }
                 };
             }
+        }
+
+        pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (dbg_stale != 0) self.noteStale(addr, 'w');
+            if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
+            if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);
@@ -423,6 +431,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// how most SNES main loops are written — must not look like a loop with
         /// side effects just because it pushed a return address.
         pub fn push8(self: *Self, value: u8) void {
+            if (dbg_watch_lo != 0) self.dbgWatchWrite(self.regs.s, value);
             self.bus.write8(self.regs.s, value);
             if (self.regs.e) {
                 self.regs.s = 0x0100 | ((self.regs.s -% 1) & 0xFF);
