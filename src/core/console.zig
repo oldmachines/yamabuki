@@ -556,9 +556,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     self.dma_a1t_src[ch] = none;
                     if (self.bus.mdr <= 0x3F and pending != none) pb.addDmaAddrProven(pending);
                     if ((self.bus.mdr >= 0xA0 and self.bus.mdr <= 0xDF) and
-                        self.prev_load_end != none and self.prev_load_w == 1)
+                        self.prev_load_end != none and self.prev_load_w == 1 and
+                        self.bus.peek8(@intCast(self.prev_load_end)) == self.bus.mdr)
                     {
-                        // The misfit-mirror banks prove on the store too.
+                        // The misfit-mirror banks prove on the store too —
+                        // but only when the source byte IS the stored value.
                         if (self.bus.mdr >= 0xC0)
                             pb.addHiProven(self.prev_load_end)
                         else
@@ -606,8 +608,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     if (tb >= 0xC0 and tb <= 0xDF) {
                         const operand = self.bus.peek8(pc +% 1) orelse 0;
                         const slot = self.cpu.regs.d +% operand +% 2;
-                        if (slot < 0x2000 and pb.src_any[slot] != none)
+                        if (slot < 0x2000 and pb.src_any[slot] != none and
+                            self.bus.peek8(@intCast(pb.src_any[slot])) == tb)
+                        {
                             pb.addHiProven(pb.src_any[slot]);
+                        }
                     }
                     if (usage_map.isWramBank(tb, conv)) {
                         const operand = self.bus.peek8(pc +% 1) orelse 0;
@@ -655,10 +660,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 const tgt = dataAddr(self.bus.last_data_write) orelse dataAddr(self.bus.last_data_read);
                 if (tgt) |t| {
                     const tb: u8 = @truncate(t >> 16);
-                    if (tb == self.cpu.regs.dbr and tb >= 0xA0 and tb <= 0xBF) {
+                    if (tb == self.cpu.regs.dbr and tb >= 0xA0 and tb <= 0xBF and
+                        self.bus.peek8(@intCast(self.dbr_src)) == tb)
+                    {
                         pb.addA0Proven(self.dbr_src);
                     }
-                    if (tb == self.cpu.regs.dbr and tb >= 0xC0 and tb <= 0xDF) {
+                    if (tb == self.cpu.regs.dbr and tb >= 0xC0 and tb <= 0xDF and
+                        self.bus.peek8(@intCast(self.dbr_src)) == tb)
+                    {
                         // The MMC-misfit banks: data under a $C0-$DF DBR
                         // reads content the conversion parks $20 banks
                         // lower — prove the PLB'd byte for the -$20 family.
@@ -676,7 +685,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             //    one-byte A-load carries that load's source; PLB moves it into
             //    DBR. Anything else touching the stack or DBR clears the
             //    chain rather than guessing across it.
-            switch (op) {
+            sw: switch (op) {
                 0x48 => { // PHA
                     self.pushed_src = if (self.prev_load_w == 1) self.prev_load_end else none;
                     self.pushed_hi_src = none;
@@ -693,9 +702,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     }
                 },
                 0xAB => { // PLB — a second PLB pulls PEI's high byte
-                    self.dbr_src = self.pushed_src;
+                    const transient = self.pushed_hi_src != none;
+                    self.dbr_src = if (transient) none else self.pushed_src;
                     self.pushed_src = self.pushed_hi_src;
                     self.pushed_hi_src = none;
+                    if (transient) break :sw;
                     // A $C0-$DF pull proves EAGERLY: pinning DBR to the
                     // Super MMC misfit banks has no purpose but reading
                     // them, and waiting for a confirming access loses the
@@ -704,12 +715,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     // clks, and the NMIs' RTIs wiped dbr_src before the
                     // first non-long access).
                     if (self.cpu.regs.dbr >= 0xC0 and self.cpu.regs.dbr <= 0xDF and
-                        self.dbr_src != none)
+                        self.dbr_src != none and
+                        self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
                     {
                         pb.addHiProven(self.dbr_src);
                     }
                     if (self.cpu.regs.dbr >= 0xA0 and self.cpu.regs.dbr <= 0xBF and
-                        self.dbr_src != none)
+                        self.dbr_src != none and
+                        self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
                     {
                         pb.addA0Proven(self.dbr_src);
                     }

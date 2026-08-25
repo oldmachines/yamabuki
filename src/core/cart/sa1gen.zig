@@ -3774,10 +3774,14 @@ fn extendCoverage(
         walk: while (true) {
             const wbank = addr >> 16;
             const a16 = addr & 0xFFFF;
+            const cpu0: u32 = addr;
             if (wbank >= 0x40 or a16 < 0x8000) break;
             const file = wbank * 0x8000 + (a16 - 0x8000);
             if (file >= image.len) break;
             if (seen[file]) break;
+            const dyn = usage[cpu0] | usage[0x80_0000 | cpu0];
+            if (dyn & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                dyn & usage_map.flag_opcode == 0) break;
             seen[file] = true;
             const op = image[file];
             const len: u32 = usage_map.instrLen(op, m8, x8);
