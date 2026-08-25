@@ -77,7 +77,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp" };
 
         cart: Cartridge,
         bus: Bus,
@@ -116,6 +116,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// The last PLB's own pc — where a misfit-bank pin would be
         /// patched with a translate-in thunk.
         plb_pc: if (cfg.profile) u32 else void,
+        /// PEI/PLB/PLB pair tracking that does not depend on attribution:
+        /// 1 after PEI, 2 after its first PLB, 0 otherwise. The first
+        /// pull's DBR is the pushed word's LOW byte — never a pin.
+        pei_stage: if (cfg.profile) u8 else void,
+        pei_dp: if (cfg.profile) u8 else void,
         /// When the previous step was a 16-bit A-load out of TRACKED WRAM:
         /// the staged source (`PtrBankEvidence.src`) of the load's HIGH
         /// byte, else `none`. A DMA queue drain stores that word straight
@@ -188,6 +193,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.prev_load_hi_src = usage_map.PtrBankEvidence.none;
                 self.pushed_hi_src = usage_map.PtrBankEvidence.none;
                 self.plb_pc = usage_map.PtrBankEvidence.none;
+                self.pei_stage = 0;
+                self.pei_dp = 0;
             }
         }
 
@@ -565,10 +572,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     {
                         // The misfit-mirror banks prove on the store too —
                         // but only when the source byte IS the stored value.
-                        if (self.bus.mdr >= 0xC0)
-                            pb.addHiProven(self.prev_load_end)
-                        else
-                            pb.addA0Proven(self.prev_load_end);
+                        if (self.bus.mdr >= 0xC0) { pb.addHiProven(self.prev_load_end); } else pb.addA0Proven(self.prev_load_end);
                     }
                     if (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F) {
                         // The bank can ride A or X: Super Metroid's palette
@@ -678,10 +682,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == tb)
                         {
-                            if (tb >= 0xC0)
-                                pb.addHiProven(self.dbr_src)
-                            else
-                                pb.addA0Proven(self.dbr_src);
+                            if (tb >= 0xC0) { pb.addHiProven(self.dbr_src); } else pb.addA0Proven(self.dbr_src);
                         }
                     }
                     if (usage_map.isWramBank(tb, conv) and tb == self.cpu.regs.dbr) {
@@ -703,6 +704,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 },
                 0xD4 => { // PEI ($dp): pushes the dp WORD, low byte on top
                     const operand = self.bus.peek8(pc +% 1) orelse 0;
+                    self.pei_stage = 1;
+                    self.pei_dp = operand;
                     const slot = self.cpu.regs.d +% operand;
                     if (slot < 0x1FFF) {
                         self.pushed_src = pb.src_any[slot];
@@ -713,12 +716,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     }
                 },
                 0xAB => { // PLB — a second PLB pulls PEI's high byte
-                    const transient = self.pushed_hi_src != none;
+                    const transient = self.pei_stage == 1;
                     self.plb_pc = pc;
                     self.dbr_src = if (transient) none else self.pushed_src;
                     self.pushed_src = self.pushed_hi_src;
                     self.pushed_hi_src = none;
-                    if (transient) break :sw;
+                    if (transient) {
+                        self.pei_stage = 2;
+                        break :sw;
+                    }
+                    const pei_pin = self.pei_stage == 2;
+                    self.pei_stage = 0;
                     // A $C0-$DF pull proves EAGERLY: pinning DBR to the
                     // Super MMC misfit banks has no purpose but reading
                     // them, and waiting for a confirming access loses the
@@ -732,20 +740,18 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         // decompressor's 3-byte param blocks, single-role)
                         // value-prove instead — their fire rate makes a
                         // thunk cost ~a frame across a load.
-                        const dp_op = self.bus.peek8(pc -% 2) orelse 0xFF;
                         const shape_lda = (self.bus.peek8(pc -% 1) orelse 0) == 0x48 and
                             (self.bus.peek8(pc -% 3) orelse 0) == 0xA5;
-                        const shape_pei = (self.bus.peek8(pc -% 1) orelse 0) == 0xAB and
-                            (self.bus.peek8(pc -% 3) orelse 0) == 0xD4;
-                        if ((shape_lda or shape_pei) and dp_op < 0x10) {
+                        const dp_op: u8 = if (pei_pin)
+                            self.pei_dp
+                        else
+                            self.bus.peek8(pc -% 2) orelse 0xFF;
+                        if ((shape_lda or pei_pin) and dp_op < 0x10) {
                             pb.addXlSite(pc);
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
                         {
-                            if (self.cpu.regs.dbr >= 0xC0)
-                                pb.addHiProven(self.dbr_src)
-                            else
-                                pb.addA0Proven(self.dbr_src);
+                            if (self.cpu.regs.dbr >= 0xC0) { pb.addHiProven(self.dbr_src); } else pb.addA0Proven(self.dbr_src);
                         }
                     }
                 },
@@ -755,6 +761,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xF4 => {
                     self.pushed_src = none;
                     self.pushed_hi_src = none;
+                    self.pei_stage = 0;
                     if (op == 0x40) self.dbr_src = none; // RTI restores a bank we did not track
                 },
                 else => {},
