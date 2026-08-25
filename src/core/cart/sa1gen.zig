@@ -3813,6 +3813,23 @@ fn extendCoverage(
                     const tb: u32 = image[file + 3] & 0x7F;
                     try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
                     if (op == 0x5C) break; // JSL falls through on return
+                    // A JSL the profiled run EXECUTED whose return address
+                    // it never marked as an opcode is a call with INLINE
+                    // PARAMS — the callee walks the return address past
+                    // them (SM's DMA launcher carries 8 bytes after every
+                    // JSL). Decoding those as code plants rewrites inside
+                    // data (measured: `19 00 00` in a param block became a
+                    // context-split thunk and the armed transfer read
+                    // $F768 — the thunk's own address). The profile
+                    // outranks static reach: stop the fall-through.
+                    if (a16 + 4 < 0x10000) {
+                        const fall: u32 = addr + 4;
+                        const dyn_site = usage[addr] & usage_map.flag_opcode != 0 or
+                            usage[0x80_0000 | addr] & usage_map.flag_opcode != 0;
+                        const dyn_fall = usage[fall] & usage_map.flag_opcode != 0 or
+                            usage[0x80_0000 | fall] & usage_map.flag_opcode != 0;
+                        if (dyn_site and !dyn_fall) break;
+                    }
                 },
                 0x20 => { // JSR abs: target plus fall-through
                     const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
