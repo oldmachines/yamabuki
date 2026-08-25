@@ -77,7 +77,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -113,6 +113,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// low), so the second PLB of a `PEI ($dp)/PLB/PLB` pin pulls the
         /// HIGH byte — the bank, staged in memory, never in A.
         pushed_hi_src: if (cfg.profile) u32 else void,
+        /// Byte-sources of A's two halves after a 16-bit WRAM load. They
+        /// survive exactly one XBA — which swaps them — so the sound
+        /// dispatch's `LDA table,Y / XBA / PHA / PLB / PLB` hands the
+        /// second PLB the TABLE byte's address and the mirror-bank value
+        /// proves like any other (measured: the handler bank $A6 rode
+        /// this shape into PBR, fetched MB2 code, and BRK'd into the
+        /// crash trap).
+        a_lo_src: if (cfg.profile) u32 else void,
+        a_hi_src: if (cfg.profile) u32 else void,
         /// The last PLB's own pc — where a misfit-bank pin would be
         /// patched with a translate-in thunk.
         plb_pc: if (cfg.profile) u32 else void,
@@ -192,6 +201,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.dma_a1t_src = @splat(usage_map.PtrBankEvidence.none);
                 self.prev_load_hi_src = usage_map.PtrBankEvidence.none;
                 self.pushed_hi_src = usage_map.PtrBankEvidence.none;
+                self.a_lo_src = usage_map.PtrBankEvidence.none;
+                self.a_hi_src = usage_map.PtrBankEvidence.none;
                 self.plb_pc = usage_map.PtrBankEvidence.none;
                 self.pei_stage = 0;
                 self.pei_dp = 0;
@@ -699,8 +710,17 @@ pub fn Console(comptime cfg: CoreConfig) type {
             //    chain rather than guessing across it.
             sw: switch (op) {
                 0x48 => { // PHA
-                    self.pushed_src = if (self.prev_load_w == 1) self.prev_load_end else none;
-                    self.pushed_hi_src = none;
+                    if (self.prev_load_w == 1) {
+                        self.pushed_src = self.prev_load_end;
+                        self.pushed_hi_src = none;
+                    } else if (self.a_lo_src != none or self.a_hi_src != none) {
+                        // 16-bit push: PLB pulls the LOW half first.
+                        self.pushed_src = self.a_lo_src;
+                        self.pushed_hi_src = self.a_hi_src;
+                    } else {
+                        self.pushed_src = none;
+                        self.pushed_hi_src = none;
+                    }
                 },
                 0xD4 => { // PEI ($dp): pushes the dp WORD, low byte on top
                     const operand = self.bus.peek8(pc +% 1) orelse 0;
@@ -772,6 +792,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.prev_load_end = none;
             self.prev_load_w = 0;
             self.prev_load_hi_src = none;
+            if (op == 0xEB) { // XBA: A's halves swap, sources ride along
+                const t = self.a_lo_src;
+                self.a_lo_src = self.a_hi_src;
+                self.a_hi_src = t;
+            } else {
+                self.a_lo_src = none;
+                self.a_hi_src = none;
+            }
             if (usage_map.loadASource(op)) {
                 const w: u8 = if (m8) 1 else 2;
                 if (op == 0xA9) {
@@ -801,6 +829,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         // HIGH byte's staged source — the half a $43x3
                         // queue drain turns into an A-bus bank.
                         self.prev_load_hi_src = pb.src[off];
+                        // `r` is the END of the read: hi half. Both halves
+                        // stage for the XBA/PHA/PLB chain.
+                        if (off >= 1) self.a_lo_src = pb.src_any[off - 1];
+                        self.a_hi_src = pb.src_any[off];
                     }
                 }
             }
