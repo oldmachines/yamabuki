@@ -9527,3 +9527,57 @@ test "window: a DMA bank byte riding X is proven and re-banked" {
     try testing.expectEqual(@as(u32, 1), res.stats.rewritten_ptr_banks);
     try testing.expectEqual(@as(u8, 0x40), res.image[0x0005]);
 }
+
+test "window: a $C0-$DF table bank byte proves through the dp-staged PLB pin" {
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // Super Metroid's round-2 music upload: the pointer table's bank byte
+    // ($D0) rides the HIGH half of a 16-bit dp store, gets pulled into DBR
+    // via `LDA $02 / PHA / PLB`, and the next data access under that DBR
+    // is the proof. The byte re-banks -$20 (the Super MMC misfit).
+    @memcpy(rom[0x0000..0x001B], &[_]u8{
+        0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+        0xA2, 0x00, 0x00, // LDX #$0000
+        0xBF, 0x21, 0x80, 0x00, // LDA $00:8021,X — table word (E2, D0)
+        0x85, 0x01, // STA $01 -> dp $01/$02
+        0xE2, 0x20, // SEP #$20
+        0xA5, 0x02, // LDA $02 — the bank byte, staged
+        0x48, 0xAB, // PHA / PLB -> DBR = $D0
+        0xA0, 0x00, 0x90, // LDY #$9000
+        0xB9, 0x00, 0x00, // LDA $0000,Y — access under the $D0 DBR
+        0x80, 0xFE, // spin
+    });
+    rom[0x0020] = 0x11; // table entry: addr lo (unused here)
+    rom[0x0021] = 0xE2; // addr hi
+    rom[0x0022] = 0xD0; // the bank byte to prove
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const pe = try gpa.create(usage_map.PtrBankEvidence);
+    defer gpa.destroy(pe);
+    pe.* = .init;
+    const map: usage_map.UsageMap = .{ .bytes = bytes, .ptr_banks = pe };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..2) |_| con.runFrame();
+    }
+    try testing.expectEqual(@as(usize, 1), pe.n_hi);
+    try testing.expectEqual(@as(u32, 0x8022), pe.hi_proven[0]);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, pe, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u32, 1), res.stats.rewritten_hi_banks);
+    try testing.expectEqual(@as(u8, 0xB0), res.image[0x0022]);
+}

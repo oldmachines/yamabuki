@@ -77,7 +77,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -109,6 +109,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// it (the bank-byte family re-banks those to $40, where the
         /// image's own layout already answers); anything else drops it.
         dma_a1t_src: if (cfg.profile) [8]u32 else void,
+        /// Second push slot: PEI pushes a dp WORD (high byte below the
+        /// low), so the second PLB of a `PEI ($dp)/PLB/PLB` pin pulls the
+        /// HIGH byte — the bank, staged in memory, never in A.
+        pushed_hi_src: if (cfg.profile) u32 else void,
         /// When the previous step was a 16-bit A-load out of TRACKED WRAM:
         /// the staged source (`PtrBankEvidence.src`) of the load's HIGH
         /// byte, else `none`. A DMA queue drain stores that word straight
@@ -179,6 +183,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 self.x_w = 0;
                 self.dma_a1t_src = @splat(usage_map.PtrBankEvidence.none);
                 self.prev_load_hi_src = usage_map.PtrBankEvidence.none;
+                self.pushed_hi_src = usage_map.PtrBankEvidence.none;
             }
         }
 
@@ -654,16 +659,44 @@ pub fn Console(comptime cfg: CoreConfig) type {
             //    DBR. Anything else touching the stack or DBR clears the
             //    chain rather than guessing across it.
             switch (op) {
-                0x48 => self.pushed_src = if (self.prev_load_w == 1) self.prev_load_end else none, // PHA
-                0xAB => { // PLB
+                0x48 => { // PHA
+                    self.pushed_src = if (self.prev_load_w == 1) self.prev_load_end else none;
+                    self.pushed_hi_src = none;
+                },
+                0xD4 => { // PEI ($dp): pushes the dp WORD, low byte on top
+                    const operand = self.bus.peek8(pc +% 1) orelse 0;
+                    const slot = self.cpu.regs.d +% operand;
+                    if (slot < 0x1FFF) {
+                        self.pushed_src = pb.src_any[slot];
+                        self.pushed_hi_src = pb.src_any[slot + 1];
+                    } else {
+                        self.pushed_src = none;
+                        self.pushed_hi_src = none;
+                    }
+                },
+                0xAB => { // PLB — a second PLB pulls PEI's high byte
                     self.dbr_src = self.pushed_src;
-                    self.pushed_src = none;
+                    self.pushed_src = self.pushed_hi_src;
+                    self.pushed_hi_src = none;
+                    // A $C0-$DF pull proves EAGERLY: pinning DBR to the
+                    // Super MMC misfit banks has no purpose but reading
+                    // them, and waiting for a confirming access loses the
+                    // source to interrupt traffic (measured: SM's round-2
+                    // music upload pins $D0, spins the handshake for ~1M
+                    // clks, and the NMIs' RTIs wiped dbr_src before the
+                    // first non-long access).
+                    if (self.cpu.regs.dbr >= 0xC0 and self.cpu.regs.dbr <= 0xDF and
+                        self.dbr_src != none)
+                    {
+                        pb.addHiProven(self.dbr_src);
+                    }
                 },
                 // Other stack traffic and the bank-setting instructions make
-                // the single-slot model a guess: drop it.
+                // the two-slot model a guess: drop it.
                 0x08, 0x0B, 0x4B, 0x5A, 0x8B, 0xDA, 0x28, 0x2B, 0x68, 0x7A, 0xFA,
-                0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xD4, 0xF4 => {
+                0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xF4 => {
                     self.pushed_src = none;
+                    self.pushed_hi_src = none;
                     if (op == 0x40) self.dbr_src = none; // RTI restores a bank we did not track
                 },
                 else => {},
