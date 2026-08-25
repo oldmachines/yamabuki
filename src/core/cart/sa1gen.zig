@@ -5489,6 +5489,54 @@ pub fn convertWholeGame(
                 if ((cov[dca] | cov[0x80_0000 | dca]) & usage_map.flag_opcode == 0) continue;
                 const df = db_file + (da - 0x8000);
                 const dop = image[df];
+                // DBR immediates fold the same way the operands do: the
+                // music library pins its data bank with `PEA $A000/PLB/PLB`
+                // and reads everything through it — on the shim map $A0
+                // carries MB2, so every one of those reads walked the wrong
+                // megabyte (measured: the sample-queue builder read the
+                // header field at $A0:E275 as $2700 instead of MB1's $BA00,
+                // queued seven phantom records banked $C2, and the upload
+                // copy never terminated — black screen, input dead). The
+                // PLB right after the immediate is what makes the intent
+                // unambiguous.
+                const dmap = struct {
+                    fn m(bk: u8) ?u8 {
+                        return if (bk >= 0xA0 and bk <= 0xBF)
+                            bk - 0x80
+                        else if (bk >= 0xC0 and bk <= 0xDF)
+                            bk - 0x20
+                        else if (bk >= 0x40 and bk <= 0x5F)
+                            bk + 0x60
+                        else
+                            null;
+                    }
+                }.m;
+                if (dop == 0xF4 and df + 3 < image.len and image[df + 3] == 0xAB) {
+                    if (dmap(image[df + 2])) |v| {
+                        out[df + 2] = v;
+                        n_demirror += 1;
+                    }
+                    continue;
+                }
+                if (dop == 0xA9 and (cov[dca] | cov[0x80_0000 | dca]) & usage_map.flag_m != 0 and
+                    df + 3 < image.len and image[df + 2] == 0x48 and image[df + 3] == 0xAB)
+                {
+                    if (dmap(image[df + 1])) |v| {
+                        out[df + 1] = v;
+                        n_demirror += 1;
+                    }
+                    continue;
+                }
+                if (dop == 0xA9 and (cov[dca] | cov[0x80_0000 | dca]) & usage_map.flag_m == 0 and
+                    df + 5 < image.len and image[df + 3] == 0x48 and image[df + 4] == 0xAB and
+                    image[df + 5] == 0xAB)
+                {
+                    if (dmap(image[df + 2])) |v| {
+                        out[df + 2] = v;
+                        n_demirror += 1;
+                    }
+                    continue;
+                }
                 const is_long = usage_map.mode(dop) == .long or usage_map.mode(dop) == .long_x or
                     dop == 0x22 or dop == 0x5C;
                 if (!is_long or df + 3 >= image.len) continue;
