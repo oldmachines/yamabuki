@@ -494,7 +494,35 @@ pub fn Console(comptime cfg: CoreConfig) type {
                             self.prev_load_end -% i
                         else
                             none;
-                        pb.src_any[off] = if (attributed) self.prev_load_end -% i else none;
+                        // A 16-bit WRAM-to-WRAM copy has no prev_load_end —
+                        // the load staged only per-half sources — so the
+                        // copy propagates those instead of dropping the
+                        // chain (measured: the room-header parser copies
+                        // the tileset pointer $C2:C104 through $07C6-$C8
+                        // into dp $47-$49 with exactly this shape, and the
+                        // decompressor's PLB found nothing to prove — the
+                        // palette source stayed a folded $C2 and the
+                        // new-game room faded in black).
+                        // Contiguous pairs only: a genuine copied WORD has
+                        // hi == lo + 1 by construction; propagating loose
+                        // halves let the word families (dma-addr, (dp)
+                        // pointers) assemble false pairs and shift a ROM
+                        // pointer word that was never a moved-WRAM address
+                        // (measured: +18 bytes of collateral rewrites and a
+                        // striped room).
+                        const pair_ok = width == 2 and
+                            self.a_lo_src != none and
+                            self.a_hi_src == self.a_lo_src +% 1;
+                        const half_src = if (pair_ok)
+                            (if (i == 0) self.a_hi_src else self.a_lo_src)
+                        else
+                            none;
+                        pb.src_any[off] = if (attributed)
+                            self.prev_load_end -% i
+                        else if (half_src != none)
+                            half_src
+                        else
+                            none;
                     }
                 }
                 // DMA A-bus bank registers ($43x4): a $7E/$7F written there
