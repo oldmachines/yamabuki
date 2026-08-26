@@ -9,7 +9,8 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-root-caused to a provenance gap with a candidate fix in test.
+fixed by the `src_any` propagation fix (`38f0d7d`), leaving one cosmetic
+color-math residual (below).
 
 ---
 
@@ -47,7 +48,7 @@ root-caused to a provenance gap with a candidate fix in test.
 | `15f77a3` | **XBA-aware provenance** (`a_lo_src`/`a_hi_src` staging, console.zig) | The sound dispatch `LDA table,Y / XBA / PHA / PLB / PLB` carries the handler bank in the *low* half of a 16-bit load; XBA killed the chain, `$A6` entered PBR unproven, MB2 *code* was fetched, BRK → crash trap. With the fix the byte proves and folds to `$26` — this landed the first full two-surface verification |
 | `22fd4a2` | **Pointer-literal descent** in `extendCoverage` | The static walk stops at `JMP (cell)`, but the pointers are stored as immediates: `LDA #$E737 / STA $099C`. Fixpoint: a low-WRAM cell *activates* when a covered 16-bit literal store names it **and** a raw `JMP (cell)` exists (two-sided conjunction gates false positives); active cells accept raw-store expansion so chain links only the chain itself reaches seed transitively; dispatchers of active cells are marked as instruction starts directly and **uncapped** (a 64-slot list died on coincidental `$6C` bytes in bank `$01` — three failed generations) |
 
-### In test (rev6, console.zig — not yet committed)
+### `38f0d7d` — 16-bit copy provenance (console.zig)
 
 **16-bit WRAM→WRAM copies drop `src_any`.** The w==2 WRAM-load path stages
 only `prev_load_hi_src` plus the `a_lo/a_hi` halves — `prev_load_end` stays
