@@ -528,7 +528,19 @@ pub fn main(init: std.process.Init) !void {
             w.print("  hdma{d}: src={x:0>6} bank={x:0>2}{s}\n", .{
                 i, src, ch.a_bank, if (dead) "  <-- ABANDONED MEMORY" else "",
             }) catch {};
+            // Indirect tables fetch their DATA through a second bank the
+            // CPU never touches after arming: a $7E there reads the
+            // abandoned WRAM and no CPU-side instrument can see it.
+            w.print("    control=0x{x:0>2} b_addr=0x{x:0>2} indirect_bank={x:0>2} indirect_addr={x:0>4} line_counter={d}\n", .{
+                ch.control, ch.b_addr, ch.indirect_bank, ch.count, ch.line_counter,
+            }) catch {};
         }
+        // Color math: the one axis two byte-identical CGRAM/VRAM images can
+        // still render differently through (measured: Super Metroid's Ceres
+        // alarm tint, an indirect HDMA on $2132 reading abandoned $7E WRAM).
+        w.print("cgwsel=0x{x:0>2} cgadsub=0x{x:0>2} fixed_color=0x{x:0>4} setini=0x{x:0>2}\n", .{
+            p.cgwsel, p.cgadsub, p.fixed_color, p.setini,
+        }) catch {};
         var vnz: usize = 0;
         for (p.vram) |word| { if (word != 0) vnz += 1; }
         w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};

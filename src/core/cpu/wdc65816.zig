@@ -297,7 +297,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// the machine's state, never call/return bookkeeping.
         fn noteDmaBank(self: *Self, addr: u24, value: u8) void {
             const a16: u16 = @truncate(addr);
-            if (a16 < 0x4300 or a16 > 0x437F or a16 & 0xF != 4) return;
+            if (a16 < 0x4300 or a16 > 0x437F or (a16 & 0xF != 4 and a16 & 0xF != 7)) return;
             // Keyed on the VALUE too: a site that hands over $40 on one pass
             // and $7F on another is exactly the bug being hunted, and a
             // PC-only key would report only whichever came first.

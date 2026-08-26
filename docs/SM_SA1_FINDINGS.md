@@ -9,8 +9,8 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`), leaving one cosmetic
-color-math residual (below).
+fixed by the `src_any` propagation fix (`38f0d7d`). One cosmetic residual
+remains, root-caused but deferred: the Ceres alarm color-math tint (§4a).
 
 ---
 
@@ -116,6 +116,44 @@ The longest chase; each layer was real but not the cause:
    on conv it runs with a **proven `db=$39`** source (the immediates family
    working). The *palette* call's source arrives via WRAM copies instead, and
    its `$C2` never proves — the rev6 gap.
+
+## 4a. The Ceres alarm color-math tint (open, cosmetic)
+
+After the black room was fixed, the new-game Ceres room renders with correct
+tiles and palette but a steady bright-orange tint (luminance 76 vs stock's 33)
+that should be the pulsing red **self-destruct alarm**. Root-caused, not yet
+fixed:
+
+1. Everything a register snapshot captures is byte-identical at the freeze
+   frame — CGRAM, VRAM chars, both tilemaps, and (after extending `--dump-ppu`
+   with `cgwsel`/`cgadsub`/`fixed_color`/`setini`) the color-math registers.
+2. The alarm is an **indirect HDMA on `$2132`** (COLDATA): `hdma2 control=0x40
+   b_addr=0x32 indirect_bank=7e`. The per-scanline color data is fetched from
+   bank `$7E` — real WRAM on stock, the **abandoned home** on the conversion
+   (the window moved WRAM to `$40`). Reading zeros there leaves COLDATA stuck
+   at its boot fixed-color value → a steady tint instead of a pulse. HDMA
+   indirect data is invisible to every CPU-side instrument (the CPU issues no
+   load), the same blind spot the dump's own HDMA-source warning is about.
+3. The live DASB (`$4327`) writer is the HDMA-object processor at `$08:867A`
+   (found by extending the `$43x4` write trap to `$43x7`). It is *covered*, but
+   it writes the `$7E` from a **runtime data load** (`LDA $0000,Y` off a ROM
+   HDMA-object), which the immediate-rebank arm cannot reach — it only rewrites
+   `LDA #$7E` literals and long operands, never a data byte flowing through A.
+4. The gradient **builder** (`$08:DEA8`/`$08:DEBD`, `STA $7E:9D00,X`) is
+   **uncovered**, so its low-WRAM inputs (`LDA $1920,X`) and its `$7E` store
+   were never rewritten — it reads the abandoned homes the rewritten mainline
+   abandoned.
+
+A correct fix needs two parts, neither a safe one-liner: **(a)** cover the
+alarm subsystem (`$08:DExx`/`$08:86xx`/`$01:A6xx`) so its WRAM refs rewrite
+consistently — a coverage surface reaching the alarm, except the newg2 replay
+already runs it and the cover harvest picked up nothing, so the harvest path
+needs investigating first; and **(b)** a way to rebank an HDMA object's
+indirect-bank **data** byte (`$7E → $40`), which the generator has no general
+mechanism for (it is neither an immediate nor a long operand). Deferred: the
+functional black-room bug is fixed and shipped; this is cosmetic and a fix
+risks the verified surfaces. The `$43x7` write trap and the color-math dump
+fields were added as diagnostics and kept.
 
 ## 5. Instruments and technique notes
 
