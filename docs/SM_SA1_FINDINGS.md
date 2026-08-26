@@ -171,5 +171,15 @@ gen31-38: the six-fix chain to first verification · gen39: mash evidence
 surface (intro-skip fix) · gen40: player-recording cover harvest
 (cutscene-end fix) · gen41-45: `$099C` descent iterations (parse traps,
 capped-list bug) · gen46-49: descent landed, all four split sites shifted,
-`$099C` exonerated · gen50: rev6 provenance-copy fix, in flight at the time
-of this document.
+`$099C` exonerated · gen50-51: the rev6 provenance-copy fix **landed** —
+the tileset table's three pointer banks prove and fold
+(`$0F:E73D/E740/E743`, file-offset-verified), palette staging and CGRAM
+come out byte-identical to stock, and the new-game room renders. The
+black-room freeze is fixed (committed as the `src_any` propagation fix).
+
+**Open residual**: the rendered room carries a steady bright-orange tint
+(lum 76 vs stock's 33) with byte-identical CGRAM/VRAM/registers — the one
+axis the dumps don't capture is color math (CGWSEL/CGADSUB/COLDATA, the
+Ceres alarm's fixed-color add, HDMA channels 2/3). The alarm's pulse
+driver appears stuck at full addition on the conversion — a cosmetic
+divergence, next on the list.
