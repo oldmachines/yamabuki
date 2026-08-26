@@ -544,6 +544,19 @@ pub fn main(init: std.process.Init) !void {
         var vnz: usize = 0;
         for (p.vram) |word| { if (word != 0) vnz += 1; }
         w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
+        // CGRAM digest: same tiles + same tilemap rendering differently can
+        // only be the palette (measured: SM's Ceres room corrupts to stripes
+        // when CGRAM diverges while VRAM stays identical).
+        var cgsum: u32 = 0;
+        for (p.cgram) |c| cgsum +%= c;
+        w.print("cgram_sum={x:0>8} bg1pal={x:0>4},{x:0>4},{x:0>4},{x:0>4} bg2pal={x:0>4},{x:0>4}\n", .{
+            cgsum, p.cgram[0], p.cgram[1], p.cgram[2], p.cgram[3], p.cgram[0x20], p.cgram[0x21],
+        }) catch {};
+        // Window + mosaic: vertical banding that VRAM/CGRAM cannot explain
+        // lives here (the window carves columns; mosaic blocks them).
+        w.print("mosaic=0x{x:0>2} w12sel=0x{x:0>2} w34sel=0x{x:0>2} wobjsel=0x{x:0>2} wh0={d} wh1={d} wh2={d} wh3={d} wbglog=0x{x:0>2} tmw=0x{x:0>2} tsw=0x{x:0>2}\n", .{
+            p.mosaic, p.w12sel, p.w34sel, p.wobjsel, p.wh0, p.wh1, p.wh2, p.wh3, p.wbglog, p.tmw, p.tsw,
+        }) catch {};
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = w.buffered() }) catch {};
         out.print("wrote {s}\n", .{ppath}) catch {};
         out.flush() catch {};

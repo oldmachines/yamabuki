@@ -9,8 +9,10 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`). One cosmetic residual
-remains, root-caused but deferred: the Ceres alarm color-math tint (§4a).
+fixed by the `src_any` propagation fix (`38f0d7d`). One display-only
+residual remains, root-caused but deferred: the Ceres escape renders garbled
+(the alarm's color-math HDMA reads abandoned `$7E` WRAM) while the game logic
+is verified equivalent and fully playable (§4a).
 
 ---
 
@@ -117,7 +119,48 @@ The longest chase; each layer was real but not the cause:
    working). The *palette* call's source arrives via WRAM copies instead, and
    its `$C2` never proves — the rev6 gap.
 
-## 4a. The Ceres alarm color-math tint (open, cosmetic)
+## 4a. The Ceres escape display garble (open, display-only)
+
+**Corrected 2026-08-26 (user report #3, a recording).** Earlier this section
+called the effect a subtle "tint"; a full recording shows the whole escape-room
+BG rendering as vertical yellow/red stripes (lum ~76 vs stock ~33). The
+mechanism below is confirmed, with two corrections to the first pass:
+
+- **It is display-only, proven.** A tick-locked `--verify-behavioral` with the
+  scripted escape movie as a surface returns BEHAVIORALLY EQUIVALENT — the
+  game's WRAM/logic state matches. The behavioral tier never compares
+  VRAM/CGRAM/framebuffer, so a display effect can diverge while logic passes.
+  The escape is fully playable; only its picture is wrong.
+- **Frame-locked stock comparison is invalid here.** The conversion removes
+  lag, so at the same movie-frame number the conversion has advanced the game
+  further than stock — they are different game moments. Comparing VRAM/CGRAM/
+  registers at equal frame numbers showed them "identical yet rendering
+  differently," which is the confound, not a paradox. (A save-state gotcha
+  compounded it: the conversion's state file has a different layout, so CGRAM
+  sits at a different offset — re-find structures by signature per state.)
+- **Color math IS active.** `$2131` (CGADSUB) is written `$33` during the frame
+  (BG1/BG2/OBJ/backdrop) and reset to `0` by end-of-frame; the earlier
+  `cgadsub=0` reading was that reset value. So the alarm's color-math add is on,
+  and the indirect COLDATA HDMA feeding it matters.
+
+Mechanism: the alarm is an indirect HDMA on `$2132` (COLDATA) whose per-scanline
+gradient is fetched from bank `$7E` — real WRAM on stock, the abandoned home on
+the conversion. The alarm's gradient builder and its HDMA object live in
+partially-covered code (`$08:867A`, `$08:DExx`): some `$7E`/low-WRAM references
+were rewritten (`LDA $18C0,X → $78C0,X`) and some were not, so the builder, the
+`$7E:9D00` gradient buffer, and the DASB indirect bank are decoupled across the
+`$7E`/`$40` split. Targeted `$7E → $40` binary patches did not converge (patching
+one leg deepens the decoupling), confirming the fix is not a single byte.
+
+A correct fix is a focused generator effort, not a patch: rebank the HDMA
+indirect-bank data consistently with wherever its gradient buffer was
+relocated, which spans data-flow through uncovered code the immediate/long-
+operand rewriters do not reach. Deferred against that cost — the escape is
+logically correct and playable. Diagnostics added while chasing it (kept):
+`--dump-ppu` now prints color-math, window/mosaic, per-HDMA-channel indirect
+banks, and a CGRAM digest; the DMA-bank write trap covers `$43x7`.
+
+## (superseded) 4a-old. The Ceres alarm color-math tint
 
 After the black room was fixed, the new-game Ceres room renders with correct
 tiles and palette but a steady bright-orange tint (luminance 76 vs stock's 33)
