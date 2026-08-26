@@ -2123,7 +2123,7 @@ fn writeScreenshot(
     err.flush() catch {};
 }
 
-const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu };
+const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu, ShaderDirNotFound, ShaderNotBaked };
 
 /// Bring up a GL context and load `name` from the best profile the driver will
 /// give us. Tries GLES 3, then desktop GL 3.3, then GLES 2 — and for each, only
@@ -2141,13 +2141,29 @@ fn initGl(
     err: *std.Io.Writer,
 ) !*GlVideo {
     const sdl_gl = sdl3.loadGl() catch return InitGlError.NoGlSymbols;
+    // Base handle only for SDL_GetError diagnostics on the failure paths — a
+    // silent `continue` per profile hid WHY every GL context creation failed
+    // (measured: a machine where all three rungs returned null and the user
+    // could not tell a driver problem from a missing shader variant).
+    const base = sdl3.load() catch return InitGlError.NoGlSymbols;
+
+    // Distinguish the three ways this fails so the message is honest: the
+    // shader DIRECTORY was not found (the common one — `--shader-dir` defaults
+    // to "shaders" relative to the working directory, so launching the exe
+    // from anywhere but the repo root finds nothing), the requested preset is
+    // not among the baked ones, or every GL context genuinely failed. Blaming
+    // the GPU for a missing directory cost a real debugging cycle.
+    var any_dir_listed = false;
+    var name_seen = false;
 
     for (profiles) |prof| {
         // Which presets exist for this profile is the gate: no point holding a
         // context we cannot use. The listing doubles as the `,`/`.` cycle order.
         const profile_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ shader_root, prof.dir });
         const names = listPresets(io, gpa, profile_dir) catch continue;
+        any_dir_listed = true;
         const start = indexOfName(names, name) orelse continue;
+        name_seen = true;
 
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_profile_mask, prof.profile_mask);
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_major_version, prof.major);
@@ -2156,7 +2172,13 @@ fn initGl(
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.depth_size, 0);
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.stencil_size, 0);
 
-        const ctx = sdl_gl.SDL_GL_CreateContext(window) orelse continue;
+        const ctx = sdl_gl.SDL_GL_CreateContext(window) orelse {
+            err.print("  gl: {s} (GL {d}.{d}) context creation failed: {s}\n", .{
+                prof.dir, prof.major, prof.minor, base.SDL_GetError(),
+            }) catch {};
+            err.flush() catch {};
+            continue;
+        };
         _ = sdl_gl.SDL_GL_MakeCurrent(window, ctx);
         // Pacing is ours, as in the software path: never vsync-throttle here or
         // the game clock follows the display refresh.
@@ -2205,6 +2227,12 @@ fn initGl(
 
         return g;
     }
+    if (!any_dir_listed) {
+        err.print("  gl: no baked shader presets under '{s}' (set --shader-dir to the yamabuki 'shaders' directory)\n", .{shader_root}) catch {};
+        err.flush() catch {};
+        return InitGlError.ShaderDirNotFound;
+    }
+    if (!name_seen) return InitGlError.ShaderNotBaked;
     return InitGlError.NoVariantForThisGpu;
 }
 
