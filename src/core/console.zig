@@ -428,6 +428,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     } else if (a16 == 0x420C and self.bus.dma.hdmaen != 0) {
                         for (self.bus.dma.hdmaArms(&arms_buf)) |a| {
                             self.prof.noteDmaArm(.hdma, a.channel, a.src, 0, a.b_reg, false, a.indirect_bank);
+                            // An indirect HDMA's table carries per-segment
+                            // addresses; if any name the moved low 8 KiB the
+                            // window conversion relocates them. Record the
+                            // table into the SHARED provenance (not the
+                            // per-surface profiler) so every profiled surface
+                            // contributes — the escape lives on a late one.
+                            if (a.indirect_bank != null) {
+                                if (self.usage) |u| if (u.ptr_banks) |pb| pb.addHdmaTable(a.src);
+                            }
                         }
                     }
                 }

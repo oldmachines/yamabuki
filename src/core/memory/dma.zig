@@ -56,7 +56,11 @@ pub var dbg_dma: usize = 0;
 var dbg_dma_seen: [256]u64 = @splat(0);
 var dbg_dma_n: usize = 0;
 
-fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool) void {
+/// DIAGNOSTIC bitmask (headless `--hdma-disable`): HDMA channels to skip
+/// each scanline, to isolate which per-scanline effect a render depends on.
+pub var dbg_hdma_disable: u8 = 0;
+
+fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: u16) void {
     const key: u64 = @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
     for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
     if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;
@@ -65,11 +69,17 @@ fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool) void {
     const bank: u8 = @intCast(src >> 16);
     const off: u16 = @truncate(src);
     const dead = bank == 0x7E or bank == 0x7F or ((bank & 0x7F) < 0x40 and off < 0x2000);
-    std.debug.print("[dma] ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s){s}{s}\n", .{
+    // For a VRAM transfer ($2118/$2119) the destination word matters as much
+    // as the source — a tile upload landing at the wrong VMADD (or garbled at
+    // the right one) shows up only against the destination.
+    const is_vram = b_reg == 0x18 or b_reg == 0x19;
+    std.debug.print("[dma] ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s){s}{s}{s}", .{
         i, src, b_reg, bytes,
         if (a_is_dest) " (READ FROM B-BUS)" else "",
         if (dead) "  <-- ABANDONED MEMORY" else "",
+        if (is_vram) " vdest=$" else "\n",
     });
+    if (is_vram) std.debug.print("{x:0>4}\n", .{vdest});
 }
 
 pub const Dma = struct {
@@ -208,7 +218,7 @@ pub const Dma = struct {
             self.last_gdma_src[i] = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             self.last_gdma_len[i] = if (ch.count == 0) 0x10000 else ch.count;
             if (dbg_dma != 0)
-                noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0);
+                noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0, if (@hasField(@TypeOf(bus.*), "ppu")) bus.ppu.vram_addr else 0);
         }
         const start = bus.clock;
         var cost: u64 = dma_setup_cycles;
@@ -310,6 +320,7 @@ pub const Dma = struct {
         for (0..8) |i| {
             const ch = &self.channels[i];
             if (self.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            if (dbg_hdma_disable & (@as(u8, 1) << @intCast(i)) != 0) continue;
             if (ch.line_counter == 0) continue; // channel completed this frame
 
             if (ch.hdma_do_transfer) self.hdmaTransfer(bus, ch);

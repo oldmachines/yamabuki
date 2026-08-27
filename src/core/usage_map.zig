@@ -240,7 +240,18 @@ pub const PtrBankEvidence = struct {
     xl_sites: [max_xl]u32,
     n_xl: usize,
 
+    /// CPU addresses (bank:addr) of indirect-HDMA tables a profiled run
+    /// armed. The window conversion walks each table and relocates any
+    /// per-segment indirect address naming the moved low 8 KiB (< $2000)
+    /// into the window (+$6000) — an HDMA whose source is that WRAM buffer
+    /// otherwise fetches the abandoned physical mirror (measured: Super
+    /// Metroid's Ceres escape, whose per-scanline $2105 HDMA read $00:07EB
+    /// and rendered the room as a full-screen tile-sheet).
+    hdma_tables: [max_hdma_tables]u24,
+    n_hdma_tables: usize,
+
     pub const none: u32 = 0xFFFF_FFFF;
+    pub const max_hdma_tables = 32;
     pub const max_proven = 256;
     pub const max_unres = 48;
     pub const max_xl = 32;
@@ -264,7 +275,16 @@ pub const PtrBankEvidence = struct {
         .n_a0 = 0,
         .xl_sites = undefined,
         .n_xl = 0,
+        .hdma_tables = undefined,
+        .n_hdma_tables = 0,
     };
+
+    pub fn addHdmaTable(self: *PtrBankEvidence, table: u24) void {
+        for (self.hdma_tables[0..self.n_hdma_tables]) |t| if (t == table) return;
+        if (self.n_hdma_tables == max_hdma_tables) return;
+        self.hdma_tables[self.n_hdma_tables] = table;
+        self.n_hdma_tables += 1;
+    }
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
         self.unresolved += 1;

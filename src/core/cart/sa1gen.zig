@@ -255,6 +255,11 @@ pub const Stats = struct {
     /// it — the thunk maps $7E/$7F->$40/$41 as the write happens, so an
     /// indirect HDMA fetching WRAM follows its data into BW-RAM.
     rewritten_dasb: u32 = 0,
+    /// Low-WRAM indirect addresses relocated +$6000 inside profiled
+    /// indirect-HDMA tables (window mode): a per-segment indirect address
+    /// naming the moved low 8 KiB is shifted into the window so the DMA
+    /// unit fetches the relocated buffer, not the abandoned physical mirror.
+    rewritten_hdma_indirect: u32 = 0,
     /// Measured $C0-$DF bank values re-banked -$20 (>2 MiB window mode):
     /// the Super MMC cannot stride those banks LoROM-style; the de-mirror
     /// map parks the content $20 banks lower.
@@ -3429,6 +3434,55 @@ fn rebankDasbWrites(
             out[file] = 0x20; // JSR — same 3-byte footprint as the store
             std.mem.writeInt(u16, out[file + 1 ..][0..2], taddr, .little);
             res.stats.rewritten_dasb += 1;
+        }
+    }
+}
+
+/// The file offset a runtime CPU address reads from, under the window
+/// conversion's map. A <=2 MiB image is plain LoROM; a >2 MiB image follows
+/// the shim's Super-MMC programming ($00-$1F/$80-$9F -> MB0, $20-$3F -> MB1,
+/// $A0-$BF -> MB2), which is where the de-mirror pass parks the content.
+/// Only ROM homes are mapped; a bank with no fixed ROM home returns null.
+fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
+    const bank: u32 = (cpu >> 16) & 0xFF;
+    const a16: u32 = cpu & 0xFFFF;
+    if (a16 < 0x8000) return null;
+    const off: usize = a16 - 0x8000;
+    const file: usize = if (image_len <= 0x20_0000)
+        (bank & 0x7F) * 0x8000 + off
+    else if (bank < 0x20 or (bank >= 0x80 and bank < 0xA0))
+        (bank & 0x1F) * 0x8000 + off // MB0
+    else if (bank >= 0x20 and bank < 0x40)
+        (bank - 0x20) * 0x8000 + 0x10_0000 + off // MB1
+    else if (bank >= 0xA0 and bank < 0xC0)
+        (bank - 0xA0) * 0x8000 + 0x20_0000 + off // MB2
+    else
+        return null;
+    return if (file < image_len) file else null;
+}
+
+/// Relocate low-WRAM indirect addresses inside the profiled indirect-HDMA
+/// tables (window mode; see PtrBankEvidence.hdma_tables and the Ceres
+/// escape). Each table is a run of `[line-count][addr-lo][addr-hi]` entries
+/// terminated by a zero count; an entry whose 16-bit indirect address names
+/// the moved low 8 KiB (< $2000) is shifted +$6000 so the DMA unit fetches
+/// the relocated buffer through the window instead of the abandoned physical
+/// mirror. The count byte's bit 7 (repeat vs. continuous) does not change the
+/// three-byte stride. Bounded against a table whose terminator was itself a
+/// relocated byte, and skips a table whose home is not statically mappable.
+fn relocateHdmaIndirect(out: []u8, tables: []const u24, res: *Result) void {
+    for (tables) |cpu| {
+        var f = loromFileOffset(out.len, cpu) orelse continue;
+        var guard: usize = 0;
+        while (guard < 256) : (guard += 1) {
+            if (f + 3 > out.len) break;
+            if (out[f] == 0) break; // zero line-count ends the table
+            const addr = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
+            if (addr < 0x2000) {
+                std.mem.writeInt(u16, out[f + 1 ..][0..2], addr + wg_bw_window, .little);
+                res.stats.rewritten_hdma_indirect += 1;
+            }
+            f += 3;
         }
     }
 }
@@ -6837,6 +6891,11 @@ pub fn convertWholeGame(
     // never a split-thunk site and the two passes never touch a shared byte.
     if (window and bwram) try rebankDasbWrites(out, cov, header.offset, carve, carve_len, &far, refusal, &res);
 
+    // Relocate low-WRAM indirect addresses in the profiled indirect-HDMA
+    // tables into the window, so an HDMA whose per-scanline source is a
+    // relocated WRAM buffer reads the live copy, not the abandoned mirror.
+    if (window and bwram) if (ptr_ev) |pe| relocateHdmaIndirect(out, pe.hdma_tables[0..pe.n_hdma_tables], &res);
+
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
     // BW-RAM gates, select window block 0, reproduce the power-on direct
     // page and stack INSIDE the window (the game's own D/S establishes
@@ -8836,6 +8895,40 @@ test "window: an HDMA indirect-bank write loading $7E from data follows WRAM int
     // The WRAM bank followed its data into BW-RAM; the ROM bank did not.
     try testing.expectEqual(@as(u8, 0x40), con.bus.dma.channels[2].indirect_bank);
     try testing.expectEqual(@as(u8, 0x80), con.bus.dma.channels[3].indirect_bank);
+}
+
+test "window: a low-WRAM indirect-HDMA table address relocates into the window" {
+    // The Ceres-escape shape, reduced. An indirect-HDMA table names a
+    // per-scanline source in low WRAM ($07EB); the conversion moved that
+    // buffer to the window, so the table entry must follow (+$6000). A
+    // second entry names upper WRAM ($1234 — still < $2000, also moves); a
+    // third names ROM ($9000 — untouched); a zero count ends the table.
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // Table at $00:8100 (file 0x100 — code-region data the rewriter never
+    // walks, not the $FF carve): [count][addr-lo][addr-hi] entries.
+    const tf = 0x100;
+    @memcpy(rom[tf..][0..10], &[_]u8{
+        0x10, 0xEB, 0x07, // $07EB -> $67EB
+        0x20, 0x34, 0x12, // $1234 -> $7234
+        0x40, 0x00, 0x90, // $9000 (ROM) — unchanged
+        0x00, // end
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    var pe: usage_map.PtrBankEvidence = .init;
+    pe.addHdmaTable(0x00_8100);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, &pe, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u32, 2), res.stats.rewritten_hdma_indirect);
+    try testing.expectEqual(@as(u16, 0x67EB), std.mem.readInt(u16, res.image[tf + 1 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 0x7234), std.mem.readInt(u16, res.image[tf + 4 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 0x9000), std.mem.readInt(u16, res.image[tf + 7 ..][0..2], .little));
 }
 
 test "window: an unmeasured tiny-base indexed site serves all three of its worlds" {

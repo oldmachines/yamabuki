@@ -3323,6 +3323,11 @@ fn reportSa1(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
                 .{res.stats.rewritten_dasb},
             );
+        if (res.stats.rewritten_hdma_indirect != 0)
+            try out.print(
+                "  {} low-WRAM indirect address(es) relocated +$6000 in indirect-HDMA\n  table(s) (a per-scanline HDMA source in the moved low 8 KiB now reads\n  the window copy, not the abandoned mirror)\n",
+                .{res.stats.rewritten_hdma_indirect},
+            );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
             for (res.stats.offload_entries[0..res.stats.offload_count], 0..) |e, i| {
@@ -4697,6 +4702,9 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--dma-trace")) {
             const v = it.next() orelse return error.MissingValue;
             core.dma.dbg_dma = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--hdma-disable")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.dma.dbg_hdma_disable = try std.fmt.parseInt(u8, v, 16);
         } else if (std.mem.eql(u8, a, "--stale")) {
             // "<max-sites>" or "<max-sites>:<from-clock>"
             const v = it.next() orelse return error.MissingValue;
