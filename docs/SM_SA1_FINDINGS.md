@@ -9,10 +9,10 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`). One display-only
-residual remains, root-caused but deferred: the Ceres escape renders garbled
-(the alarm's color-math HDMA reads abandoned `$7E` WRAM) while the game logic
-is verified equivalent and fully playable (§4a).
+fixed by the `src_any` propagation fix (`38f0d7d`). The last display-only
+residual — the Ceres escape rendering garbled — is now **fixed** by a
+generator feature that re-banks the alarm's HDMA indirect-bank register at
+run time (§4a); the conversion is clean on every surface tried.
 
 ---
 
@@ -119,73 +119,70 @@ The longest chase; each layer was real but not the cause:
    working). The *palette* call's source arrives via WRAM copies instead, and
    its `$C2` never proves — the rev6 gap.
 
-## 4a. The Ceres escape display garble (open, display-only)
+## 4a. The Ceres escape display garble — FIXED (`$43x7` DASB rebank thunk)
 
-**Corrected 2026-08-26 (user report #3, a recording).** Earlier this section
-called the effect a subtle "tint"; a full recording shows the whole escape-room
-BG rendering as vertical yellow/red stripes (lum ~76 vs stock ~33). The
-mechanism below is confirmed, with two corrections to the first pass:
+The escape-room BG rendered as vertical yellow/red stripes (a full recording,
+user report #3, corrected an earlier "subtle tint" reading). Root-caused,
+then **fixed by a focused generator feature**. The first write-up of this
+section proposed the wrong mechanism; the corrected story and the fix follow.
 
-- **It is display-only, proven.** A tick-locked `--verify-behavioral` with the
-  scripted escape movie as a surface returns BEHAVIORALLY EQUIVALENT — the
-  game's WRAM/logic state matches. The behavioral tier never compares
-  VRAM/CGRAM/framebuffer, so a display effect can diverge while logic passes.
-  The escape is fully playable; only its picture is wrong.
+- **It was display-only, proven.** A tick-locked `--verify-behavioral` over
+  the escape returns BEHAVIORALLY EQUIVALENT — the game's WRAM/logic state
+  matches. The behavioral tier never compares VRAM/CGRAM/framebuffer, so a
+  display effect can diverge while logic passes. The escape always played
+  correctly; only its picture was wrong.
 - **Frame-locked stock comparison is invalid here.** The conversion removes
-  lag, so at the same movie-frame number the conversion has advanced the game
-  further than stock — they are different game moments. Comparing VRAM/CGRAM/
-  registers at equal frame numbers showed them "identical yet rendering
-  differently," which is the confound, not a paradox. (A save-state gotcha
-  compounded it: the conversion's state file has a different layout, so CGRAM
-  sits at a different offset — re-find structures by signature per state.)
-- **Color math IS active.** `$2131` (CGADSUB) is written `$33` during the frame
-  (BG1/BG2/OBJ/backdrop) and reset to `0` by end-of-frame; the earlier
-  `cgadsub=0` reading was that reset value. So the alarm's color-math add is on,
-  and the indirect COLDATA HDMA feeding it matters.
+  lag, so at the same movie-frame number it has advanced further than stock —
+  different game moments. Comparing VRAM/CGRAM at equal frame numbers showed
+  them "identical yet rendering differently," the confound, not a paradox.
 
-Mechanism: the alarm is an indirect HDMA on `$2132` (COLDATA) whose per-scanline
-gradient is fetched from bank `$7E` — real WRAM on stock, the abandoned home on
-the conversion. The alarm's gradient builder and its HDMA object live in
-partially-covered code (`$08:867A`, `$08:DExx`): some `$7E`/low-WRAM references
-were rewritten (`LDA $18C0,X → $78C0,X`) and some were not, so the builder, the
-`$7E:9D00` gradient buffer, and the DASB indirect bank are decoupled across the
-`$7E`/`$40` split. Targeted `$7E → $40` binary patches did not converge (patching
-one leg deepens the decoupling), confirming the fix is not a single byte.
+**The real mechanism (measured, not the first guess).** The alarm is an
+indirect HDMA on `$2132` (COLDATA) whose per-scanline gradient it fetches from
+the bank named in the channel's DASB register (`$4327`). On stock that bank is
+`$7E` (WRAM); the escape's builder writes the gradient into WRAM and the HDMA
+reads it back. `--dump-ppu` on the conversion showed exactly one bad channel:
 
-A correct fix is a focused generator effort, not a patch: rebank the HDMA
-indirect-bank data consistently with wherever its gradient buffer was
-relocated, which spans data-flow through uncovered code the immediate/long-
-operand rewriters do not reach. Deferred against that cost — the escape is
-logically correct and playable. Diagnostics added while chasing it (kept):
-`--dump-ppu` now prints color-math, window/mosaic, per-HDMA-channel indirect
-banks, and a CGRAM digest; the DMA-bank write trap covers `$43x7`.
+```
+hdma2: control=0x40 b_addr=0x32 indirect_bank=7e indirect_addr=3522  <-- ABANDONED
+```
 
-### 4a extras — the mechanism in detail
+The gradient buffer is at `$3522`, **not** `$9D00`, and the builder was NOT the
+problem: a `--watch 3520-3528` over the escape showed every gradient write
+landing at `$40:3520-3528` — the LIVE BW-RAM home, from covered code. The
+builder is correct. The *only* stale leg is the DASB byte: the HDMA reads
+`$7E:3522` (abandoned) while the builder fills `$40:3522` (live). (The earlier
+`$9D00`/`$08:DEA8`-builder-coverage theory was wrong — it never reproduced,
+because the builder was never the split.)
 
-The concrete sites, for whoever builds the fix:
+Why the byte escapes every static rebanker: the DASB writer is the HDMA-object
+processor at `$08:867A` — `LDA $0000,Y : STA $4307,X` — which loads the bank
+from a **ROM HDMA-object table** (`$88:DED8`, value `$7E`) and stores it to the
+register. The value flows through `A` as data; the immediate arm only rewrites
+`LDA #$7E` literals, and the long arm only rewrites a `$7E` bank *operand*.
+Neither can touch a byte the code fetches at run time. Binary-patching the
+object byte or the writer did not converge — a single leg, and fragile.
 
-1. The alarm is an **indirect HDMA on `$2132`** (COLDATA): `hdma2 control=0x40
-   b_addr=0x32 indirect_bank=7e`, per-scanline color data fetched from bank
-   `$7E` (abandoned on the conversion). HDMA indirect data is invisible to
-   every CPU-side instrument (the CPU issues no load) — the dump's own
-   HDMA-source warning is about exactly this blind spot.
-2. The live DASB (`$4327`) writer is the HDMA-object processor at `$08:867A`
-   (found by extending the `$43x4` write trap to `$43x7`). It is *covered*, but
-   writes the `$7E` from a **runtime data load** (`LDA $0000,Y` off a ROM
-   HDMA-object) — the immediate-rebank arm cannot reach a data byte flowing
-   through A; it only rewrites `LDA #$7E` literals and long operands.
-3. The gradient **builder** (`$08:DEA8`/`$08:DEBD`, `STA $7E:9D00,X`) is
-   **uncovered**, so its low-WRAM inputs (`LDA $1920,X`) and its `$7E` store
-   were never rewritten. The handler at `$08:8650` is *partially* rewritten
-   (`LDA $18C0,X → $78C0,X` did land), which is why builder / `$7E:9D00`
-   buffer / DASB end up on opposite sides of the split.
+**The fix — a runtime rebank thunk on the register write** (`rebankDasbWrites`
++ `dasbThunkBody` in `sa1gen.zig`). Every covered `STA $43x7` (DASB; abs or
+`abs,X/,Y` — column 7 is DASB on every channel) is wrapped in a `JSR` thunk
+that, on the way to the store, maps an 8-bit `A` of `$7E/$7F` to `$40/$41` and
+leaves any other bank untouched. The JSR is the store's own 3-byte footprint;
+the thunk restores the caller's exact `A` and flags, so a store inside a
+CMP/branch pair behaves in situ. It is sound on *every* DASB write whatever the
+value's origin: any DASB that named `$7E/$7F` on stock must name `$40/$41` on a
+conversion whose WRAM moved to BW-RAM. This sidesteps the object table, the
+writer's dataflow, and coverage entirely — it fixes the value at the hardware
+boundary. Verified: the same `sm-game` movie now shows `hdma2 indirect_bank=40`
+on the conversion, the writer routes through the thunk (`pc=88:a220`), the
+stripes become the real gradient, and `--verify-behavioral` still returns
+BEHAVIORALLY EQUIVALENT (`1 DASB write wrapped`, dropped frames 25→25).
 
-Fix shape: cover the alarm subsystem (`$08:DExx`/`$08:86xx`/`$01:A6xx`) so its
-WRAM refs rewrite consistently, **and** teach the generator to rebank an HDMA
-object's indirect-bank data byte (`$7E → $40`) — neither an immediate nor a
-long operand today. The cover-harvest of the escape reported zero new
-coverage even though the replay runs the code, so the harvest path is the
-first thing to investigate.
+Diagnostics kept from the chase: `--dump-ppu` prints color-math, window/mosaic,
+per-HDMA-channel indirect banks, and a CGRAM digest; the DMA-bank write trap
+(`--dma-bank-pc`) covers `$43x7`; and `--movie-ignore-crc` replays a recording
+made on a previous conversion against a freshly regenerated one (window mode
+preserves S-CPU timing, so power-on movies stay in sync — a save-state-anchored
+movie still cannot cross builds).
 
 ## 5. Instruments and technique notes
 
@@ -278,8 +275,8 @@ capped-list bug) · gen46-49: descent landed, all four split sites shifted,
 the tileset table's three pointer banks prove and fold
 (`$0F:E73D/E740/E743`, file-offset-verified), palette staging and CGRAM
 come out byte-identical to stock, and the new-game room renders. The
-black-room freeze is fixed. **Open residual**: the Ceres-escape display
-garble (§4a) — display-only, logic verified equivalent, deferred.
+black-room freeze is fixed. The Ceres-escape display garble is now also
+fixed — the `$43x7` DASB rebank thunk (§4a) — so no display residual stands.
 
 ## 8. Cross-cutting learnings
 
@@ -335,4 +332,7 @@ Method traps that cost real time and are worth internalizing:
 - `fd2b825` — honest SDL shader-init errors (§9).
 - `a112bbe` — CGRAM/window/mosaic PPU dump and the corrected, display-only
   Ceres-escape diagnosis (§4a).
+- _(this change)_ — `rebankDasbWrites`/`dasbThunkBody`: the `$43x7` DASB
+  runtime rebank thunk that fixes the Ceres-escape garble, its unit test, and
+  the `--movie-ignore-crc` diagnostic (§4a).
 - Docs live in this file; the working branch is `claude/sa1-async-offload`.

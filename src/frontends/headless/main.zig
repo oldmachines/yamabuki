@@ -119,6 +119,12 @@ const Args = struct {
     /// the picture is either disabled, pointed somewhere empty, or fed a
     /// tilemap that never arrived, and those look identical in WRAM.
     dump_ppu: ?[]const u8 = null,
+    /// `--movie-ignore-crc`: DIAGNOSTIC. Replay a movie whose recorded
+    /// image CRC differs from this run's — for re-playing a recording made
+    /// on a previous conversion against a freshly regenerated one (window
+    /// mode preserves the S-CPU's code and frame timing, so controller
+    /// input usually stays in sync). The end-hash check becomes advisory.
+    movie_ignore_crc: bool = false,
     /// `--dump-vram`: raw VRAM (64 KiB) then OAM (544 B) after the run.
     dump_vram: ?[]const u8 = null,
     /// --save-state-at: frame to stop at and the file to write the machine to.
@@ -706,12 +712,20 @@ fn loadMovie(
     };
     const crc = util.movie.imageCrc(image);
     if (m.rom_crc != crc) {
-        out.print(
-            "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
-                "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
-            .{ path, m.rom_crc, crc },
-        ) catch {};
-        fail(out);
+        if (args.movie_ignore_crc) {
+            out.print(
+                "warning: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                    "         (--movie-ignore-crc: replaying anyway; input may desync if timing changed)\n",
+                .{ path, m.rom_crc, crc },
+            ) catch {};
+        } else {
+            out.print(
+                "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                    "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
+                .{ path, m.rom_crc, crc },
+            ) catch {};
+            fail(out);
+        }
     }
     const acc: u8 = if (args.accuracy == .accurate) 1 else 0;
     if (m.accuracy != acc) {
@@ -3287,6 +3301,11 @@ fn reportSa1(
                 "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000, {} dma-addr word(s) pre-shifted\n  +$6000 (addressing state travelling as data — the idioms operand\n  rewrites cannot reach)\n",
                 .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words, res.stats.rewritten_dma_addrs },
             );
+        if (res.stats.rewritten_dasb != 0)
+            try out.print(
+                "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
+                .{res.stats.rewritten_dasb},
+            );
         if (res.stats.offload_count != 0) {
             try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
             for (res.stats.offload_entries[0..res.stats.offload_count], 0..) |e, i| {
@@ -4586,6 +4605,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_vram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ppu")) {
             out.dump_ppu = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--movie-ignore-crc")) {
+            out.movie_ignore_crc = true;
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {

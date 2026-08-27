@@ -249,6 +249,12 @@ pub const Stats = struct {
     /// staged transfer sources naming the moved low 8 KiB through a
     /// system bank.
     rewritten_dma_addrs: u32 = 0,
+    /// HDMA indirect-bank ($43x7 DASB) writes wrapped in a runtime rebank
+    /// thunk (window mode): the bank is a value loaded from an HDMA object,
+    /// not an immediate/long operand, so the static rebankers cannot reach
+    /// it — the thunk maps $7E/$7F->$40/$41 as the write happens, so an
+    /// indirect HDMA fetching WRAM follows its data into BW-RAM.
+    rewritten_dasb: u32 = 0,
     /// Measured $C0-$DF bank values re-banked -$20 (>2 MiB window mode):
     /// the Super MMC cannot stride those banks LoROM-style; the de-mirror
     /// map parks the content $20 banks lower.
@@ -3318,6 +3324,113 @@ fn longThunkBodyWrap(op: u8, v: u16, bank: u8) [long_wrap_thunk_len]u8 {
         0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
         0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  bank, 0x6B, // rom
     };
+}
+
+/// The HDMA indirect-bank ($43x7 DASB) rebank thunk. An indirect HDMA whose
+/// per-scanline source is WRAM names that WRAM bank in DASB, and the value
+/// is loaded from the channel's HDMA object (a ROM table) — not an
+/// immediate or a long operand — so no static rebanker can reach it. The
+/// register write itself is wrapped: on the way to `STA $43x7`, an 8-bit A
+/// holding $7E/$7F becomes $40/$41, so DASB follows its data into BW-RAM;
+/// any other bank passes through untouched, which makes the thunk sound on
+/// every DASB write, whatever the value's origin. `store` is the site's own
+/// three operand bytes (STA abs / abs,X / abs,Y — same 3-byte footprint the
+/// JSR replaces), replayed here with the remapped value; the caller's exact
+/// A and flags are restored, so a store that sat inside a CMP/branch pair or
+/// left A live behaves byte-for-byte as in situ. `ret` is RTS in-bank, RTL
+/// behind a far stub. SEP #$20 forces the byte width the register demands
+/// regardless of the caller's M (the PHA/PLA then move exactly one byte).
+const dasb_thunk_len: u32 = 21;
+fn dasbThunkBody(store: [3]u8, ret: u8) [dasb_thunk_len]u8 {
+    return .{
+        0x08, // PHP
+        0xE2, 0x20, // SEP #$20 — DASB is a byte register
+        0x48, // PHA — save the caller's value
+        0xC9, 0x7E, // CMP #$7E
+        0x90, 0x07, // BCC store — A < $7E, no WRAM bank
+        0xC9, 0x80, // CMP #$80
+        0xB0, 0x03, // BCS store — A >= $80, not $7E/$7F
+        0x38, 0xE9, 0x3E, // SEC / SBC #$3E — $7E->$40, $7F->$41
+        store[0], store[1], store[2], // STA $43x7[,X/Y] (remapped or as-is)
+        0x68, // PLA — restore the caller's value
+        0x28, // PLP
+        ret,
+    };
+}
+
+/// Wrap every covered `STA $43x7` (a channel's DASB — the indirect HDMA
+/// source bank) in a runtime rebank thunk. When an indirect HDMA's source
+/// is WRAM, the game names the WRAM bank in DASB, and that bank is a byte
+/// loaded from the channel's HDMA object (a ROM table) — not an immediate
+/// or a long operand, so no static rebanker can reach it. Super Metroid's
+/// Ceres alarm is the witness: its color-math COLDATA HDMA reads a
+/// per-scanline gradient the game builds into live BW-RAM ($40), but its
+/// object still names bank $7E, so the hardware fetches the abandoned copy
+/// and the escape room renders as stripes while its logic runs correctly.
+/// The remap ($7E/$7F->$40/$41) is a no-op for a ROM or already-BW-RAM
+/// bank, so wrapping is sound on every DASB write whatever the value's
+/// origin — any DASB that named $7E/$7F on stock must name $40/$41 here.
+///
+/// A separate function from convertWholeGame on purpose: its own working
+/// set (the per-bank PadAlloc) stays out of that already-deep frame.
+fn rebankDasbWrites(
+    out: []u8,
+    cov: []const u8,
+    header_off: u32,
+    carve: u32,
+    carve_len: u32,
+    far: *FarPad,
+    refusal: *?Refusal,
+    res: *Result,
+) Error!void {
+    var dasb_pad: PadAlloc = undefined;
+    var dasb_pad_bank: u32 = 0xFFFF;
+    var dbank: u32 = 0;
+    while (dbank < 0x40) : (dbank += 1) {
+        const bank_file = dbank * 0x8000;
+        if (bank_file >= out.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu_addr = (dbank << 16) | a16;
+            const fl_lo = cov[cpu_addr];
+            const fl_hi = cov[0x80_0000 | cpu_addr];
+            if ((fl_lo | fl_hi) & usage_map.flag_opcode == 0) continue;
+            const file = bank_file + (a16 - 0x8000);
+            if (file + 3 > out.len) continue;
+            const op = out[file];
+            // STA abs / abs,X / abs,Y whose target is a $43x7 register:
+            // column 7 is DASB. abs,X/abs,Y index by channel*$10, so the
+            // base already names column 7; abs names the channel outright.
+            switch (op) {
+                0x8D, 0x9D, 0x99 => {},
+                else => continue,
+            }
+            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            if (tgt < 0x4307 or tgt > 0x4377 or (tgt & 0xF) != 7) continue;
+            // The register is a byte, and the thunk compares an 8-bit A; a
+            // 16-bit store here would be writing DASB+A2A-low as a word, not
+            // a plain bank set — leave that shape untouched.
+            const fl = if (fl_lo & usage_map.flag_opcode != 0) fl_lo else fl_hi;
+            if (fl & usage_map.flag_m == 0) continue;
+            if (dbank != dasb_pad_bank) {
+                dasb_pad = padAllocFor(out, header_off, dbank, carve, carve_len);
+                dasb_pad_bank = dbank;
+            }
+            const store: [3]u8 = out[file..][0..3].*;
+            const taddr = placeThunk(
+                out,
+                &dasb_pad,
+                far,
+                &dasbThunkBody(store, 0x60),
+                &dasbThunkBody(store, 0x6B),
+                false,
+                &res.stats.split_far,
+            ) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = dasb_thunk_len });
+            out[file] = 0x20; // JSR — same 3-byte footprint as the store
+            std.mem.writeInt(u16, out[file + 1 ..][0..2], taddr, .little);
+            res.stats.rewritten_dasb += 1;
+        }
+    }
 }
 
 /// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
@@ -6718,6 +6831,12 @@ pub fn convertWholeGame(
         res.stats.idx_split_sites += @intCast(n_lthunks);
     }
 
+    // HDMA indirect-bank ($43x7 DASB) rebank thunks (see rebankDasbWrites).
+    // Placed after the split/long thunks so the same far pool and per-bank
+    // padding serve it — a DASB store targets MMIO, never WRAM, so it was
+    // never a split-thunk site and the two passes never touch a shared byte.
+    if (window and bwram) try rebankDasbWrites(out, cov, header.offset, carve, carve_len, &far, refusal, &res);
+
     // Emit. Window mode's scaffold is ONE S-CPU shim: open the S-CPU's
     // BW-RAM gates, select window block 0, reproduce the power-on direct
     // page and stack INSIDE the window (the game's own D/S establishes
@@ -8666,6 +8785,57 @@ test "window: a context-split site serves both caller classes through its thunk"
     const sys_only: u8 = con.bus.sa1.bwram[0x0142];
     const twice: u8 = sys_only *% 2;
     try testing.expect(both -% twice <= 2 or twice -% both <= 2);
+}
+
+test "window: an HDMA indirect-bank write loading $7E from data follows WRAM into BW-RAM" {
+    // The Ceres-alarm shape, reduced. An indirect HDMA names its WRAM
+    // source bank in DASB ($43x7), and the game sets it from a byte it
+    // LOADS (here from a ROM table) — no immediate, no long operand, so no
+    // static rebanker reaches it. Two writes: channel 2 gets $7E (WRAM,
+    // must become $40 so the fetch follows the relocated buffer) and
+    // channel 3 gets $80 (a ROM bank, must pass through untouched). The
+    // rewriter wraps each store in a runtime rebank thunk.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // ROM data the loads read (abs, DBR=$00): $8F00=$7E (WRAM), $8F01=$80.
+    rom[0x0F00] = 0x7E;
+    rom[0x0F01] = 0x80;
+    @memcpy(rom[0x0000..0x0012], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0xAD, 0x00, 0x8F, // LDA $8F00 — A = $7E (a data load, not an immediate)
+        0x8D, 0x27, 0x43, // STA $4327 — channel 2 DASB
+        0xAD, 0x01, 0x8F, // LDA $8F01 — A = $80
+        0x8D, 0x37, 0x43, // STA $4337 — channel 3 DASB
+        0x80, 0xFE, // spin
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x800A, 0x800D, 0x8010 }) |a| markOp(bytes, a);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    // Both DASB stores were wrapped, and each site is now a 3-byte JSR.
+    try testing.expectEqual(@as(u32, 2), res.stats.rewritten_dasb);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0007]);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x000D]);
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    for (0..3) |_| con.runFrame();
+    // The WRAM bank followed its data into BW-RAM; the ROM bank did not.
+    try testing.expectEqual(@as(u8, 0x40), con.bus.dma.channels[2].indirect_bank);
+    try testing.expectEqual(@as(u8, 0x80), con.bus.dma.channels[3].indirect_bank);
 }
 
 test "window: an unmeasured tiny-base indexed site serves all three of its worlds" {
