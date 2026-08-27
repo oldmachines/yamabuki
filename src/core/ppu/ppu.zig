@@ -40,6 +40,16 @@ pub const BgLayer = struct {
     tile16: bool = false,
 };
 
+/// DIAGNOSTIC (headless `--bg-disable <hexmask>`): layer bits (BG1=1, BG2=2,
+/// BG3=4, BG4=8, OBJ=$10) masked OUT of TM/TS at render time, to isolate which
+/// layer contributes a given piece of the picture. Render-only; no state moves.
+pub var dbg_layer_disable: u8 = 0;
+
+/// DIAGNOSTIC (headless `--no-color-math`): skip the $2130-$2132 blend
+/// entirely, to tell an emulator compositing difference apart from the game
+/// legitimately tinting the scene.
+pub var dbg_no_color_math: bool = false;
+
 pub const Ppu = struct {
     // Derived state: the RGB565 palette and the brightness-scaled line palette
     // are rebuilt from cgram, and the framebuffer is output, so none is part of

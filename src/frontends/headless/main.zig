@@ -4702,6 +4702,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--dma-trace")) {
             const v = it.next() orelse return error.MissingValue;
             core.dma.dbg_dma = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--no-color-math")) {
+            core.ppu.dbg_no_color_math = true;
+        } else if (std.mem.eql(u8, a, "--bg-disable")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.ppu.dbg_layer_disable = try std.fmt.parseInt(u8, v, 16);
         } else if (std.mem.eql(u8, a, "--hdma-disable")) {
             const v = it.next() orelse return error.MissingValue;
             core.dma.dbg_hdma_disable = try std.fmt.parseInt(u8, v, 16);
