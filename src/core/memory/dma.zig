@@ -60,7 +60,7 @@ var dbg_dma_n: usize = 0;
 /// each scanline, to isolate which per-scanline effect a render depends on.
 pub var dbg_hdma_disable: u8 = 0;
 
-fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: u16) void {
+fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: u16, control: u8) void {
     const key: u64 = @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
     for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
     if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;
@@ -73,8 +73,8 @@ fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: 
     // as the source — a tile upload landing at the wrong VMADD (or garbled at
     // the right one) shows up only against the destination.
     const is_vram = b_reg == 0x18 or b_reg == 0x19;
-    std.debug.print("[dma] ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s){s}{s}{s}", .{
-        i, src, b_reg, bytes,
+    std.debug.print("[dma] ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s) ctl={x:0>2} mode={d}{s}{s}{s}", .{
+        i, src, b_reg, bytes, control, control & 0x07,
         if (a_is_dest) " (READ FROM B-BUS)" else "",
         if (dead) "  <-- ABANDONED MEMORY" else "",
         if (is_vram) " vdest=$" else "\n",
@@ -218,7 +218,7 @@ pub const Dma = struct {
             self.last_gdma_src[i] = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             self.last_gdma_len[i] = if (ch.count == 0) 0x10000 else ch.count;
             if (dbg_dma != 0)
-                noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0, if (@hasField(@TypeOf(bus.*), "ppu")) bus.ppu.vram_addr else 0);
+                noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0, if (@hasField(@TypeOf(bus.*), "ppu")) bus.ppu.vram_addr else 0, ch.control);
         }
         const start = bus.clock;
         var cost: u64 = dma_setup_cycles;

@@ -746,12 +746,16 @@ fn loadMovie(
     }
     const acc: u8 = if (args.accuracy == .accurate) 1 else 0;
     if (m.accuracy != acc) {
-        out.print("error: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+        // `--movie-ignore-crc` waives this too: replaying a fast-core recording
+        // on the accurate core is exactly how a renderer difference between the
+        // two cores is isolated. Input may desync; the dumps still write.
+        out.print("{s}: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+            if (args.movie_ignore_crc) @as([]const u8, "warning") else "error",
             path,
             if (m.accuracy == 1) "accurate" else "fast",
             if (acc == 1) "accurate" else "fast",
         }) catch {};
-        fail(out);
+        if (!args.movie_ignore_crc) fail(out);
     }
     const explicit_conflict = switch (args.region) {
         .auto => false,
