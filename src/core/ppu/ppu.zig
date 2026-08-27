@@ -360,8 +360,14 @@ pub const Ppu = struct {
                     2, 3 => 128,
                 };
             },
-            0x16 => self.vram_addr = (self.vram_addr & 0xFF00) | value, // VMADDL
-            0x17 => self.vram_addr = (self.vram_addr & 0x00FF) | (@as(u16, value) << 8), // VMADDH
+            0x16 => { // VMADDL — hardware prefetches the read latch on VMADD writes
+                self.vram_addr = (self.vram_addr & 0xFF00) | value;
+                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            },
+            0x17 => { // VMADDH — same prefetch
+                self.vram_addr = (self.vram_addr & 0x00FF) | (@as(u16, value) << 8);
+                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            },
             0x18 => self.writeVramLow(value), // VMDATAL
             0x19 => self.writeVramHigh(value), // VMDATAH
             0x21 => { // CGADD
@@ -515,15 +521,26 @@ pub const Ppu = struct {
 
     fn readVramLow(self: *Ppu) u8 {
         const v: u8 = @truncate(self.vram_read_latch);
-        self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
-        self.vramStep(false);
+        // Hardware reloads the prefetch latch (and steps the address) only on
+        // the port VMAIN's bit 7 designates; the OTHER port returns its latch
+        // byte with no side effects. Reloading on both ports made a 16-bit
+        // read of $2139 pair one word's low byte with the NEXT word's high
+        // byte (measured: Super Metroid's decompress-to-VRAM back-references
+        // fetch odd source bytes through exactly that idiom, and the Ceres
+        // station tiles rendered as speckle).
+        if (!self.vram_inc_high) {
+            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vramStep(false);
+        }
         return v;
     }
 
     fn readVramHigh(self: *Ppu) u8 {
         const v: u8 = @truncate(self.vram_read_latch >> 8);
-        self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
-        self.vramStep(true);
+        if (self.vram_inc_high) {
+            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vramStep(true);
+        }
         return v;
     }
 
