@@ -59,6 +59,14 @@ pub const state_header_size: usize = 16;
 
 pub const StateError = error{ BadMagic, UnsupportedVersion, WrongSize, Corrupt, WrongRom };
 
+/// DIAGNOSTIC (set by the headless `--movie-ignore-crc`): accept a state
+/// whose stored ROM crc32 differs from the loaded image. The state
+/// FINGERPRINT check still runs, so the field tree must match byte-for-byte
+/// — this only waives the "same image" identity, for replaying a recording
+/// made on a previous conversion against a freshly regenerated one whose
+/// memory map is unchanged.
+pub var dbg_ignore_state_rom_crc: bool = false;
+
 pub const Accuracy = enum { fast, accurate };
 
 pub const CoreConfig = struct {
@@ -1037,7 +1045,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // machine — restoring another image's state is never partial
             // damage, it is a different machine entirely. Pre-9 states
             // carry no identity and load on trust, as they always did.
-            if (with_rom_crc and
+            if (with_rom_crc and !dbg_ignore_state_rom_crc and
                 std.mem.readInt(u32, in[state_header_size + state_payload_size + cart_ram_len ..][0..4], .little) != self.bus.cart.rom_crc)
                 return error.WrongRom;
             _ = serialize.read(Self, self, payload) catch return error.Corrupt;

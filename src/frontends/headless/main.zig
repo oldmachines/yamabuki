@@ -52,6 +52,13 @@ const Args = struct {
     rom: []const u8,
     frames: ?u32 = null,
     ppm: ?[]const u8 = null,
+    /// `--ppm-range start:count:prefix`: DIAGNOSTIC. Dump each frame in
+    /// [start, start+count) as `<prefix>NNNNN.ppm` (5-digit, zero-padded) —
+    /// a frame window to assemble into a recording of a moving effect the
+    /// single final-frame `--ppm` cannot show.
+    ppm_range_start: ?u32 = null,
+    ppm_range_count: u32 = 0,
+    ppm_range_prefix: []const u8 = "frame",
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
     region: RegionArg = .auto,
@@ -626,6 +633,13 @@ pub fn main(init: std.process.Init) !void {
             try out.print("wrote {s} ({d} bytes) — the machine after frame {d}\n", .{ args.save_state_path, n, at });
             try out.flush();
         };
+        if (args.ppm_range_start) |start| if (i >= start and i < start + args.ppm_range_count) {
+            const rfb = con.framebuffer();
+            const rw = con.frameWidth();
+            const path = try std.fmt.allocPrint(gpa, "{s}{d:0>5}.ppm", .{ args.ppm_range_prefix, i });
+            defer gpa.free(path);
+            try util.writeFramebufferPpm(gpa, io, path, rfb, rw, @intCast(rfb.len / rw));
+        };
         if (hash_stream) |*hs| try hs.append(core.console.hashFrame(con.framebuffer()));
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
@@ -646,7 +660,10 @@ pub fn main(init: std.process.Init) !void {
                         .{ fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged" },
                     );
                     try out.flush();
-                    std.process.exit(1);
+                    // A cross-build replay is EXPECTED to end differently (the
+                    // point is a changed picture); keep the run so its dumps
+                    // still write. A same-build desync is a real failure.
+                    if (!args.movie_ignore_crc) std.process.exit(1);
                 }
             }
         };
@@ -4537,6 +4554,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.skip = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--ppm")) {
             out.ppm = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--ppm-range")) {
+            // "<start>:<count>:<prefix>"
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.ppm_range_start = try std.fmt.parseInt(u32, pit.next().?, 10);
+            out.ppm_range_count = try std.fmt.parseInt(u32, pit.next() orelse return error.MissingValue, 10);
+            out.ppm_range_prefix = pit.next() orelse "frame";
         } else if (std.mem.eql(u8, a, "--wav")) {
             out.wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
@@ -4607,6 +4631,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_ppu = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--movie-ignore-crc")) {
             out.movie_ignore_crc = true;
+            core.console.dbg_ignore_state_rom_crc = true; // also let an anchored state cross builds
+
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
