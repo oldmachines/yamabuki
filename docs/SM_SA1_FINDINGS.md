@@ -160,45 +160,45 @@ logically correct and playable. Diagnostics added while chasing it (kept):
 `--dump-ppu` now prints color-math, window/mosaic, per-HDMA-channel indirect
 banks, and a CGRAM digest; the DMA-bank write trap covers `$43x7`.
 
-## (superseded) 4a-old. The Ceres alarm color-math tint
+### 4a extras — the mechanism in detail
 
-After the black room was fixed, the new-game Ceres room renders with correct
-tiles and palette but a steady bright-orange tint (luminance 76 vs stock's 33)
-that should be the pulsing red **self-destruct alarm**. Root-caused, not yet
-fixed:
+The concrete sites, for whoever builds the fix:
 
-1. Everything a register snapshot captures is byte-identical at the freeze
-   frame — CGRAM, VRAM chars, both tilemaps, and (after extending `--dump-ppu`
-   with `cgwsel`/`cgadsub`/`fixed_color`/`setini`) the color-math registers.
-2. The alarm is an **indirect HDMA on `$2132`** (COLDATA): `hdma2 control=0x40
-   b_addr=0x32 indirect_bank=7e`. The per-scanline color data is fetched from
-   bank `$7E` — real WRAM on stock, the **abandoned home** on the conversion
-   (the window moved WRAM to `$40`). Reading zeros there leaves COLDATA stuck
-   at its boot fixed-color value → a steady tint instead of a pulse. HDMA
-   indirect data is invisible to every CPU-side instrument (the CPU issues no
-   load), the same blind spot the dump's own HDMA-source warning is about.
-3. The live DASB (`$4327`) writer is the HDMA-object processor at `$08:867A`
+1. The alarm is an **indirect HDMA on `$2132`** (COLDATA): `hdma2 control=0x40
+   b_addr=0x32 indirect_bank=7e`, per-scanline color data fetched from bank
+   `$7E` (abandoned on the conversion). HDMA indirect data is invisible to
+   every CPU-side instrument (the CPU issues no load) — the dump's own
+   HDMA-source warning is about exactly this blind spot.
+2. The live DASB (`$4327`) writer is the HDMA-object processor at `$08:867A`
    (found by extending the `$43x4` write trap to `$43x7`). It is *covered*, but
-   it writes the `$7E` from a **runtime data load** (`LDA $0000,Y` off a ROM
-   HDMA-object), which the immediate-rebank arm cannot reach — it only rewrites
-   `LDA #$7E` literals and long operands, never a data byte flowing through A.
-4. The gradient **builder** (`$08:DEA8`/`$08:DEBD`, `STA $7E:9D00,X`) is
+   writes the `$7E` from a **runtime data load** (`LDA $0000,Y` off a ROM
+   HDMA-object) — the immediate-rebank arm cannot reach a data byte flowing
+   through A; it only rewrites `LDA #$7E` literals and long operands.
+3. The gradient **builder** (`$08:DEA8`/`$08:DEBD`, `STA $7E:9D00,X`) is
    **uncovered**, so its low-WRAM inputs (`LDA $1920,X`) and its `$7E` store
-   were never rewritten — it reads the abandoned homes the rewritten mainline
-   abandoned.
+   were never rewritten. The handler at `$08:8650` is *partially* rewritten
+   (`LDA $18C0,X → $78C0,X` did land), which is why builder / `$7E:9D00`
+   buffer / DASB end up on opposite sides of the split.
 
-A correct fix needs two parts, neither a safe one-liner: **(a)** cover the
-alarm subsystem (`$08:DExx`/`$08:86xx`/`$01:A6xx`) so its WRAM refs rewrite
-consistently — a coverage surface reaching the alarm, except the newg2 replay
-already runs it and the cover harvest picked up nothing, so the harvest path
-needs investigating first; and **(b)** a way to rebank an HDMA object's
-indirect-bank **data** byte (`$7E → $40`), which the generator has no general
-mechanism for (it is neither an immediate nor a long operand). Deferred: the
-functional black-room bug is fixed and shipped; this is cosmetic and a fix
-risks the verified surfaces. The `$43x7` write trap and the color-math dump
-fields were added as diagnostics and kept.
+Fix shape: cover the alarm subsystem (`$08:DExx`/`$08:86xx`/`$01:A6xx`) so its
+WRAM refs rewrite consistently, **and** teach the generator to rebank an HDMA
+object's indirect-bank data byte (`$7E → $40`) — neither an immediate nor a
+long operand today. The cover-harvest of the escape reported zero new
+coverage even though the replay runs the code, so the harvest path is the
+first thing to investigate.
 
 ## 5. Instruments and technique notes
+
+`--dump-ppu` grew several times this campaign; it now prints, per frame:
+layers (map/char bases, tile-size, scroll, per-BG nonzero tilemap count),
+brightness/force-blank, `TM`/`TS`, **color math** (`cgwsel`/`cgadsub`/
+`fixed_color`/`setini`), **window + mosaic** (`w12sel`..`wh3`/`wbglog`/
+`tmw`/`tsw`/`mosaic`), per-active-HDMA-channel `control`/`b_addr`/
+`indirect_bank`/`indirect_addr`, a **CGRAM digest** (`cgram_sum` + sample
+palette entries), and a `<-- ABANDONED MEMORY` flag on any HDMA channel whose
+source is a `$7E`/`$7F` or low-mirror bank. Add the *specific* register class
+before assuming a render bug is impossible — three "everything identical yet
+different" dead-ends were just a register the dump didn't yet print.
 
 - `--watch lo-hi` (WRAM offsets, hex; `lo=0` disarms) prints writers with
   home-normalized addresses — window (`$6xxx`) and raw forms mix; normalize
@@ -215,12 +215,33 @@ fields were added as diagnostics and kept.
   regexes. Sequence-align pc streams with difflib (index-compare breaks at
   the first IRQ skew); filter far-pool banks (`$38-$3F`) first.
 - `--site-ev a,b,... --ev-only` prints per-site coverage/evidence for both
-  homes (`cov`/`cov80`, `ev`/`ev80`) after profiling. `--dump-ppu` is a text
-  summary (layers, brightness, HDMA); `--dump-vram` is raw VRAM+OAM.
+  homes (`cov`/`cov80`, `ev`/`ev80`) after profiling. `--dump-vram` is raw
+  VRAM (64 KiB) + OAM (544 B), so cross-image VRAM/OAM diffs are byte-exact.
+- `--watch` **also covers MMIO** (`$2100-$4400`), not just WRAM — a range like
+  `--watch 2131-2131` catches PPU/DMA register writes with their PC/value.
+  Caveat: the printed address is the full 24-bit access, so a WRAM offset
+  (`$40:4327`) and the port (`$00:4327`) both surface under one range —
+  disambiguate by bank. `--watch-min HH` filters to values `≥ HH` (find the
+  one nonzero write among a stream of zeros — that is how `cgadsub=$33` was
+  caught after end-of-frame showed `0`).
+- `--dma-bank-pc N` traps writes to the DMA/HDMA A-bus bank **and** indirect
+  bank registers (`$43x4` *and* `$43x7`), printing PC/channel/value and an
+  `<-- ABANDONED` flag on `$7E`/`$7F`. This is the only clean way to name who
+  armed an HDMA reading a moved home — the CPU-side watch cannot, because the
+  bank often arrives as runtime data, not an immediate.
 - Save states: payload WRAM at `0x2001A`; a conversion's *live* WRAM is the
-  BW-RAM image at `len − 0x40004`. ARAM was pinned at `0x45C42` in this
-  build's states by matching engine bytes to ROM — offsets do **not**
-  transfer across builds.
+  BW-RAM image at `len − 0x40004`. **The conversion's state file has a
+  different layout from stock's** (BW-RAM appended), so fixed PPU structures
+  (CGRAM, OAM) sit at *different offsets* — always re-locate them by signature
+  search *per state*, never by a shared offset (a wrong-offset read once
+  "proved" a zeroed CGRAM that was actually identical). ARAM was pinned at
+  `0x45C42` in one build's states by matching engine bytes to ROM — offsets do
+  **not** transfer across builds either.
+- **End-of-frame register dumps miss mid-frame changes.** HDMA rewrites
+  registers every scanline and the CPU often sets-then-resets (`cgadsub` goes
+  `$33` during the visible frame, `0` by vblank). To know a register's value
+  *while a given scanline rendered*, watch its writes across the frame — do
+  not trust the snapshot.
 - Movies (`.ymv`): CRC binds to the image at `0x08`, frame count `0x0C`,
   4 B/frame at `0x20` (v2: anchor after the header). Buttons u16 LE:
   Start `$1000`, A `$0080`, B `$8000`, Right `$0100`. CRC-patch a copy to
@@ -257,11 +278,61 @@ capped-list bug) · gen46-49: descent landed, all four split sites shifted,
 the tileset table's three pointer banks prove and fold
 (`$0F:E73D/E740/E743`, file-offset-verified), palette staging and CGRAM
 come out byte-identical to stock, and the new-game room renders. The
-black-room freeze is fixed (committed as the `src_any` propagation fix).
+black-room freeze is fixed. **Open residual**: the Ceres-escape display
+garble (§4a) — display-only, logic verified equivalent, deferred.
 
-**Open residual**: the rendered room carries a steady bright-orange tint
-(lum 76 vs stock's 33) with byte-identical CGRAM/VRAM/registers — the one
-axis the dumps don't capture is color math (CGWSEL/CGADSUB/COLDATA, the
-Ceres alarm's fixed-color add, HDMA channels 2/3). The alarm's pulse
-driver appears stuck at full addition on the conversion — a cosmetic
-divergence, next on the list.
+## 8. Cross-cutting learnings
+
+Method traps that cost real time and are worth internalizing:
+
+- **Frame-locked comparison is invalid for a lag-removing conversion.**
+  Removing lag means the conversion advances the game *further* per wall
+  frame, so stock and conversion at the same frame number are at *different
+  game moments*. Comparing VRAM/CGRAM/registers there will show spurious
+  differences (or spurious matches). Use the **tick-locked behavioral
+  verifier**, which anchors on controller polls, for any state comparison.
+- **The behavioral tier verifies logic, never the picture.** It compares
+  WRAM/logic state tick-by-tick; it does not look at VRAM/CGRAM/OAM/the
+  framebuffer. A display-only divergence (a mis-fed HDMA color effect) passes
+  behavioral verification while looking broken. "BEHAVIORALLY EQUIVALENT"
+  means the game plays correctly, not that every pixel matches.
+- **A deterministic renderer with identical inputs produces identical output.**
+  When it seemingly does not, an input differs and you have not found it yet —
+  keep adding register classes to the dump (color math → window/mosaic →
+  per-scanline HDMA) rather than concluding "impossible."
+- **Player recordings are the best repro, but need a stock-comparable twin.**
+  An anchored recording binds to the conversion image and cannot replay on
+  stock. Reproduce the same scene with a from-power-on scripted movie so both
+  sides run it; then the tick-locked verifier can compare them.
+- **The stale-exe trap.** On Windows a running player holds
+  `yamabuki-*.exe`, so a rebuild compiles (`N/M steps`) but fails the *install
+  copy* with `AccessDenied` — the old binary stays in place and every
+  subsequent run is stale. Gate build+gen chains on a *zero* `error:` count,
+  close players before rebuilding, and verify the exe mtime.
+- **Verify a patch landed by a *new, unique* symbol.** Grepping a name that
+  collides with existing code (`disp_sites`) silently hid three failed
+  patches; grep something the patch is the sole source of (`disp_cells`).
+
+## 9. Player / packaging notes
+
+- **`--shader-dir` defaults to `"shaders"` relative to the working directory.**
+  Launching the exe from anywhere but the repo root finds no baked presets, and
+  the old code mislabeled that as `NoVariantForThisGpu` (a GPU failure) —
+  wasting a debugging cycle on a hardware problem that did not exist. Fixed in
+  `fd2b825`: `initGl` now distinguishes `ShaderDirNotFound` (with a hint naming
+  `--shader-dir`), `ShaderNotBaked`, and a genuine `NoVariantForThisGpu` (which
+  now also prints the per-profile `SDL_GetError`). Shaders run fine on this
+  NVIDIA card once pointed at `<repo>/shaders` (`crt-easymode-halation`,
+  `essl300`); `,`/`.` cycle the ten baked presets in the player.
+
+## 10. Commit index
+
+- `4577111`,`9f7e475`,`10442ad`,`213bb3a`,`f9fcb7e`,`15f77a3`,`22fd4a2` —
+  the generator/provenance fixes (§2).
+- `38f0d7d` — 16-bit copy `src_any` propagation (the black-room fix).
+- `fb30de3` — color-math/HDMA-indirect PPU dump + `$43x7` trap (diagnostics)
+  and the first Ceres-tint root cause.
+- `fd2b825` — honest SDL shader-init errors (§9).
+- `a112bbe` — CGRAM/window/mosaic PPU dump and the corrected, display-only
+  Ceres-escape diagnosis (§4a).
+- Docs live in this file; the working branch is `claude/sa1-async-offload`.
