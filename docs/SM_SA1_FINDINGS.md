@@ -233,6 +233,25 @@ made on a previous conversion against a freshly regenerated one (window mode
 preserves S-CPU timing, so power-on movies stay in sync — a save-state-anchored
 movie still cannot cross builds).
 
+### 4b. Epilogue — theresidual speckle was the BASE EMULATOR (VRAM read latch)
+
+After both HDMA fixes the escape rendered structurally right but the Ceres
+rooms still looked "busier" than bsnes (user screenshot comparison, raw, no
+shader). That residual was NOT the conversion — stock and SA-1 rendered it
+pixel-identically — and the hunt ended in the core: yamabuki's VRAM read
+ports reloaded the prefetch latch on EVERY read, where hardware reloads (and
+steps VMADD) only on the port VMAIN designates, and prefetches on $2116/17
+writes. A 16-bit `LDA $2139` under VMAIN=$80 thus paired word W's low byte
+with word W+1's HIGH byte — and Super Metroid's decompress-to-VRAM
+back-references ($80:B3C8) are the one consumer, speckling the Ceres tile
+sheet (the game's only decompress-to-VRAM scene) while everything
+WRAM-decompressed stayed pixel-perfect. Fixed in `866e6d0`; the Ceres arrival
+room now matches a raw bsnes capture. Method notes: the mode-7 discovery
+(the room's BGMODE HDMA runs 31 lines mode 9 + 112 lines mode 7; the
+end-of-frame `bg_mode=1` dump is the vblank restore, a trap), the trace-dedup
+hiding re-uploads (fixed in `c5f33c8`), and `--watch` being blind to banks
+$7F/$41 (an open instrument gap) are recorded in the memory.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
