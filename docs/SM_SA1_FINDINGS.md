@@ -9,10 +9,12 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`). The last display-only
-residual — the Ceres escape rendering garbled — is now **fixed** by a
-generator feature that re-banks the alarm's HDMA indirect-bank register at
-run time (§4a); the conversion is clean on every surface tried.
+fixed by the `src_any` propagation fix (`38f0d7d`). One display bug is still
+OPEN: the Ceres escape renders as a full-screen garbage tile-sheet (§4a). Its
+color-math HDMA leg was fixed (the `$43x7` DASB rebank thunk), but that only
+recoloured the garbage — the real cause is the escape room's BG tile graphics
+never uploading to VRAM (same family as the black-room DMA-source bug). Logic
+is verified equivalent and the game is playable; the picture is wrong.
 
 ---
 
@@ -119,12 +121,36 @@ The longest chase; each layer was real but not the cause:
    working). The *palette* call's source arrives via WRAM copies instead, and
    its `$C2` never proves — the rev6 gap.
 
-## 4a. The Ceres escape display garble — FIXED (`$43x7` DASB rebank thunk)
+## 4a. The Ceres escape display garble — STILL OPEN (VRAM tile upload)
 
-The escape-room BG rendered as vertical yellow/red stripes (a full recording,
-user report #3, corrected an earlier "subtle tint" reading). Root-caused,
-then **fixed by a focused generator feature**. The first write-up of this
-section proposed the wrong mechanism; the corrected story and the fix follow.
+The escape-room BG renders as a full-screen sheet of character/stripe tiles
+(user report #3, and #4 confirming it is still wrong). **This is NOT fixed.**
+Two distinct bugs live here and only the smaller one is closed:
+
+- **Color-math HDMA — FIXED (`$43x7` DASB rebank thunk).** A real bug: the
+  alarm's COLDATA HDMA read its per-scanline gradient from the abandoned `$7E`
+  home. The DASB rebank thunk (below) corrects it, and the alarm's colour is
+  now right. But this only recoloured the garbage (orange → blue); it is a
+  secondary effect, not the cause of the sheet.
+- **VRAM tile upload — OPEN, the actual bug.** Proven 2026-08-27 by a
+  same-moment comparison: conv and stock at `sm-game` frame 15000 are the
+  IDENTICAL game moment (same room `$079B=45DF`, Samus `$0AF6/0AFA=2D00/7B01`,
+  clk within 4 ticks, relocated WRAM 39 bytes apart), yet stock draws the shaft
+  and the conversion draws garbage. Everything the renderer consumes is
+  byte-identical — BG char+maps (VRAM `0..0xB000`), CGRAM (`cgram_sum` equal),
+  scroll, BGMODE, TM/TS, and OAM (0 bytes differ). The ONLY rendering-relevant
+  difference is VRAM around word `0x6D00` (byte `0xDA00-0xE400`), where stock
+  holds the escape tileset and the conversion holds noise, plus a small BG3-map
+  diff at word `0x583C`. So the room's BG tile GRAPHICS never upload correctly:
+  the tilemap points at tiles that were never written. Same failure family as
+  the black-room bug — a DMA whose source bank was not rebanked, reading
+  abandoned/wrong memory — but for BG tiles, not CGRAM. `--verify-behavioral`
+  cannot see it: the behavioral tier compares WRAM/logic, never VRAM.
+
+Next step (unstarted): trace the VRAM tile-upload DMA for the escape tileset
+(destination VRAM word `~0x6D00`), find the mis-rebanked source, fix it in the
+generator, and verify by the tiles APPEARING — not by a register value. The
+DASB fix below stays because it is independently correct; it is not this fix.
 
 - **It was display-only, proven.** A tick-locked `--verify-behavioral` over
   the escape returns BEHAVIORALLY EQUIVALENT — the game's WRAM/logic state
@@ -275,8 +301,9 @@ capped-list bug) · gen46-49: descent landed, all four split sites shifted,
 the tileset table's three pointer banks prove and fold
 (`$0F:E73D/E740/E743`, file-offset-verified), palette staging and CGRAM
 come out byte-identical to stock, and the new-game room renders. The
-black-room freeze is fixed. The Ceres-escape display garble is now also
-fixed — the `$43x7` DASB rebank thunk (§4a) — so no display residual stands.
+black-room freeze is fixed. The Ceres-escape garble is STILL OPEN: its
+color-math leg was fixed (`$43x7` DASB thunk) but the escape room's BG tiles
+still fail to upload to VRAM (§4a) — a same-moment stock comparison proved it.
 
 ## 8. Cross-cutting learnings
 
@@ -332,7 +359,9 @@ Method traps that cost real time and are worth internalizing:
 - `fd2b825` — honest SDL shader-init errors (§9).
 - `a112bbe` — CGRAM/window/mosaic PPU dump and the corrected, display-only
   Ceres-escape diagnosis (§4a).
-- _(this change)_ — `rebankDasbWrites`/`dasbThunkBody`: the `$43x7` DASB
-  runtime rebank thunk that fixes the Ceres-escape garble, its unit test, and
-  the `--movie-ignore-crc` diagnostic (§4a).
+- `929a6a0` — `rebankDasbWrites`/`dasbThunkBody`: the `$43x7` DASB runtime
+  rebank thunk (fixes the alarm's color-math HDMA leg, NOT the whole garble),
+  its unit test, and (in `1ca8bbe`) the `--movie-ignore-crc` diagnostic + the
+  `--ppm-range` frame dump + the anchored-state cross-build bypass (§4a).
+- OPEN: the escape's BG tile-upload bug (§4a) — no commit yet.
 - Docs live in this file; the working branch is `claude/sa1-async-offload`.
