@@ -9,12 +9,13 @@ pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
 gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
 off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
 were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`). One display bug is still
-OPEN: the Ceres escape renders as a full-screen garbage tile-sheet (§4a). Its
-color-math HDMA leg was fixed (the `$43x7` DASB rebank thunk), but that only
-recoloured the garbage — the real cause is the escape room's BG tile graphics
-never uploading to VRAM (same family as the black-room DMA-source bug). Logic
-is verified equivalent and the game is playable; the picture is wrong.
+fixed by the `src_any` propagation fix (`38f0d7d`). The last display bug — the
+Ceres escape rendering as a full-screen garbage tile-sheet — is now **fixed**
+(§4a): two indirect HDMA channels fetched per-scanline data from relocated WRAM
+buffers the DMA unit could not follow, closed by relocating low-WRAM HDMA-table
+indirect addresses into the window (hdma3, the tile-sheet) and the `$43x7` DASB
+rebank thunk (hdma2, the colour). The conversion now renders the escape
+pixel-identical to stock and still verifies BEHAVIORALLY EQUIVALENT.
 
 ---
 
@@ -121,36 +122,58 @@ The longest chase; each layer was real but not the cause:
    working). The *palette* call's source arrives via WRAM copies instead, and
    its `$C2` never proves — the rev6 gap.
 
-## 4a. The Ceres escape display garble — STILL OPEN (VRAM tile upload)
+## 4a. The Ceres escape display garble — FIXED (two HDMA legs)
 
-The escape-room BG renders as a full-screen sheet of character/stripe tiles
-(user report #3, and #4 confirming it is still wrong). **This is NOT fixed.**
-Two distinct bugs live here and only the smaller one is closed:
+The escape room rendered as a full-screen garbage tile-sheet. **Now fixed.** It
+took TWO complementary generator fixes, because the escape drives the picture
+through TWO indirect HDMA channels, each fetching per-scanline data from a
+relocated WRAM buffer the DMA unit could not follow:
 
-- **Color-math HDMA — FIXED (`$43x7` DASB rebank thunk).** A real bug: the
-  alarm's COLDATA HDMA read its per-scanline gradient from the abandoned `$7E`
-  home. The DASB rebank thunk (below) corrects it, and the alarm's colour is
-  now right. But this only recoloured the garbage (orange → blue); it is a
-  secondary effect, not the cause of the sheet.
-- **VRAM tile upload — OPEN, the actual bug.** Proven 2026-08-27 by a
-  same-moment comparison: conv and stock at `sm-game` frame 15000 are the
-  IDENTICAL game moment (same room `$079B=45DF`, Samus `$0AF6/0AFA=2D00/7B01`,
-  clk within 4 ticks, relocated WRAM 39 bytes apart), yet stock draws the shaft
-  and the conversion draws garbage. Everything the renderer consumes is
-  byte-identical — BG char+maps (VRAM `0..0xB000`), CGRAM (`cgram_sum` equal),
-  scroll, BGMODE, TM/TS, and OAM (0 bytes differ). The ONLY rendering-relevant
-  difference is VRAM around word `0x6D00` (byte `0xDA00-0xE400`), where stock
-  holds the escape tileset and the conversion holds noise, plus a small BG3-map
-  diff at word `0x583C`. So the room's BG tile GRAPHICS never upload correctly:
-  the tilemap points at tiles that were never written. Same failure family as
-  the black-room bug — a DMA whose source bank was not rebanked, reading
-  abandoned/wrong memory — but for BG tiles, not CGRAM. `--verify-behavioral`
-  cannot see it: the behavioral tier compares WRAM/logic, never VRAM.
+1. **hdma3 — `$2105` per-scanline data, from LOW WRAM `$07EB` — the tile-sheet.**
+   The dominant bug. Disabling either channel proved it: the escape room draws
+   correctly ONLY when hdma3 delivers its per-scanline values, and on stock it
+   reads them from WRAM `$07EB`. On the conversion that buffer moved to the
+   window (`$67EB`), but the address lived in the channel's ROM HDMA table,
+   loaded by the DMA unit — reachable by no operand rewrite — so hdma3 read the
+   abandoned physical mirror `$00:07EB` (all zeros) and the room became noise.
+   Fixed by relocating the table's low-WRAM indirect addresses `+$6000`
+   (`relocateHdmaIndirect`, below).
+2. **hdma2 — `$2132` COLDATA gradient, from UPPER WRAM `$3522`, bank `$7E` — the
+   colour.** A real but secondary bug: the alarm's colour-math gradient sits at
+   `$7E:3522` on stock, `$40:3522` on the conversion, and the HDMA's DASB
+   register named `$7E`. Fixed by the `$43x7` DASB rebank thunk (below).
 
-Next step (unstarted): trace the VRAM tile-upload DMA for the escape tileset
-(destination VRAM word `~0x6D00`), find the mis-rebanked source, fix it in the
-generator, and verify by the tiles APPEARING — not by a register value. The
-DASB fix below stays because it is independently correct; it is not this fix.
+Both were proven, and the fix verified, by a **same-moment stock comparison**:
+conv and stock at `sm-game` frame 15000 are the IDENTICAL game moment (same room
+`$079B=45DF`, Samus `$0AF6/0AFA=2D00/7B01`, clk within 4 ticks, relocated WRAM 39
+bytes apart), so a side-by-side is apples-to-apples. Before the fix everything
+the renderer consumes was byte-identical to stock — BG char+maps, CGRAM, scroll,
+BGMODE, TM/TS, OAM — EXCEPT the VRAM regions the bad HDMAs drive; after, the
+conversion renders the escape pixel-identical to stock (bar one blinking HUD
+digit off by the lag skew). `--verify-behavioral` is blind to all of this — the
+behavioral tier compares WRAM/logic, never VRAM — which is why the conversion
+"passed" for the whole campaign while the picture was wrong. Wrong theories that
+cost time and are recorded so they are not retried: a "VRAM tile-upload DMA with
+a mis-rebanked source" (the tiles at word `0x6D00` are OBJ data, a red herring),
+and a `$9D00`/builder-coverage split (the builder was always correct).
+
+### The hdma3 fix — relocate low-WRAM indirect-HDMA addresses
+
+An indirect HDMA's table is a run of `[line-count][addr-lo][addr-hi]` entries;
+`$07EB` is one such indirect address, naming a WRAM buffer the game rebuilds each
+frame. No operand rewrite reaches it — it is HDMA-table data the DMA unit loads,
+not a CPU operand. So: the DMA-arm hook records every indirect-HDMA table address
+into the SHARED provenance (`PtrBankEvidence.hdma_tables`) — shared, not the
+per-surface profiler, because the escape lives on a late profiling surface — and
+`convertWholeGame` walks each table and shifts any indirect address naming the
+moved low 8 KiB (`< $2000`) by `+$6000` into the window. Sound by construction:
+an address `< $2000` in an HDMA table is always low WRAM, and `+$6000` lands
+exactly in the 8 KiB window. `loromFileOffset` maps the runtime table address to
+its file home (plain LoROM, or the >2 MiB de-mirror MB layout). Verified: the
+full conversion reports `2 low-WRAM indirect address(es) relocated`, still
+verifies BEHAVIORALLY EQUIVALENT (dropped frames 25→25), and the room renders.
+
+### The hdma2 fix — the `$43x7` DASB rebank thunk
 
 - **It was display-only, proven.** A tick-locked `--verify-behavioral` over
   the escape returns BEHAVIORALLY EQUIVALENT — the game's WRAM/logic state
@@ -301,9 +324,9 @@ capped-list bug) · gen46-49: descent landed, all four split sites shifted,
 the tileset table's three pointer banks prove and fold
 (`$0F:E73D/E740/E743`, file-offset-verified), palette staging and CGRAM
 come out byte-identical to stock, and the new-game room renders. The
-black-room freeze is fixed. The Ceres-escape garble is STILL OPEN: its
-color-math leg was fixed (`$43x7` DASB thunk) but the escape room's BG tiles
-still fail to upload to VRAM (§4a) — a same-moment stock comparison proved it.
+black-room freeze is fixed. The Ceres-escape garble is now fixed too (§4a):
+low-WRAM HDMA-table indirect addresses relocate into the window (hdma3) and the
+`$43x7` DASB thunk rebanks the colour HDMA (hdma2) — pixel-identical to stock.
 
 ## 8. Cross-cutting learnings
 
@@ -363,5 +386,9 @@ Method traps that cost real time and are worth internalizing:
   rebank thunk (fixes the alarm's color-math HDMA leg, NOT the whole garble),
   its unit test, and (in `1ca8bbe`) the `--movie-ignore-crc` diagnostic + the
   `--ppm-range` frame dump + the anchored-state cross-build bypass (§4a).
-- OPEN: the escape's BG tile-upload bug (§4a) — no commit yet.
+- `23edcad` — `relocateHdmaIndirect`/`loromFileOffset` + the DMA-arm hook
+  recording indirect-HDMA tables into shared provenance: relocates low-WRAM
+  HDMA-table indirect addresses into the window (the hdma3 tile-sheet leg of
+  the Ceres escape), its unit test, and the `--hdma-disable`/`--dma-trace`
+  vdest diagnostics (§4a). The escape now renders correct.
 - Docs live in this file; the working branch is `claude/sa1-async-offload`.
