@@ -665,7 +665,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
                     {
                         // The misfit-mirror banks prove on the store too —
                         // but only when the source byte IS the stored value.
-                        if (self.bus.mdr >= 0xC0) { pb.addHiProven(self.prev_load_end); } else pb.addA0Proven(self.prev_load_end);
+                        if (self.bus.mdr >= 0xC0) {
+                            pb.addHiProven(self.prev_load_end);
+                        } else pb.addA0Proven(self.prev_load_end);
                     }
                     if (self.bus.mdr == 0x7E or self.bus.mdr == 0x7F) {
                         // The bank can ride A or X: Super Metroid's palette
@@ -793,7 +795,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == tb)
                         {
-                            if (tb >= 0xC0) { pb.addHiProven(self.dbr_src); } else pb.addA0Proven(self.dbr_src);
+                            if (tb >= 0xC0) {
+                                pb.addHiProven(self.dbr_src);
+                            } else pb.addA0Proven(self.dbr_src);
                         }
                     }
                     if (usage_map.isWramBank(tb, conv) and tb == self.cpu.regs.dbr) {
@@ -891,14 +895,15 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
                         {
-                            if (self.cpu.regs.dbr >= 0xC0) { pb.addHiProven(self.dbr_src); } else pb.addA0Proven(self.dbr_src);
+                            if (self.cpu.regs.dbr >= 0xC0) {
+                                pb.addHiProven(self.dbr_src);
+                            } else pb.addA0Proven(self.dbr_src);
                         }
                     }
                 },
                 // Other stack traffic and the bank-setting instructions make
                 // the two-slot model a guess: drop it.
-                0x08, 0x0B, 0x4B, 0x5A, 0x8B, 0xDA, 0x28, 0x2B, 0x68, 0x7A, 0xFA,
-                0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xF4 => {
+                0x08, 0x0B, 0x4B, 0x5A, 0x8B, 0xDA, 0x28, 0x2B, 0x68, 0x7A, 0xFA, 0x20, 0x22, 0xFC, 0x60, 0x6B, 0x40, 0x62, 0xF4 => {
                     self.pushed_src = none;
                     self.pushed_hi_src = none;
                     self.pei_stage = 0;

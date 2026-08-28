@@ -2389,38 +2389,38 @@ fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, thun
                     if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: far JSL to bank {x:0>2} at ${x:0>4}\n", .{ entry, out[file + 3], pc });
                     return false;
                 } else jsl: {
-                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if (tgt < 0x8000) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: JSL below ROM (${x:0>4}) at ${x:0>4}\n", .{ entry, tgt, pc });
-                    return false;
-                }
-                const dup_at: ?usize = for (spec.members[0..spec.n_members], 0..) |m, di| {
-                    if (m.entry == tgt) break di;
-                } else null;
-                const ci: usize = dup_at orelse blk: {
-                    if (spec.n_members == ptr_tree_cap) {
-                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: member cap at JSL ${x:0>4}\n", .{ entry, tgt });
+                    const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (tgt < 0x8000) {
+                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: JSL below ROM (${x:0>4}) at ${x:0>4}\n", .{ entry, tgt, pc });
                         return false;
                     }
-                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .entry_pin = db_pin, .pin_seen = true };
-                    spec.n_members += 1;
-                    break :blk spec.n_members - 1;
-                };
-                if (dup_at != null) {
-                    // Meet of the call sites' pins: the first site this
-                    // pass contributes its pin, every further site must
-                    // agree or the member weakens to unpinned.
-                    if (!spec.members[ci].pin_seen) {
-                        spec.members[ci].entry_pin = db_pin;
-                        spec.members[ci].pin_seen = true;
-                    } else if (!std.meta.eql(spec.members[ci].entry_pin, db_pin)) {
-                        spec.members[ci].entry_pin = null;
+                    const dup_at: ?usize = for (spec.members[0..spec.n_members], 0..) |m, di| {
+                        if (m.entry == tgt) break di;
+                    } else null;
+                    const ci: usize = dup_at orelse blk: {
+                        if (spec.n_members == ptr_tree_cap) {
+                            if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: member cap at JSL ${x:0>4}\n", .{ entry, tgt });
+                            return false;
+                        }
+                        spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .entry_pin = db_pin, .pin_seen = true };
+                        spec.n_members += 1;
+                        break :blk spec.n_members - 1;
+                    };
+                    if (dup_at != null) {
+                        // Meet of the call sites' pins: the first site this
+                        // pass contributes its pin, every further site must
+                        // agree or the member weakens to unpinned.
+                        if (!spec.members[ci].pin_seen) {
+                            spec.members[ci].entry_pin = db_pin;
+                            spec.members[ci].pin_seen = true;
+                        } else if (!std.meta.eql(spec.members[ci].entry_pin, db_pin)) {
+                            spec.members[ci].entry_pin = null;
+                        }
                     }
-                }
-                // Transitive cleanliness: calling a dirty member dirties
-                // this one.
-                if (!spec.members[ci].dbr_clean) dbr_clean = false;
-                break :jsl;
+                    // Transitive cleanliness: calling a dirty member dirties
+                    // this one.
+                    if (!spec.members[ci].dbr_clean) dbr_clean = false;
+                    break :jsl;
                 }
             },
             // Wrong return shape, near calls, far jumps, interrupt ops,
@@ -3265,8 +3265,8 @@ fn splitThunkBody(op: u8, v: u16, ret: u8) [split_thunk_len]u8 {
     const sh: u16 = v + wg_bw_window;
     return .{
         0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
-        0x30, 0x0A, 0x89, 0x40,        0xF0,             0x06, // BMI sys / BIT #$40 / BEQ sys
-        0x68, 0x28, op,   @truncate(v), @truncate(v >> 8), ret,
+        0x30, 0x0A, 0x89, 0x40,          0xF0,               0x06, // BMI sys / BIT #$40 / BEQ sys
+        0x68, 0x28, op,   @truncate(v),  @truncate(v >> 8),  ret,
         0x68, 0x28, op,   @truncate(sh), @truncate(sh >> 8), ret,
     };
 }
@@ -3293,9 +3293,9 @@ fn longThunkBody(op: u8, v: u16, bank: u8) [long_thunk_len]u8 {
     return .{
         0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
         0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
-        0xE0, @truncate(lim),      @truncate(lim >> 8), 0xB0, 0x07, // CPX #lim / BCS rom
-        0x68, 0x28, op, @truncate(sh),  @truncate(sh >> 8),  bank, 0x6B, // low
-        0x68, 0x28, op, @truncate(v),   @truncate(v >> 8),   bank, 0x6B, // rom
+        0xE0, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x07, // CPX #lim / BCS rom
+        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
+        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom
     };
 }
 
@@ -3325,9 +3325,9 @@ fn longThunkBodyWrap(op: u8, v: u16, bank: u8) [long_wrap_thunk_len]u8 {
         0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
         0xA3, 0x02, 0x89, 0x10, 0xD0, 0x0A, // LDA $02,S / BIT #$10 / BNE low
         0xE0, @truncate(lim), @truncate(lim >> 8), 0x90, 0x05, // CPX #lim / BCC low
-        0xE0, @truncate(wl),  @truncate(wl >> 8),  0x90, 0x07, // CPX #wl / BCC rom
+        0xE0, @truncate(wl), @truncate(wl >> 8), 0x90, 0x07, // CPX #wl / BCC rom
         0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
-        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  bank, 0x6B, // rom
+        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom
     };
 }
 
@@ -3539,9 +3539,9 @@ fn idxThunkBodyV2(op: u8, v: u16, ret: u8) [idx_thunk_v2_len]u8 {
     const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
     return .{
         0x08, 0xE2, 0x20, 0xA3, 0x01, 0x89, 0x10, 0xD0, 0x05, // PHP/SEP/LDA $01,S/BIT #$10/BNE low
-        cp,   @truncate(lim),       @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
-        0x28, op, @truncate(sh),  @truncate(sh >> 8),  ret, // low: PLP / op v+$6000
-        0x28, op, @truncate(v),   @truncate(v >> 8),   ret, // rom: PLP / op v
+        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
+        0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: PLP / op v+$6000
+        0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: PLP / op v
     };
 }
 
@@ -3581,10 +3581,10 @@ fn longNegThunkBody(op: u8, v: u16, bank: u8) [long_neg_thunk_len]u8 {
     const sb: u8 = bank +% 1;
     return .{
         0x08, 0xC2, 0x10, // PHP / REP #$10
-        0xE0, @truncate(lo),      @truncate(lo >> 8), 0x90, 0x0B, // CPX #lo / BCC rom
-        0xE0, @truncate(hi),      @truncate(hi >> 8), 0xB0, 0x06, // CPX #hi / BCS rom
-        0x28, op, @truncate(sh),  @truncate(sh >> 8), sb,   0x6B, // low: the window
-        0x28, op, @truncate(v),   @truncate(v >> 8),  bank, 0x6B, // rom: as written
+        0xE0, @truncate(lo), @truncate(lo >> 8), 0x90, 0x0B, // CPX #lo / BCC rom
+        0xE0, @truncate(hi), @truncate(hi >> 8), 0xB0, 0x06, // CPX #hi / BCS rom
+        0x28, op, @truncate(sh), @truncate(sh >> 8), sb, 0x6B, // low: the window
+        0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom: as written
     };
 }
 
@@ -3603,9 +3603,9 @@ fn idxThunkBodyShort(op: u8, v: u16, ret: u8) [idx_thunk_short_len]u8 {
     return .{
         0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
         0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
-        cp,   @truncate(lim),       @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
+        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
         0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
-        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  ret, // rom: as written
+        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: as written
     };
 }
 
@@ -3619,9 +3619,9 @@ fn idxThunkBody(op: u8, v: u16, ret: u8) [idx_thunk_len]u8 {
         0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
         0x30, 0x04, 0x89, 0x40, 0xD0, 0x11, // BMI sys / BIT #$40 / BNE rom
         0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // sys: LDA $02,S / BIT #$10 / BNE low
-        cp,   @truncate(lim),        @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
+        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
         0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
-        0x68, 0x28, op, @truncate(v),  @truncate(v >> 8),  ret, // rom: as written
+        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: as written
     };
 }
 
@@ -4030,281 +4030,281 @@ fn extendCoverage(
     // cutscene faded into a black room with input alive).
     var round: u32 = 0;
     fixpoint: while (round < 6) : (round += 1) {
-    while (stack.pop()) |item| {
-        var addr: u32 = item.addr;
-        var m8 = item.m8;
-        var x8 = item.x8;
-        walk: while (true) {
-            const wbank = addr >> 16;
-            const a16 = addr & 0xFFFF;
-            const cpu0: u32 = addr;
-            if (wbank >= 0x40 or a16 < 0x8000) break;
-            const file = wbank * 0x8000 + (a16 - 0x8000);
-            if (file >= image.len) break;
-            if (seen[file]) break;
-            const dyn = usage[cpu0] | usage[0x80_0000 | cpu0];
-            if (dyn & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                dyn & usage_map.flag_opcode == 0) break;
-            seen[file] = true;
-            const op = image[file];
-            const len: u32 = usage_map.instrLen(op, m8, x8);
-            if (a16 + len > 0x10000) break;
-            if (ext[addr] & usage_map.flag_opcode == 0) {
-                ext[addr] &= ~(usage_map.flag_m | usage_map.flag_x);
-                ext[addr] |= usage_map.flag_opcode | usage_map.flag_exec |
-                    (if (m8) usage_map.flag_m else @as(u8, 0)) |
-                    (if (x8) usage_map.flag_x else @as(u8, 0));
-                var i: u32 = 1;
-                while (i < len) : (i += 1) ext[addr + i] |= usage_map.flag_exec;
-            }
-            switch (op) {
-                // Path enders: returns, software interrupts, STP — and the
-                // two instructions after which the widths are anyone's
-                // guess.
-                0x60, 0x6B, 0x40, 0x00, 0x02, 0xDB, 0x28, 0xFB => break,
-                0xE2 => { // SEP #imm
-                    const im = image[file + 1];
-                    if (im & 0x20 != 0) m8 = true;
-                    if (im & 0x10 != 0) x8 = true;
-                },
-                0xC2 => { // REP #imm
-                    const im = image[file + 1];
-                    if (im & 0x20 != 0) m8 = false;
-                    if (im & 0x10 != 0) x8 = false;
-                },
-                0x4C => { // JMP abs: bank-confined
-                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                    break;
-                },
-                0x5C, 0x22 => { // JML long / JSL long
-                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                    const tb: u32 = image[file + 3] & 0x7F;
-                    try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
-                    if (op == 0x5C) break; // JSL falls through on return
-                    // A JSL the profiled run EXECUTED whose return address
-                    // it never marked as an opcode is a call with INLINE
-                    // PARAMS — the callee walks the return address past
-                    // them (SM's DMA launcher carries 8 bytes after every
-                    // JSL). Decoding those as code plants rewrites inside
-                    // data (measured: `19 00 00` in a param block became a
-                    // context-split thunk and the armed transfer read
-                    // $F768 — the thunk's own address). The profile
-                    // outranks static reach: stop the fall-through.
-                    if (a16 + 4 < 0x10000) {
-                        const dyn_site = usage[addr] & usage_map.flag_opcode != 0 or
-                            usage[0x80_0000 | addr] & usage_map.flag_opcode != 0;
-                        if (dyn_site) {
-                            // Two shapes leave a covered JSL with an
-                            // uncovered fall-through, and they need opposite
-                            // treatment. INLINE PARAMS: the callee returns
-                            // PAST the params, so the profile marked a real
-                            // opcode a few bytes further on — trust it and
-                            // stop, or the params decode as code (measured:
-                            // `19 00 00` in a param block became a
-                            // context-split thunk). CALL NEVER RETURNED: the
-                            // profiled run died or was cut inside the callee
-                            // (measured: the door-transition JSL chain at
-                            // $82:E1CA — the player's recording crashed in
-                            // the first callee, so the two SIBLING JSLs
-                            // behind it kept their stock $A0 banks and the
-                            // next walk-through crashed one call later).
-                            // There the window past the call is dyn-DEAD,
-                            // and the static fall-through is both safe and
-                            // the only way to make progress.
-                            var probe: u32 = addr + 4;
-                            var dyn_near = false;
-                            const lim: u32 = @min(addr + 4 + 32, (wbank << 16) | 0xFFFF);
-                            while (probe < lim) : (probe += 1) {
-                                if (usage[probe] & usage_map.flag_opcode != 0 or
-                                    usage[0x80_0000 | probe] & usage_map.flag_opcode != 0)
-                                {
-                                    dyn_near = true;
-                                    break;
+        while (stack.pop()) |item| {
+            var addr: u32 = item.addr;
+            var m8 = item.m8;
+            var x8 = item.x8;
+            walk: while (true) {
+                const wbank = addr >> 16;
+                const a16 = addr & 0xFFFF;
+                const cpu0: u32 = addr;
+                if (wbank >= 0x40 or a16 < 0x8000) break;
+                const file = wbank * 0x8000 + (a16 - 0x8000);
+                if (file >= image.len) break;
+                if (seen[file]) break;
+                const dyn = usage[cpu0] | usage[0x80_0000 | cpu0];
+                if (dyn & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                    dyn & usage_map.flag_opcode == 0) break;
+                seen[file] = true;
+                const op = image[file];
+                const len: u32 = usage_map.instrLen(op, m8, x8);
+                if (a16 + len > 0x10000) break;
+                if (ext[addr] & usage_map.flag_opcode == 0) {
+                    ext[addr] &= ~(usage_map.flag_m | usage_map.flag_x);
+                    ext[addr] |= usage_map.flag_opcode | usage_map.flag_exec |
+                        (if (m8) usage_map.flag_m else @as(u8, 0)) |
+                        (if (x8) usage_map.flag_x else @as(u8, 0));
+                    var i: u32 = 1;
+                    while (i < len) : (i += 1) ext[addr + i] |= usage_map.flag_exec;
+                }
+                switch (op) {
+                    // Path enders: returns, software interrupts, STP — and the
+                    // two instructions after which the widths are anyone's
+                    // guess.
+                    0x60, 0x6B, 0x40, 0x00, 0x02, 0xDB, 0x28, 0xFB => break,
+                    0xE2 => { // SEP #imm
+                        const im = image[file + 1];
+                        if (im & 0x20 != 0) m8 = true;
+                        if (im & 0x10 != 0) x8 = true;
+                    },
+                    0xC2 => { // REP #imm
+                        const im = image[file + 1];
+                        if (im & 0x20 != 0) m8 = false;
+                        if (im & 0x10 != 0) x8 = false;
+                    },
+                    0x4C => { // JMP abs: bank-confined
+                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        break;
+                    },
+                    0x5C, 0x22 => { // JML long / JSL long
+                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                        const tb: u32 = image[file + 3] & 0x7F;
+                        try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
+                        if (op == 0x5C) break; // JSL falls through on return
+                        // A JSL the profiled run EXECUTED whose return address
+                        // it never marked as an opcode is a call with INLINE
+                        // PARAMS — the callee walks the return address past
+                        // them (SM's DMA launcher carries 8 bytes after every
+                        // JSL). Decoding those as code plants rewrites inside
+                        // data (measured: `19 00 00` in a param block became a
+                        // context-split thunk and the armed transfer read
+                        // $F768 — the thunk's own address). The profile
+                        // outranks static reach: stop the fall-through.
+                        if (a16 + 4 < 0x10000) {
+                            const dyn_site = usage[addr] & usage_map.flag_opcode != 0 or
+                                usage[0x80_0000 | addr] & usage_map.flag_opcode != 0;
+                            if (dyn_site) {
+                                // Two shapes leave a covered JSL with an
+                                // uncovered fall-through, and they need opposite
+                                // treatment. INLINE PARAMS: the callee returns
+                                // PAST the params, so the profile marked a real
+                                // opcode a few bytes further on — trust it and
+                                // stop, or the params decode as code (measured:
+                                // `19 00 00` in a param block became a
+                                // context-split thunk). CALL NEVER RETURNED: the
+                                // profiled run died or was cut inside the callee
+                                // (measured: the door-transition JSL chain at
+                                // $82:E1CA — the player's recording crashed in
+                                // the first callee, so the two SIBLING JSLs
+                                // behind it kept their stock $A0 banks and the
+                                // next walk-through crashed one call later).
+                                // There the window past the call is dyn-DEAD,
+                                // and the static fall-through is both safe and
+                                // the only way to make progress.
+                                var probe: u32 = addr + 4;
+                                var dyn_near = false;
+                                const lim: u32 = @min(addr + 4 + 32, (wbank << 16) | 0xFFFF);
+                                while (probe < lim) : (probe += 1) {
+                                    if (usage[probe] & usage_map.flag_opcode != 0 or
+                                        usage[0x80_0000 | probe] & usage_map.flag_opcode != 0)
+                                    {
+                                        dyn_near = true;
+                                        break;
+                                    }
                                 }
+                                if (dyn_near) break; // inline params: profile wins
                             }
-                            if (dyn_near) break; // inline params: profile wins
                         }
+                    },
+                    0x20 => { // JSR abs: target plus fall-through
+                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                    },
+                    0x80, 0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
+                        const rel: i8 = @bitCast(image[file + 1]);
+                        const t = (a16 +% 2 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        if (op == 0x80) break; // BRA is unconditional
+                    },
+                    0x82 => { // BRL
+                        const rel: i16 = @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little));
+                        const t = (a16 +% 3 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        break;
+                    },
+                    // Indirect control transfers: statically opaque. (JSR
+                    // (abs,X) does fall through on return, so it continues.)
+                    0x6C, 0x7C, 0xDC => break,
+                    else => {},
+                }
+                addr += len;
+                continue :walk;
+            }
+        }
+        // Scan for new pointer-literal seeds. The dispatchers themselves are
+        // usually part of the UNCOVERED cluster (that is the hole being
+        // closed), so they are matched in the RAW image — any `JMP (cell)` /
+        // `JSR (cell,X)` shape naming a low-WRAM cell — and the conjunction
+        // with a COVERED immediate store to the same cell is what makes a
+        // false positive unlikely: both sides must independently name the
+        // same sub-$2000 pointer. A matched dispatcher is seeded as code too,
+        // so its own pointer operand shifts with the cell.
+        // Banks with ANY dynamically-executed opcode: dispatchers are CODE, and
+        // real ones live amid covered code (the cutscene dispatchers sit in bank
+        // $02's covered cluster). A pure DATA bank supplies raw $6C/$FC bytes by
+        // the thousand — 3,526 of them matched across the 3 MiB image once the
+        // site list was uncapped (22fd4a2), each planting a window-shifted fake
+        // operand inside stream data (the Ceres door confetti was one such byte;
+        // the rest garble tilesets of rooms the profiled surfaces never visit).
+        var bank_has_exec = [_]bool{false} ** 0x40;
+        {
+            var eb: u32 = 0;
+            while (eb < 0x40) : (eb += 1) {
+                if (eb * 0x8000 >= image.len) break;
+                var ea: u32 = 0x8000;
+                while (ea < 0x10000) : (ea += 1) {
+                    const ec = (eb << 16) | ea;
+                    if ((usage[ec] | usage[0x80_0000 | ec]) & usage_map.flag_opcode != 0) {
+                        bank_has_exec[eb] = true;
+                        break;
                     }
-                },
-                0x20 => { // JSR abs: target plus fall-through
-                    const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                },
-                0x80, 0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
-                    const rel: i8 = @bitCast(image[file + 1]);
-                    const t = (a16 +% 2 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                    if (op == 0x80) break; // BRA is unconditional
-                },
-                0x82 => { // BRL
-                    const rel: i16 = @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little));
-                    const t = (a16 +% 3 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                    try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                    break;
-                },
-                // Indirect control transfers: statically opaque. (JSR
-                // (abs,X) does fall through on return, so it continues.)
-                0x6C, 0x7C, 0xDC => break,
-                else => {},
-            }
-            addr += len;
-            continue :walk;
-        }
-    }
-    // Scan for new pointer-literal seeds. The dispatchers themselves are
-    // usually part of the UNCOVERED cluster (that is the hole being
-    // closed), so they are matched in the RAW image — any `JMP (cell)` /
-    // `JSR (cell,X)` shape naming a low-WRAM cell — and the conjunction
-    // with a COVERED immediate store to the same cell is what makes a
-    // false positive unlikely: both sides must independently name the
-    // same sub-$2000 pointer. A matched dispatcher is seeded as code too,
-    // so its own pointer operand shifts with the cell.
-    // Banks with ANY dynamically-executed opcode: dispatchers are CODE, and
-    // real ones live amid covered code (the cutscene dispatchers sit in bank
-    // $02's covered cluster). A pure DATA bank supplies raw $6C/$FC bytes by
-    // the thousand — 3,526 of them matched across the 3 MiB image once the
-    // site list was uncapped (22fd4a2), each planting a window-shifted fake
-    // operand inside stream data (the Ceres door confetti was one such byte;
-    // the rest garble tilesets of rooms the profiled surfaces never visit).
-    var bank_has_exec = [_]bool{false} ** 0x40;
-    {
-        var eb: u32 = 0;
-        while (eb < 0x40) : (eb += 1) {
-            if (eb * 0x8000 >= image.len) break;
-            var ea: u32 = 0x8000;
-            while (ea < 0x10000) : (ea += 1) {
-                const ec = (eb << 16) | ea;
-                if ((usage[ec] | usage[0x80_0000 | ec]) & usage_map.flag_opcode != 0) {
-                    bank_has_exec[eb] = true;
-                    break;
                 }
             }
         }
-    }
-    var ptr_bank = [_]u8{0} ** 0x2000; // cell -> dispatcher bank + 1
-    var pb2: u32 = 0;
-    while (pb2 < 0x40) : (pb2 += 1) {
-        if (pb2 * 0x8000 >= image.len) break;
-        var pa2: u32 = 0x8000;
-        while (pa2 < 0x10000) : (pa2 += 1) {
-            const f2 = pb2 * 0x8000 + (pa2 - 0x8000);
-            const o2 = image[f2];
-            if (o2 == 0x6C or o2 == 0x7C or o2 == 0xFC or o2 == 0xDC) {
-                if (f2 + 2 < image.len) {
-                    // DATA-GATE: a byte the profile READ without ever
-                    // executing is stream/table data, and a raw `$FC` there
-                    // is a coincidence, not a dispatcher. Seeding it as code
-                    // window-shifts a fake operand INSIDE the data
-                    // (measured: `FC FC 0A` in the Ceres door-tileset's
-                    // compressed stream became `JSR ($0AFC,X)`, its "$0AFC"
-                    // was shifted to $6AFC — one byte, $0A -> $6A — and the
-                    // decompressor's back-references cascaded it across the
-                    // whole door sprite band as confetti).
-                    if (!bank_has_exec[pb2]) continue;
-                    const cpu2 = (pb2 << 16) | pa2;
-                    const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
-                    const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                        dflags & usage_map.flag_opcode == 0;
-                    const cell = std.mem.readInt(u16, image[f2 + 1 ..][0..2], .little);
-                    if (cell < 0x2000 and !data_only) ptr_bank[cell] = @intCast(pb2 + 1);
+        var ptr_bank = [_]u8{0} ** 0x2000; // cell -> dispatcher bank + 1
+        var pb2: u32 = 0;
+        while (pb2 < 0x40) : (pb2 += 1) {
+            if (pb2 * 0x8000 >= image.len) break;
+            var pa2: u32 = 0x8000;
+            while (pa2 < 0x10000) : (pa2 += 1) {
+                const f2 = pb2 * 0x8000 + (pa2 - 0x8000);
+                const o2 = image[f2];
+                if (o2 == 0x6C or o2 == 0x7C or o2 == 0xFC or o2 == 0xDC) {
+                    if (f2 + 2 < image.len) {
+                        // DATA-GATE: a byte the profile READ without ever
+                        // executing is stream/table data, and a raw `$FC` there
+                        // is a coincidence, not a dispatcher. Seeding it as code
+                        // window-shifts a fake operand INSIDE the data
+                        // (measured: `FC FC 0A` in the Ceres door-tileset's
+                        // compressed stream became `JSR ($0AFC,X)`, its "$0AFC"
+                        // was shifted to $6AFC — one byte, $0A -> $6A — and the
+                        // decompressor's back-references cascaded it across the
+                        // whole door sprite band as confetti).
+                        if (!bank_has_exec[pb2]) continue;
+                        const cpu2 = (pb2 << 16) | pa2;
+                        const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
+                        const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                            dflags & usage_map.flag_opcode == 0;
+                        const cell = std.mem.readInt(u16, image[f2 + 1 ..][0..2], .little);
+                        if (cell < 0x2000 and !data_only) ptr_bank[cell] = @intCast(pb2 + 1);
+                    }
                 }
             }
         }
-    }
-    var grew = false;
-    // TWO-TIER ACTIVATION: matching raw stores image-wide over-reaches
-    // (measured: the raw scan activated cells across the whole image and
-    // ballooned coverage by 16 KiB of speculation, and the dispatcher
-    // marks were lost under overlapping walks). A cell ACTIVATES only
-    // when a COVERED 16-bit literal store names it — the genuine
-    // mixed-population signal — and only active cells accept the
-    // raw-store expansion that reaches the chain's deeper links.
-    var cell_active = [_]bool{false} ** 0x2000;
-    var ab: u32 = 0;
-    while (ab < 0x40) : (ab += 1) {
-        if (ab * 0x8000 >= image.len) break;
-        var aa: u32 = 0x8000;
-        while (aa < 0x10000) : (aa += 1) {
-            const ca = (ab << 16) | aa;
-            const fla = ext[ca] | ext[0x80_0000 | ca];
-            if (fla & usage_map.flag_opcode == 0) continue;
-            if (fla & usage_map.flag_m != 0) continue;
-            const fa = ab * 0x8000 + (aa - 0x8000);
-            if (fa + 6 > image.len) continue;
-            if (image[fa] != 0xA9 or image[fa + 3] != 0x8D) continue;
-            const acell = std.mem.readInt(u16, image[fa + 4 ..][0..2], .little);
-            if (acell < 0x2000 and ptr_bank[acell] != 0) cell_active[acell] = true;
-        }
-    }
-    var sb3: u32 = 0;
-    while (sb3 < 0x40) : (sb3 += 1) {
-        if (sb3 * 0x8000 >= image.len) break;
-        var sa3: u32 = 0x8000;
-        while (sa3 < 0x10000) : (sa3 += 1) {
-            const c3 = (sb3 << 16) | sa3;
-            const f3 = sb3 * 0x8000 + (sa3 - 0x8000);
-            if (f3 + 6 > image.len) continue;
-            if (image[f3] != 0xA9 or image[f3 + 3] != 0x8D) continue;
-            const cell = std.mem.readInt(u16, image[f3 + 4 ..][0..2], .little);
-            if (cell >= 0x2000 or !cell_active[cell]) continue;
-            const tgt = std.mem.readInt(u16, image[f3 + 1 ..][0..2], .little);
-            if (tgt < 0x8000) continue;
-            const fl3 = ext[c3] | ext[0x80_0000 | c3];
-            const covered3 = fl3 & usage_map.flag_opcode != 0;
-            if (covered3 and fl3 & usage_map.flag_m != 0) continue;
-            const db3: u32 = ptr_bank[cell] - 1;
-            const taddr: u32 = (db3 << 16) | tgt;
-            const tfile = db3 * 0x8000 + (tgt - 0x8000);
-            if (tfile >= image.len) continue;
-            const x8_3 = covered3 and fl3 & usage_map.flag_x != 0;
-            if (!seen[tfile]) {
-                try stack.append(.{ .addr = @intCast(taddr), .m8 = false, .x8 = x8_3 });
-                grew = true;
-            }
-            if (!covered3 and !seen[f3]) {
-                try stack.append(.{ .addr = @intCast(c3), .m8 = false, .x8 = x8_3 });
-                grew = true;
+        var grew = false;
+        // TWO-TIER ACTIVATION: matching raw stores image-wide over-reaches
+        // (measured: the raw scan activated cells across the whole image and
+        // ballooned coverage by 16 KiB of speculation, and the dispatcher
+        // marks were lost under overlapping walks). A cell ACTIVATES only
+        // when a COVERED 16-bit literal store names it — the genuine
+        // mixed-population signal — and only active cells accept the
+        // raw-store expansion that reaches the chain's deeper links.
+        var cell_active = [_]bool{false} ** 0x2000;
+        var ab: u32 = 0;
+        while (ab < 0x40) : (ab += 1) {
+            if (ab * 0x8000 >= image.len) break;
+            var aa: u32 = 0x8000;
+            while (aa < 0x10000) : (aa += 1) {
+                const ca = (ab << 16) | aa;
+                const fla = ext[ca] | ext[0x80_0000 | ca];
+                if (fla & usage_map.flag_opcode == 0) continue;
+                if (fla & usage_map.flag_m != 0) continue;
+                const fa = ab * 0x8000 + (aa - 0x8000);
+                if (fa + 6 > image.len) continue;
+                if (image[fa] != 0xA9 or image[fa + 3] != 0x8D) continue;
+                const acell = std.mem.readInt(u16, image[fa + 4 ..][0..2], .little);
+                if (acell < 0x2000 and ptr_bank[acell] != 0) cell_active[acell] = true;
             }
         }
-    }
-    // Dispatchers of ACTIVE cells: marked as instruction starts DIRECTLY —
-    // a `JMP (cell)` is three bytes and the walk would only break on it
-    // anyway, and walk-order overlaps were losing the mark. Re-scanned
-    // raw and uncapped here: a fixed-size site list overflowed on the
-    // coincidental `6C xx` bytes of three megabytes of data long before
-    // it reached the real dispatchers (measured: 64 slots died in bank
-    // $01 while the cutscene dispatchers live at $02:E16F/$02:E28F).
-    var mb2: u32 = 0;
-    while (mb2 < 0x40) : (mb2 += 1) {
-        if (mb2 * 0x8000 >= image.len) break;
-        var ma2: u32 = 0x8000;
-        while (ma2 < 0x10000) : (ma2 += 1) {
-            const mf = mb2 * 0x8000 + (ma2 - 0x8000);
-            const mo = image[mf];
-            if (mo != 0x6C and mo != 0x7C and mo != 0xFC and mo != 0xDC) continue;
-            if (mf + 2 >= image.len) continue;
-            if (!bank_has_exec[mb2]) continue;
-            const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
-            if (mcell >= 0x2000 or !cell_active[mcell]) continue;
-            const msite = (mb2 << 16) | ma2;
-            // Same DATA-GATE as the ptr_bank scan: a byte the profile READ
-            // without executing is data, and marking it as a dispatcher
-            // start window-shifts a fake operand inside it (the Ceres
-            // door-stream `FC FC 0A` confetti byte).
-            const mflags = usage[msite] | usage[0x80_0000 | msite];
-            if (mflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                mflags & usage_map.flag_opcode == 0) continue;
-            if (ext[msite] & usage_map.flag_opcode == 0) {
-                ext[msite] &= ~(usage_map.flag_m | usage_map.flag_x);
-                ext[msite] |= usage_map.flag_opcode | usage_map.flag_exec;
-                ext[msite + 1] |= usage_map.flag_exec;
-                ext[msite + 2] |= usage_map.flag_exec;
-                grew = true;
+        var sb3: u32 = 0;
+        while (sb3 < 0x40) : (sb3 += 1) {
+            if (sb3 * 0x8000 >= image.len) break;
+            var sa3: u32 = 0x8000;
+            while (sa3 < 0x10000) : (sa3 += 1) {
+                const c3 = (sb3 << 16) | sa3;
+                const f3 = sb3 * 0x8000 + (sa3 - 0x8000);
+                if (f3 + 6 > image.len) continue;
+                if (image[f3] != 0xA9 or image[f3 + 3] != 0x8D) continue;
+                const cell = std.mem.readInt(u16, image[f3 + 4 ..][0..2], .little);
+                if (cell >= 0x2000 or !cell_active[cell]) continue;
+                const tgt = std.mem.readInt(u16, image[f3 + 1 ..][0..2], .little);
+                if (tgt < 0x8000) continue;
+                const fl3 = ext[c3] | ext[0x80_0000 | c3];
+                const covered3 = fl3 & usage_map.flag_opcode != 0;
+                if (covered3 and fl3 & usage_map.flag_m != 0) continue;
+                const db3: u32 = ptr_bank[cell] - 1;
+                const taddr: u32 = (db3 << 16) | tgt;
+                const tfile = db3 * 0x8000 + (tgt - 0x8000);
+                if (tfile >= image.len) continue;
+                const x8_3 = covered3 and fl3 & usage_map.flag_x != 0;
+                if (!seen[tfile]) {
+                    try stack.append(.{ .addr = @intCast(taddr), .m8 = false, .x8 = x8_3 });
+                    grew = true;
+                }
+                if (!covered3 and !seen[f3]) {
+                    try stack.append(.{ .addr = @intCast(c3), .m8 = false, .x8 = x8_3 });
+                    grew = true;
+                }
             }
         }
-    }
-    if (!grew) break :fixpoint;
+        // Dispatchers of ACTIVE cells: marked as instruction starts DIRECTLY —
+        // a `JMP (cell)` is three bytes and the walk would only break on it
+        // anyway, and walk-order overlaps were losing the mark. Re-scanned
+        // raw and uncapped here: a fixed-size site list overflowed on the
+        // coincidental `6C xx` bytes of three megabytes of data long before
+        // it reached the real dispatchers (measured: 64 slots died in bank
+        // $01 while the cutscene dispatchers live at $02:E16F/$02:E28F).
+        var mb2: u32 = 0;
+        while (mb2 < 0x40) : (mb2 += 1) {
+            if (mb2 * 0x8000 >= image.len) break;
+            var ma2: u32 = 0x8000;
+            while (ma2 < 0x10000) : (ma2 += 1) {
+                const mf = mb2 * 0x8000 + (ma2 - 0x8000);
+                const mo = image[mf];
+                if (mo != 0x6C and mo != 0x7C and mo != 0xFC and mo != 0xDC) continue;
+                if (mf + 2 >= image.len) continue;
+                if (!bank_has_exec[mb2]) continue;
+                const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
+                if (mcell >= 0x2000 or !cell_active[mcell]) continue;
+                const msite = (mb2 << 16) | ma2;
+                // Same DATA-GATE as the ptr_bank scan: a byte the profile READ
+                // without executing is data, and marking it as a dispatcher
+                // start window-shifts a fake operand inside it (the Ceres
+                // door-stream `FC FC 0A` confetti byte).
+                const mflags = usage[msite] | usage[0x80_0000 | msite];
+                if (mflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                    mflags & usage_map.flag_opcode == 0) continue;
+                if (ext[msite] & usage_map.flag_opcode == 0) {
+                    ext[msite] &= ~(usage_map.flag_m | usage_map.flag_x);
+                    ext[msite] |= usage_map.flag_opcode | usage_map.flag_exec;
+                    ext[msite + 1] |= usage_map.flag_exec;
+                    ext[msite + 2] |= usage_map.flag_exec;
+                    grew = true;
+                }
+            }
+        }
+        if (!grew) break :fixpoint;
     }
     return ext;
 }
@@ -4869,7 +4869,7 @@ fn emitSplit(
                 put(d, &cur, &.{ 0xC9, 0x80 }); // CMP #$80
                 put(d, &cur, &.{ 0xB0, 0x04 }); // BCS store
                 put(d, &cur, &.{ 0x38, 0xE9, 0x3E }); // SEC / SBC #$3E
-                put(d, &cur, &.{ 0xEA }); // pad: both branches land on the store
+                put(d, &cur, &.{0xEA}); // pad: both branches land on the store
                 put(d, &cur, &.{ 0x8D, 0x04, 0x43, 0x60 }); // STA $4304 / RTS
                 out[st] = 0x20; // JSR thunk over the 3-byte STA
                 std.mem.writeInt(u16, out[st + 1 ..][0..2], th16, .little);
@@ -6861,10 +6861,7 @@ pub fn convertWholeGame(
             // that stops costing bank bytes.
             const cap = pad.stubCapacity();
             const tier: enum { bodies, stubs, shared } =
-                if (pad.freeBytes() >= need) .bodies
-                else if (cap >= n_dist) .stubs
-                else if (cap >= n_dist_hot + 1) .shared
-                else return refuse(refusal, .{ .reason = .wg_thunk_space, .detail = tbank });
+                if (pad.freeBytes() >= need) .bodies else if (cap >= n_dist) .stubs else if (cap >= n_dist_hot + 1) .shared else return refuse(refusal, .{ .reason = .wg_thunk_space, .detail = tbank });
             const ff = tier != .bodies;
             if (dbg_thunk_pad)
                 std.debug.print("[thunkpad] bank {x:0>2}: {} site(s), {} distinct ({} hot), need {} free {} cap {} tier {s}\n", .{ tbank, j - i, n_dist, n_dist_hot, need, pad.freeBytes(), cap, @tagName(tier) });
@@ -8865,8 +8862,8 @@ test "window offload: the root's DBR pin travels through in-tree JSLs and admits
         } else &[_]u8{
             0xEA, 0xEA, 0xEA, 0xEA, 0xEA,
             0xA9, 0x11, 0x8D, 0x00, 0x05,
-            0x22, 0xA0, 0x80, 0x00,
-            0xEA, 0x6B,
+            0x22, 0xA0, 0x80, 0x00, 0xEA,
+            0x6B,
         });
         // Helper: a live counter, then a never-taken branch guarding the
         // hazard-shaped site (statically discovered code, zero evidence).
@@ -9234,8 +9231,9 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     @memcpy(rom[0x0000..0x002E], &[_]u8{
         0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
         0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
-        0xA9, 0x10, 0x8D, 0x82, 0x21,
-        0x9C, 0x83, 0x21,
+        0xA9, 0x10, 0x8D,
+        0x82, 0x21, 0x9C,
+        0x83, 0x21,
         0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
         0xEA, 0xEA, 0xEA, 0xEA, // mainloop ($8014): the displaced anchor
         0xAD, 0x12, 0x42, // LDA $4212 (mirror-swapped)
@@ -9628,13 +9626,15 @@ test "window: a NEGATIVE-base LONG,X site follows its wrap into the window" {
     });
     @memcpy(rom[0x00A0..0x00AB], &[_]u8{
         0xA2, 0x00, 0x00, // LDX #$0000
-        0x22, 0x00, 0x81, 0x00,
+        0x22, 0x00, 0x81,
+        0x00,
         0x8D, 0x74, 0x01, // STA $0174
         0x6B,
     });
     @memcpy(rom[0x00C0..0x00CB], &[_]u8{
         0xA2, 0x01, 0x80, // LDX #$8001
-        0x22, 0x00, 0x81, 0x00,
+        0x22, 0x00, 0x81,
+        0x00,
         0x8D, 0x78, 0x01, // STA $0178
         0x6B,
     });
@@ -10230,7 +10230,8 @@ test "window: a block move naming the SRAM banks refuses rather than guesses" {
         0xA0, 0x00, 0x00, // LDY #$0000
         0xA9, 0x00, 0x00, // LDA #$0000 (move 1 byte)
         0x54, 0x70, 0x7E, // MVN dst=$70, src=$7E
-        0x80, 0xFE, 0xEA, 0xEA,
+        0x80, 0xFE, 0xEA,
+        0xEA,
     });
     const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
     defer gpa.free(bytes);

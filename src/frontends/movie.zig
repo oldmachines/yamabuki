@@ -220,8 +220,12 @@ test "movie: a power-on recording still writes version 1" {
     const gpa = testing.allocator;
     const frames = try gpa.dupe([2]u16, &.{.{ 0x0100, 0 }});
     var m: Movie = .{
-        .accuracy = 1, .region = 0, .rom_crc = 1,
-        .end_frame_hash = 0, .end_audio_hash = 0, .frames = frames,
+        .accuracy = 1,
+        .region = 0,
+        .rom_crc = 1,
+        .end_frame_hash = 0,
+        .end_audio_hash = 0,
+        .frames = frames,
     };
     defer m.deinit(gpa);
     const bytes = try encode(gpa, m);
@@ -237,9 +241,13 @@ test "movie: an anchor round-trips and the frames still land after it" {
     const frames = try gpa.dupe([2]u16, &.{ .{ 0xAAAA, 0x5555 }, .{ 0x1234, 0x8765 } });
     const anchor = try gpa.dupe(u8, &[_]u8{ 'Y', 'M', 'B', 'K', 9, 9, 9 });
     var m: Movie = .{
-        .accuracy = 0, .region = 0, .rom_crc = 0xC0FFEE,
-        .end_frame_hash = 7, .end_audio_hash = 8,
-        .frames = frames, .anchor = anchor,
+        .accuracy = 0,
+        .region = 0,
+        .rom_crc = 0xC0FFEE,
+        .end_frame_hash = 7,
+        .end_audio_hash = 8,
+        .frames = frames,
+        .anchor = anchor,
     };
     defer m.deinit(gpa);
 

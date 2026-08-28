@@ -77,10 +77,8 @@ fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: 
     // the right one) shows up only against the destination.
     const is_vram = b_reg == 0x18 or b_reg == 0x19;
     std.debug.print("[dma] clk={d} ch{d} src={x:0>6} -> $21{x:0>2} {d} byte(s) ctl={x:0>2} mode={d}{s}{s}{s}", .{
-        clk, i, src, b_reg, bytes, control, control & 0x07,
-        if (a_is_dest) " (READ FROM B-BUS)" else "",
-        if (dead) "  <-- ABANDONED MEMORY" else "",
-        if (is_vram) " vdest=$" else "\n",
+        clk,                                         i,                                          src,                               b_reg, bytes, control, control & 0x07,
+        if (a_is_dest) " (READ FROM B-BUS)" else "", if (dead) "  <-- ABANDONED MEMORY" else "", if (is_vram) " vdest=$" else "\n",
     });
     if (is_vram) std.debug.print("{x:0>4}\n", .{vdest});
 }

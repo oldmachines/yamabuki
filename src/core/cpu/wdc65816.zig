@@ -308,7 +308,7 @@ pub fn Cpu(comptime BusT: type) type {
             dbg_dmabank_n += 1;
             const dead = value == 0x7E or value == 0x7F;
             std.debug.print("[dmabank] pc={x:0>2}:{x:0>4} ch{d} bank<={x:0>2} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2}{s}\n", .{
-                self.regs.pbr, self.regs.pc, (a16 >> 4) & 7, value, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr,
+                self.regs.pbr,                       self.regs.pc, (a16 >> 4) & 7, value, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr,
                 if (dead) "  <-- ABANDONED" else "",
             });
         }
@@ -331,9 +331,9 @@ pub fn Cpu(comptime BusT: type) type {
                     a16
                 else if ((bank & 0x7F) < 0x40 and a16 >= 0x6000 and a16 < 0x8000)
                     a16 - 0x6000
-                    // MMIO passes through as itself: a --watch range above
-                    // $2000 names PPU/DMA registers (the VRAM address, a
-                    // DMA channel), which no WRAM home could alias.
+                        // MMIO passes through as itself: a --watch range above
+                        // $2000 names PPU/DMA registers (the VRAM address, a
+                        // DMA channel), which no WRAM home could alias.
                 else if ((bank & 0x7F) < 0x40 and a16 >= 0x2100 and a16 < 0x4400)
                     a16
                 else

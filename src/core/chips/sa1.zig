@@ -594,7 +594,6 @@ pub const Sa1 = struct {
     }
 
     fn writeIoCpu(self: *Sa1, a16: u16, value: u8) void {
-
         switch (a16) {
             0x2200 => { // CCNT: SA-1 control
                 if (self.sa1_resb and value & 0x20 == 0) {

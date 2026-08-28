@@ -401,7 +401,6 @@ fn pcToFileOffset(header: header_mod.Header, image_len: usize, pc: u24) ?u32 {
 /// mirroring repeats it (384 KiB = 256 + 2x128, and so on); if the size is
 /// too irregular even for that, the plain sum stands — the pair is still
 /// self-consistent, which is all the console ever checks.
-
 pub fn recomputeChecksum(image: []u8, header_offset: u32) void {
     const cs = header_offset + 0x1C;
     var sum: u32 = 0x1FE; // FF + FF + 00 + 00

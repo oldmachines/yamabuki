@@ -238,7 +238,6 @@ fn ownerOf(nodes: []const Node, addr: u24) ?usize {
     return if (nodes[i].entry >> 16 == addr >> 16) i else null;
 }
 
-
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;

@@ -431,7 +431,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
@@ -514,7 +513,10 @@ pub fn main(init: std.process.Init) !void {
             // A tilemap of all-zero entries renders as nothing even with the
             // layer enabled, so count what is actually there.
             const words: usize = switch (b.map_size) {
-                0 => 0x400, 1 => 0x800, 2 => 0x800, 3 => 0x1000,
+                0 => 0x400,
+                1 => 0x800,
+                2 => 0x800,
+                3 => 0x1000,
             };
             var nonzero: usize = 0;
             var k: usize = 0;
@@ -523,8 +525,11 @@ pub fn main(init: std.process.Init) !void {
                 if (p.vram[idx] != 0) nonzero += 1;
             }
             w.print("bg{d}: on_main={} map_base=0x{x:0>4} map_size={d} char_base=0x{x:0>4} tile16={} hofs={d} vofs={d} tilemap_nonzero={d}/{d}\n", .{
-                i + 1, (p.main_screen >> @intCast(i)) & 1 != 0,
-                b.map_base, b.map_size, b.char_base, b.tile16, b.hofs, b.vofs, nonzero, words,
+                i + 1,       (p.main_screen >> @intCast(i)) & 1 != 0,
+                b.map_base,  b.map_size,
+                b.char_base, b.tile16,
+                b.hofs,      b.vofs,
+                nonzero,     words,
             }) catch {};
         }
         // HDMA: per-scanline effects read their table straight out of memory
@@ -555,7 +560,9 @@ pub fn main(init: std.process.Init) !void {
             p.cgwsel, p.cgadsub, p.fixed_color, p.setini,
         }) catch {};
         var vnz: usize = 0;
-        for (p.vram) |word| { if (word != 0) vnz += 1; }
+        for (p.vram) |word| {
+            if (word != 0) vnz += 1;
+        }
         w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
         // CGRAM digest: same tiles + same tilemap rendering differently can
         // only be the palette (measured: SM's Ceres room corrupts to stripes
@@ -2889,17 +2896,17 @@ fn runBehavioralProbe(
         try out.print(
             "surface {}: {s} — ticks {} ({} wall-stable, {} skew-active), bad {}, addrs {} ({} stable-active), novelty {}, worst_run {} (from tick {}), held {}, overflow {}, epochs {}, first_bad_frame {}\n",
             .{
-                s + 1,                      verdict_name,              bv.ticks_base,
-                bv.stats.stable_ticks,      bv.stats.skew_active_ticks, bv.stats.bad_ticks,
-                bv.stats.n_addrs,           bv.stats.stableAddrCount(), bv.stats.novelty_ticks,
-                bv.stats.worst_run,         bv.stats.worst_start,      bv.stats.heldCount(),
-                bv.stats.addr_overflow,     bv.stats.epoch_budget,     bv.first_bad_frame,
+                s + 1,                  verdict_name,               bv.ticks_base,
+                bv.stats.stable_ticks,  bv.stats.skew_active_ticks, bv.stats.bad_ticks,
+                bv.stats.n_addrs,       bv.stats.stableAddrCount(), bv.stats.novelty_ticks,
+                bv.stats.worst_run,     bv.stats.worst_start,       bv.stats.heldCount(),
+                bv.stats.addr_overflow, bv.stats.epoch_budget,      bv.first_bad_frame,
             },
         );
         try out.print("  runs: worst {} [{}..{}], runner-up {}, last_tick {}, reaches_end {}, burst_ticks {} (runs <= {}), long {} ({} ticks)\n", .{
-            bv.stats.worst_run,   bv.stats.worst_start,             bv.stats.worst_end, bv.stats.second_run,
-            bv.stats.last_tick,   bv.stats.runReachesEnd(),         bv.stats.burst_total,
-            util.Persistence.burst_len,                             bv.stats.long_runs, bv.stats.long_total,
+            bv.stats.worst_run, bv.stats.worst_start,     bv.stats.worst_end,   bv.stats.second_run,
+            bv.stats.last_tick, bv.stats.runReachesEnd(), bv.stats.burst_total, util.Persistence.burst_len,
+            bv.stats.long_runs, bv.stats.long_total,
         });
         if (bv.n_sample > 0) {
             try out.print("  first-bad sample:", .{});
@@ -3530,9 +3537,8 @@ fn printAudit(
             res.audit.bank_data[bank] == 0;
         if (odd) suspect += 1;
         try out.print("    ${x:0>2}  {d:>5} {d:>5} {d:>5} {d:>6}   .{d:0>3}  {d:>6}{s}\n", .{
-            bank,                      ran,  seen, res.audit.bank_calls[bank],
-            res.audit.bank_data[bank], dens, content,
-            if (odd) @as([]const u8, "   <-- code-like, never entered") else "",
+            bank,                      ran,  seen,    res.audit.bank_calls[bank],
+            res.audit.bank_data[bank], dens, content, if (odd) @as([]const u8, "   <-- code-like, never entered") else "",
         });
     }
     try out.print("  indirect transfers in seen code: {} JMP (abs), {} JMP/JSR (abs,X), {} JMP [abs]\n", .{

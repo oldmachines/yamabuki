@@ -169,7 +169,7 @@ test "cheat: multi-part codes split on +, and high WRAM is not mirrored" {
 
 test "cheat: a malformed code is refused rather than half-read" {
     var buf: [4]Poke = undefined;
-    try testing.expectError(error.BadAddress, parseCodes("7E00860", &buf, 0));   // 7 digits
+    try testing.expectError(error.BadAddress, parseCodes("7E00860", &buf, 0)); // 7 digits
     try testing.expectError(error.BadAddress, parseCodes("7E0086044", &buf, 0)); // 9 digits
     try testing.expectError(error.BadValue, parseCodes("7E0086zz", &buf, 0));
 }
