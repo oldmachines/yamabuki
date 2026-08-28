@@ -4055,12 +4055,39 @@ fn extendCoverage(
                     // $F768 — the thunk's own address). The profile
                     // outranks static reach: stop the fall-through.
                     if (a16 + 4 < 0x10000) {
-                        const fall: u32 = addr + 4;
                         const dyn_site = usage[addr] & usage_map.flag_opcode != 0 or
                             usage[0x80_0000 | addr] & usage_map.flag_opcode != 0;
-                        const dyn_fall = usage[fall] & usage_map.flag_opcode != 0 or
-                            usage[0x80_0000 | fall] & usage_map.flag_opcode != 0;
-                        if (dyn_site and !dyn_fall) break;
+                        if (dyn_site) {
+                            // Two shapes leave a covered JSL with an
+                            // uncovered fall-through, and they need opposite
+                            // treatment. INLINE PARAMS: the callee returns
+                            // PAST the params, so the profile marked a real
+                            // opcode a few bytes further on — trust it and
+                            // stop, or the params decode as code (measured:
+                            // `19 00 00` in a param block became a
+                            // context-split thunk). CALL NEVER RETURNED: the
+                            // profiled run died or was cut inside the callee
+                            // (measured: the door-transition JSL chain at
+                            // $82:E1CA — the player's recording crashed in
+                            // the first callee, so the two SIBLING JSLs
+                            // behind it kept their stock $A0 banks and the
+                            // next walk-through crashed one call later).
+                            // There the window past the call is dyn-DEAD,
+                            // and the static fall-through is both safe and
+                            // the only way to make progress.
+                            var probe: u32 = addr + 4;
+                            var dyn_near = false;
+                            const lim: u32 = @min(addr + 4 + 32, (wbank << 16) | 0xFFFF);
+                            while (probe < lim) : (probe += 1) {
+                                if (usage[probe] & usage_map.flag_opcode != 0 or
+                                    usage[0x80_0000 | probe] & usage_map.flag_opcode != 0)
+                                {
+                                    dyn_near = true;
+                                    break;
+                                }
+                            }
+                            if (dyn_near) break; // inline params: profile wins
+                        }
                     }
                 },
                 0x20 => { // JSR abs: target plus fall-through
@@ -10248,6 +10275,52 @@ test "window: a $C0-$DF table bank byte proves through the dp-staged PLB pin" {
     try testing.expectEqual(@as(u32, 1), res.stats.xl_pins);
     try testing.expectEqual(@as(u8, 0xD0), res.image[0x0022]); // byte stays stock
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x000F]); // site is a JML thunk
+}
+
+test "static walk: a covered JSL whose callee never returned still falls through" {
+    // Two shapes share "covered JSL, uncovered return": INLINE PARAMS (the
+    // profile marked a real opcode a few bytes past the call — stop, or the
+    // params decode as code) and a CALLEE THAT NEVER RETURNED during
+    // profiling (the door-transition chain: the recording crashed inside
+    // call #1, so calls #2 and #3 behind it kept stock banks and the next
+    // playthrough crashed one call later). The discriminator is dynamic
+    // coverage within a small window after the call.
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // site A @8100: JSL $008180, then two more JSLs — callee crashed, the
+    // window after A is dyn-dead. All three must be statically walked.
+    @memcpy(rom[0x0100..0x010C], &[_]u8{
+        0x22, 0x80, 0x81, 0x00, // JSL $00:8180  (dyn-covered, crashed inside)
+        0x22, 0x90, 0x81, 0x00, // JSL $00:8190  (never executed)
+        0x22, 0xA0, 0x81, 0x00, // JSL $00:81A0  (never executed)
+    });
+    rom[0x010C] = 0x60; // RTS
+    rom[0x0180] = 0x60;
+    rom[0x0190] = 0x60;
+    rom[0x01A0] = 0x60;
+    // site B @8200: the inline-params shape — dyn coverage resumes at +12,
+    // the 8 bytes after the JSL are DATA and must NOT be decoded.
+    @memcpy(rom[0x0200..0x0204], &[_]u8{ 0x22, 0xB0, 0x81, 0x00 });
+    @memset(rom[0x0204..0x020C], 0x42); // param block (WDM soup)
+    rom[0x020C] = 0x60; // the real return point (dyn-covered below)
+    rom[0x01B0] = 0x60;
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    markOp(bytes, 0x8100); // the crashed call — covered
+    markOp(bytes, 0x8200); // the inline-params call — covered
+    markOp(bytes, 0x820C); // ...and its skipped-params return point
+
+    const header = try header_mod.detect(rom);
+    const ext = try extendCoverage(gpa, rom, header, bytes);
+    defer gpa.free(ext);
+    // Crashed-callee chain: both sibling JSLs statically reached.
+    try testing.expect(ext[0x8104] & usage_map.flag_opcode != 0);
+    try testing.expect(ext[0x8108] & usage_map.flag_opcode != 0);
+    // Inline params stay data.
+    try testing.expect(ext[0x8204] & usage_map.flag_opcode == 0);
 }
 
 test "window: the abs,X-loaded HIGH-byte PLB pin translates instead of value-proving" {
