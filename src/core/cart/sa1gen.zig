@@ -4133,8 +4133,21 @@ fn extendCoverage(
             const o2 = image[f2];
             if (o2 == 0x6C or o2 == 0x7C or o2 == 0xFC or o2 == 0xDC) {
                 if (f2 + 2 < image.len) {
+                    // DATA-GATE: a byte the profile READ without ever
+                    // executing is stream/table data, and a raw `$FC` there
+                    // is a coincidence, not a dispatcher. Seeding it as code
+                    // window-shifts a fake operand INSIDE the data
+                    // (measured: `FC FC 0A` in the Ceres door-tileset's
+                    // compressed stream became `JSR ($0AFC,X)`, its "$0AFC"
+                    // was shifted to $6AFC — one byte, $0A -> $6A — and the
+                    // decompressor's back-references cascaded it across the
+                    // whole door sprite band as confetti).
+                    const cpu2 = (pb2 << 16) | pa2;
+                    const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
+                    const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                        dflags & usage_map.flag_opcode == 0;
                     const cell = std.mem.readInt(u16, image[f2 + 1 ..][0..2], .little);
-                    if (cell < 0x2000) ptr_bank[cell] = @intCast(pb2 + 1);
+                    if (cell < 0x2000 and !data_only) ptr_bank[cell] = @intCast(pb2 + 1);
                 }
             }
         }
@@ -4214,6 +4227,13 @@ fn extendCoverage(
             const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
             if (mcell >= 0x2000 or !cell_active[mcell]) continue;
             const msite = (mb2 << 16) | ma2;
+            // Same DATA-GATE as the ptr_bank scan: a byte the profile READ
+            // without executing is data, and marking it as a dispatcher
+            // start window-shifts a fake operand inside it (the Ceres
+            // door-stream `FC FC 0A` confetti byte).
+            const mflags = usage[msite] | usage[0x80_0000 | msite];
+            if (mflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
+                mflags & usage_map.flag_opcode == 0) continue;
             if (ext[msite] & usage_map.flag_opcode == 0) {
                 ext[msite] &= ~(usage_map.flag_m | usage_map.flag_x);
                 ext[msite] |= usage_map.flag_opcode | usage_map.flag_exec;
@@ -10321,6 +10341,50 @@ test "static walk: a covered JSL whose callee never returned still falls through
     try testing.expect(ext[0x8108] & usage_map.flag_opcode != 0);
     // Inline params stay data.
     try testing.expect(ext[0x8204] & usage_map.flag_opcode == 0);
+}
+
+test "static walk: a raw $FC inside profile-read data is not a dispatcher" {
+    // The Ceres confetti byte: compressed stream data happened to contain
+    // `FC FC 0A` — a coincidental `JSR ($0AFC,X)` — while covered code
+    // elsewhere stored a 16-bit literal into the same cell. The raw
+    // dispatcher scan seeded the stream as code and window-shifted the fake
+    // operand ($0A -> $6A) inside the data. Bytes the profile READ without
+    // executing must never match as dispatchers.
+    const gpa = testing.allocator;
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    // Covered code: store a pointer literal into cell $0AFC, then a real
+    // `JMP ($0AFC)` dispatcher so the cell ACTIVATES (both tiers).
+    @memcpy(rom[0x0000..0x000B], &[_]u8{
+        0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+        0xA9, 0x00, 0x83, // LDA #$8300
+        0x8D, 0xFC, 0x0A, // STA $0AFC
+        0x6C, // JMP ($0AFC) -> covered dispatcher at 800A
+    });
+    rom[0x000B] = 0xFC;
+    rom[0x000C] = 0x0A;
+    rom[0x0300] = 0x60; // the pointer target: RTS
+    // Profile-READ data containing the same coincidental shape.
+    @memcpy(rom[0x0500..0x0503], &[_]u8{ 0xFC, 0xFC, 0x0A });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    // The activation matcher demands the literal store run M16 — mark the
+    // covered ops with 16-bit widths (flag_m/flag_x CLEAR), not markOp's m8.
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x800A }) |a|
+        bytes[a] |= usage_map.flag_opcode | usage_map.flag_exec;
+    bytes[0x8500] |= usage_map.flag_read; // the stream byte: READ, never executed
+    bytes[0x8501] |= usage_map.flag_read;
+    bytes[0x8502] |= usage_map.flag_read;
+
+    const header = try header_mod.detect(rom);
+    const ext = try extendCoverage(gpa, rom, header, bytes);
+    defer gpa.free(ext);
+    // The data's fake dispatcher must NOT be decoded as code.
+    try testing.expect(ext[0x8500] & usage_map.flag_opcode == 0);
+    // The real dispatcher's pointer target IS reached (the feature works).
+    try testing.expect(ext[0x8300] & usage_map.flag_opcode != 0);
 }
 
 test "window: the abs,X-loaded HIGH-byte PLB pin translates instead of value-proving" {
