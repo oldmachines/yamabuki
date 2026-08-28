@@ -361,6 +361,14 @@ value, so frame-times computed as N x 357366 miss trace windows entirely;
 and when a band matches NEITHER candidate home, re-derive the file math
 before inventing a third mechanism.
 
+**Known residual (open):** the HUD minimap's current-room cell. Stock
+blinks it on an ~8-frame cadence (two tile patterns); v8 shows a third,
+static pattern. The entire 64 KiB settled OBJ/map page differs from
+stock in exactly 4 bytes - the cell's two tilemap words at `$7F:B078`
+and `$7F:B0B8` - and the f14999 frames are otherwise pixel-identical.
+Cosmetic, one cell, invisible to `--verify-behavioral`; the blink
+routine's data source is the suspect for a future pass.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
