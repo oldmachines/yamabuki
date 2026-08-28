@@ -616,6 +616,43 @@ pub fn Console(comptime cfg: CoreConfig) type {
                         pb.noteUnresolved(pc, a16);
                 }
                 if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4304 and a16 <= 0x4374 and
+                    (a16 & 0xF) == 4 and width == 2 and
+                    self.bus.mdr >= 0xA0 and self.bus.mdr <= 0xDF)
+                {
+                    // The MISFIT arm of the same 16-bit $43x3 idiom: the
+                    // staged bank is mirror-intent ($A0-$BF reads MB2 under
+                    // the shim, $C0-$DF homes $20 lower). Measured: the
+                    // escape's door-tile upload `$B0:C400 -> vdest $7000`
+                    // stages its word via `STA $4313` ($80:8CAA); the $B0
+                    // was never proven, the transfer read the MB2 home
+                    // (file $284400) instead of MB1 ($184400), and the
+                    // door's second OBJ tile table rendered as confetti.
+                    // Proved ONLY when the source byte IS the stored value
+                    // (the dual-role lesson: a byte that is addr-half for
+                    // another consumer must stay stock).
+                    const ch2b: u3 = @truncate(a16 >> 4);
+                    self.dma_a1t_src[ch2b] = none;
+                    // Candidate source of the bank (high) byte just stored:
+                    // a direct ROM load proves itself; a load from a WRAM
+                    // QUEUE CELL (the DMA job queue) proves through the
+                    // cell's src_any copy-chain, which the 16-bit staging
+                    // path leaves in a_hi_src — the strict chain in
+                    // prev_load_hi_src is the fallback.
+                    const rsrc: u32 = if (self.prev_load_end != none and self.prev_load_w == 2)
+                        self.prev_load_end
+                    else if (self.a_hi_src != none)
+                        self.a_hi_src
+                    else if (self.prev_load_hi_src != none)
+                        self.prev_load_hi_src
+                    else
+                        none;
+                    if (rsrc != none and (rsrc & 0xFFFF) >= 0x8000 and
+                        self.bus.peek8(@intCast(rsrc)) == self.bus.mdr)
+                    {
+                        if (self.bus.mdr >= 0xC0) pb.addHiProven(rsrc) else pb.addA0Proven(rsrc);
+                    } else pb.noteUnresolved(pc, a16);
+                }
+                if (((a >> 16) & 0x7F) <= 0x3F and a16 >= 0x4304 and a16 <= 0x4374 and
                     (a16 & 0xF) == 4 and width == 1)
                 {
                     const ch: u3 = @truncate(a16 >> 4);

@@ -3363,6 +3363,43 @@ fn dasbThunkBody(store: [3]u8, ret: u8) [dasb_thunk_len]u8 {
     };
 }
 
+/// The A-bus bank (A1B, $43x4) runtime rebank thunk body: the FULL misfit
+/// map, because a staged DMA source bank can carry any mirror-intent value —
+/// $7E/$7F (WRAM -> BW-RAM, -$3E), $A0-$BF (mirror-of-MB1 intent that the
+/// shim parks at MB2, -$80), $C0-$DF (MB2 content homed $20 lower, -$20).
+/// Measured: Super Metroid's escape arms `$B0:C400 -> vdest $7000` through a
+/// staged bank byte the provenance never proved; the transfer read the MB2
+/// home (file $284400) instead of MB1 ($184400) and the door's second OBJ
+/// tile table arrived as confetti. Banks $00-$3F and $80-$9F pass through
+/// (region 2 restores that mirror). Same calling convention as the DASB
+/// body: the JSR replaces the 3-byte store; A and P are preserved.
+const a1b_thunk_len: u32 = 37;
+fn a1bThunkBody(store: [3]u8, ret: u8) [a1b_thunk_len]u8 {
+    // Branch offsets audited by simulation; store at body index 31.
+    return .{
+        0x08, // PHP
+        0xE2, 0x20, // SEP #$20
+        0x48, // PHA
+        0xC9, 0x7E, // CMP #$7E
+        0x90, 0x17, // BCC store — plain banks $00-$7D
+        0xC9, 0x80, // CMP #$80
+        0xB0, 0x05, // BCS mirror-region checks
+        0x38, 0xE9, 0x3E, // SEC / SBC #$3E — $7E/$7F -> $40/$41
+        0x80, 0x0E, // BRA store
+        0xC9, 0xA0, // CMP #$A0
+        0x90, 0x0A, // BCC store — $80-$9F: genuine mirror
+        0xC9, 0xC0, // CMP #$C0
+        0xB0, 0x04, // BCS hi
+        0xE9, 0x7F, // SBC #$7F (carry clear) — $A0-$BF -> -$80
+        0x80, 0x02, // BRA store
+        0xE9, 0x20, // hi: SBC #$20 (carry set) — $C0-$DF -> -$20
+        store[0], store[1], store[2], // STA $43x4[,X/Y]
+        0x68, // PLA
+        0x28, // PLP
+        ret,
+    };
+}
+
 /// Wrap every covered `STA $43x7` (a channel's DASB — the indirect HDMA
 /// source bank) in a runtime rebank thunk. When an indirect HDMA's source
 /// is WRAM, the game names the WRAM bank in DASB, and that bank is a byte
@@ -3411,7 +3448,11 @@ fn rebankDasbWrites(
                 else => continue,
             }
             const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            if (tgt < 0x4307 or tgt > 0x4377 or (tgt & 0xF) != 7) continue;
+            if (tgt < 0x4300 or tgt > 0x437F) continue;
+            const col = tgt & 0xF;
+            // Column 7 (DASB) always; column 4 (A1B) on >2 MiB images, where
+            // an unmapped mirror-intent bank sources the wrong megabyte.
+            if (col != 7 and !(col == 4 and out.len > 0x20_0000)) continue;
             // The register is a byte, and the thunk compares an 8-bit A; a
             // 16-bit store here would be writing DASB+A2A-low as a word, not
             // a plain bank set — leave that shape untouched.
@@ -3422,15 +3463,11 @@ fn rebankDasbWrites(
                 dasb_pad_bank = dbank;
             }
             const store: [3]u8 = out[file..][0..3].*;
-            const taddr = placeThunk(
-                out,
-                &dasb_pad,
-                far,
-                &dasbThunkBody(store, 0x60),
-                &dasbThunkBody(store, 0x6B),
-                false,
-                &res.stats.split_far,
-            ) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = dasb_thunk_len });
+            const taddr = (if (col == 7)
+                placeThunk(out, &dasb_pad, far, &dasbThunkBody(store, 0x60), &dasbThunkBody(store, 0x6B), false, &res.stats.split_far)
+            else
+                placeThunk(out, &dasb_pad, far, &a1bThunkBody(store, 0x60), &a1bThunkBody(store, 0x6B), false, &res.stats.split_far)) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = a1b_thunk_len });
             out[file] = 0x20; // JSR — same 3-byte footprint as the store
             std.mem.writeInt(u16, out[file + 1 ..][0..2], taddr, .little);
             res.stats.rewritten_dasb += 1;
@@ -10365,6 +10402,50 @@ test "static walk: a covered JSL whose callee never returned still falls through
     try testing.expect(ext[0x8108] & usage_map.flag_opcode != 0);
     // Inline params stay data.
     try testing.expect(ext[0x8204] & usage_map.flag_opcode == 0);
+}
+
+test "window: a misfit bank staged via 16-bit STA $4313 proves and re-banks" {
+    // The Ceres door-tile upload: `LDA $tbl,X / STA $4313` stages A1T-hi in
+    // the low byte and the BANK ($B0, mirror-intent MB1) in the high. The
+    // $7E arm of this family existed; the misfit arm did not, so the $B0
+    // went unproven and the DMA read the wrong megabyte. The high byte's
+    // ROM source must prove and re-bank -$80.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memcpy(rom[0x0000..0x0012], &[_]u8{
+        0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+        0xA2, 0x00, 0x00, // LDX #$0000
+        0xBD, 0x20, 0x80, // LDA $8020,X — table word (C4, B0)
+        0x8D, 0x13, 0x43, // STA $4313 — A1T-hi + A1B
+        0xA9, 0x00, 0x04, // LDA #$0400
+        0x80, 0xFE, // spin
+    });
+    rom[0x0020] = 0xC4; // A1T-hi
+    rom[0x0021] = 0xB0; // the misfit bank byte
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const pe = try gpa.create(usage_map.PtrBankEvidence);
+    defer gpa.destroy(pe);
+    pe.* = .init;
+    const map: usage_map.UsageMap = .{ .bytes = bytes, .ptr_banks = pe };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..2) |_| con.runFrame();
+    }
+    try testing.expectEqual(@as(usize, 1), pe.n_a0);
+    try testing.expectEqual(@as(u32, 0x8021), pe.a0_proven[0]);
 }
 
 test "static walk: a raw $FC inside profile-read data is not a dispatcher" {
