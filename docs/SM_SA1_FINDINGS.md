@@ -449,6 +449,10 @@ different" dead-ends were just a register the dump didn't yet print.
   (`$0641`), and stored-bank representational twins (`$7E/$7F → $40/$41`).
   A "translated-twin" gate excuse would make these formally clean.
 - The RNG fork tail (f13,901 → end) is excused by design — eyeball it in play.
+- **The HUD minimap current-room cell is static on v8** (stock blinks it,
+  ~8-frame cadence). Exactly 4 bytes of the settled 64K `$7F` page differ:
+  the cell's two tilemap words `$7F:B078/$7F:B0B8` (stock `A810/3C23`,
+  v8 `E91F/3EEE`). Cosmetic, invisible to `--verify-behavioral`; see §11.
 
 ## 7. Chronology of generations (this campaign)
 
@@ -463,6 +467,13 @@ come out byte-identical to stock, and the new-game room renders. The
 black-room freeze is fixed. The Ceres-escape garble is now fixed too (§4a):
 low-WRAM HDMA-table indirect addresses relocate into the window (hdma3) and the
 `$43x7` DASB thunk rebanks the colour HDMA (hdma2) — pixel-identical to stock.
+gen52-55 (v2-v5): player report #5/#6 fix chain — the four stacked
+invisible-beam pins, the walker fall-through guard, and both dispatcher-plant
+gates; the door freeze dies · gen56-58 (v6-v8): the misfit-bank hunt — two
+mis-wired provenance candidates (unresolved-site counter 2), then the
+`a_hi_src` wiring lands and **v8 ships**: door band 24 → 1024/1024,
+unresolved 0, behaviorally equivalent. The stack (#115/#114/#113) merged to
+`main` 2026-08-28.
 
 ## 8. Cross-cutting learnings
 
@@ -496,6 +507,33 @@ Method traps that cost real time and are worth internalizing:
   collides with existing code (`disp_sites`) silently hid three failed
   patches; grep something the patch is the sole source of (`disp_cells`).
 
+- **Two mechanisms can share one symptom — keep a money check.** The
+  dispatcher-plant census closed a real, image-wide bug, and the door band
+  was still garbage: a second, unrelated mechanism (the unproven queue-staged
+  bank, §4d) hid behind the same confetti. Define the one decisive
+  comparison up front (band bytes vs their stock file home, the frame after
+  the arming DMA) and re-run it after every candidate fix; declare nothing
+  fixed until it flips.
+- **Wire a provenance arm to what the staging code actually leaves behind.**
+  Two full generation cycles were spent on plausible-but-wrong candidate
+  variables. The load-staging block is the ground truth: for a 16-bit WRAM
+  load it leaves the `src_any`-resolved high byte in `a_hi_src` (the chain
+  that survives RAM staging) and *none* in `prev_load_end`. Read the staging
+  code and the stock disassembly at the armer pc first; don't guess
+  candidates. The `noteUnresolved` counter (2 → 0) was the signal that told
+  hit from miss.
+- **Out-of-suite consumers rot silently when an API grows.** `zig build
+  test` never compiles `tests/patchgen_runner.zig`; `convertWholeGame` grew
+  three parameters across sessions and only CI (`test-patchgen`) caught the
+  drift — after weeks. When widening a public generator signature, grep all
+  call sites including `tests/` and `tools/`, or the breakage surfaces at
+  merge time.
+- **A blink can masquerade as corruption (and vice versa).** The minimap
+  residual triage: single-frame pixel diff → suspicious cell; then compare
+  the *sets* of the cell's patterns over a frame window on both builds.
+  Overlapping sets = phase lag (benign); disjoint sets (our case) = real
+  content divergence. Twenty frames each settled it.
+
 ## 9. Player / packaging notes
 
 - **`--shader-dir` defaults to `"shaders"` relative to the working directory.**
@@ -527,4 +565,50 @@ Method traps that cost real time and are worth internalizing:
   HDMA-table indirect addresses into the window (the hdma3 tile-sheet leg of
   the Ceres escape), its unit test, and the `--hdma-disable`/`--dma-trace`
   vdest diagnostics (§4a). The escape now renders correct.
-- Docs live in this file; the working branch is `claude/sa1-async-offload`.
+- `866e6d0` — base-emulator VRAM read-latch fix (reload only on the
+  VMAIN-designated port; Ceres speckle == bsnes after) (§4b).
+- `4f6c09a` — the four stacked invisible-beam pin fixes (dual-role `abs,X`
+  PLB value-proof, the new `abs,X` thunk shape, `map_body` sub-`$A0` branch,
+  `idBank` on 3 MiB) (§4c).
+- `feec2a4` — walker JSL fall-through guard (dyn-coverage-within-32-bytes
+  discriminator); de-mirrors the door JSL chain (§4d.1-2).
+- `2af4eb2` + `5c443ee` — dispatcher-plant gates: profile-read data never a
+  candidate; raw scans only in banks with executed code (§4d.3).
+- `e7a3005` — the misfit-bank provenance arm (16-bit `STA $4313`,
+  `a_hi_src`/`src_any` resolution) + `a1bThunkBody` + test; the confetti
+  root fix (§4d.4).
+- `452903d` — the minimap-cell residual note; `5acd82e` — patchgen-runner
+  signature mend + branch-wide `zig fmt` (the CI green-up).
+- Landed in `main` 2026-08-28 via the #115 → #114 → #113 stack
+  (`main @ 35d5dc8`); the working branch is `claude/sa1-async-offload`,
+  rebased onto main after landing.
+
+## 11. What next
+
+In rough value order:
+
+1. **The minimap-cell residual (§6).** Concrete entry point: the two
+   tilemap words `$7F:B078/$7F:B0B8`. Blocker to remove first: `--watch`
+   is blind to banks `$7F`/`$41`, so the write site can't be trapped yet —
+   extend the watch to WRAM/BW-RAM addresses, then trap the stock writes,
+   find the blink routine's data source, and check its provenance in the
+   conversion (prediction: another value-mediated home the rewriter missed,
+   small sibling of §4d.4).
+2. **Broaden the play surface.** Every player report so far came from the
+   first minutes of the game; the plants and misfit banks it flushed were
+   generic mechanisms. A longer recorded playthrough (Zebes proper, item
+   pickups, map/pause screens, a save station) would flush the remaining
+   idiom families cheaply while the harvest machinery is warm.
+3. **The mainline-split probe (Gradius III-style SA-1 offload).** First
+   step is cheap: lag-profile the stock surfaces to see where SM actually
+   lags. Then attempt `--wg-split-mode` with current evidence and read the
+   refusals — that list is the campaign plan. Expected hard parts: the
+   `$2139`-reading decompressor must stay S-CPU-side, the DMA-queue-arming
+   mainline is MMIO-entangled, and every split thunk multiplies the 3 MiB
+   mirror-provenance surface.
+4. **Formalize the behavioral "held" excuses (§6)** — a translated-twin
+   gate excuse for `$7E/$7F → $40/$41` representational twins would make
+   the in-game surface formally clean instead of waiver-clean.
+5. **Uncovered handlers (§6)** — `$94:98E9` and `$00:840F` remain stock;
+   any surface that executes them (item cutscenes?) converts them for free
+   via the existing harvest path.
