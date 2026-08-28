@@ -252,6 +252,37 @@ end-of-frame `bg_mode=1` dump is the vblank restore, a trap), the trace-dedup
 hiding re-uploads (fixed in `c5f33c8`), and `--watch` being blind to banks
 $7F/$41 (an open instrument gap) are recorded in the memory.
 
+### 4c. The invisible beam and the confetti door (player report #5)
+
+One recording ("I try to fire the gun but it doesn't work, and the door on the
+right is garbled") unwound into FOUR stacked generator defects - each masking
+the next, each found by refusing intermediate signals and verifying against
+the rendered game:
+
+1. **A dual-role table word value-proved.** The escape's sprite-tile builder
+   pins DBR via `LDA $abs,X / PHA / PLB / PLB`; the eager PLB-time prove had
+   no arm for that idiom and re-banked the word's ADDRESS half -$80 (ROM
+   `$20:E276`, `$BA -> $3A`), so the builder read zeros and the beam/door
+   sprites went blank. The gun always fired - layer isolation showed the
+   projectile in flight; only its tiles were empty.
+2. **No translate-in shape for the idiom** - added (6-byte site, SEP/REP
+   bracket around the 8-bit map, returns past the orphaned PLB pair).
+3. **The shared map_body mangled banks below $A0** (BCC one arm short) -
+   latent since Gradius, exposed the first time the map ran on a loop
+   pulling ordinary banks.
+4. **xl JML banks assumed the stock mirror** (`|$80`): on a 3 MiB image
+   that is MB2, and the first bank-$20 xl bodies jumped into the wrong
+   megabyte - two failed regenerations whose freeze (jam at a mid-body
+   address, alien D/DBR) was decoded from the un-pulled stack frames.
+
+Proof chain: builder buffer byte-identical to stock (0/4096; broken build
+1132 wrong), muzzle flash renders (beam-motion 29 -> 140, stock 195),
+residual VRAM delta uniform across the 16 door-flash animation slots (phase,
+not corruption), BEHAVIORALLY EQUIVALENT with the player's recording
+harvested. Method note: a save-state-anchored recording restores the OLD
+build's VRAM - it can prove a bug but never a fix; power-on surfaces prove
+fixes.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
