@@ -52,6 +52,13 @@ const Args = struct {
     rom: []const u8,
     frames: ?u32 = null,
     ppm: ?[]const u8 = null,
+    /// `--ppm-range start:count:prefix`: DIAGNOSTIC. Dump each frame in
+    /// [start, start+count) as `<prefix>NNNNN.ppm` (5-digit, zero-padded) —
+    /// a frame window to assemble into a recording of a moving effect the
+    /// single final-frame `--ppm` cannot show.
+    ppm_range_start: ?u32 = null,
+    ppm_range_count: u32 = 0,
+    ppm_range_prefix: []const u8 = "frame",
     wav: ?[]const u8 = null,
     accuracy: core.Accuracy = .fast,
     region: RegionArg = .auto,
@@ -79,6 +86,8 @@ const Args = struct {
     /// profiled run as a bsnes-plus `-usage.bin` file (DiztinGUIsh imports
     /// it). A `--sa1-report` modifier, like `--hot`.
     usage_map_out: ?[]const u8 = null,
+    /// --call-graph: where to write the routine graph (Graphviz DOT).
+    call_graph_out: ?[]const u8 = null,
     /// Stage S2: print the relocation plan — the WRAM -> I-RAM/BW-RAM
     /// allocation map for the conversion verdict's hot set.
     plan: bool = false,
@@ -86,11 +95,126 @@ const Args = struct {
     /// 256, for a widescreen game patch (e.g. wide-snes) that draws into the
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
-    /// A recorded playthrough (.ymv) driving both pads from power-on. In a
-    /// normal run it replays and verifies the movie's end hashes; in the
-    /// generator/report modes it drives the profiled runs, so coverage and
-    /// verification come from real gameplay instead of the attract mode.
-    movie: ?[]const u8 = null,
+    /// Recorded playthroughs (.ymv) driving both pads from power-on. In a
+    /// normal run one movie replays and verifies its end hashes; in the
+    /// generator/report modes movies drive the profiled runs, so coverage
+    /// and verification come from real gameplay instead of the attract
+    /// mode. The generator accepts SEVERAL `--movie` flags: each is an
+    /// input SURFACE, all of them feed one evidence/coverage union, and
+    /// every one must verify — because each movie is a different world,
+    /// and a surface one movie covers can be exactly the surface another
+    /// displaces (measured: the movie that added stage-1 gameplay lost
+    /// the attract demo, and demo-only code fell out of the rewrite).
+    movies: [max_movies][]const u8 = undefined,
+    n_movies: usize = 0,
+    /// Per-movie: does this movie VERIFY (a surface every attempt must
+    /// pass) or only contribute evidence/coverage? `--evidence-movie`
+    /// adds the latter kind — a playthrough whose later stretch is
+    /// UNVERIFIABLE by construction rather than broken: gameplay forks at
+    /// the first RNG-divergent event (enemy RNG seeds from wall-origin
+    /// counters the conversion legitimately offsets; measured: stock's
+    /// ship exploded at wall 3100 while the byte-equivalent conversion's
+    /// ship flew on — every later tick compares two different games). The
+    /// code such a stretch covers (death sequence, continue screen) still
+    /// runs in real play and still needs its rewrites.
+    movie_verify: [max_movies]bool = @splat(true),
+    /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
+    /// file after the run.
+    dump_ram: ?[]const u8 = null,
+    /// `--dump-ppu`: the display state as text after the run. For the
+    /// question a RAM dump cannot answer — a layer that is missing from
+    /// the picture is either disabled, pointed somewhere empty, or fed a
+    /// tilemap that never arrived, and those look identical in WRAM.
+    dump_ppu: ?[]const u8 = null,
+    /// `--movie-ignore-crc`: DIAGNOSTIC. Replay a movie whose recorded
+    /// image CRC differs from this run's — for re-playing a recording made
+    /// on a previous conversion against a freshly regenerated one (window
+    /// mode preserves the S-CPU's code and frame timing, so controller
+    /// input usually stays in sync). The end-hash check becomes advisory.
+    movie_ignore_crc: bool = false,
+    /// `--dump-vram`: raw VRAM (64 KiB) then OAM (544 B) after the run.
+    dump_vram: ?[]const u8 = null,
+    /// --save-state-at: frame to stop at and the file to write the machine to.
+    /// A recording that carries its own anchor cannot be a window-mode
+    /// surface, but the machine it passes through CAN anchor a profile — this
+    /// is how a late-game scene reaches the generator without a power-on take.
+    save_state_at: ?u32 = null,
+    save_state_path: []const u8 = "",
+    /// `--poke ADDR=VAL`: cheat writes held after every frame. Repeatable,
+    /// and each flag may carry a comma-separated list.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
+    /// Verifier debugging (undocumented): run ONLY the behavioral tier —
+    /// stock ROM as baseline, this converted image, the given movies —
+    /// and print the verdict with its full accounting. Iterating the
+    /// tier's rules against a preserved failing rung in minutes instead
+    /// of re-running the whole generation ladder.
+    behavioral_probe: ?[]const u8 = null,
+    iram_dump: bool = false,
+    /// Window debugging (undocumented): write each verification attempt's
+    /// converted image to this path (last attempt wins).
+    save_attempt: ?[]const u8 = null,
+    /// Window offloads (undocumented --wg-sync): never try the async
+    /// flavor. The async monopoly admits ONE tree; a passing async
+    /// first attempt ships alone even when the sync ladder would carry
+    /// more trees and more speedup.
+    wg_sync: bool = false,
+    /// Window mode (undocumented --wg-fastrom): layer the FastROM
+    /// transform onto every converted attempt image — MEMSEL stub,
+    /// interrupt trampolines into the $80 mirrors, observed MEMSEL
+    /// stores NOPed. The SA-1 MMC serves the fast mirrors under MEMSEL
+    /// like any FastROM cart, so this cuts ~25% off every remaining
+    /// S-CPU ROM cycle, orthogonally to the offload trees.
+    wg_fastrom: bool = false,
+    /// Window offloads (undocumented --wg-drop <hex16>, repeatable):
+    /// pre-seed the bisect's dropped list — exclude a tree the surfaces
+    /// pass but live play proves unsafe (measured: the $8EF1 walker
+    /// races NMI-side slot mutations into a ROM cycle at the continue
+    /// screen; movie surfaces never exhibit that interleaving).
+    wg_drop: [8]u32 = @splat(0),
+    n_wg_drop: usize = 0,
+    /// --wg-nmi-off <hex16> (repeatable): wrap these trees' sync stubs
+    /// in NMI/IRQ-off across the dispatch (closes the concurrent-
+    /// mutation hazard by construction; implies the tree never ships
+    /// async).
+    wg_nmi_off: [8]u32 = @splat(0),
+    n_wg_nmi_off: usize = 0,
+    /// --cover-image <patched.sfc> + --cover-movie <f.ymv>: harvest
+    /// COVERAGE (opcode + width bits only, no site evidence) from a
+    /// movie replayed on a PREVIOUS CONVERSION of this game, merged
+    /// into the union wherever the instruction byte matches the stock
+    /// image. This is how gameplay only reachable on the conversion
+    /// (a recorded run whose inputs are conv-timed dies early when
+    /// replayed on stock) still teaches the rewriter which code
+    /// exists: which instructions execute is address-space-invariant
+    /// even though their operands were rewritten.
+    /// Repeatable: each `--cover-image` opens a new pair, and the
+    /// `--cover-movie` after it fills the same slot. One recording covers
+    /// one scenario, and the defects live in the scenarios nobody
+    /// profiled — so the harvest has to take as many as there are.
+    cover_image: [24]?[]const u8 = @splat(null),
+    cover_movie: [24]?[]const u8 = @splat(null),
+    n_cover: usize = 0,
+    /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
+    /// comma-separated plan-region indices to KEEP as live relocations
+    /// (offloads disabled for the run). Bisects the relocation plan.
+    /// Undocumented --hash-stream: write one u64 frame hash per frame to
+    /// this path. The picture stream is the comparison that survives a lag
+    /// differential, so this is the cheap sound oracle for "did the build
+    /// change what the game DOES, or only how fast it does it".
+    hash_stream: ?[]const u8 = null,
+    s2_keep: ?[]const u8 = null,
+    /// Resume from an SDL-player save state instead of power-on (plain runs
+    /// and --sa1-report). Same-image, same-core states only.
+    state: ?[]const u8 = null,
+    /// S4: when the pixel gate says divergent, also run the behavioral
+    /// tier — logic-state equality at every logic tick — and accept a
+    /// conversion whose divergence is only wall-time echoes.
+    verify_behavioral: bool = false,
+    /// Diagnostic for the behavioral verifier's design: write every logic
+    /// tick's phase-aligned WRAM snapshot (u32 wall frame + 128 KiB raw,
+    /// repeated) to this file. Fast core only.
+    tick_dump: ?[]const u8 = null,
     /// Generate a FastROM patch for this ROM, verified in-emulator before
     /// anything is written (see `util.generateFastromVerified`).
     gen_fastrom: bool = false,
@@ -102,17 +226,52 @@ const Args = struct {
     /// game executes on the SA-1 and the S-CPU becomes an MMIO service
     /// loop — instead of the routine-offload ladder.
     whole_game: bool = false,
+    /// Uniform window relocation: the game keeps running on the S-CPU and
+    /// only its memory moves (WRAM low 8K -> the S-CPU BW-RAM window,
+    /// $7E/$7F longs -> $40/$41). Implies the whole-game pipeline shape.
+    window: bool = false,
     /// With --whole-game: also rewrite code the profiled run never reached,
     /// discovered by recursive-descent disassembly seeded from coverage.
     /// Unprovable shapes in that code are counted, not refused over.
     wg_static: bool = false,
+    /// --wg-copy-reserve: bytes held at the tail of the biggest padding run
+    /// for offload tree copies. The default matches the generator's own.
+    wg_copy_reserve: u32 = core.sa1gen.copy_reserve,
+    /// S5 mainline split: the engage anchor; zero = split off.
+    wg_split_mainloop: u16 = 0,
+    wg_split_tail: u16 = 0,
+    wg_split_epi: u16 = 0,
+    wg_split_dbr: u8 = 0,
+    wg_split_mode_cell: u8 = 0,
+    wg_split_mode_value: u8 = 0,
+    wg_split_mode: bool = false,
+    wg_split_io: [26]core.sa1gen.SplitIo = undefined,
+    n_wg_split_io: usize = 0,
+    wg_split_vbl: [8][2]u16 = undefined,
+    n_wg_split_vbl: usize = 0,
+    /// --wg-expand: grow the converted image to this many bytes (0 = keep the
+    /// original size), handing the conversion room it does not otherwise have.
+    wg_expand_to: u32 = 0,
+    /// --wg-add: extra offload candidates (CPU addresses), for routines a
+    /// single-scene profile ranks too low to offer.
+    wg_add: [8]u24 = @splat(0),
+    n_wg_add: usize = 0,
     /// Where to write the generated patch. Default: `<rom>.bps` next to the
     /// ROM — the softpatch convention every frontend picks up by name.
     gen_out: ?[]const u8 = null,
+    /// This process's own argv, joined and quoted. Written beside every
+    /// generated patch and echoed into the log, because a generation that
+    /// cannot be re-issued exactly cannot be reproduced — and three
+    /// separate days went into reconstructing one from prose notes, each
+    /// time missing a different flag.
+    cmdline: []const u8 = "",
 };
 
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
 const report_frames_default: u32 = 3600;
+
+/// Input surfaces one generator run accepts (each `--movie` is one).
+const max_movies: usize = 6;
 
 /// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
 /// same standard patches/fastrom-compat.zon entries are verified to.
@@ -152,7 +311,23 @@ pub fn main(init: std.process.Init) !void {
             \\  --patch-dir d where --auto-patch looks for patch files (default: patches/)
             \\  --save-patched  write the patched image and exit without emulating (needs a patch)
             \\  --auto-fastrom  pin MEMSEL=1 (FastROM timing for SlowROM games; compat-list gated)
-            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player)
+            \\  --movie f     replay a recorded playthrough (.ymv, recorded in the SDL player);
+            \\                --gen-sa1-patch accepts SEVERAL --movie flags — each is a
+            \\                verification SURFACE, evidence/coverage is their union, and
+            \\                every surface must verify
+            \\  --verify-behavioral  S4: on pixel divergence, accept a conversion whose logic
+            \\                state matches at every tick (for timing-changing offloads)
+            \\  --poke a=v    hold byte v at CPU address a (both hex) after every frame,
+            \\                the way an Action Replay does; repeatable, comma-lists ok.
+            \\                The address is a BUS address, so it lands where that byte
+            \\                really lives in THIS image: a stock ROM takes the published
+            \\                address (7E0086); a window conversion takes its window
+            \\                address (006086) — the low 8 KiB moved into BW-RAM
+            \\  --state f     resume from an SDL-player save state instead of power-on;
+            \\                with --gen-sa1-patch, anchors the profile AND verify runs at
+            \\                the state, so candidates come from a scene with real slowdown
+            \\                (a state saved playing an earlier conversion of this game works)
+            \\                (plain runs and --sa1-report; same image and core only)
             \\                from power-on, verifying its end hashes; with --sa1-report or a
             \\                --gen-* mode the movie drives the profiled runs instead, so
             \\                coverage and verification come from real gameplay
@@ -173,6 +348,12 @@ pub fn main(init: std.process.Init) !void {
             \\                executes entirely on the SA-1, the S-CPU becomes an MMIO service
             \\                loop; needs the WRAM working set inside I-RAM's identity window
             \\                and refuses by name when it cannot prove the move
+            \\  --window      with --gen-sa1-patch: uniform window relocation — the game KEEPS
+            \\                RUNNING ON THE S-CPU; WRAM's low 8 KiB moves into the S-CPU's
+            \\                BW-RAM window (+$6000, distances preserved so indexed bases
+            \\                rewrite soundly) and $7E/$7F longs re-bank to $40/$41. MMIO stays
+            \\                native; the SA-1 never leaves reset. The enabler for resident
+            \\                offloads over the whole working set (composes with --wg-static)
             \\  --sa1-report  is this game CPU-bound? (step one of the SA-1 candidacy analyser)
             \\  --skip N      frames to run before profiling starts (default 300 — boot is not gameplay)
             \\  --hot         also list the loops the frame is spent in, and how each was classified
@@ -220,19 +401,54 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // The movie identifies itself against the image AS PLAYED (post
+    // Movies identify themselves against the image AS PLAYED (post
     // soft-patching): loaded here, after the patch stage, and checked
     // against the same stripped image the run will use.
-    var mov: ?util.movie.Movie = null;
-    if (args.movie) |mpath| mov = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+    var movs_buf: [max_movies]util.movie.Movie = undefined;
+    for (args.movies[0..args.n_movies], 0..) |mpath, i|
+        movs_buf[i] = loadMovie(io, gpa, out, args, mpath, core.header.stripCopierHeader(image));
+    const movs: []const util.movie.Movie = movs_buf[0..args.n_movies];
+    const mov: ?util.movie.Movie = if (movs.len != 0) movs[0] else null;
+
+    // A verification surface is replayed on BOTH the stock image and the
+    // conversion. An anchor only restores the machine it was taken on, so in
+    // window mode — where the conversion's WRAM lives in BW-RAM and the shim's
+    // D/S moves never ran for a saved state — one of those two replays is
+    // guaranteed to be nonsense whichever image the anchor came from. Nonsense
+    // that still produces frames and hashes is the worst failure this system
+    // has, so it is refused here rather than measured.
+    if (args.window) for (movs, 0..) |m, i| {
+        if (m.anchor == null) continue;
+        try out.print(
+            "error: --movie '{s}' is anchored to a save state, which window mode cannot verify\n" ++
+                "       (a window image cannot be seeded mid-game, and a stock replay of an anchored\n" ++
+                "       recording starts from the wrong machine — one side would be measuring noise)\n" ++
+                "       use it as --cover-movie instead: the harvest replays it on its own image and\n" ++
+                "       donates the coverage and evidence, which is what a late-game recording is for.\n",
+            .{args.movies[i]},
+        );
+        try out.flush();
+        std.process.exit(2);
+    };
 
     if (args.gen_fastrom) {
         try runGenerate(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
         return;
     }
-    if (args.gen_sa1) {
-        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), mov);
+    if (args.behavioral_probe) |cpath| {
+        try runBehavioralProbe(io, gpa, out, args, core.header.stripCopierHeader(image), cpath, movs);
         return;
+    }
+    if (args.gen_sa1) {
+        try runSa1Gen(io, gpa, out, args, core.header.stripCopierHeader(image), movs);
+        return;
+    }
+    // Outside the generator, several surfaces have no meaning: one run
+    // replays one movie.
+    if (movs.len > 1) {
+        try out.print("error: multiple --movie flags are a generator feature (each is a verification surface)\n", .{});
+        try out.flush();
+        std.process.exit(2);
     }
 
     if (args.auto_fastrom) checkFastromCompat(out, core.header.stripCopierHeader(image)) catch std.process.exit(1);
@@ -245,6 +461,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.sa1_report) {
         try runReport(io, gpa, out, args, cart, mov);
+        return;
+    }
+    if (args.tick_dump) |path| {
+        try runTickDump(io, gpa, out, args, cart, mov, path);
         return;
     }
 
@@ -261,12 +481,136 @@ pub fn main(init: std.process.Init) !void {
     if (mov) |m| con.setRegion(if (m.region == 1) .pal else .ntsc);
     if (args.auto_fastrom) con.enableAutoFastrom();
     if (args.wide != 0) con.setWideMargin(args.wide);
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    // After --state on purpose: a movie's own anchor is the machine ITS
+    // inputs were recorded against, so it wins over a session-wide one.
+    try anchorMovie(con, mov, "movie", out);
+
+    // Window debugging (undocumented --dump-ram): dump memories after the
+    // run — WRAM (128K), BW-RAM's first 64K, VRAM — plus the CPU's resting
+    // place. The tool that found every window-mode blocker so far.
+    // The display state, as text: what a layer is doing is a property of the
+    // PPU registers and of what actually reached VRAM, and neither shows up
+    // in a RAM dump. Per BG: is it on the main screen at all, where is its
+    // tilemap and character data, and — the question that separates "never
+    // uploaded" from "not displayed" — how much of that tilemap in VRAM is
+    // actually non-empty.
+    defer if (args.dump_vram) |vpath| {
+        const p = &con.fast.bus.ppu;
+        var blob: [0x10000 + 0x220]u8 = undefined;
+        @memcpy(blob[0..0x10000], std.mem.sliceAsBytes(p.vram[0..]));
+        @memcpy(blob[0x10000..], &p.oam);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = vpath, .data = &blob }) catch {};
+    };
+    defer if (args.dump_ppu) |ppath| {
+        const p = &con.fast.bus.ppu;
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("bg_mode={d} force_blank={} brightness={d} main_screen(TM)=0x{x:0>2} sub_screen(TS)=0x{x:0>2}\n", .{
+            p.bg_mode, p.force_blank, p.brightness, p.main_screen, p.sub_screen,
+        }) catch {};
+        for (p.bg, 0..) |b, i| {
+            // A tilemap of all-zero entries renders as nothing even with the
+            // layer enabled, so count what is actually there.
+            const words: usize = switch (b.map_size) {
+                0 => 0x400,
+                1 => 0x800,
+                2 => 0x800,
+                3 => 0x1000,
+            };
+            var nonzero: usize = 0;
+            var k: usize = 0;
+            while (k < words) : (k += 1) {
+                const idx = (@as(usize, b.map_base) + k) & 0x7FFF;
+                if (p.vram[idx] != 0) nonzero += 1;
+            }
+            w.print("bg{d}: on_main={} map_base=0x{x:0>4} map_size={d} char_base=0x{x:0>4} tile16={} hofs={d} vofs={d} tilemap_nonzero={d}/{d}\n", .{
+                i + 1,       (p.main_screen >> @intCast(i)) & 1 != 0,
+                b.map_base,  b.map_size,
+                b.char_base, b.tile16,
+                b.hofs,      b.vofs,
+                nonzero,     words,
+            }) catch {};
+        }
+        // HDMA: per-scanline effects read their table straight out of memory
+        // without the CPU issuing a single load, so a table left pointing at
+        // abandoned WRAM is invisible to the stale detector and shows up only
+        // as a missing effect. Top/bottom bands are exactly this shape.
+        const dma = &con.fast.bus.dma;
+        w.print("hdmaen=0x{x:0>2}\n", .{dma.hdmaen}) catch {};
+        for (dma.channels, 0..) |ch, i| {
+            if (dma.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const src: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
+            const dead = ch.a_bank == 0x7E or ch.a_bank == 0x7F or
+                ((ch.a_bank & 0x7F) < 0x40 and ch.a_addr < 0x2000);
+            w.print("  hdma{d}: src={x:0>6} bank={x:0>2}{s}\n", .{
+                i, src, ch.a_bank, if (dead) "  <-- ABANDONED MEMORY" else "",
+            }) catch {};
+            // Indirect tables fetch their DATA through a second bank the
+            // CPU never touches after arming: a $7E there reads the
+            // abandoned WRAM and no CPU-side instrument can see it.
+            w.print("    control=0x{x:0>2} b_addr=0x{x:0>2} indirect_bank={x:0>2} indirect_addr={x:0>4} line_counter={d}\n", .{
+                ch.control, ch.b_addr, ch.indirect_bank, ch.count, ch.line_counter,
+            }) catch {};
+        }
+        // Color math: the one axis two byte-identical CGRAM/VRAM images can
+        // still render differently through (measured: Super Metroid's Ceres
+        // alarm tint, an indirect HDMA on $2132 reading abandoned $7E WRAM).
+        w.print("cgwsel=0x{x:0>2} cgadsub=0x{x:0>2} fixed_color=0x{x:0>4} setini=0x{x:0>2}\n", .{
+            p.cgwsel, p.cgadsub, p.fixed_color, p.setini,
+        }) catch {};
+        var vnz: usize = 0;
+        for (p.vram) |word| {
+            if (word != 0) vnz += 1;
+        }
+        w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
+        // CGRAM digest: same tiles + same tilemap rendering differently can
+        // only be the palette (measured: SM's Ceres room corrupts to stripes
+        // when CGRAM diverges while VRAM stays identical).
+        var cgsum: u32 = 0;
+        for (p.cgram) |c| cgsum +%= c;
+        w.print("cgram_sum={x:0>8} bg1pal={x:0>4},{x:0>4},{x:0>4},{x:0>4} bg2pal={x:0>4},{x:0>4}\n", .{
+            cgsum, p.cgram[0], p.cgram[1], p.cgram[2], p.cgram[3], p.cgram[0x20], p.cgram[0x21],
+        }) catch {};
+        // Window + mosaic: vertical banding that VRAM/CGRAM cannot explain
+        // lives here (the window carves columns; mosaic blocks them).
+        w.print("mosaic=0x{x:0>2} w12sel=0x{x:0>2} w34sel=0x{x:0>2} wobjsel=0x{x:0>2} wh0={d} wh1={d} wh2={d} wh3={d} wbglog=0x{x:0>2} tmw=0x{x:0>2} tsw=0x{x:0>2}\n", .{
+            p.mosaic, p.w12sel, p.w34sel, p.wobjsel, p.wh0, p.wh1, p.wh2, p.wh3, p.wbglog, p.tmw, p.tsw,
+        }) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = w.buffered() }) catch {};
+        out.print("wrote {s}\n", .{ppath}) catch {};
+        out.flush() catch {};
+    };
+
+    defer if (args.dump_ram) |dpath| {
+        const fc = &con.fast;
+        const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
+        @memset(buf, 0);
+        @memcpy(buf[0..0x20000], &fc.bus.wram.data);
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
+        @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
+        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
+        std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
+        if (fc.bus.cart.chip == .sa1)
+            std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
+    };
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
     var audio_hash = core.console.audio_hash_init;
     var audio_peak: u16 = 0;
     var audio_all: std.array_list.Managed(i16) = .init(gpa);
+    // --hash-stream: one u64 per frame, little-endian. The PICTURE STREAM
+    // is the one comparison that survives a lag differential — collapse
+    // consecutive equal hashes and two runs of the same game show the same
+    // sequence however many times each lag repeat appears. Comparing two
+    // CONVERSIONS this way (rather than a conversion against stock) is what
+    // makes it usable on a build whose whole purpose is to be faster.
+    var hash_stream: ?std.array_list.Managed(u64) = if (args.hash_stream != null)
+        .init(gpa)
+    else
+        null;
     const frames = args.frames orelse if (mov) |m| @as(u32, @intCast(m.frames.len)) else 1;
     for (0..frames) |i| {
         if (mov) |m| {
@@ -275,6 +619,35 @@ pub fn main(init: std.process.Init) !void {
             con.setButtons(1, f[1]);
         }
         con.runFrame();
+        // AFTER the frame, so the value the next frame reads is the cheat's
+        // and not whatever the game just stored over it. Applied before the
+        // frame instead, the game wins every tie and the poke does nothing.
+        if (args.n_pokes != 0) {
+            const landed = util.cheat.apply(con, args.pokes[0..args.n_pokes]);
+            // Reported once: a poke at an address the bus does not map as
+            // plain memory silently does nothing, which reads exactly like a
+            // cheat that "did not work" and wastes a session chasing it.
+            if (i == 0) {
+                try out.print("poke: {} of {} landed (refused = not writable memory at that address)\n", .{ landed, args.n_pokes });
+                try out.flush();
+            }
+        }
+        if (args.save_state_at) |at| if (i + 1 == at) {
+            const buf = try gpa.alloc(u8, core.AnyConsole.state_size);
+            defer gpa.free(buf);
+            const n = con.saveState(buf);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args.save_state_path, .data = buf[0..n] });
+            try out.print("wrote {s} ({d} bytes) — the machine after frame {d}\n", .{ args.save_state_path, n, at });
+            try out.flush();
+        };
+        if (args.ppm_range_start) |start| if (i >= start and i < start + args.ppm_range_count) {
+            const rfb = con.framebuffer();
+            const rw = con.frameWidth();
+            const path = try std.fmt.allocPrint(gpa, "{s}{d:0>5}.ppm", .{ args.ppm_range_prefix, i });
+            defer gpa.free(path);
+            try util.writeFramebufferPpm(gpa, io, path, rfb, rw, @intCast(rfb.len / rw));
+        };
+        if (hash_stream) |*hs| try hs.append(core.console.hashFrame(con.framebuffer()));
         try util.drainAudio(con, &audio_hash, AudioSink{
             .peak = &audio_peak,
             .wav = if (args.wav != null) &audio_all else null,
@@ -294,7 +667,10 @@ pub fn main(init: std.process.Init) !void {
                         .{ fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged" },
                     );
                     try out.flush();
-                    std.process.exit(1);
+                    // A cross-build replay is EXPECTED to end differently (the
+                    // point is a changed picture); keep the run so its dumps
+                    // still write. A same-build desync is a real failure.
+                    if (!args.movie_ignore_crc) std.process.exit(1);
                 }
             }
         };
@@ -306,8 +682,20 @@ pub fn main(init: std.process.Init) !void {
     try out.print("{s}: {} frames, {}x{}, hash={x:0>16}, audio={x:0>16} (peak {})\n", .{
         args.rom, frames, width, fb.len / width, hash, audio_hash, audio_peak,
     });
+    if (args.iram_dump and con.* == .fast and con.fast.bus.cart.chip == .sa1) {
+        try out.print("sa1 pc={x:0>2}:{x:0>4} resb={} iram $3780-$37BF:", .{ con.fast.bus.sa1.cpu.regs.pbr, con.fast.bus.sa1.cpu.regs.pc, con.fast.bus.sa1.sa1_resb });
+        var di: usize = 0x780;
+        while (di < 0x7C0) : (di += 1) try out.print(" {x:0>2}", .{con.fast.bus.sa1.iram[di]});
+        try out.print("\n", .{});
+    }
     try out.flush();
 
+    if (args.hash_stream) |path| {
+        const hs = &hash_stream.?;
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(hs.items) });
+        try out.print("wrote {s} ({} frame hashes)\n", .{ path, hs.items.len });
+        try out.flush();
+    }
     if (args.ppm) |path| {
         try util.writeFramebufferPpm(gpa, io, path, fb, width, @intCast(fb.len / width));
         try out.print("wrote {s}\n", .{path});
@@ -348,21 +736,33 @@ fn loadMovie(
     };
     const crc = util.movie.imageCrc(image);
     if (m.rom_crc != crc) {
-        out.print(
-            "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
-                "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
-            .{ path, m.rom_crc, crc },
-        ) catch {};
-        fail(out);
+        if (args.movie_ignore_crc) {
+            out.print(
+                "warning: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                    "         (--movie-ignore-crc: replaying anyway; input may desync if timing changed)\n",
+                .{ path, m.rom_crc, crc },
+            ) catch {};
+        } else {
+            out.print(
+                "error: movie '{s}' was recorded on image crc32 {x:0>8}; this run plays {x:0>8}\n" ++
+                    "       (the movie identifies the image as played — a soft-patched game needs the same --patch)\n",
+                .{ path, m.rom_crc, crc },
+            ) catch {};
+            fail(out);
+        }
     }
     const acc: u8 = if (args.accuracy == .accurate) 1 else 0;
     if (m.accuracy != acc) {
-        out.print("error: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+        // `--movie-ignore-crc` waives this too: replaying a fast-core recording
+        // on the accurate core is exactly how a renderer difference between the
+        // two cores is isolated. Input may desync; the dumps still write.
+        out.print("{s}: movie '{s}' was recorded on the {s} core; this run uses the {s} core\n", .{
+            if (args.movie_ignore_crc) @as([]const u8, "warning") else "error",
             path,
             if (m.accuracy == 1) "accurate" else "fast",
             if (acc == 1) "accurate" else "fast",
         }) catch {};
-        fail(out);
+        if (!args.movie_ignore_crc) fail(out);
     }
     const explicit_conflict = switch (args.region) {
         .auto => false,
@@ -402,6 +802,786 @@ fn loadMovie(
 
 /// Feed frame `i` of a movie into a console — both ports, released past the
 /// movie's end. A no-op without a movie.
+/// One frame of a behavioral replay: clear the poll flags, run, drain.
+/// Returns true when the frame completed a logic tick (the snapshot is
+/// filled and `snap.live` holds the interval's consumption since the
+/// caller last cleared it).
+/// TEMP experiment: delay the CONVERTED side's movie feed by this many
+/// frames (a frame-aligned boot pad displaces the game's timeline; input
+/// must follow it or every press lands early in game-time and forks the
+/// run). Set by the undocumented --conv-pad flag.
+pub var dbg_conv_pad: u32 = 0;
+/// Undocumented --site-ev <hex24>[,<hex24>...]: after profiling, print the
+/// union evidence byte and coverage flags for each instruction address.
+pub var dbg_site_ev: [16]u32 = @splat(0);
+pub var dbg_n_site_ev: usize = 0;
+/// Undocumented --ev-only: stop right after the --site-ev report, before any
+/// plan, conversion, or verification work.
+pub var dbg_ev_only: bool = false;
+/// --audit: convert ONCE, print the per-site conversion audit, and stop
+/// before verification — minutes instead of the whole ladder.
+pub var dbg_audit: bool = false;
+
+fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
+    con.bus.input_polled = false;
+    snap.captured = false;
+    feedMovie(con, mov, frame);
+    con.runFrame();
+    var drain: [4096]i16 = undefined;
+    while (con.readAudio(&drain) != 0) {}
+    return snap.captured;
+}
+
+/// Learn the wall-coupled byte mask from the baseline: bytes that change
+/// across a LAG frame (a short no-poll blip amid live gameplay) were
+/// written by the NMI side. Long no-poll runs are loads and transitions,
+/// where the game legitimately rewrites great swaths of WRAM — learning
+/// from them buries real corruption inside the mask (a 23%-of-WRAM blind
+/// spot on Gradius III; short-run learning masks ~500 bytes).
+fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Movie, state: ?[]const u8, total: u32) ![]u8 {
+    const wram_len = core.bus.Bus.TickSnap.wram_len;
+    const lag_run_max = 3;
+    const cart = try core.Cartridge.load(gpa, image);
+    const con = try gpa.create(core.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    // Anchored runs learn the mask from the anchored scene — a mask
+    // learned at the attract demo says nothing about a gameplay stage's
+    // wall-coupled bytes.
+    if (state) |sb| try con.loadState(sb);
+    const snap = try gpa.create(core.bus.Bus.TickSnap);
+    defer gpa.destroy(snap);
+    snap.* = .{};
+    @memset(&snap.live, 0);
+    @memset(&snap.written, 0);
+    @memset(&snap.multi, 0);
+    con.bus.tick_snap = snap;
+
+    const mask = try gpa.alloc(u8, wram_len);
+    @memset(mask, 0);
+    const prev = try gpa.alloc(u8, wram_len);
+    defer gpa.free(prev);
+    const lagbuf = try gpa.alloc(u8, wram_len * lag_run_max);
+    defer gpa.free(lagbuf);
+    @memcpy(prev, &con.bus.wram.data);
+
+    var ticks: u32 = 0;
+    var lag_run: u32 = 0;
+    for (0..total) |i| {
+        if (stepBehavioralFrame(con, snap, mov, @intCast(i))) {
+            if (lag_run > 0 and lag_run <= lag_run_max and ticks > 0) {
+                for (0..lag_run) |r| {
+                    const before = if (r == 0) prev else lagbuf[(r - 1) * wram_len ..];
+                    const after = lagbuf[r * wram_len ..];
+                    for (0..wram_len) |x| {
+                        if (before[x] != after[x]) mask[x] = 1;
+                    }
+                }
+            }
+            lag_run = 0;
+            ticks += 1;
+            @memcpy(prev, &con.bus.wram.data);
+        } else {
+            if (lag_run < lag_run_max)
+                @memcpy(lagbuf[lag_run * wram_len ..][0..wram_len], &con.bus.wram.data);
+            lag_run += 1;
+        }
+    }
+    return mask;
+}
+
+/// Where a logical WRAM byte lives in the CONVERTED image: unmoved bytes in
+/// WRAM, relocated regions wherever the plan put them — but only regions
+/// that actually moved (`region_sites` > 0; a "clean" region with zero
+/// re-pointed sites moved vacuously and WRAM stays canonical).
+const ConvHome = union(enum) { wram, sram: u32, iram: u32 };
+
+fn convHome(plan: *const profile.Plan, res: *const core.sa1gen.Result, i: u32) ConvHome {
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean or res.region_sites[ri] == 0) continue;
+        if (i < r.start or i >= r.start + r.len) continue;
+        return switch (r.dest) {
+            .iram => .{ .iram = r.dest_off + (i - r.start) },
+            .bwram => .{ .sram = r.dest_off + (i - r.start) },
+        };
+    }
+    return .wram;
+}
+
+/// Frames a side may go without polling input before the tier calls it
+/// stopped rather than merely out of budget. Five seconds: long enough
+/// that a load, a scene transition or a fade cannot trip it, short enough
+/// that a real wedge cannot hide under it.
+const hang_frames: u32 = 300;
+
+const Behavioral = struct {
+    verdict: util.Persistence.Verdict,
+    stats: util.Persistence,
+    ticks_base: u32,
+    ticks_conv: u32,
+    /// Baseline wall frame of the first diverging tick (forensics anchor).
+    first_bad_frame: u32,
+    /// Sample of diverging addresses for the report.
+    sample: [24]u32,
+    n_sample: usize,
+    /// Set when a persistence failure carries the RNG-FORK signature: the
+    /// killer run was still open at surface end, the conversion never
+    /// stopped ticking, and the fork sits in the surface's second half.
+    /// Holds the baseline wall frame where the run began — the horizon a
+    /// retry can verify up to (beyond it, tick-locked replay compares two
+    /// different healthy games and proves nothing either way).
+    fork_wall: ?u32,
+    /// HOW the tick-locked pairing ended. A `persistence` verdict has two
+    /// completely different causes wearing one message — live state that
+    /// diverged and never healed, and a run that simply stopped pairing —
+    /// and telling them apart by eye is impossible: a surface with SEVEN
+    /// diverging ticks out of 1259 and a worst run of 4 was reported as
+    /// "live state diverges and never heals" for a whole day.
+    exit: Exit = .compared_to_budget,
+
+    const Exit = enum {
+        /// The baseline ran out of budget first. Normal for a conversion
+        /// that removed slowdown: it needs fewer wall frames per tick.
+        compared_to_budget,
+        /// Neither side ever produced a tick.
+        no_ticks,
+        /// The CONVERSION ran out of budget while the baseline still had
+        /// ticks to give — after the epoch resync had advanced it alone.
+        /// The end of the comparable region, not a failure.
+        conversion_ran_out,
+        /// The conversion went `hang_frames` without polling input while
+        /// the baseline kept ticking. This one IS a failure.
+        conversion_hung,
+        /// The conversion ran out while being caught up to an input edge
+        /// the baseline had already crossed. NOT a failure — see the
+        /// comment at the break — but disclosed, because the surface's
+        /// tail went uncompared.
+        conversion_ran_out_at_edge,
+
+        fn describe(self: Exit) []const u8 {
+            return switch (self) {
+                .compared_to_budget => "baseline exhausted its budget (normal)",
+                .no_ticks => "neither side produced a logic tick",
+                .conversion_ran_out => "comparable region ended (the conversion, pushed ahead by epoch resyncs, exhausted its budget)",
+                .conversion_hung => "the CONVERSION STOPPED POLLING while the baseline kept ticking",
+                .conversion_ran_out_at_edge => "comparable region ended at an input edge (the conversion, being ahead, ran out of budget catching up)",
+            };
+        }
+    };
+};
+
+/// The behavioral tier (`--verify-behavioral`): a conversion that removes
+/// slowdown CANNOT be frame-identical to a slowed-down baseline — different
+/// lag means different pictures, and the pixel gate rightly calls that
+/// divergent. What lag cannot legitimately change is the game's LOGIC
+/// state at each logic tick. So: run both images tick-locked (a tick = the
+/// frame's first controller poll, the one phase-aligned moment two runs
+/// with different lag share), and at every tick compare the bytes the
+/// baseline's NEXT tick actually consumes (read-before-write liveness —
+/// dead residue and stack slime never qualify), each read from wherever
+/// the conversion relocated it, excluding the lag-learned wall-coupled
+/// mask. Wall-DERIVED values leak through all of that (one taint hop past
+/// the mask), so the verdict keys on persistence: echoes self-heal within
+/// ticks over a bounded address set; corruption persists, spreads, or
+/// floods.
+///
+/// Movie input breaks pure tick-locking: a button edge lands at a WALL
+/// frame, and a run with less lag has executed MORE logic passes by then —
+/// each run consumes the edge at a different tick index, and from there a
+/// global pairing compares two different moments of the same correct game
+/// (measured on Gradius III's menu: 79 ticks of menu-vs-attract, then
+/// menu timers phase-offset forever). So the pairing realigns per input
+/// EPOCH: when one run's tick stream crosses an edge before the other's,
+/// the laggard advances alone — its surplus ticks have no counterpart and
+/// go uncompared — and the pairing re-anchors at both runs' first tick of
+/// the new epoch. The state carried ACROSS an edge from wall-time origins
+/// (pass counters, timers seeded from them) stays offset by exactly the
+/// passes the speedup bought; the persistence verdict excuses precisely
+/// that shape — a held constant offset — and nothing else.
+fn verifyBehavioral(
+    gpa: std.mem.Allocator,
+    base_image: []const u8,
+    conv_image: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+    mov: ?util.movie.Movie,
+    state: ?[]const u8,
+    /// Uniform window image: every WRAM byte's home is BW-RAM at the
+    /// identity offset (`plan`/`res` are not consulted — the whole-game
+    /// pipeline never builds a plan).
+    window: bool,
+    total: u32,
+) !Behavioral {
+    const wram_len = core.bus.Bus.TickSnap.wram_len;
+    const mask = try learnWallMask(gpa, base_image, mov, state, total);
+    defer gpa.free(mask);
+
+    // The movie's input edges: wall frames where a pad mask changes. Each
+    // edge starts a new pairing epoch (see the doc comment above).
+    const edges: []const u32 = blk: {
+        var list: std.array_list.Managed(u32) = .init(gpa);
+        if (mov) |m| {
+            var prev_mask: [2]u16 = .{ 0, 0 };
+            for (m.frames, 0..) |f, i| {
+                if (f[0] != prev_mask[0] or f[1] != prev_mask[1]) {
+                    try list.append(@intCast(i));
+                    prev_mask = f;
+                }
+            }
+        }
+        break :blk try list.toOwnedSlice();
+    };
+    defer gpa.free(edges);
+
+    const Side = struct {
+        con: *core.FastConsole,
+        snap: *core.bus.Bus.TickSnap,
+        prev: *core.bus.Bus.TickSnap,
+        frame: u32 = 0,
+        /// Wall frame of the current (last returned) tick.
+        tick_wall: u32 = 0,
+        /// Boot-pad displacement: this side's game timeline runs this many
+        /// wall frames behind the movie's recording, so its inputs (and
+        /// its input-edge epochs) shift to follow.
+        pad: u32 = 0,
+        /// Frames the last `advance` call consumed. A failed call that
+        /// burned only a handful of them ran out of BUDGET; one that
+        /// burned hundreds without a poll actually stopped ticking. The
+        /// return value alone cannot tell those apart, and conflating
+        /// them is what made the tier reject faster builds.
+        span: u32 = 0,
+
+        fn init(al: std.mem.Allocator, image: []const u8) !@This() {
+            const cart = try core.Cartridge.load(al, image);
+            const con = try al.create(core.FastConsole);
+            con.init(cart);
+            const snap = try al.create(core.bus.Bus.TickSnap);
+            snap.* = .{};
+            @memset(&snap.live, 0);
+            @memset(&snap.written, 0);
+            @memset(&snap.multi, 0);
+            con.bus.tick_snap = snap;
+            return .{ .con = con, .snap = snap, .prev = try al.create(core.bus.Bus.TickSnap) };
+        }
+
+        fn advance(self: *@This(), m: ?util.movie.Movie, budget: u32) bool {
+            const from = self.frame;
+            while (self.frame < budget) {
+                const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame -| self.pad);
+                self.frame += 1;
+                if (ticked) {
+                    self.tick_wall = self.frame - 1;
+                    self.span = self.frame - from;
+                    return true;
+                }
+            }
+            self.span = self.frame - from;
+            return false;
+        }
+
+        /// Which input epoch this side's current tick sits in: the number
+        /// of edges its tick stream has sampled.
+        fn epoch(self: *const @This(), es: []const u32) usize {
+            var n: usize = 0;
+            while (n < es.len and es[n] <= self.tick_wall -| self.pad) n += 1;
+            return n;
+        }
+    };
+
+    var base = try Side.init(gpa, base_image);
+    var conv = try Side.init(gpa, conv_image);
+    conv.pad = dbg_conv_pad;
+    if (state) |sb| {
+        try base.con.loadState(sb);
+        try seedConverted(conv.con, sb, plan, res);
+    }
+
+    var out: Behavioral = .{
+        .verdict = .{ .pass = .clean },
+        .stats = .{ .epoch_budget = @intCast(edges.len + 1) },
+        .ticks_base = 0,
+        .ticks_conv = 0,
+        .first_bad_frame = 0,
+        .sample = @splat(0),
+        .n_sample = 0,
+        .fork_wall = null,
+    };
+    // Baseline wall frame of each FED tick, indexed like the tick indices
+    // handed to Persistence.feed — what maps a verdict's tick back to a
+    // wall frame (the fork-horizon retry needs the killer run's start).
+    var tick_walls = try gpa.alloc(u32, total + 1);
+    defer gpa.free(tick_walls);
+    var n_tick_walls: usize = 0;
+
+    // Tick 0 on both sides.
+    if (!base.advance(mov, total)) {
+        out.exit = .no_ticks;
+        return out; // vacuous
+    }
+    if (!conv.advance(mov, total)) {
+        // The baseline reached gameplay and the conversion never did.
+        out.verdict = .{ .fail = .persistence };
+        out.exit = .conversion_hung;
+        return out;
+    }
+    out.ticks_base = 1;
+    out.ticks_conv = 1;
+    base.prev.* = base.snap.*;
+    conv.prev.* = conv.snap.*;
+    @memset(&base.snap.live, 0);
+    @memset(&base.snap.written, 0);
+    @memset(&base.snap.multi, 0);
+    var prev_frame: u32 = base.frame;
+
+    // Intra-frame stream detection: a byte the BASELINE writes more than
+    // once inside one tick interval is mid-stream at every snapshot
+    // instant (an APU pump's cursor, its data buffers, a handshake cell)
+    // — its value at the poll is phase, not logic, and a timing-shifted
+    // conversion can never match it at the same tick. A cell that
+    // streams in eight intervals joins the wall mask by CONSTRUCTION —
+    // previously this class was absorbed only when a surface's
+    // lag-learned mask happened to cover it, which is why one surface
+    // passed and another failed on identical input.
+    const stream_ticks = try gpa.alloc(u8, wram_len);
+    defer gpa.free(stream_ticks);
+    @memset(stream_ticks, 0);
+
+    // Which home each WRAM cell actually lives in on the conversion,
+    // learned from the ticks where it AGREED with the baseline (0 unknown,
+    // 1 BW-RAM, 2 real WRAM). A window image splits homes by access idiom
+    // — low 8K and $7E-long cells live in BW-RAM, abs-addressed high WRAM
+    // stays put — and a divergence must be measured at the LIVE home: the
+    // stale other home is dead boot residue, and a delta against dead
+    // zeros drifts as the baseline moves, faking active divergence out of
+    // a held offset.
+    const home = try gpa.alloc(u8, wram_len);
+    defer gpa.free(home);
+    @memset(home, 0);
+
+    var bad: [util.Persistence.max_addrs + 1]util.Persistence.Bad = undefined;
+    var prev_n_bad: usize = 0;
+    // The lag differential at the previous tick pair: how many more wall
+    // frames the baseline has spent than the conversion to reach the same
+    // logic tick. Wall-coupled state (NMI counters, anything seeded from
+    // them) drifts by exactly this, so persistence accounting is only
+    // meaningful on ticks where it HELD STILL — a slowdown-removing
+    // conversion legitimately walks it up through every stretch whose
+    // frames it stopped dropping (measured: 79 frames across a load).
+    var ld_prev: i64 = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
+    outer: while (true) {
+        const pair_ld: i64 = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
+        const wall_stable = pair_ld == ld_prev;
+        ld_prev = pair_ld;
+        if (!base.advance(mov, total)) break;
+        out.ticks_base += 1;
+        if (!conv.advance(mov, total)) {
+            // Ran out of budget, or hung — and only the SPAN tells them
+            // apart. The epoch resync below advances the conversion
+            // alone, so a faster conversion's frame counter is routinely
+            // pushed past the baseline's; it then exhausts the budget
+            // here having polled input a frame ago. That is the end of
+            // the comparable region. A conversion that truly stopped
+            // burns `hang_frames` without a single poll.
+            if (conv.span < hang_frames) {
+                out.exit = .conversion_ran_out;
+                break;
+            }
+            // A long no-poll SPAN is only a hang while input remains. A
+            // conversion that has consumed every input edge is simply
+            // AHEAD — it finished the movie's logic early (the removed
+            // slowdown, i.e. the point of the patch) and now sits in
+            // whatever no-poll state the story ends in (a load, a fade)
+            // while the baseline still chews through its lag.
+            if (conv.epoch(edges) >= edges.len) {
+                out.exit = .conversion_ran_out;
+                break;
+            }
+            out.verdict = .{ .fail = .persistence };
+            out.exit = .conversion_hung;
+            return out;
+        }
+        out.ticks_conv += 1;
+
+        // Epoch resync: an input edge reaches each run at its own tick
+        // index. When one side has crossed an edge the other hasn't, the
+        // pairing is between different epochs — advance the laggard alone
+        // (its surplus ticks have no counterpart) and re-anchor at both
+        // sides' first tick of the new epoch, comparing from there.
+        if (base.epoch(edges) != conv.epoch(edges)) {
+            while (base.epoch(edges) != conv.epoch(edges)) {
+                if (base.epoch(edges) > conv.epoch(edges)) {
+                    if (!conv.advance(mov, total)) {
+                        // NOT a hang, and calling it one was costing real
+                        // builds. The conversion is AHEAD — it spends
+                        // fewer wall frames per logic tick, which is the
+                        // entire point — so it sits at an earlier wall
+                        // frame than the baseline, and catching it up to
+                        // the baseline's epoch burns whatever budget it
+                        // has left. Near the end of a surface it runs out.
+                        // That is the end of the COMPARABLE REGION, not a
+                        // failure: everything paired so far was paired
+                        // honestly, and the verdict belongs to those
+                        // ticks. (The genuine hang is the other exit —
+                        // the conversion stopping while the baseline
+                        // still ticks, in the main pairing above.)
+                        //
+                        // Measured: a surface with SEVEN diverging ticks
+                        // out of 1259 and a worst run of 4 was reported
+                        // as "live state diverges and never heals", and
+                        // whether a build hit this depended on where the
+                        // last input edge fell relative to its own lag
+                        // differential — so any timing change (FastROM, a
+                        // tree, a thunk) could flip a verdict without
+                        // touching correctness.
+                        if (conv.span >= hang_frames and conv.epoch(edges) < edges.len) {
+                            out.verdict = .{ .fail = .persistence };
+                            out.exit = .conversion_hung;
+                            return out;
+                        }
+                        out.exit = .conversion_ran_out_at_edge;
+                        break :outer;
+                    }
+                    out.ticks_conv += 1;
+                } else {
+                    if (!base.advance(mov, total)) break :outer;
+                    out.ticks_base += 1;
+                }
+            }
+            base.prev.* = base.snap.*;
+            conv.prev.* = conv.snap.*;
+            @memset(&base.snap.live, 0);
+            @memset(&base.snap.written, 0);
+            @memset(&base.snap.multi, 0);
+            prev_frame = base.frame;
+            // Re-anchor the lag differential too: the laggard's surplus
+            // ticks moved one side's wall alone.
+            ld_prev = @as(i64, base.tick_wall) - (@as(i64, conv.tick_wall) - @as(i64, conv.pad));
+            continue;
+        }
+
+        // Streams first: cells the baseline multi-wrote this interval.
+        for (0..wram_len / 8) |bi| {
+            var mm = base.snap.multi[bi];
+            while (mm != 0) {
+                const bit: u3 = @intCast(@ctz(mm));
+                mm &= mm - 1;
+                const i = bi * 8 + @as(usize, bit);
+                if (stream_ticks[i] < 8) {
+                    stream_ticks[i] += 1;
+                    if (stream_ticks[i] == 8) mask[i] = 1;
+                }
+            }
+        }
+
+        // Compare the PREVIOUS tick pair on the bytes this baseline
+        // interval consumed.
+        var n_bad: usize = 0;
+        const live = &base.snap.live;
+        for (0..wram_len) |i| {
+            if (live[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) == 0) continue;
+            if (mask[i] != 0) continue;
+            const bb = base.prev.wram[i];
+            const cb = if (window) blk: {
+                // A window image moves every code-path WRAM reference to
+                // BW-RAM at the identity offset — but WMDATA-port traffic
+                // still lands in real WRAM, and nothing records which
+                // path wrote a given byte last. A byte matching EITHER
+                // home passes; matching neither is a real divergence.
+                // One more equivalence: the relocation maps WRAM bank
+                // VALUES, so data holding $7E/$7F (a pointer's bank byte)
+                // legitimately holds $40/$41 in the image — permanently,
+                // which the persistence verdict would otherwise read as
+                // immortal corruption.
+                const via_bw = conv.prev.sram[i];
+                const via_wram = conv.prev.wram[i];
+                // The home is learned ONCE, from a discriminating equality
+                // (the homes disagree and the baseline matches exactly
+                // one), and then sticks: a dead home's zero coincidentally
+                // matching a transiting baseline value must not re-teach
+                // the cell's address (measured: stock's $3A wrapping
+                // through 00 matched the stale WRAM zero and every later
+                // delta drifted again).
+                if (bb == via_bw or (bb == 0x7E and via_bw == 0x40) or (bb == 0x7F and via_bw == 0x41)) {
+                    if (home[i] == 0 and via_bw != via_wram) home[i] = 1;
+                    break :blk bb;
+                }
+                if (bb == via_wram or (bb == 0x7E and via_wram == 0x40) or (bb == 0x7F and via_wram == 0x41)) {
+                    if (home[i] == 0 and via_bw != via_wram) home[i] = 2;
+                    break :blk bb;
+                }
+                // Diverged at both homes: report the live home's value so
+                // the persistence delta tracks what the game computes.
+                break :blk switch (home[i]) {
+                    1 => via_bw,
+                    2 => via_wram,
+                    else => if (i < 0x2000) via_bw else via_wram,
+                };
+            } else switch (convHome(plan, res, @intCast(i))) {
+                .wram => conv.prev.wram[i],
+                .sram => |off| conv.prev.sram[off],
+                .iram => |off| conv.prev.iram[off & 0x7FF],
+            };
+            if (bb == cb) continue;
+            if (n_bad < bad.len) {
+                bad[n_bad] = .{ .addr = @intCast(i), .delta = bb -% cb };
+                n_bad += 1;
+            }
+        }
+        if (n_bad > 0 and out.stats.first_bad == null) {
+            out.first_bad_frame = prev_frame;
+            out.n_sample = @min(out.sample.len, n_bad);
+            for (out.sample[0..out.n_sample], bad[0..out.n_sample]) |*s, b| s.* = b.addr | (@as(u32, b.delta) << 16);
+        }
+        // Forensics on stderr: each bad-run START with both machines' wall
+        // frames and cell values — the tick<->wall mapping is nonlinear
+        // (loads stretch hundreds of wall frames per tick) and chasing a
+        // tick-domain divergence with wall-domain probes wastes hours.
+        if (n_bad > 0 and prev_n_bad == 0) {
+            std.debug.print("[bfx] run start tick={} base_wall={} conv_wall={} n_bad={}:", .{ out.ticks_base, base.frame, conv.frame, n_bad });
+            for (bad[0..@min(8, n_bad)]) |b| {
+                const cv = b.addr; // conv value recomputed below for the print
+                _ = cv;
+                std.debug.print(" ${X:0>4}(d{X:0>2})", .{ b.addr, b.delta });
+            }
+            std.debug.print("\n", .{});
+        }
+        prev_n_bad = n_bad;
+        if (out.ticks_base - 2 < tick_walls.len) {
+            tick_walls[out.ticks_base - 2] = prev_frame;
+            n_tick_walls = @max(n_tick_walls, out.ticks_base - 1);
+        }
+        out.stats.feed(out.ticks_base - 2, bad[0..n_bad], wall_stable);
+
+        base.prev.* = base.snap.*;
+        conv.prev.* = conv.snap.*;
+        @memset(&base.snap.live, 0);
+        @memset(&base.snap.written, 0);
+        @memset(&base.snap.multi, 0);
+        prev_frame = base.frame;
+    }
+
+    out.verdict = out.stats.verdict();
+    // The RNG-fork signature: a persistence failure whose killer run was
+    // still open at surface end, on a conversion that kept ticking, with
+    // the fork in the surface's second half. Report the wall frame where
+    // the run began so the caller can verify up to the horizon.
+    // (A conversion that stopped ticking never reaches this analysis —
+    // those verdicts return early from the advance failures above.)
+    // The FORK-EPISODE shape: a timing-changed conversion forks the game
+    // at each RNG-sensitive moment (a demo, a transition whose sound
+    // phase shifted); each episode that HEALS was reconverged by a scene
+    // reset — corruption does not reconverge to byte-equivalence. A small
+    // number of bounded episodes qualifies for the prefix-retry excusal
+    // when everything OUTSIDE them held: few episodes, a substantial
+    // verified prefix before the first, the excused fraction small, and
+    // the off-episode surface within the flood budget.
+    if (out.verdict == .fail and out.verdict.fail == .persistence and
+        out.stats.long_runs <= 4 and
+        out.stats.long_total * 4 <= out.stats.stable_ticks and
+        (@as(u64, out.stats.bad_ticks - out.stats.long_total - out.stats.burst_total) * 1000 <=
+            @as(u64, out.stats.stable_ticks) * util.Persistence.max_bad_per_mille * 3) and
+        out.stats.first_long_start != null and
+        out.stats.first_long_start.? > 600 and
+        out.stats.first_long_start.? < n_tick_walls)
+    {
+        out.fork_wall = tick_walls[out.stats.first_long_start.?];
+    }
+    return out;
+}
+
+/// `--tick-dump`: one record per logic tick — u32 wall frame (little-endian)
+/// followed by the phase-aligned snapshot the bus captured at that tick's
+/// controller poll: 128 KiB WRAM, 128 KiB cartridge RAM (BW-RAM), 2 KiB SA-1
+/// I-RAM — the relocated homes too, because a conversion moves state and a
+/// WRAM-only view is blind exactly where a broken offload does its damage. The offline analysis behind the behavioral
+/// verifier's design; not part of any verification path itself.
+fn runTickDump(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    cart: core.Cartridge,
+    mov: ?util.movie.Movie,
+    path: []const u8,
+) !void {
+    const con = try gpa.create(core.FastConsole);
+    con.init(cart);
+    if (args.auto_fastrom) con.bus.enableAutoFastrom();
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try anchorMovie(con, mov, "movie", out);
+
+    const snap = try gpa.create(core.bus.Bus.TickSnap);
+    snap.* = .{};
+    @memset(&snap.live, 0);
+    @memset(&snap.written, 0);
+    @memset(&snap.multi, 0);
+    con.bus.tick_snap = snap;
+
+    const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch {
+        try out.print("error: cannot create '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    defer file.close(io);
+    var fbuf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &fbuf);
+
+    // Lag-frame mask: bytes that change across a LAG frame were written by
+    // the NMI side (or by the main loop's stalled mid-computation) — the
+    // candidate set for "legitimately wall-coupled". Lag means genuine
+    // slowdown: a SHORT no-poll blip amid live gameplay. Long no-poll runs
+    // are loads and transitions, where the game legitimately rewrites great
+    // swaths of WRAM — learning from those buries real corruption inside
+    // the mask (a 23% blind spot on Gradius III), so runs longer than
+    // `lag_run_max` teach nothing.
+    const lag_run_max = 3;
+    const prev = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len);
+    const lagbuf = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len * lag_run_max);
+    const mask = try gpa.alloc(u8, core.bus.Bus.TickSnap.wram_len);
+    @memset(mask, 0);
+    @memcpy(prev, &con.bus.wram.data);
+
+    const frames = args.frames orelse 600;
+    var ticks: u32 = 0;
+    var lag_run: u32 = 0;
+    var drain: [4096]i16 = undefined;
+    for (0..frames) |i| {
+        con.bus.input_polled = false;
+        snap.captured = false;
+        feedMovie(con, mov, i);
+        con.runFrame();
+        while (con.readAudio(&drain) != 0) {}
+        if (snap.captured) {
+            var hdr: [4]u8 = undefined;
+            std.mem.writeInt(u32, &hdr, @intCast(i), .little);
+            try fw.interface.writeAll(&hdr);
+            // The liveness accumulated since the LAST poll: which bytes of
+            // the previous tick's state this interval actually consumed.
+            try fw.interface.writeAll(&snap.live);
+            try fw.interface.writeAll(&snap.wram);
+            try fw.interface.writeAll(&snap.sram);
+            try fw.interface.writeAll(&snap.iram);
+            @memset(&snap.live, 0);
+            @memset(&snap.written, 0);
+            @memset(&snap.multi, 0);
+            ticks += 1;
+            // The no-poll run just ended: it was lag (not a load) only if
+            // it stayed short, and only then does it teach the mask.
+            if (lag_run > 0 and lag_run <= lag_run_max and ticks > 1) {
+                for (0..lag_run) |r| {
+                    const before = if (r == 0) prev else lagbuf[(r - 1) * core.bus.Bus.TickSnap.wram_len ..];
+                    const after = lagbuf[r * core.bus.Bus.TickSnap.wram_len ..];
+                    for (0..core.bus.Bus.TickSnap.wram_len) |x| {
+                        if (before[x] != after[x]) mask[x] = 1;
+                    }
+                }
+            }
+            lag_run = 0;
+            @memcpy(prev, &con.bus.wram.data);
+        } else {
+            if (lag_run < lag_run_max)
+                @memcpy(lagbuf[lag_run * core.bus.Bus.TickSnap.wram_len ..][0..core.bus.Bus.TickSnap.wram_len], &con.bus.wram.data);
+            lag_run += 1;
+        }
+    }
+    // The mask rides at the tail: 128 KiB of 0/1 after the tick records.
+    try fw.interface.writeAll(mask);
+    try fw.interface.flush();
+    var masked: u32 = 0;
+    for (mask) |m| masked += m;
+    try out.print("{s}: {} ticks in {} frames, {} lag-touched bytes -> {s}\n", .{ args.rom, ticks, frames, masked, path });
+    try out.flush();
+}
+
+/// `--state`: resume from an SDL-player save state instead of power-on —
+/// which lets the profiler measure a scene the attract demo never reaches
+/// (a slowdown-heavy stage the player save-stated, say) without replaying
+/// a movie to get there. The state must be from the same image and core;
+/// the serializer's own container checks refuse anything else.
+fn loadStateInto(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    con: anytype,
+    path: []const u8,
+) !void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try out.print("error: cannot read state '{s}'\n", .{path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    con.loadState(data) catch |e| {
+        try out.print("error: state '{s}' does not load into this console: {s}\n", .{ path, @errorName(e) });
+        try out.flush();
+        std.process.exit(1);
+    };
+    try out.print("state loaded: {s}\n", .{path});
+    try out.flush();
+}
+
+/// Seed a CONVERTED image's console from a save state recorded on a
+/// DIFFERENT image of the same game — the stock ROM, or an earlier
+/// conversion (the S3 stage leaves the WRAM layout in place, so the
+/// serialized machine loads wholesale). Two halves are stale afterwards
+/// and get rebuilt here: the SA-1 (the saved PC pointed into whatever the
+/// old image carved, so it is re-booted from THIS image's CRV, exactly
+/// the writes the shim makes at reset) and the live relocated regions
+/// (the plan moved those bytes out of WRAM, so the state's WRAM copy is
+/// the truth and seeds their new homes).
+fn seedConverted(
+    con: anytype,
+    state: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+) !void {
+    try con.loadState(state);
+    const sa1 = &con.bus.sa1;
+    const clk = con.bus.clock;
+    sa1.mmioWrite(clk, 0x2200, 0x20); // hold RESB
+    sa1.mmioWrite(clk, 0x2229, 0xFF); // SIWP: S-CPU may write I-RAM
+    sa1.mmioWrite(clk, 0x2226, 0x80); // SWEN: S-CPU may write BW-RAM
+    sa1.mmioWrite(clk, 0x2203, @truncate(res.stats.crv));
+    sa1.mmioWrite(clk, 0x2204, @truncate(res.stats.crv >> 8));
+    sa1.mmioWrite(clk, 0x2200, 0x00); // release: boot from CRV
+    sa1.cmeg = 0; // drop a stale done echo from the old image's run
+    sa1.iram[0x38A] = 0; // async busy flag idle
+    for (plan.regions[0..plan.n], 0..) |r, ri| {
+        if (res.fate[ri] != .clean) continue;
+        if (res.region_sites[ri] == 0 and !(r.dp and res.stats.d_moved)) continue;
+        const src = con.bus.wram.data[r.start .. r.start + r.len];
+        switch (r.dest) {
+            .iram => @memcpy(sa1.iram[r.dest_off..][0..r.len], src),
+            .bwram => @memcpy(sa1.bwram[r.dest_off..][0..r.len], src),
+        }
+    }
+}
+
+/// Restore the machine a movie's inputs were recorded against, before its
+/// first frame runs. A movie recorded from power-on carries no anchor and
+/// this is a no-op; an anchored one is meaningless without it, so a state
+/// this console refuses is fatal rather than skipped — replaying anchored
+/// inputs from power-on produces a plausible-looking run of pure nonsense.
+///
+/// The console must be the image the anchor was taken on. That holds for
+/// replay, the stale detector and the cover harvest (all replay a recording
+/// on its own image); it does NOT hold for a stock-side verification surface
+/// in window mode, which is refused at load time instead.
+fn anchorMovie(con: anytype, mov: ?util.movie.Movie, what: []const u8, out: *std.Io.Writer) !void {
+    const m = mov orelse return;
+    const a = m.anchor orelse return;
+    con.loadState(a) catch |e| {
+        try out.print("error: the {s} carries a start state this console cannot restore: {s}\n" ++
+            "       (a save state is tied to the core's layout and the image it was taken on)\n", .{ what, @errorName(e) });
+        try out.flush();
+        std.process.exit(1);
+    };
+    try out.print("movie anchor: {s} restored ({} frames replay from it)\n", .{ what, m.frames.len });
+    try out.flush();
+}
+
 fn feedMovie(con: anytype, mov: ?util.movie.Movie, i: usize) void {
     const m = mov orelse return;
     const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
@@ -764,43 +1944,171 @@ fn runSa1Gen(
     out: *std.Io.Writer,
     args: Args,
     image: []const u8,
-    mov: ?util.movie.Movie,
+    movs: []const util.movie.Movie,
 ) !void {
-    const frames = args.frames orelse if (mov) |m|
-        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
-    else
-        gen_frames_default;
-    const total = args.skip + frames;
-    try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    // Each movie is one verification SURFACE. Evidence and coverage are
+    // the UNION over all of them — because each movie is a different
+    // world, and the surface one covers can be exactly the surface
+    // another displaces — while verification runs per surface and every
+    // one must pass. Zero movies = the one legacy surface (attract).
+    const n_surf: usize = @max(1, movs.len);
+    // First line of every generator run, so a log is self-describing even
+    // when the run fails and writes no patch. `--skip` is spelled out
+    // because it defaults to 300 and silently changes how much of each
+    // surface gets VERIFIED, which is exactly the kind of difference a
+    // reconstructed command loses.
+    try out.print("invocation: {s}\n", .{args.cmdline});
+    try out.print("  (skip {} frame(s) before each surface's verification budget)\n", .{args.skip});
+    try out.flush();
+    var totals: [max_movies]u32 = undefined;
+    for (0..n_surf) |s| {
+        const frames = args.frames orelse if (movs.len != 0)
+            @max(1, @as(u32, @intCast(movs[s].frames.len)) -| args.skip)
+        else
+            gen_frames_default;
+        totals[s] = args.skip + frames;
+    }
+    const total = totals[0];
+    // State-anchored generation: profile AND verify from a gameplay save
+    // state instead of power-on, so the candidate set comes from a scene
+    // with real slowdown — code the attract demo never executes has no
+    // coverage and can never be offloaded. The state may be from an
+    // earlier conversion of this same game: nothing binds a state to an
+    // image, and the S3 stage leaves the WRAM layout in place.
+    const state_bytes: ?[]const u8 = if (args.state) |spath| blk: {
+        if (args.whole_game and !args.window) {
+            try out.print("error: --state with --whole-game is not supported (the whole-game window shift is not applied to seeded states)\n", .{});
+            try out.flush();
+            std.process.exit(1);
+        }
+        const data = std.Io.Dir.cwd().readFileAlloc(io, spath, gpa, .limited(16 * 1024 * 1024)) catch {
+            try out.print("error: cannot read state '{s}'\n", .{spath});
+            try out.flush();
+            std.process.exit(1);
+        };
+        try out.print("anchored at state: {s}\n", .{spath});
+        break :blk data;
+    } else null;
+    // WINDOW + state: EVIDENCE and TRUTH split. A window image cannot be
+    // seeded mid-game (the shim's D/S/window moves never ran for a saved
+    // state, and the stack carries pre-move D saves as data), so the
+    // state anchors an EVIDENCE pass only — profile, coverage, and the
+    // candidate set come from the anchored scene — while verification
+    // runs from power-on, where the shim makes everything consistent.
+    // The offloads still get exercised: hot gameplay routines run in the
+    // attract too.
+    const evidence_state: ?[]const u8 = if (args.window) state_bytes else null;
+    const verify_state: ?[]const u8 = if (args.window) null else state_bytes;
+    // A surface's own anchor beats the session's --state: it IS the machine
+    // that surface's inputs were recorded against. Window mode never gets
+    // here with an anchored surface (refused at load, see checkSurfaceAnchors)
+    // so this only ever seeds an image whose layout matches the anchor's.
+    const surfaceAnchor = struct {
+        fn f(ms: []const util.movie.Movie, s: usize, fallback: ?[]const u8) ?[]const u8 {
+            if (s < ms.len) if (ms[s].anchor) |a| return a;
+            return fallback;
+        }
+    }.f;
+    if (n_surf > 1) {
+        try out.print("baseline (profiled) + verify runs over {} surfaces:", .{n_surf});
+        for (totals[0..n_surf]) |t| try out.print(" {}f", .{t});
+        try out.print("...\n", .{});
+    } else {
+        try out.print("baseline (profiled) + verify runs, {} frames each...\n", .{total});
+    }
     try out.flush();
 
-    // Baseline ONCE: per-frame hashes, audio (hash + per-frame energy
-    // envelope), the profile, and the coverage map the rewriter walks.
-    // Every verification attempt below replays against this.
-    const env_base = try gpa.alloc(u64, total);
-    @memset(env_base, 0);
-    const env_conv = try gpa.alloc(u64, total);
-    const hashes = try gpa.alloc(u64, total);
-    const conv_hashes = try gpa.alloc(u64, total);
+    // Baselines, one per surface: per-frame hashes, audio (hash +
+    // per-frame energy envelope), the profile, and the coverage map the
+    // rewriter walks — coverage and site evidence accumulate into ONE
+    // union across all surfaces. Every verification attempt below
+    // replays against these.
+    var env_base_s: [max_movies][]u64 = undefined;
+    var env_conv_s: [max_movies][]u64 = undefined;
+    var hashes_s: [max_movies][]u64 = undefined;
+    var conv_hashes_s: [max_movies][]u64 = undefined;
+    var base_audio_s: [max_movies]u64 = undefined;
+    for (0..n_surf) |s| {
+        env_base_s[s] = try gpa.alloc(u64, totals[s]);
+        @memset(env_base_s[s], 0);
+        env_conv_s[s] = try gpa.alloc(u64, totals[s]);
+        hashes_s[s] = try gpa.alloc(u64, totals[s]);
+        conv_hashes_s[s] = try gpa.alloc(u64, totals[s]);
+    }
+    const env_base = env_base_s[0];
+    const hashes = hashes_s[0];
     const ub = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(ub, 0);
-    const umap: core.usage_map.UsageMap = .{ .bytes = ub };
+    // Per-site effective-address evidence: the dynamic answer to the
+    // statically undecidable idioms (is $0000,X a ROM table walk or a
+    // low-WRAM walk? measure it). Both the evidence pass and the main
+    // baseline accumulate into the same map.
+    const site_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    @memset(site_ev, 0);
+    // Pointer-bank provenance: which ROM bytes feed $7E/$7F into runtime
+    // pointers ([dp] bank bytes, DMA bank registers). Accumulates across
+    // every profiled surface like the rest of the evidence.
+    const ptr_ev = try gpa.create(core.usage_map.PtrBankEvidence);
+    ptr_ev.* = .init;
+    const umap: core.usage_map.UsageMap = .{ .bytes = ub, .sites = site_ev, .ptr_banks = ptr_ev };
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(total);
-    var base_audio = core.console.audio_hash_init;
     // Coverage growth: how much code the profile was STILL discovering in
     // the last tenth of the capture. Every conversion failure measured so
     // far traces back to code the rewriter never saw, so this turns "the
     // capture might be too short" from a caveat into a number.
     var cov_early: u32 = 0;
     const cov_mark: usize = total - total / 10;
+    // The anchored EVIDENCE pass (window + --state): profile and coverage
+    // from the gameplay scene, into the same usage map the rewriter and
+    // the walks consume. Candidates come from THIS profile.
+    var evidence_conv: ?profile.Conversion = null;
+    if (evidence_state) |sb| {
+        const ecart = try core.Cartridge.load(gpa, image);
+        const econ = try gpa.create(core.ProfilingConsole);
+        econ.init(ecart);
+        econ.usage = &umap;
+        econ.loadState(sb) catch |e| {
+            try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
+            try out.flush();
+            std.process.exit(1);
+        };
+        var esamples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+        try esamples.ensureTotalCapacity(total);
+        for (0..total) |i| {
+            // NO input: a movie is a power-on script, and pressing its
+            // buttons into a mid-game scene means something else entirely
+            // (START pauses gameplay — one press froze an anchored
+            // evidence pass for 3,200 frames and silently changed a
+            // hundred rewrite decisions between two otherwise-identical
+            // runs). The anchored scene plays itself; evidence becomes
+            // independent of which surfaces drive verification.
+            econ.runFrame();
+            if (econ.takeProfile()) |smp| {
+                if (i >= args.skip) esamples.appendAssumeCapacity(smp);
+            }
+        }
+        const escratch = try gpa.alloc(f64, esamples.items.len);
+        const esum = profile.summarise(esamples.items, escratch);
+        evidence_conv = profile.assessConversion(&econ.prof, esum.verdict);
+        econ.cart.deinit(gpa);
+        gpa.destroy(econ);
+        try out.print("  (evidence pass: profile + coverage anchored at the state; verification stays power-on)\n", .{});
+        try out.flush();
+    }
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
+    if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
+        try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
+        try out.flush();
+        std.process.exit(1);
+    };
+    var base_audio = core.console.audio_hash_init;
     for (0..total) |i| {
         if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
-        feedMovie(con, mov, i);
+        feedMovie(con, movAt(movs, 0), i);
         con.runFrame();
         try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
         hashes[i] = core.console.hashFrame(con.framebuffer());
@@ -808,8 +2116,182 @@ fn runSa1Gen(
             if (i >= args.skip) samples.appendAssumeCapacity(smp);
         }
     }
+    base_audio_s[0] = base_audio;
     const scratch = try gpa.alloc(f64, samples.items.len);
     const sum = profile.summarise(samples.items, scratch);
+    // Surfaces beyond the first: fresh consoles into the SAME coverage
+    // and evidence union, their own hashes/audio and their own profile
+    // summary (the lag comparison is per surface).
+    var sum_s: [max_movies]@TypeOf(sum) = undefined;
+    sum_s[0] = sum;
+    for (1..n_surf) |s| {
+        const cart_s = try core.Cartridge.load(gpa, image);
+        const con_s = try gpa.create(core.ProfilingConsole);
+        con_s.init(cart_s);
+        con_s.usage = &umap;
+        if (surfaceAnchor(movs, s, verify_state)) |sb| try con_s.loadState(sb);
+        var audio_s = core.console.audio_hash_init;
+        var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
+        try samples_s.ensureTotalCapacity(totals[s]);
+        for (0..totals[s]) |i| {
+            feedMovie(con_s, movAt(movs, s), i);
+            con_s.runFrame();
+            try util.drainAudio(con_s, &audio_s, EnergySink{ .cell = &env_base_s[s][i] }, EnergySink.add);
+            hashes_s[s][i] = core.console.hashFrame(con_s.framebuffer());
+            if (con_s.takeProfile()) |smp| {
+                if (i >= args.skip) samples_s.appendAssumeCapacity(smp);
+            }
+        }
+        base_audio_s[s] = audio_s;
+        const scratch_s = try gpa.alloc(f64, samples_s.items.len);
+        sum_s[s] = profile.summarise(samples_s.items, scratch_s);
+        con_s.cart.deinit(gpa);
+        gpa.destroy(con_s);
+    }
+    // COVERAGE PAD: replay every surface PAST its movie end on throwaway
+    // consoles, coverage/evidence union only — no samples, no baselines,
+    // no verdict influence. The conversion runs AHEAD of stock by the
+    // removed slowdown, so a path stock first executes shortly AFTER the
+    // movie is reachable by the conversion WITHIN it — and an uncovered
+    // instruction there is invisible to the rewriter (measured: stock
+    // first ran the attract-cycle dispatch `JMP ($0000)` at ~f4850 of
+    // the 4800f surface; the converted run reached it at ~f4640 with
+    // the pointer operand unshifted — dead-WRAM pointer, BRK storm,
+    // permanent park behind a blank screen; latent in EVERY shipped
+    // window build, exposed only by post-movie soak probes).
+    if (args.whole_game and args.window and movs.len != 0) {
+        const cov_pad: u32 = 1500;
+        for (0..n_surf) |s| {
+            const cart_p = try core.Cartridge.load(gpa, image);
+            const con_p = try gpa.create(core.ProfilingConsole);
+            con_p.init(cart_p);
+            con_p.usage = &umap;
+            if (surfaceAnchor(movs, s, verify_state)) |sb| try con_p.loadState(sb);
+            for (0..totals[s] + cov_pad) |i| {
+                feedMovie(con_p, movAt(movs, s), i);
+                con_p.runFrame();
+            }
+            con_p.cart.deinit(gpa);
+            gpa.destroy(con_p);
+        }
+        try out.print("  coverage pad: each surface profiled {} frames past its movie (lag-led paths)\n", .{cov_pad});
+        try out.flush();
+    }
+    // CONVERSION-SIDE COVERAGE HARVEST (--cover-image + --cover-movie):
+    // stock replays of a conv-recorded run die early (the inputs are
+    // conv-timed), so gameplay only the conversion reaches — measured:
+    // the stage-1 boss arrival — never covers its handlers and their
+    // low-WRAM reads stay unshifted, reading dead memory. WHICH
+    // instructions execute is address-space-invariant, so a replay on
+    // the PREVIOUS conversion donates opcode/width coverage wherever
+    // the instruction byte matches stock (rewrites change operands, not
+    // opcodes; the previous build's scaffolding differs byte-for-byte
+    // and filters itself out). Site evidence is NOT harvested — conv
+    // effective addresses describe the post-relocation world.
+    for (0..args.n_cover) |ci_i| {
+        if (args.cover_image[ci_i] == null or args.cover_movie[ci_i] == null) continue;
+        const ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image[ci_i].?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const ci = core.header.stripCopierHeader(ci_raw);
+        const mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+            try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie[ci_i].?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const cm = util.movie.parse(gpa, mb) catch {
+            try out.print("error: '{s}' is not a valid movie\n", .{args.cover_movie[ci_i].?});
+            try out.flush();
+            std.process.exit(1);
+        };
+        const tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        defer gpa.free(tmp);
+        @memset(tmp, 0);
+        // Evidence rides along, classified through the window normalizer
+        // (window -> wram_low, $40/$41 -> wram_bank): sites that ONLY the
+        // conversion-side gameplay executes would otherwise be covered
+        // yet evidence-free, and the tiny-base indexed exemption keeps
+        // evidence-free sites unshifted — measured: the boss-arrival
+        // script reads stayed dead even after the coverage harvest, so
+        // the scroll never locked and the boss never spawned.
+        const tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+        defer gpa.free(tmp_ev);
+        @memset(tmp_ev, 0);
+        // Bank-byte provenance from the conversion side too. Without this the
+        // harvest donated coverage and site class but not WHERE a $7E/$7F bank
+        // byte came from, so an idiom that only runs in a scene no stock-side
+        // movie reaches could never be proven — the same shape of blind spot as
+        // the vector page. A byte the previous conversion already re-banked
+        // reads $40 there and simply never triggers the tracker, so what this
+        // can surface is exactly the ones still unconverted.
+        const cover_pb = try gpa.create(core.usage_map.PtrBankEvidence);
+        defer gpa.destroy(cover_pb);
+        cover_pb.* = .init;
+        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp, .sites = tmp_ev, .conv_window_homes = true, .ptr_banks = cover_pb };
+        const ccart = try core.Cartridge.load(gpa, ci);
+        const ccon = try gpa.create(core.ProfilingConsole);
+        ccon.init(ccart);
+        ccon.usage = &cover_map;
+        // SA-1-side coverage too: on a conversion image the tail's code
+        // executes on the SA-1, and this harvest exists to see it.
+        if (ccon.bus.cart.chip == .sa1) ccon.bus.sa1.usage = &cover_map;
+        // The harvest replays a recording on the very image it was made on,
+        // so an anchor restores exactly the machine it describes — this is
+        // the path that lets a LATE-GAME recording donate coverage at all.
+        try anchorMovie(ccon, cm, "cover movie", out);
+        for (0..cm.frames.len + 600) |i| {
+            feedMovie(ccon, cm, i);
+            ccon.runFrame();
+        }
+        ccon.cart.deinit(gpa);
+        gpa.destroy(ccon);
+        var merged: u32 = 0;
+        var merged_ev: u32 = 0;
+        var pc: u32 = 0;
+        while (pc < core.usage_map.cpu_map_len) : (pc += 1) {
+            if (tmp[pc] & core.usage_map.flag_opcode == 0) continue;
+            const bank = (pc >> 16) & 0x7F;
+            const a16 = pc & 0xFFFF;
+            if (bank > 0x3F or a16 < 0x8000) continue;
+            const file = bank * 0x8000 + (a16 - 0x8000);
+            if (file >= image.len or file >= ci.len) continue;
+            if (image[file] != ci[file]) continue; // scaffolding / rewritten opcode
+            if (ub[pc] & core.usage_map.flag_opcode == 0) merged += 1;
+            ub[pc] |= tmp[pc];
+            if (tmp_ev[pc] != 0) {
+                if (site_ev[pc] == 0) merged_ev += 1;
+                site_ev[pc] |= tmp_ev[pc];
+            }
+        }
+        // Merge proven bank bytes under the same byte-identity guard the
+        // coverage merge uses: a ROM byte that differs between the images is
+        // this conversion's own scaffolding and proves nothing about stock.
+        var merged_pb: u32 = 0;
+        for (cover_pb.proven[0..cover_pb.n_proven]) |ca| {
+            const bank = (ca >> 16) & 0x7F;
+            const a16 = ca & 0xFFFF;
+            if (bank > 0x3F or a16 < 0x8000) continue;
+            const file = bank * 0x8000 + (a16 - 0x8000);
+            if (file >= image.len or file >= ci.len) continue;
+            if (image[file] != ci[file]) continue;
+            const before = ptr_ev.n_proven;
+            ptr_ev.addProven(ca);
+            if (ptr_ev.n_proven != before) merged_pb += 1;
+        }
+        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb });
+        try out.flush();
+    }
+    for (dbg_site_ev[0..dbg_n_site_ev]) |p| {
+        try out.print("  [site-ev] ${x:0>6}: cov={x:0>2} cov80={x:0>2} ev={x:0>2} ev80={x:0>2}\n", .{
+            p, ub[p], ub[0x80_0000 | p], site_ev[p], site_ev[0x80_0000 | p],
+        });
+    }
+    if (dbg_n_site_ev != 0) try out.flush();
+    // --ev-only: the coverage/evidence answer is all that was wanted. Stop
+    // before the (much longer) plan-and-verify machinery.
+    if (dbg_ev_only) return;
     const cov_total = core.usage_map.countOpcodes(ub);
     const cov_late = cov_total - cov_early;
 
@@ -817,13 +2299,103 @@ fn runSa1Gen(
     // the candidate FILTER changes across bisect attempts.
     var conv: profile.Conversion = undefined;
     var plan: profile.Plan = undefined;
-    var cands: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
+    var cands: [profile.conversion_set_max + 12]core.sa1gen.Candidate = undefined;
     var n_cands: usize = 0;
     var neighbours: []const core.sa1gen.Candidate = &.{};
     var dma_pages: profile.WramPages = @splat(0);
+    // WINDOW offload candidates: the profile's hot entries, no plan or
+    // page machinery — a window image has no marshal to size, only trees
+    // to walk. The bisect and mode ladder below drive them as usual.
+    //
+    // ONE CONTEXT ONLY: the offload mailbox is single-channel, so a stub
+    // call from interrupt context landing inside a mainline handshake
+    // deadlocks both CPUs (measured on Gradius III's attract demo — the
+    // NMI-side sound pump stomped the physics tree's smeg mid-flight and
+    // both ends waited forever). Candidates partition by measured
+    // context and the class with less slow work is refused by name.
+    if (args.window) {
+        conv = evidence_conv orelse profile.assessConversion(&con.prof, sum.verdict);
+        var int_slow: u64 = 0;
+        var main_slow: u64 = 0;
+        for (conv.entry_int[0..conv.n], conv.entry_slow[0..conv.n]) |is_int, slow| {
+            if (is_int) int_slow += slow else main_slow += slow;
+        }
+        const keep_int = int_slow > main_slow;
+        for (conv.entries[0..conv.n], 0..) |e, i| {
+            if (conv.entry_int[i] != keep_int) {
+                try out.print(
+                    "  window: ${x:0>2}:{x:0>4} runs in {s} context — refused (offloads share one mailbox; keeping the {s} class, {d} vs {d} slow cycles)\n",
+                    .{
+                        e >> 16,                                                             e & 0xFFFF,
+                        if (conv.entry_int[i]) @as([]const u8, "interrupt") else "mainline", if (keep_int) @as([]const u8, "interrupt") else "mainline",
+                        if (keep_int) int_slow else main_slow,                               if (keep_int) main_slow else int_slow,
+                    },
+                );
+                continue;
+            }
+            cands[n_cands] = .{ .entry = e };
+            n_cands += 1;
+        }
+        for (args.wg_add[0..args.n_wg_add]) |e| {
+            if (n_cands == cands.len) {
+                try out.print("  --wg-add: ${x:0>6} DROPPED — candidate list full ({d} slots)\n", .{ e, cands.len });
+                try out.flush();
+                continue;
+            }
+            const dup = for (cands[0..n_cands]) |c| {
+                if (c.entry == e) break true;
+            } else false;
+            if (dup) continue;
+            cands[n_cands] = .{ .entry = e };
+            n_cands += 1;
+            try out.print("  --wg-add: offering offload ${x:0>6} to the selector\n", .{e});
+            try out.flush();
+        }
+        if (!args.verify_behavioral) {
+            for (cands[0..n_cands]) |*c| c.no_async = true;
+        }
+    }
     if (!args.whole_game) {
         conv = profile.assessConversion(&con.prof, sum.verdict);
         plan = profile.planRelocation(&con.prof, conv);
+        // Anchored runs hunt OFFLOADS, not relocations. Two reasons, one
+        // fundamental and one earned: the dp-window move happens in the
+        // boot shim, which a state seeded mid-game never executes (its
+        // live D and stacked D saves predate any move); and live-region
+        // moves from a gameplay profile are exactly the aggressive plans
+        // (34 KiB of shared WRAM on the first real cart tried) that no
+        // verification has ever passed — the attract-demo plans only ever
+        // moved dead regions. Offloads carry the plan's value anyway: the
+        // S3 stage exists to put compute on the SA-1, and candidates from
+        // a scene with real slowdown are the whole point of anchoring.
+        if (state_bytes != null and plan.n > 0) {
+            // TEMP S2 debugging: YAMABUKI_S2_KEEP="1,3" keeps only those
+            // region indices (dp always dropped — unseedable); unset
+            // keeps the production behavior (all relocation disabled).
+            const keep_env: ?[]const u8 = args.s2_keep;
+            if (keep_env) |ke| {
+                var w: usize = 0;
+                for (plan.regions[0..plan.n], 0..) |r, ri| {
+                    if (r.dp) continue;
+                    var it = std.mem.splitScalar(u8, ke, ',');
+                    const keep = while (it.next()) |tok| {
+                        const idx = std.fmt.parseInt(usize, std.mem.trim(u8, tok, " "), 10) catch continue;
+                        if (idx == ri) break true;
+                    } else false;
+                    if (!keep) continue;
+                    plan.regions[w] = r;
+                    w += 1;
+                }
+                plan.n = w;
+                plan.has_dp = false;
+                try out.print("  (anchored: TEMP S2 debug — keeping {} region(s) of the plan: {s})\n", .{ w, ke });
+                for (plan.regions[0..plan.n]) |r| try out.print("    keeping $7e:{x:0>4}+{} -> {s} ${x:0>4}\n", .{ r.start, r.len, @tagName(r.dest), r.dest_off });
+            } else {
+                plan.n = 0;
+                plan.has_dp = false;
+                try out.print("  (anchored: relocation disabled — offload candidates only; a seeded state predates the boot shim's moves)\n", .{});
+            }
+        }
         for (conv.entries[0..conv.n], 0..) |e, i| {
             cands[i] = .{ .entry = e };
             if (con.prof.routineInfo(e)) |r| {
@@ -835,6 +2407,14 @@ fn runSa1Gen(
             }
         }
         n_cands = conv.n;
+        // TEMP S2 debugging: relocation-only attempts, no offloads.
+        if (state_bytes != null and args.s2_keep != null) n_cands = 0;
+        // Fire-and-forget offloads reorder execution by design: only the
+        // behavioral tier can ever verify one, so without it every
+        // candidate is demoted to synchronous up front.
+        if (!args.verify_behavioral) {
+            for (cands[0..n_cands]) |*c| c.no_async = true;
+        }
         // Sibling evidence: every other profiled routine, so an alternate
         // entry point into an offloaded body folds its working set into
         // the marshal even though it is far too cold to be a candidate.
@@ -881,15 +2461,51 @@ fn runSa1Gen(
     var dropped: [profile.conversion_set_max]u24 = undefined;
     var dropped_why: [profile.conversion_set_max][]const u8 = undefined;
     var n_dropped: usize = 0;
+    // Pre-seeded drops (`--wg-drop`): trees live play proved unsafe.
+    for (args.wg_drop[0..args.n_wg_drop]) |d| {
+        dropped[n_dropped] = @intCast(d);
+        dropped_why[n_dropped] = "excluded by --wg-drop (unsafe in live play)";
+        n_dropped += 1;
+        try out.print("  --wg-drop: excluding offload $00:{x:0>4}\n", .{d});
+        try out.flush();
+    }
+    // Interrupt-masked dispatches (`--wg-nmi-off`): trees whose read-set
+    // the S-CPU's own interrupt handlers mutate — the stub masks NMI/IRQ
+    // across the handshake so the copy runs against quiescent state.
+    for (args.wg_nmi_off[0..args.n_wg_nmi_off]) |e| {
+        for (cands[0..n_cands]) |*c| {
+            if ((c.entry & 0xFFFF) == e) {
+                c.nmi_off = true;
+                c.no_async = true;
+            }
+        }
+        try out.print("  --wg-nmi-off: interrupt-masked dispatch for $00:{x:0>4}\n", .{e});
+        try out.flush();
+    }
+    var total_max: u32 = 0;
+    for (totals[0..n_surf]) |t| total_max = @max(total_max, t);
     var conv_samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
-    try conv_samples.ensureTotalCapacity(total);
+    try conv_samples.ensureTotalCapacity(total_max);
 
+    // GREEDY MODE LADDER: the sync phase bisects to its MAXIMAL passing
+    // configuration first; then one async attempt competes against it on
+    // the measured result. Shipping the first passing attempt was wrong
+    // both ways round — an async first-pass ships a single tree when the
+    // sync ladder carries more (measured: async $9BCD alone cut dropped
+    // frames 237 to 234; the sync three-tree config cut them to 106),
+    // and a sync-only run never learns whether the async flavor was the
+    // better patch. `--wg-sync` skips the async phase.
+    const SyncPass = struct { res: core.sa1gen.Result, tier: SaTier, conv_sum: @TypeOf(sum) };
+    var sync_pass: ?SyncPass = null;
+    var phase_async = false;
     while (true) {
-        // Candidates minus the dropped culprits.
+        // Candidates minus the dropped culprits. The async phase fields
+        // the full list again: its monopoly ships one tree, and the sync
+        // drops were sync verdicts.
         var act: [profile.conversion_set_max]core.sa1gen.Candidate = undefined;
         var n_act: usize = 0;
         for (cands[0..n_cands]) |c| {
-            const is_dropped = for (dropped[0..n_dropped]) |d| {
+            const is_dropped = !phase_async and for (dropped[0..n_dropped]) |d| {
                 if (d == c.entry) break true;
             } else false;
             if (!is_dropped) {
@@ -898,12 +2514,71 @@ fn runSa1Gen(
             }
         }
 
+        if (ptr_ev.n_proven != 0 or ptr_ev.unresolved != 0 or ptr_ev.n_idx != 0 or ptr_ev.idx_unresolved != 0 or ptr_ev.n_dma_addr != 0 or ptr_ev.n_hi != 0 or ptr_ev.n_a0 != 0) {
+            try out.print("  value provenance: {} pointer-bank byte(s) ({} unresolved), {} dp,X word(s) ({} unresolved), {} dma-addr word(s)\n", .{ ptr_ev.n_proven, ptr_ev.unresolved, ptr_ev.n_idx, ptr_ev.idx_unresolved, ptr_ev.n_dma_addr });
+            for (ptr_ev.proven[0..ptr_ev.n_proven]) |pa| {
+                try out.print("    proven bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.xl_sites[0..ptr_ev.n_xl]) |pa| {
+                try out.print("    misfit-bank pin site at ${x:0>2}:{x:0>4} (translate-in)\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.a0_proven[0..ptr_ev.n_a0]) |pa| {
+                try out.print("    proven $A0-$BF bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.hi_proven[0..ptr_ev.n_hi]) |pa| {
+                try out.print("    proven $C0-$DF bank byte at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.dma_addr_proven[0..ptr_ev.n_dma_addr]) |pa| {
+                try out.print("    proven dma-addr word at ${x:0>2}:{x:0>4}\n", .{ pa >> 16, pa & 0xFFFF });
+            }
+            for (ptr_ev.unres_sites[0..ptr_ev.n_unres]) |s_| {
+                try out.print("    unresolved site ${x:0>2}:{x:0>4} bank cell ${x:0>4} (x{})\n", .{ s_.pc >> 16, s_.pc & 0xFFFF, s_.slot, s_.hits });
+            }
+            try out.flush();
+        }
         var refusal: ?core.sa1gen.Refusal = null;
+        const split_spec: ?core.sa1gen.SplitSpec = if (args.wg_split_mainloop != 0 or args.wg_split_tail != 0) .{
+            .io_entries = args.wg_split_io[0..args.n_wg_split_io],
+            .vbl_ranges = args.wg_split_vbl[0..args.n_wg_split_vbl],
+            .mainloop = args.wg_split_mainloop,
+            .tail = args.wg_split_tail,
+            .tail_epilogue = args.wg_split_epi,
+            .tail_dbr = args.wg_split_dbr,
+            .mode_cell = args.wg_split_mode_cell,
+            .mode_value = args.wg_split_mode_value,
+            .mode_gate = args.wg_split_mode,
+        } else null;
+        if (split_spec != null) {
+            try out.print("  --wg-split: engaging the split (anchor $00:{x:0>4}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) args.wg_split_tail else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
+            try out.flush();
+        }
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, args.wg_static, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, if (split_spec != null) &.{} else act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, split_spec, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
-        const res = converted catch |e| switch (e) {
+        if (converted) |cr| {
+            if (cr.stats.split_engage_addr != 0) {
+                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} multiply site(s) through the arithmetic helper\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_mul });
+                var hi: usize = 0;
+                while (hi < cr.stats.n_split_hazards) : (hi += 1)
+                    try out.print("  split HAZARD (open bus or dead wait on the SA-1): ${x:0>2}:{x:0>4}\n", .{ cr.stats.split_hazards[hi] >> 16, cr.stats.split_hazards[hi] & 0xFFFF });
+                try out.flush();
+            }
+            if (cr.stats.offload_space_short != 0)
+                try out.print(
+                    "  offloads ABANDONED: the tree copies need {} contiguous byte(s) and no\n  padding run is that big — the thunk bodies are in the same padding\n",
+                    .{cr.stats.offload_space_short},
+                );
+        } else |_| {}
+        if (args.n_wg_nmi_off != 0 and !phase_async) {
+            if (converted) |cr| {
+                if (cr.stats.nmi_off_sites != 0)
+                    try out.print("  wg-nmi-off: {} STA-$4200 site(s) thunked through the $378F mirror\n", .{cr.stats.nmi_off_sites})
+                else
+                    try out.print("  wg-nmi-off: NO usable $4200 writer sites — wrap NOT emitted\n", .{});
+            } else |_| {}
+        }
+        var res = converted catch |e| switch (e) {
             error.Refused => {
                 const r = refusal.?;
                 try out.print("refused: {s}\n", .{r.reason.describe()});
@@ -923,6 +2598,7 @@ fn runSa1Gen(
                         .{ r.detail >> 16, r.detail & 0xFFFF },
                     ),
                     .no_free_space => try out.print("  needs {} bytes\n", .{r.detail}),
+                    .wg_thunk_space => try out.print("  bank ${x:0>2}\n", .{r.detail}),
                     else => {},
                 }
                 try out.flush();
@@ -931,71 +2607,211 @@ fn runSa1Gen(
             else => return e,
         };
 
-        // The verify run for this attempt.
-        @memset(env_conv, 0);
-        var fast_audio = core.console.audio_hash_init;
-        conv_samples.clearRetainingCapacity();
-        {
-            const cart2 = try core.Cartridge.load(gpa, res.image);
-            const con2 = try gpa.create(core.ProfilingConsole);
-            con2.init(cart2);
-            for (0..total) |i| {
-                feedMovie(con2, mov, i);
-                con2.runFrame();
-                try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &env_conv[i] }, EnergySink.add);
-                conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
-                if (con2.takeProfile()) |smp| {
-                    if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
-                }
-            }
-            con2.cart.deinit(gpa);
-            gpa.destroy(con2);
-        }
-        const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
-        const conv_sum = profile.summarise(conv_samples.items, conv_scratch);
-
-        // Stage-S4 gate, three tiers: strict identity; frames identical
-        // with envelope-equivalent audio; equivalent modulo timing with a
-        // non-negative lag improvement.
-        const equiv = util.framesEquivalent(hashes, conv_hashes);
-        var fail_why: []const u8 = "";
-        var fail_frame: u32 = 0;
-        const passed: ?SaTier = switch (equiv) {
-            .identical => blk: {
-                if (fast_audio == base_audio) break :blk .strict;
-                if (util.audioEnvelopeMismatch(env_base, env_conv)) |bad| {
-                    fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
-                    fail_frame = bad;
-                    break :blk null;
-                }
-                break :blk .envelope;
-            },
-            .equivalent => blk: {
-                if (conv_sum.lag_frames > sum.lag_frames) {
-                    fail_why = "same pictures but MORE dropped frames — a regression";
-                    break :blk null;
-                }
-                break :blk .equivalent;
-            },
-            .divergent => blk: {
-                fail_why = "renders pictures the original never showed";
-                fail_frame = firstDiff(hashes, conv_hashes);
-                break :blk null;
-            },
-        };
-
-        if (passed) |tier| {
-            // Success: write the patch and the report.
-            try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+        // --audit: the conversion is the answer; verification is not being
+        // asked for. Reported on the FIRST attempt, which is the full
+        // candidate set — the one whose decisions describe the whole image.
+        if (dbg_audit) {
+            // Honour --save-attempt here too: the audit path is the SIX
+            // MINUTE way to get a converted image (profile + one
+            // conversion) instead of the forty-minute ladder, which makes
+            // it the right tool for diffing one rewrite rule against
+            // another.
+            if (args.save_attempt) |ap|
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
+            try printAudit(out, image, ub, &res);
+            try out.flush();
             return;
         }
 
-        // Failure. Terminal when no offloaded routine could explain it.
-        if (args.whole_game or res.stats.offload_count == 0) {
+        // The FastROM layer, applied to every attempt image BEFORE
+        // verification so the verified artifact IS the shipped one. The
+        // profiler's observed MEMSEL stores come from the surface-0
+        // power-on baseline (the stock `STZ $420D` init idiom runs at
+        // boot). Refusal is fatal: the flag is an explicit request.
+        if (args.wg_fastrom and args.whole_game and args.window) {
+            var fr_ref: ?core.patchgen.Refusal = null;
+            const fr = core.patchgen.generate(gpa, res.image, .{
+                .memsel_store_pcs = con.prof.memsel_pcs[0..con.prof.n_memsel_pcs],
+                .allow_coprocessor = true,
+                .keep_map_mode = true,
+                .lift_usage = ub,
+            }, &fr_ref) catch |e| {
+                if (e == error.Refused) {
+                    try out.print("wg-fastrom refused: {s}\n", .{fr_ref.?.reason.describe()});
+                    try out.flush();
+                    std.process.exit(1);
+                }
+                return e;
+            };
+            res.image = fr.image;
+            try out.print(
+                "  wg-fastrom: MEMSEL stub at $00:{x:0>4}, {} trampoline(s), {} MEMSEL store(s) neutralised, {} long bank(s) lifted to the fast mirrors\n",
+                .{ fr.stub_addr, fr.trampolines, fr.memsel_stores_nopped, fr.banks_lifted },
+            );
+            try out.flush();
+        }
+        if (args.save_attempt) |ap| {
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
+            // Every rung, numbered — the bisect overwrites the plain name,
+            // and the failing rung is usually the interesting one.
+            var nbuf: [256]u8 = undefined;
+            const numbered = if (phase_async)
+                std.fmt.bufPrint(&nbuf, "{s}.async", .{ap}) catch ap
+            else
+                std.fmt.bufPrint(&nbuf, "{s}.{d}", .{ ap, n_dropped }) catch ap;
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = numbered, .data = res.image });
+        }
+        // The verify runs for this attempt, one per surface. Every
+        // surface must pass; the attempt's tier is the WEAKEST across
+        // them, and the first failing surface drives the bisect.
+        var passed: ?SaTier = .strict;
+        var fail_why: []const u8 = "";
+        var fail_frame: u32 = 0;
+        var equiv: util.Equivalence = .identical;
+        var fail_mov: ?util.movie.Movie = null;
+        var conv_sum: @TypeOf(sum) = undefined;
+        for (0..n_surf) |s| {
+            // Evidence-only movie: it profiled into the union above; its
+            // gameplay forks at the first RNG-divergent event, so a
+            // tick-locked verdict over it compares two different games.
+            if (!args.movie_verify[s]) continue;
+            const s_total = totals[s];
+            const s_hashes = hashes_s[s];
+            const s_conv_hashes = conv_hashes_s[s];
+            const s_env_base = env_base_s[s];
+            const s_env_conv = env_conv_s[s];
+            @memset(s_env_conv, 0);
+            var fast_audio = core.console.audio_hash_init;
+            conv_samples.clearRetainingCapacity();
+            {
+                const cart2 = try core.Cartridge.load(gpa, res.image);
+                const con2 = try gpa.create(core.ProfilingConsole);
+                con2.init(cart2);
+                if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
+                for (0..s_total) |i| {
+                    feedMovie(con2, movAt(movs, s), i);
+                    con2.runFrame();
+                    try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &s_env_conv[i] }, EnergySink.add);
+                    s_conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
+                    if (con2.takeProfile()) |smp| {
+                        if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
+                    }
+                }
+                con2.cart.deinit(gpa);
+                gpa.destroy(con2);
+            }
+            const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
+            const s_conv_sum = profile.summarise(conv_samples.items, conv_scratch);
+            if (s == 0) conv_sum = s_conv_sum;
+
+            // Stage-S4 gate, three tiers: strict identity; frames
+            // identical with envelope-equivalent audio; equivalent modulo
+            // timing with a non-negative lag improvement.
+            const s_equiv = util.framesEquivalent(s_hashes, s_conv_hashes);
+            var s_tier: ?SaTier = switch (s_equiv) {
+                .identical => blk: {
+                    if (fast_audio == base_audio_s[s]) break :blk .strict;
+                    if (util.audioEnvelopeMismatch(s_env_base, s_env_conv)) |bad| {
+                        fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
+                        fail_frame = bad;
+                        break :blk null;
+                    }
+                    break :blk .envelope;
+                },
+                .equivalent => blk: {
+                    if (s_conv_sum.lag_frames > sum_s[s].lag_frames) {
+                        fail_why = "same pictures but MORE dropped frames — a regression";
+                        break :blk null;
+                    }
+                    break :blk .equivalent;
+                },
+                .divergent => blk: {
+                    fail_why = "renders pictures the original never showed";
+                    fail_frame = firstDiff(s_hashes, s_conv_hashes);
+                    break :blk null;
+                },
+            };
+
+            // The behavioral tier: a slowdown-removing conversion cannot
+            // be frame-identical to a slowed-down baseline, so
+            // `divergent` from the pixel gate is where working offloads
+            // go to die. Opt-in. Whole-game (SA-1-execution) images stay
+            // excluded — their state relocation is not modelled — but
+            // WINDOW images are in.
+            if (s_tier == null and s_equiv == .divergent and args.verify_behavioral and
+                (!args.whole_game or args.window))
+            {
+                if (n_surf > 1) try out.print("  surface {} of {}:\n", .{ s + 1, n_surf });
+                s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), surfaceAnchor(movs, s, verify_state), args.window, s_total, &fail_why, &fail_frame);
+            }
+            if (s_tier) |t| {
+                if (@intFromEnum(t) > @intFromEnum(passed.?)) passed = t;
+            } else {
+                passed = null;
+                equiv = s_equiv;
+                fail_mov = movAt(movs, s);
+                if (n_surf > 1) try out.print("  surface {} of {} FAILED: {s}\n", .{ s + 1, n_surf, fail_why });
+                break;
+            }
+        }
+
+        if (passed) |tier| {
+            if (!phase_async) {
+                // The sync ladder's maximal passing configuration. Try
+                // the async flavor when it exists and would differ —
+                // window mode, a first candidate never async-demoted,
+                // and the caller didn't opt out.
+                const async_worth = args.whole_game and args.window and !args.wg_sync and
+                    args.verify_behavioral and n_cands > 0 and !cands[0].no_async;
+                if (async_worth) {
+                    sync_pass = .{ .res = res, .tier = tier, .conv_sum = conv_sum };
+                    phase_async = true;
+                    try out.print(
+                        "  greedy: sync config PASSED ({} tree(s), {} dropped frame(s)); trying the async flavor...\n",
+                        .{ res.stats.offload_count, conv_sum.lag_frames },
+                    );
+                    try out.flush();
+                    continue;
+                }
+                try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+                return;
+            }
+            // Async passed too: ship whichever measured better.
+            const sp = sync_pass.?;
+            if (conv_sum.lag_frames < sp.conv_sum.lag_frames) {
+                try out.print(
+                    "  greedy: async config wins — {} vs {} dropped frame(s); shipping async\n",
+                    .{ conv_sum.lag_frames, sp.conv_sum.lag_frames },
+                );
+                try reportSa1(io, gpa, out, args, image, res, tier, total, sum, conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            } else {
+                try out.print(
+                    "  greedy: sync config wins — {} vs {} dropped frame(s); shipping sync\n",
+                    .{ sp.conv_sum.lag_frames, conv_sum.lag_frames },
+                );
+                try reportSa1(io, gpa, out, args, image, sp.res, sp.tier, total, sum, sp.conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            }
+            return;
+        }
+
+        // A failed async flavor loses the competition and nothing more:
+        // the sync winner already exists and ships.
+        if (phase_async) {
+            const sp = sync_pass.?;
+            try out.print("  greedy: async flavor failed ({s}) — keeping the sync config ({} dropped frame(s))\n", .{ fail_why, sp.conv_sum.lag_frames });
+            try reportSa1(io, gpa, out, args, image, sp.res, sp.tier, total, sum, sp.conv_sum, dropped[0..n_dropped], dropped_why[0..n_dropped], cov_total, cov_late);
+            return;
+        }
+
+        // Failure. Terminal when no offloaded routine could explain it —
+        // window images bisect their offloads like the S3 path (a failed
+        // window attempt with none left is what proves the RELOCATION
+        // itself, which the seventh commit already did).
+        if ((args.whole_game and !args.window) or res.stats.offload_count == 0) {
             try out.print("verification FAILED: {s}", .{fail_why});
             if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
             try out.print(".\n  No patch written.\n", .{});
-            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv, fail_frame, total);
+            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv_s[0], fail_frame, total);
             if (equiv == .divergent) {
                 try out.print(
                     \\  Either uncovered code touches moved state, or the game animates through
@@ -1009,8 +2825,21 @@ fn runSa1Gen(
             std.process.exit(1);
         }
 
-        // Diagnose and drop a culprit, then go around again.
-        const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], mov, equiv, fail_frame, fail_why, ub);
+        // Diagnose and drop a culprit, then go around again — against the
+        // surface that failed.
+        const culprit = try diagnoseCulprit(gpa, out, image, res, cands[0..n_cands], fail_mov, equiv, fail_frame, fail_why, ub);
+        // The mode ladder: an ASYNC culprit is demoted to synchronous
+        // before it is dropped — a caller that needed the routine's
+        // register results, or a read racing the in-flight window, is
+        // cured by waiting. Only a sync culprit is dropped outright.
+        if (res.stats.async_entry == culprit) {
+            for (cands[0..n_cands]) |*c| {
+                if (c.entry == culprit) c.no_async = true;
+            }
+            try out.print("  auto-bisect: offload $00:{x:0>4} was ASYNC — retrying it synchronously ({} attempt(s) so far)\n", .{ culprit, n_dropped + 1 });
+            try out.flush();
+            continue;
+        }
         dropped[n_dropped] = culprit;
         dropped_why[n_dropped] = fail_why;
         n_dropped += 1;
@@ -1020,7 +2849,235 @@ fn runSa1Gen(
 }
 
 /// Which S4 tier a successful SA-1 conversion verified under.
-const SaTier = enum { strict, envelope, equivalent };
+const SaTier = enum { strict, envelope, equivalent, behavioral };
+
+/// Surface `s`'s movie — null for the legacy no-movie (attract) surface.
+fn movAt(movs: []const util.movie.Movie, s: usize) ?util.movie.Movie {
+    return if (movs.len == 0) null else movs[s];
+}
+
+/// `--behavioral-probe` (undocumented): the behavioral tier alone, stock
+/// baseline vs a saved rung image, full verdict accounting printed —
+/// iterating the tier's rules in minutes instead of ladder-hours.
+fn runBehavioralProbe(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    args: Args,
+    base_image: []const u8,
+    conv_path: []const u8,
+    movs: []const util.movie.Movie,
+) !void {
+    const conv_raw = std.Io.Dir.cwd().readFileAlloc(io, conv_path, gpa, .limited(16 * 1024 * 1024)) catch {
+        try out.print("error: cannot read '{s}'\n", .{conv_path});
+        try out.flush();
+        std.process.exit(1);
+    };
+    const conv_image = core.header.stripCopierHeader(conv_raw);
+    var plan: profile.Plan = .{};
+    var res: core.sa1gen.Result = .{ .image = @constCast(conv_image), .stats = .{}, .fate = @splat(.not_attempted) };
+    const n = @max(1, movs.len);
+    for (0..n) |s| {
+        const m = movAt(movs, s);
+        const frames = args.frames orelse if (m) |mm|
+            @max(1, @as(u32, @intCast(mm.frames.len)) -| args.skip)
+        else
+            gen_frames_default;
+        const total = args.skip + frames;
+        const bv = try verifyBehavioral(gpa, base_image, conv_image, &plan, &res, m, null, true, total);
+        const verdict_name: []const u8 = switch (bv.verdict) {
+            .pass => |k| if (k == .clean) "PASS clean" else "PASS echoes",
+            .fail => |w| switch (w) {
+                .persistence => "FAIL persistence",
+                .spread => "FAIL spread",
+                .flood => "FAIL flood",
+            },
+        };
+        try out.print(
+            "surface {}: {s} — ticks {} ({} wall-stable, {} skew-active), bad {}, addrs {} ({} stable-active), novelty {}, worst_run {} (from tick {}), held {}, overflow {}, epochs {}, first_bad_frame {}\n",
+            .{
+                s + 1,                  verdict_name,               bv.ticks_base,
+                bv.stats.stable_ticks,  bv.stats.skew_active_ticks, bv.stats.bad_ticks,
+                bv.stats.n_addrs,       bv.stats.stableAddrCount(), bv.stats.novelty_ticks,
+                bv.stats.worst_run,     bv.stats.worst_start,       bv.stats.heldCount(),
+                bv.stats.addr_overflow, bv.stats.epoch_budget,      bv.first_bad_frame,
+            },
+        );
+        try out.print("  runs: worst {} [{}..{}], runner-up {}, last_tick {}, reaches_end {}, burst_ticks {} (runs <= {}), long {} ({} ticks)\n", .{
+            bv.stats.worst_run, bv.stats.worst_start,     bv.stats.worst_end,   bv.stats.second_run,
+            bv.stats.last_tick, bv.stats.runReachesEnd(), bv.stats.burst_total, util.Persistence.burst_len,
+            bv.stats.long_runs, bv.stats.long_total,
+        });
+        if (bv.n_sample > 0) {
+            try out.print("  first-bad sample:", .{});
+            for (bv.sample[0..bv.n_sample]) |adr| try out.print(" ${X:0>4}(d{X:0>2})", .{ adr & 0xFFFF, (adr >> 16) & 0xFF });
+            try out.print("\n", .{});
+        }
+        if (bv.fork_wall) |fw| if (fw > 600 and fw + 120 < total) {
+            try out.print("  RNG-fork signature (open terminal run) — probing up to the horizon at wall {}...\n", .{fw});
+            try out.flush();
+            const bv2 = try verifyBehavioral(gpa, base_image, conv_image, &plan, &res, m, null, true, fw);
+            try out.print("  pre-horizon: {s} — ticks {}, bad {}, worst_run {}\n", .{
+                switch (bv2.verdict) {
+                    .pass => |k| if (k == .clean) @as([]const u8, "PASS clean") else "PASS echoes",
+                    .fail => "FAIL",
+                },
+                bv2.ticks_base,
+                bv2.stats.bad_ticks,
+                bv2.stats.worst_run,
+            });
+        };
+        try out.flush();
+    }
+}
+
+/// The behavioral tier for one surface: returns `.behavioral` on pass,
+/// null on fail with `fail_why`/`fail_frame` filled for the bisect.
+fn runBehavioralTier(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    base_image: []const u8,
+    conv_image: []const u8,
+    plan: *const profile.Plan,
+    res: *const core.sa1gen.Result,
+    mov: ?util.movie.Movie,
+    verify_state: ?[]const u8,
+    window: bool,
+    total: u32,
+    fail_why: *[]const u8,
+    fail_frame: *u32,
+) !?SaTier {
+    try out.print("  pixel gate: divergent; behavioral tier (tick-locked replays)...\n", .{});
+    try out.flush();
+    const bv = try verifyBehavioral(gpa, base_image, conv_image, plan, res, mov, verify_state, window, total);
+    switch (bv.verdict) {
+        .pass => |kind| {
+            try out.print(
+                "  behavioral: {s} — {} ticks compared ({} at stable lag differential), {} diverging ({} address(es), worst run {})\n",
+                .{
+                    if (kind == .clean) @as([]const u8, "logic state IDENTICAL at every tick") else "wall-time echoes only",
+                    bv.ticks_base,
+                    bv.stats.stable_ticks,
+                    bv.stats.bad_ticks,
+                    bv.stats.n_addrs,
+                    bv.stats.worst_run,
+                },
+            );
+            try out.print(
+                "    inputs: {} frame(s), movie {} frame(s), {s}, {s}\n    pairing ended: {s}\n",
+                .{
+                    total,
+                    if (mov) |m| @as(u32, @intCast(m.frames.len)) else 0,
+                    if (verify_state != null) @as([]const u8, "seeded from a state") else "from power-on",
+                    if (window) @as([]const u8, "window homes") else "plan homes",
+                    bv.exit.describe(),
+                },
+            );
+            if (bv.stats.skew_active_ticks > 0)
+                try out.print(
+                    "    {} tick(s) diverged only while the lag differential itself was moving (the removed slowdown, not corruption; excluded from the budgets)\n",
+                    .{bv.stats.skew_active_ticks},
+                );
+            if (bv.stats.heldCount() > 0)
+                try out.print(
+                    "    {} cell(s) hold a constant offset (wall-time origins: pass counters and state seeded from them)\n",
+                    .{bv.stats.heldCount()},
+                );
+            return .behavioral;
+        },
+        .fail => |why| {
+            // A terminal open run in the second half is the RNG-fork
+            // signature: the timing change moved the wall-origin counters
+            // enemy RNG seeds from, the game forked at the first
+            // RNG-sensitive event, and every later tick compares two
+            // different healthy games. Verify up to the horizon: a pass
+            // there is the honest maximum tick-locked replay can prove
+            // (v17 has the same property; humans QA past it).
+            if (bv.fork_wall) |fw| if (fw > 600 and fw + 120 < total) {
+                try out.print(
+                    "  behavioral: diverges from wall frame {} to surface end — RNG-fork signature; re-verifying up to the horizon...\n",
+                    .{fw},
+                );
+                try out.flush();
+                const bv2 = try verifyBehavioral(gpa, base_image, conv_image, plan, res, mov, verify_state, window, fw);
+                if (bv2.verdict == .pass) {
+                    try out.print(
+                        "  behavioral: equivalent MODULO {} RNG-FORK EPISODE(S) — prefix of {} ticks verified to the first fork at wall frame {} of {}; {} tick(s) inside fork episodes excused ({s}); off-episode divergence {} tick(s) with every run <= {}\n",
+                        .{
+                            bv.stats.long_runs,
+                            bv2.ticks_base,
+                            fw,
+                            total,
+                            bv.stats.long_total,
+                            if (bv.stats.runReachesEnd()) @as([]const u8, "the last runs to the surface end: a gameplay fork, unverifiable by replay — eyeball it") else "each healed by a scene reset, which corruption would not survive",
+                            bv.stats.bad_ticks - bv.stats.long_total,
+                            util.Persistence.max_run,
+                        },
+                    );
+                    return .behavioral;
+                }
+                try out.print("  behavioral: pre-horizon verification also fails — treating as real divergence\n", .{});
+            };
+            fail_why.* = switch (why) {
+                .persistence => "live state diverges and never heals (or the conversion stopped ticking)",
+                .spread => "live-state divergence keeps reaching new addresses",
+                .flood => "live state diverges on too many ticks",
+            };
+            fail_frame.* = bv.first_bad_frame;
+            try out.print("  behavioral: FAIL — {s}\n", .{fail_why.*});
+            // The SAME statistics a pass prints, and the tier's inputs
+            // besides. A pass used to report "2517 ticks compared, worst
+            // run 24" while a failure reported a sentence — so a passing
+            // run and a failing one could not be diffed field by field,
+            // and a day went into inferring what one line would have
+            // said. A verdict that cannot be compared to another verdict
+            // is not evidence.
+            try out.print(
+                "    inputs: {} frame(s), movie {} frame(s), {s}, {s}\n" ++
+                    "    pairing ended: {s}\n" ++
+                    "    stats: {} ticks compared ({} at stable lag differential), {} diverging\n" ++
+                    "      ({} address(es), {} stable-active), novelty {}, held {}, epochs {}\n" ++
+                    "      worst run {} [{}..{}], runner-up {}, reaches end {}, bursts {} (runs <= {}),\n" ++
+                    "      long runs {} ({} ticks), last tick {}, addr overflow {}\n",
+                .{
+                    total,
+                    if (mov) |m| @as(u32, @intCast(m.frames.len)) else 0,
+                    if (verify_state != null) @as([]const u8, "seeded from a state") else "from power-on",
+                    if (window) @as([]const u8, "window homes") else "plan homes",
+                    bv.exit.describe(),
+                    bv.ticks_base,
+                    bv.stats.stable_ticks,
+                    bv.stats.bad_ticks,
+                    bv.stats.n_addrs,
+                    bv.stats.stableAddrCount(),
+                    bv.stats.novelty_ticks,
+                    bv.stats.heldCount(),
+                    bv.stats.epoch_budget,
+                    bv.stats.worst_run,
+                    bv.stats.worst_start,
+                    bv.stats.worst_end,
+                    bv.stats.second_run,
+                    bv.stats.runReachesEnd(),
+                    bv.stats.burst_total,
+                    util.Persistence.burst_len,
+                    bv.stats.long_runs,
+                    bv.stats.long_total,
+                    bv.stats.last_tick,
+                    bv.stats.addr_overflow,
+                },
+            );
+            if (bv.n_sample > 0) {
+                try out.print("    first at baseline frame {}, e.g.:", .{bv.first_bad_frame});
+                for (bv.sample[0..bv.n_sample]) |adr| {
+                    try out.print(" ${X:0>2}:{X:0>4}", .{ @as(u32, 0x7E) + (adr >> 16), adr & 0xFFFF });
+                }
+                try out.print("\n", .{});
+            }
+            try out.flush();
+            return null;
+        },
+    }
+}
 
 /// First index where the two per-frame hash streams differ (streams are
 /// equal length by construction). Only meaningful for the divergent case,
@@ -1231,9 +3288,68 @@ fn reportSa1(
         try out.flush();
         std.process.exit(1);
     };
+    // The invocation, beside its own artifact. A patch whose command has
+    // to be remembered is a patch nobody can regenerate.
+    const cmd_path = try std.fmt.allocPrint(gpa, "{s}.cmd", .{path});
+    const cmd_data = try std.fmt.allocPrint(gpa, "{s}\n", .{args.cmdline});
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cmd_path, .data = cmd_data }) catch {};
 
-    try out.print("wrote {s} ({} bytes)\n\n", .{ path, bps.len });
-    if (args.whole_game) {
+    try out.print("wrote {s} ({} bytes)\n", .{ path, bps.len });
+    try out.print("wrote {s}\n\n", .{cmd_path});
+    if (args.window) {
+        try out.print(
+            \\uniform window relocation (v17's architecture):
+            \\  boot shim at $00:{x:0>4}; the game KEEPS RUNNING ON THE S-CPU
+            \\  its WRAM moved wholesale — low 8 KiB into the S-CPU's BW-RAM window
+            \\  ($6000-$7FFF, every relative distance preserved, so indexed bases
+            \\  rewrite soundly), $7E/$7F long references re-banked to $40/$41
+            \\  {d} long site(s) and {d} absolute site(s) rewritten; {d} D/S/DBR move(s)
+            \\  MMIO stays native; the SA-1 never leaves reset — the cart is carried
+            \\  for its RAM. This is the enabler for resident offloads over the whole
+            \\  working set.
+            \\
+        , .{
+            res.stats.shim_addr,
+            res.stats.rewritten_long,
+            res.stats.rewritten_abs,
+            res.stats.dp_sites,
+        });
+        if (res.stats.split_sites != 0)
+            try out.print(
+                "  {} split site(s) dispatch through a thunk instead of a fixed operand:\n  {} on the runtime data bank, {} on the index register's magnitude\n  (tiny-base indexed absolutes — no single operand serves a data base\n  and a ROM walk); {} of them behind a far stub for want of bank room\n",
+                .{ res.stats.split_sites, res.stats.split_sites - res.stats.idx_split_sites, res.stats.idx_split_sites, res.stats.split_far },
+            );
+        if (res.stats.disp_sites != 0)
+            try out.print(
+                "  {} unmeasured site(s) in full banks share one stub per bank through\n  the cold dispatcher (return-address lookup; ~150 cycles, never-seen code)\n",
+                .{res.stats.disp_sites},
+            );
+        if (res.stats.rewritten_ptr_banks != 0 or res.stats.rewritten_idx_words != 0 or res.stats.rewritten_dma_addrs != 0)
+            try out.print(
+                "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000, {} dma-addr word(s) pre-shifted\n  +$6000 (addressing state travelling as data — the idioms operand\n  rewrites cannot reach)\n",
+                .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words, res.stats.rewritten_dma_addrs },
+            );
+        if (res.stats.rewritten_dasb != 0)
+            try out.print(
+                "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
+                .{res.stats.rewritten_dasb},
+            );
+        if (res.stats.rewritten_hdma_indirect != 0)
+            try out.print(
+                "  {} low-WRAM indirect address(es) relocated +$6000 in indirect-HDMA\n  table(s) (a per-scanline HDMA source in the moved low 8 KiB now reads\n  the window copy, not the abandoned mirror)\n",
+                .{res.stats.rewritten_hdma_indirect},
+            );
+        if (res.stats.offload_count != 0) {
+            try out.print("  {} routine tree(s) execute ON THE SA-1, verbatim against the shared\n  window (resident by construction, registers+D+DBR through the mailbox):\n", .{res.stats.offload_count});
+            for (res.stats.offload_entries[0..res.stats.offload_count], 0..) |e, i| {
+                try out.print("    $00:{x:0>4} ({} byte(s) of tree copied{s})\n", .{
+                    e,
+                    res.stats.offload_copy_len[i],
+                    if (res.stats.async_entry == e) @as([]const u8, ", ASYNC — fire-and-forget") else "",
+                });
+            }
+        }
+    } else if (args.whole_game) {
         try out.print(
             \\whole-game migration (SA-1 Root):
             \\  boot shim at $00:{x:0>4}, S-CPU service loop at $00:{x:0>4}
@@ -1280,6 +3396,15 @@ fn reportSa1(
                         "  in BW-RAM (only the direct page is still copied, per call)\n",
                     .{res.stats.resident_offloads},
                 );
+                if (res.stats.async_entry != 0) try out.print(
+                    "  $00:{x:0>4} runs ASYNCHRONOUSLY: its stub fires the SA-1 and returns at\n" ++
+                        "  once with the caller's own registers; a fence (at the next call and in\n" ++
+                        "  an injected NMI prologue) completes the handshake. Nothing is copied\n" ++
+                        "  back — only its BW-RAM-resident effects survive, by contract. The\n" ++
+                        "  S-CPU and SA-1 genuinely overlap — this is where the conversion stops\n" ++
+                        "  paying for its offloads and starts profiting from them\n",
+                    .{res.stats.async_entry},
+                );
             }
         } else {
             try out.print("  S3b: no hot routine passed the offload walks; execution stays on the\n  S-CPU (relocation-only patch)\n", .{});
@@ -1306,6 +3431,14 @@ fn reportSa1(
             \\  equivalence is not checkable across a timing shift and goes UNVERIFIED
             \\
         , .{total}),
+        .behavioral => try out.print(
+            \\  verified: BEHAVIORALLY EQUIVALENT — the game's logic state matches at every
+            \\  logic tick over {} frames (compared on the bytes the original actually
+            \\  consumes, wherever the conversion relocated them; residual divergence was
+            \\  wall-time echoes that self-heal). Pixels, audio, and wall timing change BY
+            \\  DESIGN in a slowdown-removing conversion and go UNVERIFIED — eyeball a run.
+            \\
+        , .{total}),
     }
     try out.print(
         "  measured: dropped frames {} -> {}, mean utilisation {d:.0}% -> {d:.0}%\n",
@@ -1324,6 +3457,146 @@ fn reportSa1(
 /// stopped growing. New instructions still appearing in the last tenth of
 /// a run mean the profile had not settled — so whatever the rewriter did,
 /// it did on partial evidence.
+/// The conversion audit (`--audit`): what the rewriter did with every
+/// memory-touching site it saw, and — the part that matters — what it left
+/// alone and why.
+///
+/// The point is a DENOMINATOR. Until this existed, unconverted sites were
+/// discovered by playing the game until something broke: twelve of them
+/// turned up that way, and the laser bug lived among them for a week. A
+/// census does not prove the conversion correct — it cannot, because the
+/// hard question is which home an operand addresses at run time and that is
+/// not a static property — but it turns "what else is broken?" from a QA
+/// lottery into a list with a length.
+fn printAudit(
+    out: *std.Io.Writer,
+    image: []const u8,
+    ub: []const u8,
+    res: *const core.sa1gen.Result,
+) !void {
+    const V = core.sa1gen.Verdict;
+    const a = &res.audit;
+
+    try out.print("\nCONVERSION AUDIT\n", .{});
+
+    // --- reach: how much of the ROM the rewriter can even see ----------
+    const dyn = core.usage_map.countOpcodes(ub);
+    try out.print(
+        "\n  reach: {} instruction(s) executed while profiling",
+        .{dyn},
+    );
+    if (res.stats.cov_static_added != 0)
+        try out.print(", + {} found by static\n  descent (--wg-static)", .{res.stats.cov_static_added})
+    else
+        try out.print("\n  (--wg-static NOT used: code the profile never ran was never rewritten)", .{});
+    try out.print("\n", .{});
+
+    // Per bank: instructions seen against bytes that are not blank fill.
+    // A bank with content and no coverage is either graphics or code
+    // nobody has played into — this cannot tell which, and says so.
+    // A bank the descent never entered is a problem only if it holds CODE,
+    // and "looks like code" is exactly the judgement a disassembler cannot
+    // make on a ROM with no markers. So do not judge it — measure three
+    // independent signals and print them side by side:
+    //
+    //   seen      instructions the rewriter has in hand
+    //   calls     JSL/JML sites in seen code naming this bank as a TARGET
+    //   data      long accesses and block moves in seen code naming it as
+    //             a SOURCE or destination — positive evidence of data
+    //   density   how often this bank's bytes are the opcodes that
+    //             dominate real 65816 code, against the two banks known to
+    //             be code as the yardstick
+    //
+    // A bank with no coverage, no calls, plenty of data references and a
+    // density a third of the code banks' is data, and the report should
+    // say so rather than raise an alarm it cannot substantiate.
+    const codey = [_]u8{ 0x60, 0x6B, 0x20, 0x22, 0xA9, 0x85, 0xAD, 0x8D };
+    try out.print("\n  per bank — ran / seen / calls-in / data-refs / density / non-blank:\n", .{});
+    var bank: u32 = 0;
+    var suspect: u32 = 0;
+    while (bank * 0x8000 < image.len) : (bank += 1) {
+        var ran: u32 = 0;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x10000) : (a16 += 1) {
+            const cpu = (bank << 16) | a16;
+            if ((ub[cpu] | ub[0x80_0000 | cpu]) & core.usage_map.flag_opcode != 0) ran += 1;
+        }
+        const seen = res.audit.bank_ops[bank];
+        const lo = bank * 0x8000;
+        const hi = @min(lo + 0x8000, image.len);
+        var content: u32 = 0;
+        var hits: u32 = 0;
+        for (image[lo..hi]) |b| {
+            content += @intFromBool(b != 0xFF and b != 0x00);
+            for (codey) |c| hits += @intFromBool(b == c);
+        }
+        const dens: u32 = if (hi > lo) hits * 1000 / @as(u32, @intCast(hi - lo)) else 0;
+        // Code-like, never entered, and nothing references it as data: the
+        // only combination this report is willing to call suspicious.
+        const odd = seen == 0 and content > 0x1000 and dens >= 80 and
+            res.audit.bank_data[bank] == 0;
+        if (odd) suspect += 1;
+        try out.print("    ${x:0>2}  {d:>5} {d:>5} {d:>5} {d:>6}   .{d:0>3}  {d:>6}{s}\n", .{
+            bank,                      ran,  seen,    res.audit.bank_calls[bank],
+            res.audit.bank_data[bank], dens, content, if (odd) @as([]const u8, "   <-- code-like, never entered") else "",
+        });
+    }
+    try out.print("  indirect transfers in seen code: {} JMP (abs), {} JMP/JSR (abs,X), {} JMP [abs]\n", .{
+        res.audit.n_ind_abs, res.audit.n_ind_absx, res.audit.n_ind_long,
+    });
+    if (suspect == 0)
+        try out.print("  No bank is code-like, unentered AND unreferenced as data.\n", .{})
+    else
+        try out.print("  {} bank(s) look like code the descent never entered — start there.\n", .{suspect});
+
+    // --- what happened to the sites it did see -------------------------
+    const rows = [_]struct { v: V, label: []const u8 }{
+        .{ .v = .shifted, .label = "moved into the window (+$6000)" },
+        .{ .v = .rebanked, .label = "re-banked $7E/$7F -> $40/$41" },
+        .{ .v = .thunk_dbr, .label = "thunked, dispatching on the data bank" },
+        .{ .v = .thunk_index, .label = "thunked, dispatching on the index" },
+        .{ .v = .left_high, .label = "left: operand >= $2000 (MMIO or ROM)" },
+        .{ .v = .left_rom, .label = "left: measured traffic never touched low WRAM" },
+        .{ .v = .left_pinned, .label = "left: data bank statically proved BW-RAM" },
+        .{ .v = .left_mixed, .label = "LEFT: measured low WRAM, but not only" },
+        .{ .v = .left_unproven, .label = "LEFT: no evidence, shape not provable" },
+    };
+    var total: u32 = 0;
+    for (rows) |r| total += a.count(r.v);
+    try out.print("\n  {} memory-touching site(s) decided:\n", .{total});
+    for (rows) |r| {
+        const n = a.count(r.v);
+        if (n == 0) continue;
+        try out.print("    {d:>6}  {s}\n", .{ n, r.label });
+    }
+
+    const hazards = a.count(.left_pinned) + a.count(.left_mixed) + a.count(.left_unproven);
+    if (hazards == 0) {
+        try out.print("\n  No site was left addressing the abandoned home on a guess.\n", .{});
+        return;
+    }
+    try out.print(
+        "\n  {} site(s) still address the pre-conversion home. Each is a bet that\n" ++
+            "  the path reaching it does not want low WRAM; `--stale` is the way to\n" ++
+            "  collect the ones that lose.\n\n",
+        .{hazards},
+    );
+    for (a.sites[0..a.n_sites]) |s| {
+        const b: u32 = s.file / 0x8000;
+        const a16: u32 = 0x8000 + (s.file % 0x8000);
+        var ev: [4]u8 = "----".*;
+        if (s.ev & core.usage_map.site_wram_low != 0) ev[0] = 'L';
+        if (s.ev & core.usage_map.site_rom != 0) ev[1] = 'R';
+        if (s.ev & core.usage_map.site_wram_bank != 0) ev[2] = 'B';
+        if (s.ev & core.usage_map.site_other != 0) ev[3] = 'O';
+        try out.print("    ${x:0>2}:{x:0>4}  op ${x:0>2}  ${x:0>4}  ev {s}  {s}\n", .{
+            b, a16, s.op, s.v, &ev, @tagName(s.verdict),
+        });
+    }
+    if (a.truncated != 0)
+        try out.print("    ... and {} more (list capped)\n", .{a.truncated});
+}
+
 fn printCoverage(out: *std.Io.Writer, total_ops: u32, late_ops: u32, frames: u32) !void {
     const late_pct = @as(f64, @floatFromInt(late_ops)) * 100 /
         @as(f64, @floatFromInt(@max(1, total_ops)));
@@ -1371,11 +3644,13 @@ fn runReport(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
+    if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try anchorMovie(con, mov, "movie", out);
 
     // Coverage wants the boot code too, so the map is attached before the
     // skipped frames run, not after.
     var umap: core.usage_map.UsageMap = undefined;
-    if (args.usage_map_out != null) {
+    if (args.usage_map_out != null or args.call_graph_out != null) {
         const bytes = try gpa.alloc(u8, core.usage_map.cpu_map_len);
         @memset(bytes, 0);
         umap = .{ .bytes = bytes };
@@ -1392,6 +3667,55 @@ fn runReport(
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
         if (i >= args.skip) samples.appendAssumeCapacity(s);
+    }
+
+    if (args.call_graph_out) |path| {
+        var seeds: std.array_list.Managed(u24) = .init(gpa);
+        defer seeds.deinit();
+        for (&con.prof.routines) |*r| {
+            if (r.entry == profile.Routine.empty) continue;
+            try seeds.append(@intCast(r.entry & 0xFF_FFFF));
+        }
+        var g = try core.callgraph.analyze(gpa, cart.rom, umap.bytes, seeds.items);
+        defer g.deinit();
+
+        // Ranked by complexity: the routines whose bodies branch the most are
+        // where the frame goes and where a verbatim copy is hardest to prove.
+        const by_cx = try gpa.dupe(core.callgraph.Node, g.nodes);
+        defer gpa.free(by_cx);
+        std.mem.sort(core.callgraph.Node, by_cx, {}, struct {
+            fn lt(_: void, x: core.callgraph.Node, y: core.callgraph.Node) bool {
+                return x.complexity() > y.complexity();
+            }
+        }.lt);
+        try out.print("\n  call graph: {d} routine(s), {d} edge(s), {d} unresolved dispatch site(s)\n", .{ g.nodes.len, g.edges.len, g.unresolved });
+        try out.print("    entry     bytes  cx  callers  calls  indirect\n", .{});
+        var shown: usize = 0;
+        for (by_cx) |n| {
+            if (n.instrs == 0) continue;
+            if (shown == 16) break;
+            shown += 1;
+            try out.print("    ${x:0>6}  {d:>6}  {d:>3}  {d:>7}  {d:>5}  {d:>8}\n", .{ n.entry, n.bytes, n.complexity(), n.callers, n.calls_out, n.indirect });
+        }
+        // Every routine, tab-separated, for whatever wants to sort it.
+        var tsv: std.array_list.Managed(u8) = .init(gpa);
+        defer tsv.deinit();
+        try tsv.appendSlice("entry\tbytes\tinstrs\tcomplexity\tcallers\tcalls_out\tindirect\n");
+        for (g.nodes) |n| {
+            if (n.instrs == 0) continue;
+            const line = try std.fmt.allocPrint(gpa, "{x:0>6}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+                n.entry, n.bytes, n.instrs, n.complexity(), n.callers, n.calls_out, n.indirect,
+            });
+            defer gpa.free(line);
+            try tsv.appendSlice(line);
+        }
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tsv.items }) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            try out.flush();
+            std.process.exit(1);
+        };
+        try out.print("  wrote {s}\n", .{path});
+        try out.flush();
     }
 
     if (args.usage_map_out) |path| {
@@ -1560,6 +3884,11 @@ fn runReport(
     try out.print("  slowdown          {} of {} frames ({d:.1}%)\n", .{
         sum.slow_frames, sum.frames, sum.slowRatio() * 100,
     });
+    if (sum.n_slow_runs > 0) {
+        try out.print("    at frame(s):", .{});
+        for (sum.slow_runs[0..sum.n_slow_runs]) |r| try out.print(" {}(x{})", .{ r.start, r.len });
+        try out.print("\n", .{});
+    }
     if (sum.stalls > 0) {
         try out.print("  stalls            {} ({} frames) — loads or transitions, not slowdown\n", .{
             sum.stalls, sum.stall_frames,
@@ -1756,12 +4085,12 @@ fn runReport(
     // is the first thing a reader needs, because every number below is a
     // number *about that run* — a demo loop, a chosen moment, and a recorded
     // playthrough are three different games as far as the frame budget cares.
-    if (args.movie) |path| {
+    if (args.n_movies != 0) {
         try out.print(
             \\
             \\  Replayed {s} — real recorded input, so this is gameplay rather than a demo.
             \\
-        , .{path});
+        , .{args.movies[0]});
     } else {
         try out.print(
             \\
@@ -1779,7 +4108,7 @@ fn runReport(
     try out.flush();
 }
 
-const routine_rows_shown: usize = 16;
+var routine_rows_shown: usize = 16;
 
 /// Write a usage map in bsnes-plus's `-usage.bin` layout: the CPU block
 /// verbatim, then a zero-filled SMP block, then a zero-filled coprocessor
@@ -2214,8 +4543,22 @@ fn printWramFootprint(out: *std.Io.Writer, fp: core.profile.WramFootprint) !void
 fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     // Not deinit'd — the returned Args slice into it, and `gpa` is the
     // process arena.
+    // The invocation, verbatim, before anything consumes it.
+    var cmd: std.array_list.Managed(u8) = .init(gpa);
+    {
+        var cit = try util.argIterator(init, gpa);
+        var first = true;
+        while (cit.next()) |a| {
+            if (!first) try cmd.append(' ');
+            first = false;
+            const quote = std.mem.indexOfAny(u8, a, " \t\"") != null;
+            if (quote) try cmd.append('"');
+            try cmd.appendSlice(a);
+            if (quote) try cmd.append('"');
+        }
+    }
     var it = try util.argIterator(init, gpa);
-    var out: Args = .{ .rom = undefined };
+    var out: Args = .{ .rom = undefined, .cmdline = cmd.items };
     var rom: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--frames")) {
@@ -2226,6 +4569,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.skip = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--ppm")) {
             out.ppm = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--ppm-range")) {
+            // "<start>:<count>:<prefix>"
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.ppm_range_start = try std.fmt.parseInt(u32, pit.next().?, 10);
+            out.ppm_range_count = try std.fmt.parseInt(u32, pit.next() orelse return error.MissingValue, 10);
+            out.ppm_range_prefix = pit.next() orelse "frame";
         } else if (std.mem.eql(u8, a, "--wav")) {
             out.wav = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--accurate")) {
@@ -2251,6 +4601,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.hot = true;
         } else if (std.mem.eql(u8, a, "--routines")) {
             out.routines = true;
+        } else if (std.mem.eql(u8, a, "--routines-all")) {
+            // The full attribution table, for analyses that need every
+            // MMIO-touching routine rather than the hot sixteen.
+            out.routines = true;
+            routine_rows_shown = 100000;
+        } else if (std.mem.eql(u8, a, "--call-graph")) {
+            out.call_graph_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--usage-map")) {
             out.usage_map_out = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--plan")) {
@@ -2259,13 +4616,205 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             out.wide = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--movie")) {
-            out.movie = it.next() orelse return error.MissingValue;
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_movies == max_movies) return error.TooManyMovies;
+            out.movies[out.n_movies] = v;
+            out.n_movies += 1;
+        } else if (std.mem.eql(u8, a, "--evidence-movie")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_movies == max_movies) return error.TooManyMovies;
+            out.movies[out.n_movies] = v;
+            out.movie_verify[out.n_movies] = false;
+            out.n_movies += 1;
+        } else if (std.mem.eql(u8, a, "--state")) {
+            out.state = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--hash-stream")) {
+            out.hash_stream = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--s2-keep")) {
+            out.s2_keep = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--cheat")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.n_pokes = util.cheat.parseCodes(v, &out.pokes, out.n_pokes) catch
+                return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--poke")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.n_pokes = util.cheat.parseList(v, &out.pokes, out.n_pokes) catch
+                return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--dump-vram")) {
+            out.dump_vram = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--dump-ppu")) {
+            out.dump_ppu = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--movie-ignore-crc")) {
+            out.movie_ignore_crc = true;
+            core.console.dbg_ignore_state_rom_crc = true; // also let an anchored state cross builds
+
+        } else if (std.mem.eql(u8, a, "--dump-ram")) {
+            out.dump_ram = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
+            out.behavioral_probe = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--wg-sync")) {
+            out.wg_sync = true;
+        } else if (std.mem.eql(u8, a, "--wg-fastrom")) {
+            out.wg_fastrom = true;
+        } else if (std.mem.eql(u8, a, "--wg-drop")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_drop == out.wg_drop.len) return error.TooManyDrops;
+            out.wg_drop[out.n_wg_drop] = try std.fmt.parseInt(u16, v, 16);
+            out.n_wg_drop += 1;
+        } else if (std.mem.eql(u8, a, "--wg-nmi-off")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_nmi_off == out.wg_nmi_off.len) return error.TooManyDrops;
+            out.wg_nmi_off[out.n_wg_nmi_off] = try std.fmt.parseInt(u16, v, 16);
+            out.n_wg_nmi_off += 1;
+        } else if (std.mem.eql(u8, a, "--cover-image")) {
+            if (out.n_cover == out.cover_image.len) return error.TooManyArgs;
+            out.cover_image[out.n_cover] = it.next() orelse return error.MissingValue;
+            out.n_cover += 1;
+        } else if (std.mem.eql(u8, a, "--cover-movie")) {
+            // Fills the pair the last --cover-image opened.
+            if (out.n_cover == 0) return error.MissingValue;
+            out.cover_movie[out.n_cover - 1] = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--clock-pc")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_clock_pc = try std.fmt.parseInt(u24, v, 16);
+        } else if (std.mem.eql(u8, a, "--conv-pad")) {
+            const v = it.next() orelse return error.MissingValue;
+            dbg_conv_pad = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--ev-only")) {
+            dbg_ev_only = true;
+        } else if (std.mem.eql(u8, a, "--audit")) {
+            dbg_audit = true;
+        } else if (std.mem.eql(u8, a, "--site-ev")) {
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ',');
+            while (pit.next()) |one| {
+                if (dbg_n_site_ev == dbg_site_ev.len) break;
+                dbg_site_ev[dbg_n_site_ev] = try std.fmt.parseInt(u24, one, 16);
+                dbg_n_site_ev += 1;
+            }
+        } else if (std.mem.eql(u8, a, "--trace-clk")) {
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            core.wdc65816.dbg_trace_from = try std.fmt.parseInt(u64, pit.next().?, 10);
+            core.wdc65816.dbg_trace_to = try std.fmt.parseInt(u64, pit.next().?, 10);
+        } else if (std.mem.eql(u8, a, "--trace-sa1")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_trace_sa1 = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--save-state-at")) {
+            // "<frame>=<path>": replay to that frame, then write the machine.
+            const v = it.next() orelse return error.MissingValue;
+            const eq = std.mem.indexOfScalar(u8, v, '=') orelse return error.MissingValue;
+            out.save_state_at = try std.fmt.parseInt(u32, v[0..eq], 10);
+            out.save_state_path = v[eq + 1 ..];
+        } else if (std.mem.eql(u8, a, "--dma-bank-pc")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_dmabank = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--dma-trace")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.dma.dbg_dma = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--no-color-math")) {
+            core.ppu.dbg_no_color_math = true;
+        } else if (std.mem.eql(u8, a, "--bg-disable")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.ppu.dbg_layer_disable = try std.fmt.parseInt(u8, v, 16);
+        } else if (std.mem.eql(u8, a, "--hdma-disable")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.dma.dbg_hdma_disable = try std.fmt.parseInt(u8, v, 16);
+        } else if (std.mem.eql(u8, a, "--stale")) {
+            // "<max-sites>" or "<max-sites>:<from-clock>"
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            core.wdc65816.dbg_stale = try std.fmt.parseInt(usize, pit.next().?, 10);
+            if (pit.next()) |f| core.wdc65816.dbg_stale_from = try std.fmt.parseInt(u64, f, 10);
+        } else if (std.mem.eql(u8, a, "--iram-dump")) {
+            out.iram_dump = true;
+        } else if (std.mem.eql(u8, a, "--stale-ring")) {
+            core.wdc65816.dbg_stale_ring = true;
+        } else if (std.mem.eql(u8, a, "--watch-min")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_watch_val_min = try std.fmt.parseInt(u8, v, 16);
+        } else if (std.mem.eql(u8, a, "--watch-from")) {
+            const v = it.next() orelse return error.MissingValue;
+            core.wdc65816.dbg_watch_from = try std.fmt.parseInt(u64, v, 10);
+        } else if (std.mem.eql(u8, a, "--watch")) {
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            core.wdc65816.dbg_watch_lo = try std.fmt.parseInt(u16, pit.next().?, 16);
+            core.wdc65816.dbg_watch_hi = if (pit.next()) |h| try std.fmt.parseInt(u16, h, 16) else core.wdc65816.dbg_watch_lo;
+        } else if (std.mem.eql(u8, a, "--save-attempt")) {
+            out.save_attempt = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--tick-dump")) {
+            out.tick_dump = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--verify-behavioral")) {
+            out.verify_behavioral = true;
         } else if (std.mem.eql(u8, a, "--gen-fastrom-patch")) {
             out.gen_fastrom = true;
         } else if (std.mem.eql(u8, a, "--gen-sa1-patch")) {
             out.gen_sa1 = true;
         } else if (std.mem.eql(u8, a, "--whole-game")) {
             out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--window")) {
+            // Window mode rides the whole-game pipeline (all-or-nothing,
+            // no candidates, no plan) with execution left on the S-CPU.
+            out.window = true;
+            out.whole_game = true;
+        } else if (std.mem.eql(u8, a, "--wg-add")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_add == out.wg_add.len) return error.TooManyAdds;
+            out.wg_add[out.n_wg_add] = try std.fmt.parseInt(u24, v, 16);
+            out.n_wg_add += 1;
+        } else if (std.mem.eql(u8, a, "--wg-split")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wg_split_mainloop = try std.fmt.parseInt(u16, v, 16);
+        } else if (std.mem.eql(u8, a, "--wg-split-tail")) {
+            // "<tail>:<epilogue>:<dbr>" — the NMI-tail flavor.
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.wg_split_tail = try std.fmt.parseInt(u16, pit.next().?, 16);
+            out.wg_split_epi = try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16);
+            out.wg_split_dbr = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+        } else if (std.mem.eql(u8, a, "--wg-split-mode")) {
+            // "<cell>:<value>" (hex) — gameplay-mode gate: the tail goes
+            // to the SA-1 only while dp <cell> holds <value>; menus and
+            // transitions run nested-native (the stock shape).
+            const v = it.next() orelse return error.MissingValue;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            out.wg_split_mode_cell = try std.fmt.parseInt(u8, pit.next().?, 16);
+            out.wg_split_mode_value = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+            out.wg_split_mode = true;
+        } else if (std.mem.eql(u8, a, "--wg-split-io")) {
+            // "<hex4>[:d][:l]" — d = deferred (handshake body, pump-only
+            // post-engage), l = RTL-shaped (JSL-called).
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_split_io == out.wg_split_io.len) return error.TooManyAdds;
+            var pit = std.mem.splitScalar(u8, v, ':');
+            var io: core.sa1gen.SplitIo = .{ .entry = try std.fmt.parseInt(u16, pit.next().?, 16) };
+            while (pit.next()) |f| {
+                if (std.mem.eql(u8, f, "d")) io.deferred = true;
+                if (std.mem.eql(u8, f, "l")) io.rtl = true;
+                if (std.mem.eql(u8, f, "f")) io.ff = true;
+            }
+            out.wg_split_io[out.n_wg_split_io] = io;
+            out.n_wg_split_io += 1;
+        } else if (std.mem.eql(u8, a, "--wg-split-vbl")) {
+            const v = it.next() orelse return error.MissingValue;
+            if (out.n_wg_split_vbl == out.wg_split_vbl.len) return error.TooManyAdds;
+            var pit = std.mem.splitScalar(u8, v, '-');
+            out.wg_split_vbl[out.n_wg_split_vbl] = .{
+                try std.fmt.parseInt(u16, pit.next().?, 16),
+                try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16),
+            };
+            out.n_wg_split_vbl += 1;
+        } else if (std.mem.eql(u8, a, "--wg-expand")) {
+            // Accepts bytes, or "1m"/"2m" for whole megabytes.
+            const v = it.next() orelse return error.MissingValue;
+            const mb = v.len > 1 and (v[v.len - 1] == 'm' or v[v.len - 1] == 'M');
+            const n = try std.fmt.parseInt(u32, if (mb) v[0 .. v.len - 1] else v, 10);
+            out.wg_expand_to = if (mb) n * 1024 * 1024 else n;
+            if (!std.math.isPowerOfTwo(out.wg_expand_to)) return error.BadExpandSize;
+        } else if (std.mem.eql(u8, a, "--wg-copy-reserve")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.wg_copy_reserve = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--wg-static")) {
             out.wg_static = true;
         } else if (std.mem.eql(u8, a, "--out")) {
@@ -2286,5 +4835,6 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
     if (out.gen_fastrom and out.gen_sa1) return error.GenConflicts;
     if (out.whole_game and !out.gen_sa1) return error.GenConflicts;
     if (out.usage_map_out != null and !out.sa1_report) return error.UsageNeedsReport;
+    if (out.call_graph_out != null and !out.sa1_report) return error.UsageNeedsReport;
     return out;
 }

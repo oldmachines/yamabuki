@@ -29,9 +29,10 @@
 const std = @import("std");
 const wdc65816 = @import("../cpu/wdc65816.zig");
 const sa1_trace = @import("../sa1_trace.zig");
+const usage_map = @import("../usage_map.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "mmc_base", "mmc_flat", "trace" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "bwram_hi", "bwram_hi_mask", "mmc_base", "mmc_flat", "trace", "usage" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -41,12 +42,23 @@ pub const Sa1 = struct {
     rom_mask: u32,
     bwram: [*]u8,
     bwram_mask: u32,
+    /// Second BW-RAM bank (linear offsets $20000-$3FFFF, bank $42+): a
+    /// window conversion's relocated battery SRAM. Mask 0 = absent.
+    bwram_hi: [*]u8,
+    bwram_hi_mask: u32,
 
     cpu: CpuT,
     /// SA-1-side execution instrumentation, attached by a profiling
     /// frontend (see sa1_trace.zig); null in every shipped path, where it
     /// costs one predictable test per SA-1 instruction and nothing else.
     trace: ?*sa1_trace.Trace,
+    /// Stage-S1 coverage from the SA-1 side, attached only by the cover
+    /// harvest (null in every shipped path; init()'s memset nulls it). On
+    /// a conversion image the game's own logic executes HERE — an
+    /// S-CPU-only harvest is blind to exactly the code a split moved (the
+    /// stage-2 boss loader's bank-immediate went unrewritten because the
+    /// only recording that reaches it runs it on this core).
+    usage: ?*const usage_map.UsageMap,
     iram: [0x800]u8,
     mdr: u8,
 
@@ -179,11 +191,13 @@ pub const Sa1 = struct {
     }
 
     /// Wire to the cartridge ROM and BW-RAM (after init or state load).
-    pub fn attach(self: *Sa1, rom: []const u8, rom_mask: u32, bwram: [*]u8, bwram_mask: u32) void {
+    pub fn attach(self: *Sa1, rom: []const u8, rom_mask: u32, bwram: [*]u8, bwram_mask: u32, bwram_hi: [*]u8, bwram_hi_mask: u32) void {
         self.rom = rom.ptr;
         self.rom_mask = rom_mask;
         self.bwram = bwram;
         self.bwram_mask = bwram_mask;
+        self.bwram_hi = bwram_hi;
+        self.bwram_hi_mask = bwram_hi_mask;
         self.cpu.bus = self;
         self.refreshMmc(); // derived table isn't serialized; rebuild after load
     }
@@ -228,6 +242,28 @@ pub const Sa1 = struct {
             if (self.trace) |t| {
                 const r = &self.cpu.regs;
                 t.note(@as(u24, r.pbr) << 16 | r.pc, r.c, r.x, r.y, r.d, r.dbr, r.p);
+            }
+            if (self.usage) |u| {
+                const r = &self.cpu.regs;
+                // ROM-window pcs only, folded through the fast mirrors —
+                // and peeked without touching budget or MDR.
+                if (r.pc >= 0x8000 and (r.pbr & 0x7F) < 0x40) {
+                    const pc = @as(u24, @as(u24, r.pbr & 0x7F) << 16) | r.pc;
+                    const op = self.rom[self.mmcTranslate(squashLo(pc), true)];
+                    const m8 = r.e or (r.p & 0x20) != 0;
+                    const x8 = r.e or (r.p & 0x10) != 0;
+                    // A BRK/COP/STP/WDM opcode is a wedge, not evidence: no
+                    // shippable image runs one (the generator refuses them),
+                    // so reaching one means this core walked off the rails —
+                    // a take whose anchor carries another image's SA-1 state
+                    // resumes at a pc that means nothing here and marks a
+                    // misaligned death rattle (an operand byte at $847B once
+                    // read back as a covered BRK and refused a good split).
+                    // Stop donating from the wedge onward.
+                    if (op == 0x00 or op == 0x02 or op == 0xDB or op == 0x42) {
+                        self.usage = null;
+                    } else u.noteInstr(pc, op, m8, x8);
+                }
             }
             const before = self.budget;
             self.cpu.step();
@@ -343,12 +379,29 @@ pub const Sa1 = struct {
     // --- BW-RAM projections ---------------------------------------------------
 
     fn bwLinearRead(self: *const Sa1, offset: u32) u8 {
+        // With a second bank present, BW-RAM is 256 KiB: bit 17 of the
+        // (mirrored) linear offset picks the bank. Without one, the old
+        // single-bank mask semantics hold exactly.
+        if (self.bwram_hi_mask != 0) {
+            const o = offset & 0x3_FFFF;
+            if (o & 0x2_0000 != 0) return self.bwram_hi[o & self.bwram_hi_mask];
+            return self.bwram[o & self.bwram_mask];
+        }
         return self.bwram[offset & self.bwram_mask];
     }
 
     fn bwLinearWrite(self: *Sa1, offset: u32, value: u8) void {
         // Write protection applies only while both enables are off.
         if (!self.swen and !self.cwen and (offset & 0x3_FFFF) < @as(u32, 0x100) << self.bwp) return;
+        if (self.bwram_hi_mask != 0) {
+            const o = offset & 0x3_FFFF;
+            if (o & 0x2_0000 != 0) {
+                self.bwram_hi[o & self.bwram_hi_mask] = value;
+                return;
+            }
+            self.bwram[o & self.bwram_mask] = value;
+            return;
+        }
         self.bwram[offset & self.bwram_mask] = value;
     }
 
@@ -714,7 +767,9 @@ pub const Sa1 = struct {
                 self.sw46 = value & 0x80 != 0;
             },
             0x2227 => self.cwen = value & 0x80 != 0,
-            0x222A => self.ciwp = value,
+            0x222A => {
+                self.ciwp = value;
+            },
             0x2230 => { // DCNT
                 self.sd = @truncate(value);
                 self.dd = @intCast((value >> 2) & 1);
@@ -970,7 +1025,7 @@ const TestChip = struct {
         tc.rom = @splat(0xEA); // NOP sled
         tc.bwram = @splat(0);
         tc.sa1.init();
-        tc.sa1.attach(&tc.rom, tc.rom.len - 1, &tc.bwram, tc.bwram.len - 1);
+        tc.sa1.attach(&tc.rom, tc.rom.len - 1, &tc.bwram, tc.bwram.len - 1, &tc.bwram, 0);
         return tc;
     }
 
@@ -1349,7 +1404,7 @@ test "sa1 state roundtrip via serialize" {
     var tc2 = try TestChip.create();
     defer tc2.destroy();
     _ = try serialize.read(Sa1, &tc2.sa1, buf);
-    tc2.sa1.attach(&tc2.rom, tc2.rom.len - 1, &tc2.bwram, tc2.bwram.len - 1);
+    tc2.sa1.attach(&tc2.rom, tc2.rom.len - 1, &tc2.bwram, tc2.bwram.len - 1, &tc2.bwram, 0);
     try testing.expectEqual(@as(u8, 0x42), tc2.sa1.iram[0]);
     try testing.expectEqual(tc.sa1.cpu.regs.pc, tc2.sa1.cpu.regs.pc);
 }
