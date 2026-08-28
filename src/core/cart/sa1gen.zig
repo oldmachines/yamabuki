@@ -4123,6 +4123,28 @@ fn extendCoverage(
     // false positive unlikely: both sides must independently name the
     // same sub-$2000 pointer. A matched dispatcher is seeded as code too,
     // so its own pointer operand shifts with the cell.
+    // Banks with ANY dynamically-executed opcode: dispatchers are CODE, and
+    // real ones live amid covered code (the cutscene dispatchers sit in bank
+    // $02's covered cluster). A pure DATA bank supplies raw $6C/$FC bytes by
+    // the thousand — 3,526 of them matched across the 3 MiB image once the
+    // site list was uncapped (22fd4a2), each planting a window-shifted fake
+    // operand inside stream data (the Ceres door confetti was one such byte;
+    // the rest garble tilesets of rooms the profiled surfaces never visit).
+    var bank_has_exec = [_]bool{false} ** 0x40;
+    {
+        var eb: u32 = 0;
+        while (eb < 0x40) : (eb += 1) {
+            if (eb * 0x8000 >= image.len) break;
+            var ea: u32 = 0x8000;
+            while (ea < 0x10000) : (ea += 1) {
+                const ec = (eb << 16) | ea;
+                if ((usage[ec] | usage[0x80_0000 | ec]) & usage_map.flag_opcode != 0) {
+                    bank_has_exec[eb] = true;
+                    break;
+                }
+            }
+        }
+    }
     var ptr_bank = [_]u8{0} ** 0x2000; // cell -> dispatcher bank + 1
     var pb2: u32 = 0;
     while (pb2 < 0x40) : (pb2 += 1) {
@@ -4142,6 +4164,7 @@ fn extendCoverage(
                     // was shifted to $6AFC — one byte, $0A -> $6A — and the
                     // decompressor's back-references cascaded it across the
                     // whole door sprite band as confetti).
+                    if (!bank_has_exec[pb2]) continue;
                     const cpu2 = (pb2 << 16) | pa2;
                     const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
                     const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
@@ -4224,6 +4247,7 @@ fn extendCoverage(
             const mo = image[mf];
             if (mo != 0x6C and mo != 0x7C and mo != 0xFC and mo != 0xDC) continue;
             if (mf + 2 >= image.len) continue;
+            if (!bank_has_exec[mb2]) continue;
             const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
             if (mcell >= 0x2000 or !cell_active[mcell]) continue;
             const msite = (mb2 << 16) | ma2;
