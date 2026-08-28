@@ -400,8 +400,15 @@ fn parseBool(s: []const u8) ParseError!bool {
 /// Parse a baked manifest. Pass-alias texture references are resolved to pass
 /// indices here, so an alias typo fails at load with `UnknownAlias` instead of
 /// sampling a black texture for the rest of the session.
-pub fn parse(text: []const u8) ParseError!Preset {
-    var p: Preset = .{};
+///
+/// Parses into `out` rather than returning a `Preset` (and leaves it partly
+/// filled on error, which every caller discards): Debug gives each of this
+/// function's ~50 `return error` sites its own `ParseError!Preset` slot and
+/// never merges them, and at a quarter-megabyte apiece that reserved a 12 MiB
+/// stack frame — more than the whole main-thread stack.
+pub fn parse(out: *Preset, text: []const u8) ParseError!void {
+    out.* = .{};
+    const p = out;
     var cur: ?*Pass = null;
 
     // Alias references are resolved in a second sweep: a pass may legally
@@ -563,7 +570,6 @@ pub fn parse(text: []const u8) ParseError!Preset {
                 return error.FeedbackNotBuffered;
         }
     }
-    return p;
 }
 
 // --- tests -----------------------------------------------------------------
@@ -634,7 +640,8 @@ test "parse: a two-pass preset with params, uniforms, and an alias reference" {
         \\  texture 1 Original original - nearest clamp_to_edge
         \\  texture 2 FirstPass pass FirstPass linear repeat
     ;
-    const p = try parse(src);
+    var p: Preset = undefined;
+    try parse(&p, src);
 
     try testing.expectEqualStrings("crt-lottes", p.name_str());
     try testing.expectEqual(Tier.handheld, p.tier);
@@ -677,7 +684,8 @@ test "parse: an unknown alias is a load-time error, not a black texture" {
         \\  frag a.frag
         \\  texture 0 NoSuchPass pass NoSuchPass linear clamp_to_edge
     ;
-    try testing.expectError(error.UnknownAlias, parse(src));
+    var p: Preset = undefined;
+    try testing.expectError(error.UnknownAlias, parse(&p, src));
 }
 
 test "parse: an unknown semantic is rejected rather than ignored" {
@@ -688,7 +696,8 @@ test "parse: an unknown semantic is rejected rather than ignored" {
         \\  frag a.frag
         \\  uniform ubo 0 global.Feedback vec4 pass_feedback
     ;
-    try testing.expectError(error.BadValue, parse(src));
+    var p: Preset = undefined;
+    try testing.expectError(error.BadValue, parse(&p, src));
 }
 
 test "parse: ESSL100's plain-uniform form round-trips" {
@@ -706,7 +715,8 @@ test "parse: ESSL100's plain-uniform form round-trips" {
         \\  uniform push 0 params.SourceSize vec4 source_size
         \\  texture 0 Source source - linear clamp_to_edge
     ;
-    const p = try parse(src);
+    var p: Preset = undefined;
+    try parse(&p, src);
     try testing.expectEqual(BlockMode.plain, p.passes[0].ubo_mode);
     try testing.expectEqualStrings("global.OutputSize", p.passes[0].uniforms[1].name_str());
     try testing.expectEqual(Semantic.source_size, p.passes[0].uniforms[2].semantic);
@@ -718,11 +728,13 @@ test "parse: passes must be declared in order" {
         \\pass 1
         \\  vert a.vert
     ;
-    try testing.expectError(error.PassOutOfOrder, parse(src));
+    var p: Preset = undefined;
+    try testing.expectError(error.PassOutOfOrder, parse(&p, src));
 }
 
 test "parse: a manifest with no passes is an error" {
-    try testing.expectError(error.NoPasses, parse("name empty\ntier desktop\n"));
+    var p: Preset = undefined;
+    try testing.expectError(error.NoPasses, parse(&p, "name empty\ntier desktop\n"));
 }
 
 test "cycle: wraps both ways, and backwards from the first lands on the last" {

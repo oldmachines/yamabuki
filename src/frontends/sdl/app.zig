@@ -2289,8 +2289,11 @@ fn buildChain(
     defer dir.close(io);
 
     const manifest = try dir.readFileAlloc(io, "preset.conf", a, .limited(1 << 20));
-    const p = try preset.parse(manifest);
-    try out.init(io, a, g.api, g.gles_major, p, dir, err);
+    // Parsed into the scratch arena, not a local: a Preset is ~280 KiB and
+    // this function is on the shader-cycling path.
+    const p = try a.create(preset.Preset);
+    try preset.parse(p, manifest);
+    try out.init(io, a, g.api, g.gles_major, p.*, dir, err);
 }
 
 /// Step `delta` presets and swap the chain in.
