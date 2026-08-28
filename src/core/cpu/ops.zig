@@ -107,7 +107,8 @@ fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: 
             const p = dpAddr(cpu, off, 0);
             const lo: u16 = cpu.read8(p);
             const hi: u16 = cpu.read8(dpSucc(cpu, p));
-            return @as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8);
+            const res = @as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8);
+            return res;
         },
         .dp_ind_x => {
             const off = cpu.fetch8();
@@ -116,7 +117,8 @@ fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: 
             const p = dpAddr(cpu, off, indexX(cpu, x8));
             const lo: u16 = cpu.read8(p);
             const hi: u16 = cpu.read8(dpSucc(cpu, p));
-            return @as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8);
+            const res = @as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8);
+            return res;
         },
         .dp_ind_y => {
             const off = cpu.fetch8();
@@ -138,7 +140,8 @@ fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: 
             const mid: u24 = cpu.read8(p +% 1);
             const hi: u24 = cpu.read8(p +% 2);
             const base = lo | mid << 8 | hi << 16;
-            return if (mode == .dp_ind_long_y) base +% indexY(cpu, x8) else base;
+            const res = if (mode == .dp_ind_long_y) base +% indexY(cpu, x8) else base;
+            return res;
         },
         .sr => {
             const off = cpu.fetch8();
@@ -152,7 +155,8 @@ fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: 
             const lo: u16 = cpu.read8(p);
             const hi: u16 = cpu.read8(p +% 1);
             cpu.idle();
-            return (@as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8)) +% indexY(cpu, x8);
+            const res = (@as(u24, cpu.regs.dbr) << 16 | (lo | hi << 8)) +% indexY(cpu, x8);
+            return res;
         },
     }
 }

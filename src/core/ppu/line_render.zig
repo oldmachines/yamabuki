@@ -191,6 +191,15 @@ const mode_table = [8]ModeDesc{
     },
 };
 
+/// TM/TS as the renderer sees them, with any `--bg-disable` layers masked out
+/// (diagnostic only; zero when unset, so this is the register value).
+inline fn tmOf(ppu: *const Ppu) u8 {
+    return ppu.main_screen & ~ppu_mod.dbg_layer_disable;
+}
+inline fn tsOf(ppu: *const Ppu) u8 {
+    return ppu.sub_screen & ~ppu_mod.dbg_layer_disable;
+}
+
 pub fn renderLine(ppu: *Ppu, line: u32) void {
     const width = ppu.fb_line_width;
     const row = ppu.fb[line * width ..][0..width];
@@ -324,6 +333,7 @@ inline fn selectOrder(ppu: *const Ppu, comptime md: ModeDesc) []const Entry {
 /// clips the main screen to black; otherwise the direct lpal path is taken
 /// and none of the math state is read.
 inline fn mathActive(ppu: *const Ppu) bool {
+    if (ppu_mod.dbg_no_color_math) return false;
     return ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
 }
 
@@ -357,7 +367,7 @@ fn renderMode(
     if (math) {
         compositeMath(ppu, order, bgbuf, objbuf, row, &winmask, .full, .full);
     } else {
-        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, ppu.main_screen, .full);
+        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, tmOf(ppu), .full);
     }
 }
 
@@ -397,9 +407,9 @@ fn renderModeHires(
     if (math) {
         compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask, main_hd, sub_hd);
     } else {
-        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, ppu.main_screen, main_hd);
+        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, tmOf(ppu), main_hd);
     }
-    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, ppu.sub_screen, sub_hd);
+    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, tsOf(ppu), sub_hd);
 
     for (0..fb_width) |x| {
         row[2 * x] = sub_row[x];
@@ -583,7 +593,7 @@ fn compositeMath(
     const prevent_region: u2 = @truncate(ppu.cgwsel >> 4);
 
     for (0..row.len) |x| {
-        const main = resolvePixel(order, bgbuf, objbuf, main_hd, x, ppu.main_screen, winmask, ppu.tmw);
+        const main = resolvePixel(order, bgbuf, objbuf, main_hd, x, tmOf(ppu), winmask, ppu.tmw);
         const in_cw = winmask[5][x];
         const clipped = regionActive(clip_region, in_cw);
         var color: u16 = if (clipped) 0 else ppu.cgram[main.abs];
@@ -598,7 +608,7 @@ fn compositeMath(
             var addend: u16 = ppu.fixed_color;
             var half = half_en and !clipped;
             if (sub_addend) {
-                const sub = resolvePixel(order, bgbuf, objbuf, sub_hd, x, ppu.sub_screen, winmask, ppu.tsw);
+                const sub = resolvePixel(order, bgbuf, objbuf, sub_hd, x, tsOf(ppu), winmask, ppu.tsw);
                 if (sub.layer != 5) {
                     addend = ppu.cgram[sub.abs];
                 } else {
@@ -631,7 +641,7 @@ fn fillBg(ppu: *Ppu, bg_index: usize, comptime bpp: u4, cgram_base: u16, comptim
 
     // Decode when the layer is on either screen; the compositor's TM/TS enable
     // mask decides which resolve pass actually sees it.
-    if ((ppu.main_screen | ppu.sub_screen) & (@as(u8, 1) << @intCast(bg_index)) == 0) {
+    if ((tmOf(ppu) | tsOf(ppu)) & (@as(u8, 1) << @intCast(bg_index)) == 0) {
         clearLine(buf[0..out_w]);
         return;
     }
@@ -781,7 +791,7 @@ fn fillMode7(ppu: *Ppu, line: u32, margin: u32, bgbuf: *[4][fb_width_max]Cell) v
     const buf = &bgbuf[0];
     const extbg = ppu.setini & 0x40 != 0;
     const enable_mask: u8 = if (extbg) 0x03 else 0x01;
-    if ((ppu.main_screen | ppu.sub_screen) & enable_mask == 0) {
+    if ((tmOf(ppu) | tsOf(ppu)) & enable_mask == 0) {
         clearLine(buf[0..width]); // the mode-7 layers are disabled on both screens
         if (extbg) clearLine(bgbuf[1][0..width]);
         return;
@@ -931,7 +941,7 @@ const obj_sizes = [8][4]u8{
 fn fillObj(ppu: *Ppu, line: u32, margin: u32, buf: *[fb_width_max]Cell) void {
     const width = fb_width + 2 * margin;
     clearLine(buf[0..width]);
-    if ((ppu.main_screen | ppu.sub_screen) & 0x10 == 0) return; // OBJ off on both screens
+    if ((tmOf(ppu) | tsOf(ppu)) & 0x10 == 0) return; // OBJ off on both screens
 
     const sz = obj_sizes[ppu.obj_size];
     var in_range: u32 = 0;

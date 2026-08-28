@@ -180,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var refusal: ?core.sa1gen.Refusal = null;
-        const wg_res = core.sa1gen.convertWholeGame(gpa, demo, usage, false, &refusal) catch |e| {
+        const wg_res = core.sa1gen.convertWholeGame(gpa, demo, usage, null, null, false, false, &.{}, false, 0, 0, null, &refusal) catch |e| {
             if (e == error.Refused) {
                 try out.print("FAIL: whole-game migration refused the demo: {s}\n", .{refusal.?.reason.describe()});
                 try out.flush();

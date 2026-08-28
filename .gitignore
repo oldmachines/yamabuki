@@ -29,3 +29,6 @@ _site/
 # never the patches themselves. Fetch them from the registry's URLs.
 patches/*.bps
 patches/*.ips
+zig-out-cli/
+zig-out-gen/
+*.log

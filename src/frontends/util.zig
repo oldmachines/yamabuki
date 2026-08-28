@@ -11,8 +11,12 @@ const core = @import("snes_core");
 /// Input movies (TAS-style record/replay); see movie.zig.
 pub const movie = @import("movie.zig");
 
+/// Cheat pokes (Action-Replay-style held writes); see cheat.zig.
+pub const cheat = @import("cheat.zig");
+
 test {
     _ = movie;
+    _ = cheat;
 }
 
 /// Expand one RGB565 pixel to RGB888 by bit-replicating the 5/6-bit channels
@@ -609,4 +613,470 @@ pub fn maybeShot(
         try err.print("shot failed: {s}\n", .{@errorName(e)});
     };
     try err.flush();
+}
+
+/// The behavioral tier's verdict machine: fed the diverging live-state
+/// cells of each compared tick (address AND value offset), it decides
+/// whether the divergence pattern is a wall-time echo or corruption.
+///
+/// The distinction, validated on Gradius III's own conversions: values the
+/// main loop DERIVES from wall-coupled state (an animation phase computed
+/// from an NMI frame counter, say) sit one taint hop past anything the
+/// lag-learned mask can identify, so they leak through — but they echo the
+/// lag delta and SELF-HEAL within a handful of ticks, over a small fixed
+/// set of addresses. Corruption is the opposite in every axis: it persists
+/// (the game trusts its state), spreads (wrong state begets wrong state),
+/// or floods (a clobbered buffer diverges wholesale). Hence three limits,
+/// each with real headroom over the measured echoes (worst observed: run
+/// 17, 18 addresses, 1.4% of ticks).
+///
+/// One shape is excused even when it never heals: a cell whose divergence
+/// HOLDS A CONSTANT OFFSET while the run goes on. A conversion that removes
+/// slowdown gives the game more logic passes per wall second, and any
+/// counter of passes — or timer seeded from one across an input edge —
+/// lands offset by exactly the passes the speedup bought, then evolves in
+/// lockstep with the baseline forever (measured on Gradius III's menu:
+/// the $3A pass counter offset by the 79 passes the offloads gained, and
+/// v17's hand-made conversion shows the same class, larger). Corruption
+/// cannot hold a constant offset against a moving baseline: a stuck cell's
+/// offset changes every time the baseline moves, and each change counts as
+/// a fresh diverging tick. So: an address re-diverging at its established
+/// offset is a wall-time origin and feeds no failure axis; an offset
+/// CHANGE is active divergence and feeds them all.
+pub const Persistence = struct {
+    /// Distinct diverging addresses tolerated before spread is even a
+    /// question.
+    pub const max_addrs = 64;
+    /// Dedup capacity past the threshold: novelty tracking needs to keep
+    /// telling new addresses from seen ones after max_addrs, or a single
+    /// busy burst would blind it. Exceeding THIS is spread outright —
+    /// sized for a multi-transition gameplay surface (menu, weapon
+    /// select, stage load, deaths, continue: each reseeds a screen's
+    /// worth of scratch, and 512 was exceeded by legitimate echoes).
+    pub const addr_buf = 4096;
+    /// Ticks-with-new-addresses tolerated. This is what separates
+    /// WANDERING corruption (novelty sustained across the run — each cell
+    /// heals but the damage keeps finding fresh ones) from a PHASE BURST
+    /// (an offload's latency shifts the poll instant through a busy
+    /// transition: dozens of scratch cells differ at the sampled moment,
+    /// re-converge by the next frame, and novelty stops when the
+    /// transition does). Measured on the menu transition: the burst's
+    /// novelty spans a handful of ticks; the classifier's own wandering
+    /// test spans ninety.
+    pub const max_novelty_ticks = 30;
+    /// Consecutive diverging ticks tolerated before the verdict is
+    /// corruption-by-persistence.
+    pub const max_run = 30;
+    /// Diverging ticks per thousand tolerated before the verdict is
+    /// corruption-by-flood.
+    pub const max_bad_per_mille = 50;
+    /// A completed run at most this long is a BURST (see `burst_total`).
+    pub const burst_len = 8;
+
+    /// One diverging live cell: where, and by how much (baseline minus
+    /// converted, wrapping). The offset is what separates a relocated
+    /// wall-time origin (holds) from active divergence (changes).
+    pub const Bad = struct { addr: u32, delta: u8 };
+
+    /// Input epochs the compared run spans (edges consumed + 1). Every
+    /// consumed edge starts a transition that legitimately reseeds a
+    /// screen's worth of wall-derived scratch, so the novelty and breadth
+    /// budgets scale with it — a five-transition gameplay surface is not
+    /// "spreading" for paying five transitions' worth of echoes.
+    epoch_budget: u32 = 1,
+    addrs: [addr_buf]u32 = undefined,
+    deltas: [addr_buf]u8 = undefined,
+    /// Addresses that re-diverged at their established offset at least
+    /// once — the wall-time origins the verdict excused, for the report.
+    held: [addr_buf]bool = undefined,
+    /// Addresses active on at least one WALL-STABLE tick. A cell whose
+    /// deltas only ever move while the two sides' lag differential is
+    /// itself moving is wall-derived BY MEASUREMENT — its divergence is
+    /// the removed slowdown, not corruption — and it stays out of the
+    /// spread verdict's breadth count.
+    stable_active: [addr_buf]bool = undefined,
+    n_addrs: usize = 0,
+    addr_overflow: bool = false,
+    novelty_ticks: u32 = 0,
+    ticks: u32 = 0,
+    /// Ticks compared at a STABLE lag differential — the persistence
+    /// verdict's actual domain. Tick-locked comparison of wall-coupled
+    /// state is undefined while one side is dropping frames the other
+    /// isn't (measured: an offload build ran 79 wall frames ahead
+    /// through the load stretches, and every NMI-side counter read as
+    /// thousands of consecutive active ticks).
+    stable_ticks: u32 = 0,
+    /// Wall-skew ticks that had activity — excluded from runs, but
+    /// disclosed: a surface verified mostly through skew proved little.
+    skew_active_ticks: u32 = 0,
+    bad_ticks: u32 = 0,
+    run: u32 = 0,
+    worst_run: u32 = 0,
+    /// Tick where the worst run began — the forensics anchor for a
+    /// persistence verdict (first_bad routinely misleads: it names the
+    /// first active tick of the whole run, not the killer stretch).
+    worst_start: u32 = 0,
+    /// Tick of the worst run's last increment: a run reaching (near) the
+    /// surface end is the RNG-fork signature, not corruption-and-recovery.
+    worst_end: u32 = 0,
+    /// The runner-up run: the longest COMPLETED run other than the worst
+    /// one's own instance. When a late fork HEALS (an attract loop's
+    /// scene reset reloads the forked state and the tail re-converges),
+    /// this is what proves the rest of the surface stayed within the echo
+    /// budget — the strongest evidence the excursion was a fork and not
+    /// corruption, because corruption does not reconverge to
+    /// byte-equivalence through a reset.
+    second_run: u32 = 0,
+    /// Most recent counted bad tick (identifies which instance is ending).
+    last_bad: u32 = 0,
+    /// First tick of the currently open run (instance identity).
+    run_start: u32 = 0,
+    /// Fork-episode accounting: completed-or-open runs that exceeded the
+    /// persistence budget. A timing-changed conversion forks the game at
+    /// RNG-sensitive moments (each demo, each transition whose sound
+    /// state phase-shifted); every episode that HEALS was reconverged by
+    /// a scene reset — corruption does not reconverge to
+    /// byte-equivalence. The caller may excuse a small number of them
+    /// when everything outside verifies.
+    long_runs: u8 = 0,
+    /// Bad ticks spent inside long runs — subtracted for the caller's
+    /// adjusted flood check.
+    long_total: u32 = 0,
+    /// Start tick of the first long run: the horizon the prefix retry
+    /// verifies up to.
+    first_long_start: ?u32 = null,
+    /// Bad ticks inside short bursts (completed runs of at most
+    /// `burst_len` = 8): the phase-burst shape — an offload's latency
+    /// shifts the poll instant through a busy moment, dozens of scratch
+    /// cells differ at the sampled instant and re-converge within a few
+    /// frames.
+    burst_total: u32 = 0,
+    /// Highest tick index fed (indices may skip: the caller's epoch
+    /// resyncs consume ticks without comparing them).
+    last_tick: u32 = 0,
+    first_bad: ?u32 = null,
+
+    /// One compared tick: `bad` is the diverging live cells (empty =
+    /// clean). Order and duplicates don't matter. `wall_stable` says the
+    /// two sides' lag differential did not change since the previous
+    /// compared tick: only such ticks feed the persistence/novelty/flood
+    /// accounting. A skew tick still records every delta (so the held
+    /// baselines track the wall offset as it moves) but neither counts
+    /// against the budgets nor resets a run — corruption that spans a
+    /// skew stretch keeps accumulating on the stable ticks around it.
+    pub fn feed(self: *Persistence, tick: u32, bad: []const Bad, wall_stable: bool) void {
+        self.ticks += 1;
+        self.last_tick = tick;
+        if (wall_stable) self.stable_ticks += 1;
+        var any_new = false;
+        var active = false;
+        for (bad) |b| {
+            const slot: ?usize = for (self.addrs[0..self.n_addrs], 0..) |x, i| {
+                if (x == b.addr) break i;
+            } else null;
+            if (slot) |i| {
+                if (self.deltas[i] == b.delta) {
+                    // Re-diverging at the established offset: the cell
+                    // evolves in lockstep with the baseline from a
+                    // relocated origin. Not corruption; feeds nothing.
+                    self.held[i] = true;
+                    continue;
+                }
+                self.deltas[i] = b.delta;
+                if (wall_stable) self.stable_active[i] = true;
+                active = true;
+                continue;
+            }
+            any_new = true;
+            active = true;
+            if (self.n_addrs == addr_buf) {
+                self.addr_overflow = true;
+                continue;
+            }
+            self.addrs[self.n_addrs] = b.addr;
+            self.deltas[self.n_addrs] = b.delta;
+            self.held[self.n_addrs] = false;
+            self.stable_active[self.n_addrs] = wall_stable;
+            self.n_addrs += 1;
+        }
+        if (!wall_stable) {
+            if (active) self.skew_active_ticks += 1;
+            return;
+        }
+        if (any_new) self.novelty_ticks += 1;
+        if (!active) {
+            // A run just ended: keep the runner-up. The worst INSTANCE is
+            // the one whose start worst_start records; any other completed
+            // run — even one that tied the worst's length — counts here.
+            if (self.run > 0 and self.worst_start != self.run_start)
+                self.second_run = @max(self.second_run, self.run);
+            if (self.run > 0 and self.run <= burst_len) self.burst_total += self.run;
+            self.run = 0;
+            return;
+        }
+        self.bad_ticks += 1;
+        self.run += 1;
+        if (self.run == 1) self.run_start = tick;
+        self.last_bad = tick;
+        if (self.run == max_run + 1) {
+            self.long_runs +|= 1;
+            self.long_total += max_run + 1;
+            if (self.first_long_start == null) self.first_long_start = self.run_start;
+        } else if (self.run > max_run + 1) {
+            self.long_total += 1;
+        }
+        if (self.run > self.worst_run) {
+            // A new record: the DETHRONED instance, if it was a different
+            // one, becomes the runner-up.
+            if (self.worst_run > 0 and self.worst_start != self.run_start)
+                self.second_run = @max(self.second_run, self.worst_run);
+            self.worst_run = self.run;
+            self.worst_start = self.run_start;
+            self.worst_end = tick;
+        }
+        if (self.first_bad == null) self.first_bad = tick;
+    }
+
+    /// How many addresses ever re-diverged at a held offset (the excused
+    /// wall-time origins).
+    pub fn heldCount(self: *const Persistence) usize {
+        var n: usize = 0;
+        for (self.held[0..self.n_addrs]) |h| n += @intFromBool(h);
+        return n;
+    }
+
+    /// How many addresses were ever active at a stable lag differential —
+    /// the breadth the spread verdict actually judges.
+    pub fn stableAddrCount(self: *const Persistence) usize {
+        var n: usize = 0;
+        for (self.stable_active[0..self.n_addrs]) |s| n += @intFromBool(s);
+        return n;
+    }
+
+    /// Did the worst run reach (nearly) the surface end? The signature of
+    /// an RNG FORK rather than corruption-and-recovery: a timing-changed
+    /// conversion legitimately forks the game at the first RNG-sensitive
+    /// event (enemy RNG seeds from wall-origin counters), and every tick
+    /// after compares two different — both healthy — games. A short clean
+    /// tail (a transition both sides idle through) doesn't break the
+    /// signature.
+    pub fn runReachesEnd(self: *const Persistence) bool {
+        return self.worst_run > 0 and self.last_tick -| self.worst_end <= max_run;
+    }
+
+    pub const Verdict = union(enum) {
+        /// No divergence at all, or only transient bounded echoes.
+        pass: enum { clean, echoes },
+        /// Named so the gate's output explains itself.
+        fail: enum { persistence, spread, flood },
+    };
+
+    pub fn verdict(self: *const Persistence) Verdict {
+        if (self.addr_overflow) return .{ .fail = .spread };
+        if (self.stableAddrCount() > max_addrs * self.epoch_budget and
+            self.novelty_ticks > max_novelty_ticks * self.epoch_budget)
+            return .{ .fail = .spread };
+        if (self.worst_run > max_run) return .{ .fail = .persistence };
+        // Flood, structure-aware: short bursts are the phase-burst shape
+        // (self-healing within a few frames — an offload's latency shifts
+        // the poll instant through busy moments) and don't count; the
+        // bounded mid-length remainder gets a tripled budget BECAUSE this
+        // branch is only reached with every run inside the persistence
+        // budget — a trajectory that carried chronic echoes for the whole
+        // surface without ever once forking or wandering has measured its
+        // diverging cells as non-load-bearing (real recomputed-wrong state
+        // feeds back: it forks, and forking shows up as a long run).
+        if (self.stable_ticks > 0 and
+            @as(u64, self.bad_ticks - self.burst_total) * 1000 >
+                @as(u64, self.stable_ticks) * max_bad_per_mille * 3)
+            return .{ .fail = .flood };
+        return .{ .pass = if (self.bad_ticks == 0 and self.skew_active_ticks == 0) .clean else .echoes };
+    }
+};
+
+test "persistence: clean and transient-echo runs pass" {
+    var p: Persistence = .{};
+    for (0..1000) |t| p.feed(@intCast(t), &.{}, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .clean }, p.verdict());
+
+    // Gradius III's measured shape: short scattered runs over 3 addresses,
+    // ~1.2% of ticks (40 of 3202 in the 3600-frame capture). Each echo
+    // burst carries a different lag delta — echoes are not held offsets.
+    p = .{};
+    for (0..1000) |t| {
+        const in_echo = (t % 250) < 8;
+        const d: u8 = @truncate(t / 250 + 1);
+        if (in_echo) p.feed(@intCast(t), &.{
+            .{ .addr = 0x1F20, .delta = d },
+            .{ .addr = 0x1F28, .delta = d +% 3 },
+            .{ .addr = 0x1F29, .delta = d +% 7 },
+        }, true) else p.feed(@intCast(t), &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+}
+
+test "persistence: a divergence that never heals is corruption" {
+    // A stuck cell against a moving baseline: the offset changes every
+    // tick, so every tick is active divergence.
+    var p: Persistence = .{};
+    for (0..100) |t| p.feed(@intCast(t), &.{}, true);
+    for (100..200) |t| p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }}, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
+    try std.testing.expectEqual(@as(?u32, 100), p.first_bad);
+}
+
+test "persistence: a constant offset held forever is a wall-time origin, not corruption" {
+    // The removed-slowdown signature: a pass counter lands offset by the
+    // passes the speedup bought, then evolves in lockstep with the
+    // baseline for the rest of the run ($3A on Gradius III's menu, offset
+    // 79 — and v17's hand conversion shows the same class).
+    var p: Persistence = .{};
+    for (0..100) |t| p.feed(@intCast(t), &.{}, true);
+    for (100..1000) |t| p.feed(@intCast(t), &.{
+        .{ .addr = 0x003A, .delta = 0x4F },
+        .{ .addr = 0x3D98, .delta = 0x01 },
+    }, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+    try std.testing.expectEqual(@as(usize, 2), p.heldCount());
+
+    // But an offset that then STARTS MOVING is a cell the conversion is
+    // actively computing wrong — the excusal must not survive the change.
+    for (1000..1040) |t| p.feed(@intCast(t), &.{.{ .addr = 0x003A, .delta = @truncate(t) }}, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
+}
+
+test "persistence: the novelty budget scales with input epochs" {
+    // A five-epoch surface pays five transitions' worth of fresh scratch:
+    // the same shape that fails a one-epoch run passes with the budget,
+    // and sustained wandering beyond it still fails.
+    var p: Persistence = .{ .epoch_budget = 5 };
+    var t: u32 = 0;
+    var a: u32 = 0x1000;
+    // 40 bursts of 4 new addrs: 160 addrs over 40 novelty ticks — over a
+    // single-epoch budget (64/30), inside a five-epoch one (320/150).
+    while (t < 800) : (t += 1) {
+        if (t % 20 == 0) {
+            p.feed(t, &.{ .{ .addr = a, .delta = 1 }, .{ .addr = a + 1, .delta = 1 }, .{ .addr = a + 2, .delta = 1 }, .{ .addr = a + 3, .delta = 1 } }, true);
+            a += 4;
+        } else p.feed(t, &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+    var single: Persistence = .{};
+    single.n_addrs = p.n_addrs;
+    single.stable_active = p.stable_active;
+    single.novelty_ticks = p.novelty_ticks;
+    single.ticks = p.ticks;
+    single.stable_ticks = p.stable_ticks;
+    single.bad_ticks = 1;
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, single.verdict());
+}
+
+test "persistence: spreading addresses are corruption even when transient" {
+    var p: Persistence = .{};
+    var t: u32 = 0;
+    var a: u32 = 0x1000;
+    while (t < 900) : (t += 1) {
+        // A new address every bad tick, each healing immediately.
+        if (t % 10 == 0) {
+            p.feed(t, &.{.{ .addr = a, .delta = 1 }}, true);
+            a += 1;
+        } else p.feed(t, &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, p.verdict());
+}
+
+test "persistence: a phase burst — many addresses, few novelty ticks — is an echo" {
+    // The menu-transition shape: an offload's latency shifts the poll
+    // instant through a busy transition, dozens of scratch cells differ
+    // for a handful of ticks, everything re-converges, and novelty stops
+    // when the transition does.
+    var p: Persistence = .{};
+    for (0..500) |t| p.feed(@intCast(t), &.{}, true);
+    var burst: [40]Persistence.Bad = undefined;
+    for (500..506) |t| {
+        for (&burst, 0..) |*b, i| b.* = .{ .addr = @intCast(0x0020 + (t - 500) * 40 + i), .delta = 1 };
+        p.feed(@intCast(t), &burst, true);
+    }
+    for (506..1000) |t| p.feed(@intCast(t), &.{}, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+
+    // The same breadth arriving as a sustained trickle stays corruption.
+    p = .{};
+    var a: u32 = 0x1000;
+    for (0..1000) |t| {
+        if (t % 10 == 0) {
+            p.feed(@intCast(t), &.{.{ .addr = a, .delta = 1 }}, true);
+            a += 1;
+        } else p.feed(@intCast(t), &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .spread }, p.verdict());
+}
+
+test "persistence: too many bad ticks are corruption even when bounded" {
+    var p: Persistence = .{};
+    for (0..1000) |t| {
+        // 50% bad in runs of 15 — bounded (under the persistence budget),
+        // past the burst length, far past the flood budget: divergence
+        // the conversion keeps recomputing wrong.
+        if (t % 30 < 15) p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }}, true) else p.feed(@intCast(t), &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .flood }, p.verdict());
+}
+
+test "persistence: dense short bursts are phase echoes, not flood" {
+    var p: Persistence = .{};
+    for (0..1000) |t| {
+        // 10% bad in runs of 5: the phase-burst shape (an offload's
+        // latency shifts the poll instant through busy moments; each
+        // burst self-heals within frames). Burst ticks are excluded from
+        // the flood numerator.
+        if (t % 50 < 5) p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }}, true) else p.feed(@intCast(t), &.{}, true);
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+}
+
+test "persistence: wall-skew activity is the removed slowdown, not corruption" {
+    // A slowdown-removing conversion walks the lag differential up through
+    // every stretch whose frames it stopped dropping; wall-coupled cells
+    // change delta on exactly those ticks. Thousands of them must not
+    // read as persistence, spread, or flood.
+    var p: Persistence = .{};
+    for (0..2000) |t| {
+        var bads: [80]Persistence.Bad = undefined;
+        for (&bads, 0..) |*b, i| b.* = .{ .addr = @intCast(0x1000 + i), .delta = @truncate(t) };
+        p.feed(@intCast(t), &bads, false);
+    }
+    for (2000..2100) |t| p.feed(@intCast(t), &.{}, true);
+    try std.testing.expectEqual(@as(u32, 0), p.worst_run);
+    try std.testing.expectEqual(@as(usize, 0), p.stableAddrCount());
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
+}
+
+test "persistence: a run survives interleaved skew ticks instead of resetting" {
+    // Corruption spanning a skew stretch keeps accumulating on the stable
+    // ticks around it — skew freezes the run, it never resets it.
+    var p: Persistence = .{};
+    var t: u32 = 0;
+    var stable_bad: u32 = 0;
+    while (stable_bad < Persistence.max_run + 1) : (t += 1) {
+        const stable = t % 3 != 2; // every third tick is skew
+        p.feed(t, &.{.{ .addr = 0x0042, .delta = @truncate(t) }}, stable);
+        if (stable) stable_bad += 1;
+    }
+    try std.testing.expectEqual(Persistence.Verdict{ .fail = .persistence }, p.verdict());
+}
+
+test "persistence: spread judges only stable-active breadth" {
+    // Hundreds of wall cells churning during skew, a handful of real cells
+    // on stable ticks: breadth is the handful.
+    var p: Persistence = .{ .epoch_budget = 1 };
+    for (0..200) |t| {
+        var bads: [200]Persistence.Bad = undefined;
+        for (&bads, 0..) |*b, i| b.* = .{ .addr = @intCast(0x2000 + i), .delta = @truncate(t) };
+        p.feed(@intCast(t), &bads, false);
+    }
+    for (200..210) |t| p.feed(@intCast(t), &.{.{ .addr = 0x0042, .delta = @truncate(t) }}, true);
+    try std.testing.expectEqual(@as(usize, 1), p.stableAddrCount());
+    for (210..1000) |t| p.feed(@intCast(t), &.{}, true);
+    try std.testing.expectEqual(Persistence.Verdict{ .pass = .echoes }, p.verdict());
 }

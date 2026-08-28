@@ -48,11 +48,43 @@ pub const Bus = struct {
     // configuration, set once at startup — it must survive a loadState
     // (skipped fields keep their in-memory value), so an old save does not
     // silently turn the option off.
-    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "vector_pull", "coproc_irq_line", "auto_fastrom" };
+    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "tick_snap", "vector_pull", "coproc_irq_line", "auto_fastrom" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
     pub const no_data_access: u32 = 0x0100_0000;
+
+    /// One phase-aligned WRAM snapshot per logic tick, for the behavioral
+    /// verifier: captured at the frame's FIRST controller poll (see
+    /// `tick_snap`). The harness clears `captured` and `input_polled`
+    /// before each frame; `captured` after the frame means the game
+    /// completed a logic tick in it, and `wram` holds the state exactly as
+    /// the tick began.
+    pub const TickSnap = struct {
+        captured: bool = false,
+        /// Read-before-write liveness over WRAM for the CURRENT tick
+        /// interval: bit set = the tick's execution read the byte before
+        /// (or without) writing it, i.e. the byte was live INPUT state at
+        /// the tick boundary. Dead residue — buffers whose next use is a
+        /// rewrite — never sets a bit, which is what lets the behavioral
+        /// comparator ignore it without knowing what any byte means.
+        live: [wram_len / 8]u8 = undefined,
+        written: [wram_len / 8]u8 = undefined,
+        /// Bytes written MORE THAN ONCE this tick: intra-frame streams
+        /// (an APU pump's cursor and buffers, a handshake cell). Their
+        /// instantaneous value at any single snapshot instant is phase,
+        /// not logic — a timing-shifted twin can never match them at the
+        /// same tick, and no state comparison should ask it to.
+        multi: [wram_len / 8]u8 = undefined,
+        wram: [wram_len]u8 = undefined,
+        /// Cartridge RAM (BW-RAM on an SA-1 cart) and SA-1 I-RAM, captured
+        /// at the same instant: a conversion RELOCATES state into these, so
+        /// a comparator that only sees WRAM is blind exactly where a broken
+        /// offload does its damage.
+        sram: [wram_len]u8 = undefined,
+        iram: [0x800]u8 = undefined,
+        pub const wram_len = 0x2_0000;
+    };
 
     // Split from one `[2048]Page` (48 KiB — bigger than a Cortex-A53's 32 KiB
     // L1D) into three parallel arrays so the read-hot path only touches
@@ -79,6 +111,14 @@ pub const Bus = struct {
     /// frame in which it stays false is a frame the main loop never came around:
     /// a dropped frame. Diagnostic only; nothing in the core reads it.
     input_polled: bool,
+    /// Behavioral-verification hook (same optional-diagnostic pattern as the
+    /// coverage map): when set, the FIRST controller poll after the harness
+    /// clears `input_polled` snapshots WRAM into it. The poll is the one
+    /// phase-aligned moment two runs with different lag share — a frame
+    /// boundary catches the main loop mid-computation, the poll catches it
+    /// at the top of a logic tick. Null (always, outside the verifier)
+    /// costs the poll paths one pointer test.
+    tick_snap: ?*TickSnap,
     /// True only for the duration of a CPU vector pull (`Cpu.readVector16`
     /// calls `vectorRead8`). The SA-1's SNV/SIV substitution is gated on it:
     /// hardware swaps the SNES NMI/IRQ vectors during the pull, not when game
@@ -147,6 +187,7 @@ pub const Bus = struct {
         self.last_data_read = no_data_access;
         self.last_data_write = no_data_access;
         self.input_polled = false;
+        self.tick_snap = null;
         self.vector_pull = false;
         self.mdr = 0;
         self.fastrom = false;
@@ -185,7 +226,7 @@ pub const Bus = struct {
     /// Wire the SA-1 to the cartridge's ROM and BW-RAM (after init or load).
     fn attachSa1(self: *Bus) void {
         if (self.cart.chip != .sa1) return;
-        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
+        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask, &self.cart.sram_hi, self.cart.sram_hi_mask);
     }
 
     /// Wire the Cx4 to the cartridge's ROM (after init or load).
@@ -286,6 +327,32 @@ pub const Bus = struct {
         return null;
     }
 
+    /// Read an instruction byte for INSTRUMENTATION: no clock, no MDR, no
+    /// side effects, so emulation stays bit-identical whether or not anyone
+    /// is watching.
+    ///
+    /// `peek8` sees only the fast page table, and an SA-1 cart deliberately
+    /// keeps the $E000-$FFFF vector page of banks $00/$80 off it so a vector
+    /// PULL can be substituted. The profiler used `peek8` and treated a null
+    /// as "not an instruction", so every instruction living in that page was
+    /// invisible to the usage map — and code the rewriter never sees execute
+    /// is code it will never convert. Measured on Gradius III: coverage in
+    /// banks $00/$80 stopped dead at $DFFF, stranding real gameplay routines
+    /// at $E3xx across a dozen conversion rounds.
+    ///
+    /// This resolves that page the way the game itself sees it — as ROM,
+    /// which is the same distinction `slowRead` makes for a non-vector read.
+    /// Null still means "no instruction byte here", which is true only of
+    /// registers and open bus, and nothing is ever fetched from those.
+    pub fn peekCode8(self: *const Bus, addr: u24) ?u8 {
+        if (self.page_read[addr >> 13]) |p| return p[addr & (page_size - 1)];
+        const bank: u8 = @intCast(addr >> 16);
+        const a16: u16 = @truncate(addr);
+        if (self.cart.chip == .sa1 and a16 >= 0xE000 and bank & 0x7F == 0)
+            return self.sa1.romRead(addr);
+        return null;
+    }
+
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {
@@ -307,6 +374,37 @@ pub const Bus = struct {
         return self.read8(addr);
     }
 
+    /// Write a byte the way a cheat device does: straight into mapped RAM,
+    /// charging no clock and running no MMIO side effect. The clock is
+    /// deliberately untouched — a cheat that stole cycles would change the
+    /// timing it is meant to observe, and every determinism guarantee in
+    /// this codebase rests on the frame's cycle count.
+    ///
+    /// Returns false when the address is not plain writable memory: an
+    /// unmapped address or a hardware register is refused rather than poked
+    /// blind, since a register write has consequences a cheat cannot model.
+    pub inline fn poke8(self: *Bus, addr: u24, value: u8) bool {
+        if (self.page_write[addr >> 13]) |p| {
+            p[addr & (page_size - 1)] = value;
+            return true;
+        }
+        // BW-RAM is not fast-paged (its writes are arbitrated and SWEN-gated),
+        // so a cheat reaches it directly. Bypassing SWEN is deliberate: a
+        // cheat device sits outside the machine and does not ask the game's
+        // permission. This is the route that matters on an SA-1 window
+        // conversion, where the game's low WRAM now lives here.
+        const bank: u8 = @intCast(addr >> 16);
+        if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
+            const off = addr & 0x3_FFFF;
+            if (self.sa1.bwram_hi_mask != 0 and off & 0x2_0000 != 0)
+                self.sa1.bwram_hi[off & self.sa1.bwram_hi_mask] = value
+            else
+                self.sa1.bwram[off & self.sa1.bwram_mask] = value;
+            return true;
+        }
+        return false;
+    }
+
     pub inline fn write8(self: *Bus, addr: u24, value: u8) void {
         self.mdr = value;
         const idx = addr >> 13;
@@ -316,6 +414,49 @@ pub const Bus = struct {
             return;
         }
         self.slowWrite(addr, value);
+    }
+
+    /// Map a CPU address to its WRAM offset, or null: banks $7E/$7F
+    /// directly, and the low-half mirror in every system bank.
+    fn wramOffset(addr: u24) ?u32 {
+        const bank: u8 = @intCast(addr >> 16);
+        if (bank == 0x7E) return addr & 0xFFFF;
+        if (bank == 0x7F) return 0x1_0000 | (addr & 0xFFFF);
+        if (isSystemBank(bank) and addr & 0xFFFF < 0x2000) return addr & 0x1FFF;
+        return null;
+    }
+
+    /// Liveness tracking for the behavioral verifier (`tick_snap` set):
+    /// a data READ of a WRAM byte not yet written this tick marks it live —
+    /// it was consumed as input state. Called from the CPU's data-access
+    /// wrappers, never from fetches.
+    pub fn noteTickRead(self: *Bus, addr: u24) void {
+        const t = self.tick_snap orelse return;
+        const off = wramOffset(addr) orelse return;
+        if (t.written[off >> 3] & (@as(u8, 1) << @intCast(off & 7)) != 0) return;
+        t.live[off >> 3] |= @as(u8, 1) << @intCast(off & 7);
+    }
+
+    pub fn noteTickWrite(self: *Bus, addr: u24) void {
+        const t = self.tick_snap orelse return;
+        const off = wramOffset(addr) orelse return;
+        const bit = @as(u8, 1) << @intCast(off & 7);
+        if (t.written[off >> 3] & bit != 0) t.multi[off >> 3] |= bit;
+        t.written[off >> 3] |= bit;
+    }
+
+    /// A controller poll: the lag-detection flag, and — under the
+    /// behavioral verifier only — the once-per-frame tick snapshot.
+    inline fn notePoll(self: *Bus) void {
+        self.input_polled = true;
+        if (self.tick_snap) |t| {
+            if (!t.captured) {
+                t.captured = true;
+                @memcpy(&t.wram, &self.wram.data);
+                @memcpy(&t.sram, &self.cart.sram);
+                @memcpy(&t.iram, &self.sa1.iram);
+            }
+        }
     }
 
     /// Re-derive the aggregated coprocessor IRQ line. Cheap enough to call
@@ -384,11 +525,11 @@ pub const Bus = struct {
             },
             0x2180 => self.wram.portRead(),
             0x4016 => blk: {
-                self.input_polled = true;
+                self.notePoll();
                 break :blk self.joy.readSerial(0, self.mdr);
             },
             0x4017 => blk: {
-                self.input_polled = true;
+                self.notePoll();
                 break :blk self.joy.readSerial(1, self.mdr);
             },
             0x4210 => self.cpuio.readRdnmi(self.mdr),
@@ -411,7 +552,7 @@ pub const Bus = struct {
             0x4216 => @truncate(self.math.rdmpy),
             0x4217 => @truncate(self.math.rdmpy >> 8),
             0x4218...0x421F => blk: {
-                self.input_polled = true;
+                self.notePoll();
                 break :blk self.joy.readAuto(@truncate(a16 & 7));
             },
             0x4300...0x437F => self.dma.readReg(a16),

@@ -20,18 +20,33 @@ pub const ChipKind = enum(u8) {
 };
 
 pub const max_sram = 0x2_0000; // 128 KiB covers all base-console carts
+/// The second BW-RAM bank (offset $20000+ = bank $42), used only by window
+/// conversions of battery carts: the first 128 KiB is the relocated WRAM
+/// image, the game's own save RAM relocates above it. A separate array —
+/// NOT a bigger `sram` — because `sram` rides inside the serialized state
+/// payload, and growing it would orphan every existing save state and every
+/// movie anchor. `sram_hi` is serialize-skipped and travels in the state's
+/// version-sized cart-RAM tail instead.
+pub const max_sram_hi = 0x2_0000;
 
 pub const Error = error{ NoHeader, RomTooSmall, OutOfMemory };
 
 pub const Cartridge = struct {
     // Derived/immutable data is rebuilt or re-supplied at load; only SRAM is
     // console state worth saving.
-    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "header", "chip", "sram_mask", "rom_crc", "sram_hi", "sram_hi_mask" };
 
     /// Power-of-two padded ROM image, owned by the loading allocator.
     rom: []const u8,
+    /// CRC32 of the loaded (stripped, unpadded) image — the identity a
+    /// save state binds to (a state restores the WHOLE machine, which on
+    /// a conversion image is meaningful only on the exact build it was
+    /// saved from).
+    rom_crc: u32,
     rom_mask: u32,
     sram: [max_sram]u8,
+    sram_hi: [max_sram_hi]u8,
+    sram_hi_mask: u32,
     /// sram_size - 1, or 0 when the cart has no SRAM.
     sram_mask: u32,
     header: Header,
@@ -45,6 +60,7 @@ pub const Cartridge = struct {
         if (image.len < 0x8000) return error.RomTooSmall;
         const header = try header_mod.detect(image);
 
+        const rom_crc = std.hash.Crc32.hash(image);
         const padded_len = std.math.ceilPowerOfTwoAssert(usize, image.len);
         const rom = try allocator.alloc(u8, padded_len);
         // Cyclic mirror by doubling: each pass copies the (whole multiple of
@@ -61,13 +77,20 @@ pub const Cartridge = struct {
 
         var cart: Cartridge = .{
             .rom = rom,
+            .rom_crc = rom_crc,
             .rom_mask = @intCast(padded_len - 1),
             .sram = @splat(0),
+            .sram_hi = @splat(0),
             .sram_mask = 0,
+            .sram_hi_mask = 0,
             .header = header,
             .chip = identifyChip(header),
         };
-        var sram_bytes: u32 = @min(header.sramBytes(), max_sram);
+        var sram_bytes: u32 = @min(header.sramBytes(), max_sram + max_sram_hi);
+        if (sram_bytes > max_sram) {
+            cart.sram_hi_mask = sram_bytes - max_sram - 1;
+            sram_bytes = max_sram;
+        }
         if (cart.chip == .superfx) {
             // Super FX carts declare their shared work RAM in the extended
             // header's expansion-RAM byte ($xxBD, log2 KiB); it lives in the
@@ -86,6 +109,19 @@ pub const Cartridge = struct {
 
     pub fn hasSram(self: *const Cartridge) bool {
         return self.sram_mask != 0;
+    }
+
+    /// Whether the cart RAM is battery-backed — the persistence question.
+    /// A window-relocated conversion carries the game's WRAM in BW-RAM:
+    /// working memory, declared WITHOUT battery, and writing it to disk
+    /// would boot the next session into stale mid-game state.
+    pub fn hasBattery(self: *const Cartridge) bool {
+        if (self.sram_mask == 0) return false;
+        // $FFD6 low nibble: 2/5/6 (and the exotic 9/A) carry a battery.
+        return switch (self.header.chipset & 0x0F) {
+            0x02, 0x05, 0x06, 0x09, 0x0A => true,
+            else => false,
+        };
     }
 };
 

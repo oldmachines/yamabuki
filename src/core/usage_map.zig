@@ -59,11 +59,387 @@ pub const cpu_map_len: usize = 1 << 24;
 /// The (zero-filled here) SMP block that follows it in the exported file.
 pub const smp_map_len: usize = 1 << 16;
 
+/// Per-SITE effective-address evidence: what memory an instruction's data
+/// accesses actually reached, recorded on the INSTRUCTION's address. This
+/// is the dynamic answer to the statically undecidable idioms — the same
+/// operand bytes mean "walk a ROM table" or "walk low WRAM" depending on
+/// runtime register values, and a rewriter that measured them does not
+/// have to guess.
+pub const site_wram_low: u8 = 0x01; // system-bank access below $2000 (the WRAM mirror)
+pub const site_rom: u8 = 0x02; // ROM, through any bank
+pub const site_wram_bank: u8 = 0x04; // through bank $7E/$7F (DBR- or long-mediated)
+pub const site_other: u8 = 0x08; // MMIO, cart space, open bus
+
+/// Classify one effective 24-bit data address into a site-evidence bit.
+pub fn siteClass(addr: u24) u8 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (bank == 0x7E or bank == 0x7F) return site_wram_bank;
+    if ((bank & 0x7F) <= 0x3F) {
+        if (a16 < 0x2000) return site_wram_low;
+        if (a16 >= 0x8000) return site_rom;
+        return site_other;
+    }
+    return if (bank >= 0xC0 or (bank & 0x7F) >= 0x40) site_rom else site_other;
+}
+
+/// Site classification for a run on a WINDOW-CONVERTED image, mapping the
+/// relocated homes back to the classes the same access has in STOCK: the
+/// BW-RAM window ($6000-$7FFF, system banks) is the moved WRAM low 8K,
+/// and banks $40/$41 are the moved $7E/$7F. Everything else classifies as
+/// stock. Used by the conversion-side evidence harvest — sites that only
+/// gameplay reachable on the conversion executes (a recorded run's boss
+/// arrival) get their evidence from the world they actually ran in.
+/// The WRAM byte an address names, as an offset into the full 128 KiB, or
+/// null when it names something else. `conv` selects the home layout: a
+/// cover replay runs on an image where the window conversion already moved
+/// WRAM into BW-RAM, so the same byte answers to $40/$41 and to $6000-$7FFF
+/// in the system banks.
+pub fn wramAnyOffset(addr: u24, conv: bool) ?u32 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (conv) {
+        if (bank == 0x40) return a16;
+        if (bank == 0x41) return 0x10000 | @as(u32, a16);
+        if ((bank & 0x7F) <= 0x3F and a16 >= 0x6000 and a16 < 0x8000) return a16 - 0x6000;
+        return null;
+    }
+    if (bank == 0x7E) return a16;
+    if (bank == 0x7F) return 0x10000 | @as(u32, a16);
+    if ((bank & 0x7F) <= 0x3F and a16 < 0x2000) return a16;
+    return null;
+}
+
+/// `siteClass` in whichever home layout the run uses.
+pub fn siteClassHomes(addr: u24, conv: bool) u8 {
+    return if (conv) siteClassConvWindow(addr) else siteClass(addr);
+}
+
+/// Is this access landing in WRAM, in whichever home this run's image uses?
+///
+/// A cover replay accepts BOTH homes, and must: $40/$41 is where a correctly
+/// re-banked reference lands, while $7E/$7F is where one the conversion MISSED
+/// still lands — and a missed one is precisely the evidence a cover replay
+/// exists to collect. Accepting only the relocated home throws away every
+/// proof of the bug being hunted (measured: it dropped the proof for
+/// `$00:92C3 LDA #$7E / PHA / PLB`, whose `($12),Y` writes take their bank
+/// straight from DBR).
+pub fn isWramBank(bank: u8, conv: bool) bool {
+    if (bank == 0x7E or bank == 0x7F) return true;
+    return conv and (bank == 0x40 or bank == 0x41);
+}
+
+pub fn siteClassConvWindow(addr: u24) u8 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (bank == 0x40 or bank == 0x41) return site_wram_bank;
+    if ((bank & 0x7F) <= 0x3F and a16 >= 0x6000 and a16 < 0x8000) return site_wram_low;
+    return siteClass(addr);
+}
+
+/// Pointer-bank PROVENANCE — the dynamic answer to the one idiom the
+/// operand rewriter cannot reach: a [dp] long-indirect access whose pointer
+/// bank byte is DATA. `LDA $01:0000,X / STA $22 / ... / STA [$20]` writes
+/// real $7E whatever the code rewrite did, because the $7E travelled as a
+/// value (from a ROM table entry, or an immediate operand). Measured here:
+/// every low-8K write remembers which ROM byte sourced the value it stored
+/// (a plain A-load's read, or its immediate operand, on the immediately
+/// preceding step); every [dp]/[dp],Y access that resolves into bank
+/// $7E/$7F then PROVES its pointer's bank-byte cell's remembered source —
+/// a ROM byte the window conversion re-banks like any long operand, which
+/// is what keeps value-mediated traffic in the same home as the rewritten
+/// world (measured: Gradius III's stage loader builds its decompression
+/// target pointers from a bank-$01 table; the un-re-banked table tore the
+/// $A000+/$E000+/$7F buffers out of BW-RAM and every gameplay sprite
+/// vanished).
+pub const PtrBankEvidence = struct {
+    /// Per WRAM byte (bank $7E at 0..$FFFF, bank $7F above it; dp slots
+    /// live in the first 8 KiB): the ROM CPU address of the byte that
+    /// sourced the $7E/$7F value currently stored in it, or `none`.
+    /// Refreshed on every tracked write.
+    ///
+    /// The whole 128 KiB, not just the moved low 8 KiB: a bank byte that
+    /// reaches hardware through a RAM staging area is proven only if the
+    /// staging cell is tracked, and those live wherever the game put them
+    /// (measured: Gradius III stages its DMA jobs at $7E:2842, and six
+    /// stage-2 tilemap transfers kept bank $7F because nothing linked the
+    /// queue cell back to the ROM record it was copied from).
+    src: [0x20000]u32,
+    /// The same staging memory WITHOUT the $7E/$7F value gate: per WRAM
+    /// byte, the ROM address of whatever byte an attributed write last put
+    /// there, or `none`. What the two-byte-pointer family needs — a (dp)
+    /// pointer WORD carries an address, not a bank, so no value filter
+    /// applies; the consumer proves both bytes and demands contiguity.
+    src_any: [0x20000]u32,
+    /// Deduped ROM bytes proven to feed pointer bank bytes (or DMA A-bus
+    /// bank registers) that carried $7E/$7F into an actual access.
+    proven: [max_proven]u32,
+    n_proven: usize,
+    /// Accesses whose bank byte had no attributable source — torn traffic
+    /// the conversion cannot repair; a verdict input, not just a counter.
+    unresolved: u32,
+    /// The unresolved accesses' SITES, deduped by pc — the campaign's
+    /// worklist. Each row: one instruction whose bank byte had no source,
+    /// the dp slot (or $43x4 register) it read the bank from, and how
+    /// often it fired. The counter above says how sick the image is; this
+    /// says where to operate.
+    unres_sites: [max_unres]UnresSite,
+    n_unres: usize,
+
+    /// Direct-page INDEX provenance — the same disease through the other
+    /// register: `LDX $0000,Y / STA $00,X` with X = $4370 reaches the DMA
+    /// registers THROUGH the direct page (D=$0000 + X), so the window's
+    /// D=$6000 move sends the write into ROM void — the channel setup
+    /// silently no-ops and every store pays slow-ROM instead of MMIO
+    /// timing (measured: +2 cycles per write, the drift that phase-shifts
+    /// the APU pump and forks gameplay). The X values are ROM table words;
+    /// each proven word is rewritten −$6000 so the moved D wraps back onto
+    /// the original target (dp addressing wraps in bank 0). Recorded here:
+    /// ROM addresses of the LAST byte of the X-load whose value carried a
+    /// dp,X access beyond the moved low 8 KiB.
+    idx_proven: [max_proven]u32,
+    n_idx: usize,
+    idx_unresolved: u32,
+
+    /// DMA A-bus ADDRESS words naming the moved low 8 KiB through a
+    /// system bank ($00-$3F) — the third family: `LDA #$0370 / STA $4302`
+    /// stages the OAM upload's source, the bank write says $00, and the
+    /// window move leaves the fired DMA reading abandoned memory
+    /// (measured: Super Metroid's boot splash text — black, because OAM
+    /// uploaded zeros). ROM addresses of the LAST byte of the staged
+    /// word; each is rewritten +$6000 so the channel follows its buffer
+    /// into the window.
+    dma_addr_proven: [max_proven]u32,
+    n_dma_addr: usize,
+
+    /// Bank VALUES $C0-$DF proven to mediate data access (PLB'd data
+    /// banks, [dp] pointer banks): the Super MMC cannot stride $C0-$DF
+    /// LoROM-style, but the de-mirror map's home for the same content is
+    /// $20 banks lower ($CF -> $AF under FXB=MB2). Measured: Super
+    /// Metroid's music engine walks its data through dp $02 = $CF..$DE —
+    /// the upload read a zero header from the wrong megabyte and the
+    /// intro played silent, 52 frames early. Rewritten -$20.
+    hi_proven: [max_proven]u32,
+    n_hi: usize,
+    /// Bank VALUES $A0-$BF proven to mediate data access: stock LoROM maps
+    /// them to MB1, the conversion's FXB parks MB2 there — the de-mirror
+    /// operand map's -$80, applied to values (measured: Super Metroid's
+    /// file-select tile transfers, 2x8 KiB from $B6:8000/C000 via the
+    /// inline-param launcher — conv read the wrong megabyte and the
+    /// SAMUS DATA screen tiles arrived as garbage).
+    a0_proven: [max_proven]u32,
+    n_a0: usize,
+
+    /// DBR-pin SITES whose runtime bank landed in the misfit ranges
+    /// ($A0-$DF): the PLB's own cpu address. The generator back-matches
+    /// the idiom bytes and patches the whole sequence with a translate-in
+    /// thunk — the TABLE bytes stay stock, because one byte can be a bank
+    /// for one consumer and an address for another (measured: $0F:E818,
+    /// Super Metroid's music table, bank of one track AND addr-hi of the
+    /// next — no value rewrite can serve both).
+    xl_sites: [max_xl]u32,
+    n_xl: usize,
+
+    /// CPU addresses (bank:addr) of indirect-HDMA tables a profiled run
+    /// armed. The window conversion walks each table and relocates any
+    /// per-segment indirect address naming the moved low 8 KiB (< $2000)
+    /// into the window (+$6000) — an HDMA whose source is that WRAM buffer
+    /// otherwise fetches the abandoned physical mirror (measured: Super
+    /// Metroid's Ceres escape, whose per-scanline $2105 HDMA read $00:07EB
+    /// and rendered the room as a full-screen tile-sheet).
+    hdma_tables: [max_hdma_tables]u24,
+    n_hdma_tables: usize,
+
+    pub const none: u32 = 0xFFFF_FFFF;
+    pub const max_hdma_tables = 32;
+    pub const max_proven = 256;
+    pub const max_unres = 48;
+    pub const max_xl = 32;
+    pub const UnresSite = struct { pc: u24, slot: u16, hits: u32 };
+    pub const init: PtrBankEvidence = .{
+        .src = @splat(none),
+        .src_any = @splat(none),
+        .proven = undefined,
+        .n_proven = 0,
+        .unresolved = 0,
+        .unres_sites = undefined,
+        .n_unres = 0,
+        .idx_proven = undefined,
+        .n_idx = 0,
+        .idx_unresolved = 0,
+        .dma_addr_proven = undefined,
+        .n_dma_addr = 0,
+        .hi_proven = undefined,
+        .n_hi = 0,
+        .a0_proven = undefined,
+        .n_a0 = 0,
+        .xl_sites = undefined,
+        .n_xl = 0,
+        .hdma_tables = undefined,
+        .n_hdma_tables = 0,
+    };
+
+    pub fn addHdmaTable(self: *PtrBankEvidence, table: u24) void {
+        for (self.hdma_tables[0..self.n_hdma_tables]) |t| if (t == table) return;
+        if (self.n_hdma_tables == max_hdma_tables) return;
+        self.hdma_tables[self.n_hdma_tables] = table;
+        self.n_hdma_tables += 1;
+    }
+
+    pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
+        self.unresolved += 1;
+        for (self.unres_sites[0..self.n_unres]) |*s| {
+            if (s.pc == pc) {
+                s.hits += 1;
+                return;
+            }
+        }
+        if (self.n_unres == max_unres) return;
+        self.unres_sites[self.n_unres] = .{ .pc = pc, .slot = slot, .hits = 1 };
+        self.n_unres += 1;
+    }
+
+    pub fn addProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF; // fast mirrors carry the same byte
+        for (self.proven[0..self.n_proven]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_proven == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.proven[self.n_proven] = a;
+        self.n_proven += 1;
+    }
+
+    pub fn addIdxProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.idx_proven[0..self.n_idx]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_idx == max_proven) {
+            self.idx_unresolved += 1;
+            return;
+        }
+        self.idx_proven[self.n_idx] = a;
+        self.n_idx += 1;
+    }
+
+    pub fn addXlSite(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.xl_sites[0..self.n_xl]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_xl == max_xl) {
+            self.unresolved += 1;
+            return;
+        }
+        self.xl_sites[self.n_xl] = a;
+        self.n_xl += 1;
+    }
+
+    pub fn addA0Proven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.a0_proven[0..self.n_a0]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_a0 == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.a0_proven[self.n_a0] = a;
+        self.n_a0 += 1;
+    }
+
+    pub fn addHiProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.hi_proven[0..self.n_hi]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_hi == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.hi_proven[self.n_hi] = a;
+        self.n_hi += 1;
+    }
+
+    pub fn addDmaAddrProven(self: *PtrBankEvidence, addr: u32) void {
+        const a = addr & 0x7F_FFFF;
+        for (self.dma_addr_proven[0..self.n_dma_addr]) |p| {
+            if (p == a) return;
+        }
+        if (self.n_dma_addr == max_proven) {
+            self.unresolved += 1;
+            return;
+        }
+        self.dma_addr_proven[self.n_dma_addr] = a;
+        self.n_dma_addr += 1;
+    }
+};
+
+/// Loads of X whose read bytes (or immediate operand) are the byte-for-byte
+/// source of the register: LDX #/dp/dp,Y/abs/abs,Y.
+pub fn loadXSource(op: u8) bool {
+    return switch (op) {
+        0xA2, 0xA6, 0xB6, 0xAE, 0xBE => true,
+        else => false,
+    };
+}
+
+/// Instructions that change X by means other than a tracked load — the
+/// register's provenance dies here. (TXA/TXS/TXY read X and keep it.)
+pub fn clobbersX(op: u8) bool {
+    return switch (op) {
+        0xAA, 0xBA, 0xCA, 0xE8, 0xFA, 0xBB, 0x44, 0x54 => true,
+        else => false,
+    };
+}
+
+/// dp,X data forms — the dp_idx modes minus the two dp,Y ones (LDX/STX).
+pub fn isDpX(op: u8) bool {
+    return mode(op) == .dp_idx and op != 0xB6 and op != 0x96;
+}
+
+/// Low-8K WRAM offset of a CPU address, if it names one: bank $7E's first
+/// 8 KiB or the system-bank mirror — the same cells either way.
+pub fn wramLowOffset(addr: u24) ?u16 {
+    const bank: u8 = @truncate(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    if (a16 >= 0x2000) return null;
+    if (bank == 0x7E or (bank & 0x7F) <= 0x3F) return a16;
+    return null;
+}
+
+/// Plain loads of A whose read bytes (or immediate operand bytes) are a
+/// byte-for-byte SOURCE of what an immediately following store writes.
+pub fn loadASource(op: u8) bool {
+    return switch (op) {
+        0xA1, 0xA3, 0xA5, 0xA7, 0xA9, 0xAD, 0xAF, 0xB1, 0xB2, 0xB3, 0xB5, 0xB7, 0xB9, 0xBD, 0xBF => true,
+        else => false,
+    };
+}
+
 pub const UsageMap = struct {
     /// Caller-allocated, `cpu_map_len` bytes, zeroed before the run. Kept
     /// out of every core struct on purpose — 16 MiB belongs on the heap of
     /// whoever asked for coverage, not inside a Console or Profiler.
     bytes: []u8,
+    /// Optional per-site evidence map, same length, indexed by the
+    /// INSTRUCTION address (`site_*` bits). Null when nobody asked.
+    sites: ?[]u8 = null,
+    /// Classify effective addresses through the window-conversion
+    /// normalizer (the run executes a converted image; evidence must
+    /// describe the stock world). See `siteClassConvWindow`.
+    conv_window_homes: bool = false,
+    /// Optional pointer-bank provenance tracking. Null when nobody asked.
+    ptr_banks: ?*PtrBankEvidence = null,
+
+    /// Record where an instruction's data access actually landed.
+    pub fn noteSite(self: *const UsageMap, pc: u24, addr: u24) void {
+        const s = self.sites orelse return;
+        s[pc] |= if (self.conv_window_homes) siteClassConvWindow(addr) else siteClass(addr);
+    }
 
     /// One executed instruction: opcode byte and its operand bytes.
     pub fn noteInstr(self: *const UsageMap, pc: u24, op: u8, m8: bool, x8: bool) void {
