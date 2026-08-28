@@ -40,6 +40,7 @@
 //! cannot be verified is never written; every refusal names its reason.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("snes_core");
 const profile = core.profile;
 const util = @import("util");
@@ -277,7 +278,31 @@ const max_movies: usize = 6;
 /// same standard patches/fastrom-compat.zon entries are verified to.
 const gen_frames_default: u32 = 1800;
 
+/// Debug builds give every local its own stack slot and never merge them —
+/// including a `defer` body's, which is re-emitted at every exit path of the
+/// function that owns it — and this program's locals are cartridge and console
+/// states measured in hundreds of KiB apiece. `run` reserves ~5 MiB of frame
+/// in Debug and the SA-1 generator another ~3, which overruns the 8 MiB
+/// main-thread stack before the first instruction executes. ReleaseFast merges
+/// the slots away and needs none of this, so buy the room only where the cost
+/// is real: a thread whose stack we get to size.
 pub fn main(init: std.process.Init) !void {
+    if (builtin.mode != .Debug) return run(init);
+    var status: anyerror!void = {};
+    const t = try std.Thread.spawn(.{ .stack_size = debug_stack_size }, runOnThread, .{ init, &status });
+    t.join();
+    return status;
+}
+
+/// Room for `run` plus the deepest callee chain under it, with the margin a
+/// Debug frame's growth deserves — it is virtual address space, not memory.
+const debug_stack_size = 64 * 1024 * 1024;
+
+fn runOnThread(init: std.process.Init, status: *anyerror!void) void {
+    status.* = run(init);
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.arena.allocator();
 
@@ -486,115 +511,15 @@ pub fn main(init: std.process.Init) !void {
     // inputs were recorded against, so it wins over a session-wide one.
     try anchorMovie(con, mov, "movie", out);
 
-    // Window debugging (undocumented --dump-ram): dump memories after the
-    // run — WRAM (128K), BW-RAM's first 64K, VRAM — plus the CPU's resting
-    // place. The tool that found every window-mode blocker so far.
-    // The display state, as text: what a layer is doing is a property of the
-    // PPU registers and of what actually reached VRAM, and neither shows up
-    // in a RAM dump. Per BG: is it on the main screen at all, where is its
-    // tilemap and character data, and — the question that separates "never
-    // uploaded" from "not displayed" — how much of that tilemap in VRAM is
-    // actually non-empty.
-    defer if (args.dump_vram) |vpath| {
-        const p = &con.fast.bus.ppu;
-        var blob: [0x10000 + 0x220]u8 = undefined;
-        @memcpy(blob[0..0x10000], std.mem.sliceAsBytes(p.vram[0..]));
-        @memcpy(blob[0x10000..], &p.oam);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = vpath, .data = &blob }) catch {};
-    };
-    defer if (args.dump_ppu) |ppath| {
-        const p = &con.fast.bus.ppu;
-        var buf: [4096]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        w.print("bg_mode={d} force_blank={} brightness={d} main_screen(TM)=0x{x:0>2} sub_screen(TS)=0x{x:0>2}\n", .{
-            p.bg_mode, p.force_blank, p.brightness, p.main_screen, p.sub_screen,
-        }) catch {};
-        for (p.bg, 0..) |b, i| {
-            // A tilemap of all-zero entries renders as nothing even with the
-            // layer enabled, so count what is actually there.
-            const words: usize = switch (b.map_size) {
-                0 => 0x400,
-                1 => 0x800,
-                2 => 0x800,
-                3 => 0x1000,
-            };
-            var nonzero: usize = 0;
-            var k: usize = 0;
-            while (k < words) : (k += 1) {
-                const idx = (@as(usize, b.map_base) + k) & 0x7FFF;
-                if (p.vram[idx] != 0) nonzero += 1;
-            }
-            w.print("bg{d}: on_main={} map_base=0x{x:0>4} map_size={d} char_base=0x{x:0>4} tile16={} hofs={d} vofs={d} tilemap_nonzero={d}/{d}\n", .{
-                i + 1,       (p.main_screen >> @intCast(i)) & 1 != 0,
-                b.map_base,  b.map_size,
-                b.char_base, b.tile16,
-                b.hofs,      b.vofs,
-                nonzero,     words,
-            }) catch {};
-        }
-        // HDMA: per-scanline effects read their table straight out of memory
-        // without the CPU issuing a single load, so a table left pointing at
-        // abandoned WRAM is invisible to the stale detector and shows up only
-        // as a missing effect. Top/bottom bands are exactly this shape.
-        const dma = &con.fast.bus.dma;
-        w.print("hdmaen=0x{x:0>2}\n", .{dma.hdmaen}) catch {};
-        for (dma.channels, 0..) |ch, i| {
-            if (dma.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
-            const src: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
-            const dead = ch.a_bank == 0x7E or ch.a_bank == 0x7F or
-                ((ch.a_bank & 0x7F) < 0x40 and ch.a_addr < 0x2000);
-            w.print("  hdma{d}: src={x:0>6} bank={x:0>2}{s}\n", .{
-                i, src, ch.a_bank, if (dead) "  <-- ABANDONED MEMORY" else "",
-            }) catch {};
-            // Indirect tables fetch their DATA through a second bank the
-            // CPU never touches after arming: a $7E there reads the
-            // abandoned WRAM and no CPU-side instrument can see it.
-            w.print("    control=0x{x:0>2} b_addr=0x{x:0>2} indirect_bank={x:0>2} indirect_addr={x:0>4} line_counter={d}\n", .{
-                ch.control, ch.b_addr, ch.indirect_bank, ch.count, ch.line_counter,
-            }) catch {};
-        }
-        // Color math: the one axis two byte-identical CGRAM/VRAM images can
-        // still render differently through (measured: Super Metroid's Ceres
-        // alarm tint, an indirect HDMA on $2132 reading abandoned $7E WRAM).
-        w.print("cgwsel=0x{x:0>2} cgadsub=0x{x:0>2} fixed_color=0x{x:0>4} setini=0x{x:0>2}\n", .{
-            p.cgwsel, p.cgadsub, p.fixed_color, p.setini,
-        }) catch {};
-        var vnz: usize = 0;
-        for (p.vram) |word| {
-            if (word != 0) vnz += 1;
-        }
-        w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
-        // CGRAM digest: same tiles + same tilemap rendering differently can
-        // only be the palette (measured: SM's Ceres room corrupts to stripes
-        // when CGRAM diverges while VRAM stays identical).
-        var cgsum: u32 = 0;
-        for (p.cgram) |c| cgsum +%= c;
-        w.print("cgram_sum={x:0>8} bg1pal={x:0>4},{x:0>4},{x:0>4},{x:0>4} bg2pal={x:0>4},{x:0>4}\n", .{
-            cgsum, p.cgram[0], p.cgram[1], p.cgram[2], p.cgram[3], p.cgram[0x20], p.cgram[0x21],
-        }) catch {};
-        // Window + mosaic: vertical banding that VRAM/CGRAM cannot explain
-        // lives here (the window carves columns; mosaic blocks them).
-        w.print("mosaic=0x{x:0>2} w12sel=0x{x:0>2} w34sel=0x{x:0>2} wobjsel=0x{x:0>2} wh0={d} wh1={d} wh2={d} wh3={d} wbglog=0x{x:0>2} tmw=0x{x:0>2} tsw=0x{x:0>2}\n", .{
-            p.mosaic, p.w12sel, p.w34sel, p.wobjsel, p.wh0, p.wh1, p.wh2, p.wh3, p.wbglog, p.tmw, p.tsw,
-        }) catch {};
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = w.buffered() }) catch {};
-        out.print("wrote {s}\n", .{ppath}) catch {};
-        out.flush() catch {};
-    };
-
-    defer if (args.dump_ram) |dpath| {
-        const fc = &con.fast;
-        const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
-        @memset(buf, 0);
-        @memcpy(buf[0..0x20000], &fc.bus.wram.data);
-        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
-        @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
-        if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = buf }) catch {};
-        std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
-        if (fc.bus.cart.chip == .sa1)
-            std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
-    };
+    // Window debugging: dump what the machine settled on, after the run.
+    // Each body is a function and not an inline `defer` block on purpose —
+    // a defer's locals are re-emitted at EVERY exit path of the function that
+    // owns it, and Debug never merges the slots, so the 64 KiB buffer in one
+    // of these costs 64 KiB per `try` in `run`. Inline, the three of them
+    // reserved 98 MiB of `run`'s stack frame.
+    defer if (args.dump_vram) |vpath| dumpVram(io, con, vpath);
+    defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
+    defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -706,6 +631,119 @@ pub fn main(init: std.process.Init) !void {
         try out.print("wrote {s} ({} stereo frames)\n", .{ path, audio_all.items.len / 2 });
         try out.flush();
     }
+}
+
+/// `--dump-vram`: raw VRAM (64 KiB) + OAM (544 B), so cross-image VRAM/OAM
+/// diffs are byte-exact.
+fn dumpVram(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
+    const p = &con.fast.bus.ppu;
+    var blob: [0x10000 + 0x220]u8 = undefined;
+    @memcpy(blob[0..0x10000], std.mem.sliceAsBytes(p.vram[0..]));
+    @memcpy(blob[0x10000..], &p.oam);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &blob }) catch {};
+}
+
+/// `--dump-ppu`: the display state as text — what a layer is doing is a
+/// property of the PPU registers and of what actually reached VRAM, and
+/// neither shows up in a RAM dump. Per BG: is it on the main screen at all,
+/// where is its tilemap and character data, and — the question that separates
+/// "never uploaded" from "not displayed" — how much of that tilemap in VRAM
+/// is actually non-empty.
+fn dumpPpu(io: std.Io, out: *std.Io.Writer, con: *core.AnyConsole, path: []const u8) void {
+    const p = &con.fast.bus.ppu;
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("bg_mode={d} force_blank={} brightness={d} main_screen(TM)=0x{x:0>2} sub_screen(TS)=0x{x:0>2}\n", .{
+        p.bg_mode, p.force_blank, p.brightness, p.main_screen, p.sub_screen,
+    }) catch {};
+    for (p.bg, 0..) |b, i| {
+        // A tilemap of all-zero entries renders as nothing even with the
+        // layer enabled, so count what is actually there.
+        const words: usize = switch (b.map_size) {
+            0 => 0x400,
+            1 => 0x800,
+            2 => 0x800,
+            3 => 0x1000,
+        };
+        var nonzero: usize = 0;
+        var k: usize = 0;
+        while (k < words) : (k += 1) {
+            const idx = (@as(usize, b.map_base) + k) & 0x7FFF;
+            if (p.vram[idx] != 0) nonzero += 1;
+        }
+        w.print("bg{d}: on_main={} map_base=0x{x:0>4} map_size={d} char_base=0x{x:0>4} tile16={} hofs={d} vofs={d} tilemap_nonzero={d}/{d}\n", .{
+            i + 1,       (p.main_screen >> @intCast(i)) & 1 != 0,
+            b.map_base,  b.map_size,
+            b.char_base, b.tile16,
+            b.hofs,      b.vofs,
+            nonzero,     words,
+        }) catch {};
+    }
+    // HDMA: per-scanline effects read their table straight out of memory
+    // without the CPU issuing a single load, so a table left pointing at
+    // abandoned WRAM is invisible to the stale detector and shows up only
+    // as a missing effect. Top/bottom bands are exactly this shape.
+    const dma = &con.fast.bus.dma;
+    w.print("hdmaen=0x{x:0>2}\n", .{dma.hdmaen}) catch {};
+    for (dma.channels, 0..) |ch, i| {
+        if (dma.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        const src: u24 = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
+        const dead = ch.a_bank == 0x7E or ch.a_bank == 0x7F or
+            ((ch.a_bank & 0x7F) < 0x40 and ch.a_addr < 0x2000);
+        w.print("  hdma{d}: src={x:0>6} bank={x:0>2}{s}\n", .{
+            i, src, ch.a_bank, if (dead) "  <-- ABANDONED MEMORY" else "",
+        }) catch {};
+        // Indirect tables fetch their DATA through a second bank the
+        // CPU never touches after arming: a $7E there reads the
+        // abandoned WRAM and no CPU-side instrument can see it.
+        w.print("    control=0x{x:0>2} b_addr=0x{x:0>2} indirect_bank={x:0>2} indirect_addr={x:0>4} line_counter={d}\n", .{
+            ch.control, ch.b_addr, ch.indirect_bank, ch.count, ch.line_counter,
+        }) catch {};
+    }
+    // Color math: the one axis two byte-identical CGRAM/VRAM images can
+    // still render differently through (measured: Super Metroid's Ceres
+    // alarm tint, an indirect HDMA on $2132 reading abandoned $7E WRAM).
+    w.print("cgwsel=0x{x:0>2} cgadsub=0x{x:0>2} fixed_color=0x{x:0>4} setini=0x{x:0>2}\n", .{
+        p.cgwsel, p.cgadsub, p.fixed_color, p.setini,
+    }) catch {};
+    var vnz: usize = 0;
+    for (p.vram) |word| {
+        if (word != 0) vnz += 1;
+    }
+    w.print("vram_nonzero={d}/{d}\n", .{ vnz, p.vram.len }) catch {};
+    // CGRAM digest: same tiles + same tilemap rendering differently can
+    // only be the palette (measured: SM's Ceres room corrupts to stripes
+    // when CGRAM diverges while VRAM stays identical).
+    var cgsum: u32 = 0;
+    for (p.cgram) |c| cgsum +%= c;
+    w.print("cgram_sum={x:0>8} bg1pal={x:0>4},{x:0>4},{x:0>4},{x:0>4} bg2pal={x:0>4},{x:0>4}\n", .{
+        cgsum, p.cgram[0], p.cgram[1], p.cgram[2], p.cgram[3], p.cgram[0x20], p.cgram[0x21],
+    }) catch {};
+    // Window + mosaic: vertical banding that VRAM/CGRAM cannot explain
+    // lives here (the window carves columns; mosaic blocks them).
+    w.print("mosaic=0x{x:0>2} w12sel=0x{x:0>2} w34sel=0x{x:0>2} wobjsel=0x{x:0>2} wh0={d} wh1={d} wh2={d} wh3={d} wbglog=0x{x:0>2} tmw=0x{x:0>2} tsw=0x{x:0>2}\n", .{
+        p.mosaic, p.w12sel, p.w34sel, p.wobjsel, p.wh0, p.wh1, p.wh2, p.wh3, p.wbglog, p.tmw, p.tsw,
+    }) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() }) catch {};
+    out.print("wrote {s}\n", .{path}) catch {};
+    out.flush() catch {};
+}
+
+/// `--dump-ram`: WRAM (128K), BW-RAM's first 64K, VRAM and I-RAM after the
+/// run, plus the CPU's resting place. The tool that found every window-mode
+/// blocker so far.
+fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
+    const fc = &con.fast;
+    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
+    @memset(buf, 0);
+    @memcpy(buf[0..0x20000], &fc.bus.wram.data);
+    if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
+    @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
+    if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf }) catch {};
+    std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
+    if (fc.bus.cart.chip == .sa1)
+        std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
 }
 
 /// Load a .ymv and refuse every mismatch that would make the replay a lie:

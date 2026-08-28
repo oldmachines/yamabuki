@@ -86,7 +86,9 @@ fn validatePreset(
     checked.* += 1;
 
     // The same parser the runtime uses: if this refuses, the emulator would too.
-    const p = preset.parse(manifest) catch |e| {
+    const p = try gpa.create(preset.Preset);
+    defer gpa.destroy(p);
+    preset.parse(p, manifest) catch |e| {
         try out.print("FAIL {s}/{s}: preset.conf does not parse: {s}\n", .{ profile, name, @errorName(e) });
         try out.flush();
         return 1;
