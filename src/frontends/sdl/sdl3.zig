@@ -131,6 +131,11 @@ pub const event_gamepad_button_down: u32 = 0x651;
 pub const event_gamepad_button_up: u32 = 0x652;
 pub const event_gamepad_added: u32 = 0x653;
 pub const event_gamepad_removed: u32 = 0x654;
+/// Joystick-level arrivals. A pad SDL enumerates but has no gamepad mapping
+/// for raises only these, never `event_gamepad_added` — which looks exactly
+/// like "the controller does nothing" from the outside.
+pub const event_joystick_added: u32 = 0x605;
+pub const event_joystick_removed: u32 = 0x606;
 
 /// SDL_scancode.h (USB HID usage values; stable).
 pub const scancode = struct {
@@ -211,6 +216,11 @@ pub const PadApi = struct {
     SDL_CloseGamepad: *const fn (pad: *Gamepad) callconv(.c) void,
     SDL_GetGamepadName: *const fn (pad: *Gamepad) callconv(.c) ?[*:0]const u8,
     SDL_GetGamepadID: *const fn (pad: *Gamepad) callconv(.c) u32,
+    /// Diagnostics: whether SDL has a gamepad mapping for a joystick, and
+    /// its name at the joystick level. A wired pad that enumerates but is
+    /// not recognised as a gamepad is invisible without these.
+    SDL_IsGamepad: *const fn (instance_id: u32) callconv(.c) bool,
+    SDL_GetJoystickNameForID: *const fn (instance_id: u32) callconv(.c) ?[*:0]const u8,
 };
 
 /// The GL entry points, resolved separately from `Api` and on demand.
@@ -316,4 +326,16 @@ pub fn loadExt() LoadError!ExtApi {
 /// "keyboard-only session".
 pub fn loadPad() LoadError!PadApi {
     return resolve(PadApi, try open());
+}
+
+/// Stream gain, its own tiny group so an SDL3 build that predates it costs
+/// the volume setting and nothing else. Gain is linear: 1.0 is unity.
+pub const GainApi = struct {
+    SDL_SetAudioStreamGain: *const fn (s: *AudioStream, gain: f32) callconv(.c) bool,
+};
+
+/// Resolve the gain entry point. Callers treat any error as "volume fixed
+/// at 100%".
+pub fn loadGain() LoadError!GainApi {
+    return resolve(GainApi, try open());
 }

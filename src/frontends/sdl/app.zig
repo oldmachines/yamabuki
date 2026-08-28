@@ -20,6 +20,7 @@ const menu = @import("menu.zig");
 const ui = @import("ui.zig");
 const config = @import("config.zig");
 const saves = @import("saves.zig");
+const infopanel = @import("infopanel.zig");
 const png = @import("png.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
@@ -29,6 +30,22 @@ const patchfind = @import("patchfind.zig");
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
 pub const RegionArg = enum { auto, ntsc, pal };
+
+/// A transient on-screen message (slot changes, state saves/loads,
+/// recording start/stop): one line at the picture's bottom-left for a
+/// couple of seconds, drawn into the compose buffer so both render paths
+/// show it and the shader shades it like game pixels.
+const Toast = struct {
+    buf: [48]u8 = undefined,
+    len: usize = 0,
+    frames: u32 = 0,
+
+    fn set(self: *Toast, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.bufPrint(&self.buf, fmt, args) catch return;
+        self.len = s.len;
+        self.frames = 120; // ~2 s
+    }
+};
 
 /// Everything the session needs, already merged from defaults ← config ← CLI
 /// by `main.zig`. Fields mirror the CLI flags they came from.
@@ -71,6 +88,11 @@ pub const Options = struct {
     /// `--movie`: a validated recorded playthrough to replay from power-on.
     /// Live input takes over when it ends.
     movie: ?util.movie.Movie,
+    /// Cheat pokes held after every executed frame; see cheat.zig.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
+    /// Basename of the soft-patch applied at load; null = playing as dumped.
+    patch_name: ?[]const u8,
 };
 
 /// Persist the config after a menu edit. Failure warns and plays on — a
@@ -275,6 +297,18 @@ pub fn run(
         if (sdl.SDL_OpenAudioDeviceStream(sdl3.audio_device_default_playback, &spec, null, null)) |stream| {
             audio = stream;
             _ = sdl.SDL_ResumeAudioStreamDevice(stream);
+            // Volume, best-effort: gain is a newer stream property, its own
+            // symbol group so an SDL3 without it costs the setting and
+            // nothing else. 100% skips the call entirely.
+            const vol = opts.cfg.effectiveVolume();
+            if (vol != 100) {
+                if (sdl3.loadGain()) |g| {
+                    _ = g.SDL_SetAudioStreamGain(stream, @as(f32, @floatFromInt(vol)) / 100.0);
+                } else |_| {
+                    try err.print("warning: this SDL3 has no SDL_SetAudioStreamGain — volume stays 100%\n", .{});
+                    try err.flush();
+                }
+            }
         } else {
             try err.print("warning: no audio device ({s}), running silent\n", .{sdl.SDL_GetError()});
             try err.flush();
@@ -304,10 +338,13 @@ pub fn run(
         }
     };
     // Battery save: restored before the first frame, autosaved on a
-    // debounced dirty check, flushed at menu-open/state-load/quit.
+    // debounced dirty check, flushed at menu-open/state-load/quit. Gated
+    // on the BATTERY, not on RAM: a window-converted cart carries the
+    // game's WRAM in BW-RAM, and persisting that would boot the next
+    // session into stale mid-game state.
     var sram: ?saves.Sram = null;
     if (opts.saves_dir) |dir| {
-        if (con.cartridge().hasSram()) {
+        if (con.cartridge().hasBattery()) {
             sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
             if (sram) |*s| s.load(io, con, err);
         }
@@ -329,6 +366,11 @@ pub fn run(
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
+    // The info palette (I): an overlay HUD, not a pause — the game keeps
+    // running under it. Slot facts are gathered when it opens and after
+    // saves/loads while it is up, never per frame.
+    var info_open = false;
+    var slot_infos: [9]infopanel.SlotInfo = @splat(.{});
     // Hold-to-scroll for the menu's Up/Down; reset whenever the menu isn't
     // open so a key held from before it opened (or from gameplay) can never
     // carry a repeat in.
@@ -346,12 +388,38 @@ pub fn run(
     var frames_run: u32 = 0;
     var audio_hash = core.console.audio_hash_init;
     // Input-movie state. Recording appends the masks actually fed to each
-    // EXECUTED frame; anything that breaks the input-stream model (reset,
-    // load state, rewind) discards it rather than writing a movie that
-    // cannot replay. Playback drives both pads from power-on until the
-    // movie runs out, then live input takes over; its end hashes are
-    // checked right after the final frame's audio drain.
+    // EXECUTED frame; anything that breaks the input-stream model DURING a
+    // take (reset, load state, rewind) discards it rather than writing a
+    // movie that cannot replay. Playback drives both pads from the movie's
+    // start until it runs out, then live input takes over; its end hashes
+    // are checked right after the final frame's audio drain.
     var rec: ?std.array_list.Managed([2]u16) = null;
+    // Codes are loaded but NOT applied until asked for: a cheat held through
+    // the title screen can wedge a game that the same cheat plays fine in.
+    var cheats_on = false;
+    // The machine the take started on, when that was not power-on: recording
+    // captures it up front and the movie carries it, so a session can start a
+    // recording deep into a game instead of replaying the road to get there.
+    var rec_anchor: ?[]u8 = null;
+    // Frame count at which each slot's state was saved DURING the take in
+    // progress. Loading a marked slot rewinds the take to that frame instead
+    // of throwing it away, which is what makes recording a long playthrough
+    // survivable: die, reload, and the log rewinds with the machine.
+    var rec_marks: [9]?u32 = @splat(null);
+    // The audio hash is a running accumulator over every frame the take has
+    // played. Rewinding the input log without rewinding this leaves the movie
+    // claiming an audio stream that includes the frames it just deleted, and
+    // a clean replay of the same inputs then reports a desync that is not
+    // there. Snapshot it with the mark; restore it with the rewind.
+    var rec_audio: [9]u64 = @splat(0);
+    // Whether the console is still exactly as it powered on. A take started
+    // here needs no anchor, which keeps "boot and record" writing the small
+    // version-1 file it always did.
+    var at_power_on = true;
+    // Transient on-screen toast (state slots, saves/loads, recording):
+    // drawn into the compose buffer like every overlay, so both render
+    // paths show it and the shader shades it.
+    var toast: Toast = .{};
     var play_movie: ?util.movie.Movie = opts.movie;
     var play_idx: usize = 0;
     var movie_end_check = false;
@@ -386,6 +454,24 @@ pub fn run(
                 // enumeration and hotplug are one code path.
                 sdl3.event_gamepad_added => .{ .pad_added = .{ .pad = ev.gdevice.which } },
                 sdl3.event_gamepad_removed => .{ .pad_removed = .{ .pad = ev.gdevice.which } },
+                // A joystick SDL enumerates but has no gamepad mapping for
+                // raises this and never `gamepad_added`, so the pad silently
+                // does nothing. Reporting it is the difference between "the
+                // controller is broken" and "SDL does not know this device":
+                // the same DualShock 4 can be a gamepad over Bluetooth and a
+                // bare joystick over USB, because the two connections present
+                // different VID/PID and report descriptors.
+                sdl3.event_joystick_added => {
+                    if (pad_api) |papi| {
+                        const id = ev.gdevice.which;
+                        const nm = if (papi.SDL_GetJoystickNameForID(id)) |n| std.mem.span(n) else "(unnamed)";
+                        try err.print("joystick added: id={d} name='{s}' recognised_as_gamepad={}\n", .{
+                            id, nm, papi.SDL_IsGamepad(id),
+                        });
+                        try err.flush();
+                    }
+                    continue;
+                },
                 else => continue,
             };
 
@@ -400,6 +486,7 @@ pub fn run(
                             try err.print("gamepad: {s} is player {d}\n", .{ name, @as(u32, o.slot) + 1 });
                         } else {
                             try err.print("warning: SDL_OpenGamepad: {s}\n", .{sdl.SDL_GetError()});
+                            inp.releaseSlot(&binds, o.slot);
                         }
                         try err.flush();
                     },
@@ -407,6 +494,13 @@ pub fn run(
                         if (pads[c.slot]) |p| papi.SDL_CloseGamepad(p);
                         pads[c.slot] = null;
                         try err.print("gamepad: player {d} disconnected\n", .{@as(u32, c.slot) + 1});
+                        if (inp.compact(&binds)) |mv| {
+                            pads[mv.to] = pads[mv.from];
+                            pads[mv.from] = null;
+                            try err.print("gamepad: player {d} is now player {d}\n", .{
+                                @as(u32, mv.from) + 1, @as(u32, mv.to) + 1,
+                            });
+                        }
                         try err.flush();
                     },
                     else => {},
@@ -445,11 +539,18 @@ pub fn run(
                             .pal => con.setRegion(.pal),
                         }
                         if (rw) |*r| r.clear();
-                        discardMovieModes(&rec, &play_movie, "reset", err);
+                        at_power_on = true;
+                        discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "reset", err);
                         mnu = null;
                     },
                     .save_state => {
                         saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
+                        if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                        if (rec) |r| {
+                            rec_marks[slot] = @intCast(r.items.len);
+                            rec_audio[slot] = audio_hash;
+                        }
+                        toast.set("STATE SAVED - SLOT {d}", .{slot});
                         mnu = null;
                     },
                     .load_state => {
@@ -459,12 +560,22 @@ pub fn run(
                             if (sram) |*s| s.flush(io, con, err);
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
-                            discardMovieModes(&rec, &play_movie, "load state", err);
-                        }
+                            at_power_on = false;
+                            if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                                toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
+                            else
+                                toast.set("STATE LOADED - SLOT {d}", .{slot});
+                        } else toast.set("NO STATE IN SLOT {d}", .{slot});
                         mnu = null;
                     },
-                    .slot_next => slot = if (slot == 8) 1 else slot + 1,
-                    .slot_prev => slot = if (slot == 1) 8 else slot - 1,
+                    .slot_next => {
+                        slot = if (slot == 8) 1 else slot + 1;
+                        toast.set("SLOT {d}", .{slot});
+                    },
+                    .slot_prev => {
+                        slot = if (slot == 1) 8 else slot - 1;
+                        toast.set("SLOT {d}", .{slot});
+                    },
                     .config_dirty => {
                         persistConfig(io, gpa, &opts, err);
                         binds = input.resolve(&opts.cfg.input, err);
@@ -514,54 +625,91 @@ pub fn run(
                         .pal => con.setRegion(.pal),
                     }
                     if (rw) |*r| r.clear();
-                    discardMovieModes(&rec, &play_movie, "reset", err);
+                    at_power_on = true;
+                    discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "reset", err);
                 },
-                .save_state => saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err),
+                .save_state => {
+                    saveStateTo(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err);
+                    if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
+                    if (rec) |r| {
+                        rec_marks[slot] = @intCast(r.items.len);
+                        rec_audio[slot] = audio_hash;
+                    }
+                    toast.set("STATE SAVED - SLOT {d}", .{slot});
+                },
                 .load_state => {
                     if (loadStateFrom(io, con, slot_paths[slot] orelse legacy_state_path, slot, state_buf, err)) {
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
-                        discardMovieModes(&rec, &play_movie, "load state", err);
-                    }
+                        at_power_on = false;
+                        if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                            toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
+                        else
+                            toast.set("STATE LOADED - SLOT {d}", .{slot});
+                    } else toast.set("NO STATE IN SLOT {d}", .{slot});
                 },
                 .record_movie => {
                     if (rec != null) {
                         // Stop: the movie's hashes describe the machine as it
                         // stands right now, after the last recorded frame.
-                        writeMovie(io, gpa, &opts, con, rec.?.items, audio_hash, err);
+                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, err);
                         rec.?.deinit();
                         rec = null;
+                        if (rec_anchor) |a| gpa.free(a);
+                        rec_anchor = null;
+                        rec_marks = @splat(null);
+                        toast.set("RECORDING SAVED", .{});
                     } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
                         try err.print("movie: cannot record during playback\n", .{});
                         try err.flush();
+                        toast.set("CANNOT RECORD DURING PLAYBACK", .{});
                     } else if (opts.movies_dir == null) {
                         try err.print("movie: recording unavailable — no per-user data directory\n", .{});
                         try err.flush();
-                    } else {
-                        // Start from power-on: that is the only state a
-                        // replay can reconstruct.
-                        con.repower();
-                        switch (opts.region) {
-                            .auto => {},
-                            .ntsc => con.setRegion(.ntsc),
-                            .pal => con.setRegion(.pal),
-                        }
+                    } else if (at_power_on) {
+                        // Nothing has run yet, so the inputs alone reconstruct
+                        // the session: no anchor, and the file stays version 1.
                         if (rw) |*r| r.clear();
                         audio_hash = core.console.audio_hash_init;
                         rec = .init(gpa);
+                        rec_marks = @splat(null);
                         try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
                         try err.flush();
+                        toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
+                    } else {
+                        // Mid-session: capture the machine as the anchor the
+                        // movie will carry. Recording a late stage should not
+                        // require replaying the road to it — but the take is
+                        // only honest if the anchor is captured BEFORE the
+                        // first recorded frame runs, which is here.
+                        if (gpa.alloc(u8, core.AnyConsole.state_size)) |anchor| {
+                            _ = con.saveState(anchor);
+                            rec_anchor = anchor;
+                            if (rw) |*r| r.clear();
+                            audio_hash = core.console.audio_hash_init;
+                            rec = .init(gpa);
+                            rec_marks = @splat(null);
+                            try err.print("movie: recording from here ({d} KiB start state carried; press again to stop and save)\n", .{anchor.len / 1024});
+                            try err.flush();
+                            toast.set("RECORDING FROM HERE - F10 STOPS", .{});
+                        } else |_| {
+                            try err.print("movie: cannot record — out of memory for the start state\n", .{});
+                            try err.flush();
+                            toast.set("RECORDING FAILED - OUT OF MEMORY", .{});
+                        }
                     }
                 },
                 .slot_next => {
                     slot = if (slot == 8) 1 else slot + 1;
                     try err.print("state slot {d}\n", .{slot});
                     try err.flush();
+                    toast.set("SLOT {d}", .{slot});
                 },
                 .slot_prev => {
                     slot = if (slot == 1) 8 else slot - 1;
                     try err.print("state slot {d}\n", .{slot});
                     try err.flush();
+                    toast.set("SLOT {d}", .{slot});
                 },
                 .screenshot => {
                     if (opts.shots_dir != null) {
@@ -570,6 +718,18 @@ pub fn run(
                         try err.print("screenshot unavailable: no per-user data directory\n", .{});
                         try err.flush();
                     }
+                },
+                .cheats => {
+                    if (opts.n_pokes == 0) {
+                        toast.set("NO CHEAT CODES LOADED", .{});
+                    } else {
+                        cheats_on = !cheats_on;
+                        if (cheats_on) toast.set("CHEATS ON", .{}) else toast.set("CHEATS OFF", .{});
+                    }
+                },
+                .info => {
+                    info_open = !info_open;
+                    if (info_open) refreshSlots(io, &slot_paths, legacy_state_path, &slot_infos);
                 },
                 // Hotplug actions can only come from pad_added/removed,
                 // which the branch above consumed.
@@ -607,10 +767,14 @@ pub fn run(
         con.setButtons(1, feed[1]);
         if (rewinding) {
             _ = rw.?.rewindStep(con);
-            discardMovieModes(&rec, &play_movie, "rewind", err);
+            discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "rewind", err);
         } else if (!halted) {
             con.runFrame();
             frames_run += 1;
+            at_power_on = false;
+            // AFTER the frame: the value the next frame reads must be the
+            // cheat's, not whatever the game just stored over it.
+            if (cheats_on and opts.n_pokes != 0) _ = util.cheat.apply(con, opts.pokes[0..opts.n_pokes]);
             if (rec) |*r| r.append(feed) catch {};
             if (play_movie) |m| {
                 if (play_idx < m.frames.len) {
@@ -644,6 +808,35 @@ pub fn run(
                 .shader_name = if (glv) |g| g.names[g.index] else null,
             }, slot);
             break :blk compose[0..fb.len];
+        } else if (info_open) blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            // game_id is `<sha16>-<title-slug>`; the slug half is the human
+            // name. A bare-hash id (blank title) shows as itself.
+            const title = if (opts.game_id.len > 17) opts.game_id[17..] else opts.game_id;
+            const inf: infopanel.Info = .{
+                .title = title,
+                .rom_name = std.fs.path.basename(opts.rom),
+                .patch_name = opts.patch_name,
+                .chip = switch (con.cartridge().chip) {
+                    .none => null,
+                    .dsp => "DSP",
+                    .sa1 => "SA-1",
+                    .superfx => "SUPER FX",
+                    .cx4 => "CX4",
+                    .sdd1 => "S-DD1",
+                    .other => "COPROC",
+                },
+                .core = @tagName(opts.accuracy),
+                .region = @tagName(con.region()),
+                .shader = if (glv) |g| g.names[g.index] else null,
+                .audio_on = audio_on and audio != null,
+                .volume = opts.cfg.effectiveVolume(),
+                .slot = slot,
+                .slots = slot_infos,
+            };
+            infopanel.draw(&surf, &inf);
+            break :blk compose[0..fb.len];
         } else if (rewinding) blk: {
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
@@ -655,9 +848,20 @@ pub fn run(
             ui.drawText(&surf, 4, 4, if (rec != null) "* REC" else "> MOVIE", ui.color.accent);
             break :blk compose[0..fb.len];
         } else fb;
+        // The toast rides ON TOP of whatever the ladder picked; when the
+        // ladder picked the raw framebuffer it gets its own compose copy.
+        const final_px: []const u16 = if (toast.frames == 0) src_px else blk: {
+            toast.frames -= 1;
+            if (src_px.ptr != compose.ptr) @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            const ty: i32 = @as(i32, @intCast(height)) - @as(i32, @intCast(ui.line_h)) - 4;
+            ui.fillRect(&surf, 2, ty - 2, ui.textWidth(toast.buf[0..toast.len]) + 4, ui.line_h + 2, ui.color.panel);
+            ui.drawText(&surf, 4, ty, toast.buf[0..toast.len], ui.color.accent);
+            break :blk compose[0..fb.len];
+        };
 
         if (glv) |g| gl_path: {
-            g.chain().upload(src_px, width, height);
+            g.chain().upload(final_px, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             _ = g.sdl_gl.SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
@@ -750,7 +954,7 @@ pub fn run(
                 tex_w = width;
                 tex_h = height;
             }
-            _ = sdl.SDL_UpdateTexture(texture.?, null, src_px.ptr, @intCast(width * 2));
+            _ = sdl.SDL_UpdateTexture(texture.?, null, final_px.ptr, @intCast(width * 2));
             _ = sdl.SDL_RenderClear(r);
             _ = sdl.SDL_RenderTexture(r, texture.?, null, null);
             _ = sdl.SDL_RenderPresent(r);
@@ -1699,10 +1903,46 @@ fn saveStateTo(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, b
     if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
     if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf })) {
         err.print("state saved: slot {d} ({s})\n", .{ slot, path }) catch {};
+        // The info palette's screenshot sidecar, from the frame on screen
+        // right now. Best-effort on purpose: a thumbnail must never fail
+        // (or slow) the save it decorates, and states saved before this
+        // existed simply have none.
+        var tp_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&tp_buf, "{s}.thumb", .{path})) |tp| {
+            var tf: [infopanel.Thumb.file_len]u8 = undefined;
+            infopanel.Thumb.encode(con.framebuffer(), con.frameWidth(), &tf);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tp, .data = &tf }) catch {};
+        } else |_| {}
     } else |e| {
         err.print("state save failed: {s}\n", .{@errorName(e)}) catch {};
     }
     err.flush() catch {};
+}
+
+/// Re-gather what the info palette shows about the slots: which exist, and
+/// their thumbnails. Eight stats and at most eight 7-KiB reads — palette-open
+/// cost, never frame cost.
+fn refreshSlots(
+    io: std.Io,
+    slot_paths: *const [9]?[]const u8,
+    legacy_state_path: []const u8,
+    infos: *[9]infopanel.SlotInfo,
+) void {
+    for (1..9) |n| {
+        const path = slot_paths[n] orelse legacy_state_path;
+        var inf: infopanel.SlotInfo = .{};
+        inf.exists = if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| true else |_| false;
+        if (inf.exists) {
+            var tp_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&tp_buf, "{s}.thumb", .{path})) |tp| {
+                var tf: [infopanel.Thumb.file_len]u8 = undefined;
+                if (std.Io.Dir.cwd().readFile(io, tp, &tf)) |data| {
+                    inf.thumb = infopanel.Thumb.decode(data);
+                } else |_| {}
+            } else |_| {}
+        }
+        infos[n] = inf;
+    }
 }
 
 fn loadStateFrom(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32, buf: []u8, err: *std.Io.Writer) bool {
@@ -1711,7 +1951,10 @@ fn loadStateFrom(io: std.Io, con: *core.AnyConsole, path: []const u8, slot: u32,
         err.flush() catch {};
         return true;
     } else |e| {
-        err.print("state load failed: {s}\n", .{@errorName(e)}) catch {};
+        if (e == error.WrongRom)
+            err.print("state load refused: slot {d} was saved on a different ROM or patch build (loading it would garble the whole machine)\n", .{slot}) catch {}
+        else
+            err.print("state load failed: {s}\n", .{@errorName(e)}) catch {};
         err.flush() catch {};
         return false;
     }
@@ -1724,11 +1967,64 @@ fn loadStateFile(io: std.Io, con: *core.AnyConsole, path: []const u8, buf: []u8)
 
 /// Encode and write one screenshot, named by the first free index — no
 /// wall-clock dependency, and the names sort in capture order.
-/// Reset, load-state, and rewind rewrite history, which an input stream
-/// cannot follow: a recording in progress is discarded (a movie that cannot
-/// replay must not be written) and a replay in progress hands input back.
-fn discardMovieModes(
+/// Reset, load-state, and rewind rewrite history MID-TAKE, which an input
+/// stream cannot follow: a recording in progress is discarded (a movie that
+/// cannot replay must not be written) and a replay in progress hands input
+/// back. Note this is about time travel *during* a recording — starting one
+/// from a loaded state is fine, and carries that state as the movie's anchor.
+/// A state load landed on `slot` while a take is recording.
+///
+/// If that slot holds a state saved during THIS take, the log is truncated
+/// back to the frame it was saved at: replaying the take from its start now
+/// reaches exactly the machine the state restored, so the recording stays
+/// valid and the player keeps their progress. Returns the frame rewound to.
+///
+/// Marks past the cut name a branch that no longer exists. Dropping them is
+/// what stops a later load from restoring a machine the truncated log cannot
+/// explain — the one way this feature could silently produce a desynced movie.
+///
+/// A slot with no mark cannot be rewound to (the take never passed through
+/// that machine), so the take is discarded as before; null says so.
+/// Forget every mark past `at`. Those states were saved on a branch the
+/// truncation just deleted: loading one would restore a machine the shortened
+/// input log cannot reach, and the movie would replay into a different game.
+fn cutMarks(marks: *[9]?u32, at: u32) void {
+    for (marks) |*m| {
+        if (m.*) |f| {
+            if (f > at) m.* = null;
+        }
+    }
+}
+
+fn rewindRecToSlot(
+    gpa: std.mem.Allocator,
     rec: *?std.array_list.Managed([2]u16),
+    rec_anchor: *?[]u8,
+    play_movie: *?util.movie.Movie,
+    marks: *[9]?u32,
+    audio_marks: *const [9]u64,
+    audio_hash: *u64,
+    slot: u32,
+    err: *std.Io.Writer,
+) ?u32 {
+    if (rec.* == null) return null;
+    const at = marks[slot] orelse {
+        discardMovieModes(gpa, rec, rec_anchor, play_movie, "load of a state not saved in this take", err);
+        marks.* = @splat(null);
+        return null;
+    };
+    rec.*.?.shrinkRetainingCapacity(at);
+    audio_hash.* = audio_marks[slot];
+    cutMarks(marks, at);
+    err.print("recording rewound to frame {d} (slot {d})\n", .{ at, slot }) catch {};
+    err.flush() catch {};
+    return at;
+}
+
+fn discardMovieModes(
+    gpa: std.mem.Allocator,
+    rec: *?std.array_list.Managed([2]u16),
+    rec_anchor: *?[]u8,
     play: *?util.movie.Movie,
     why: []const u8,
     err: *std.Io.Writer,
@@ -1736,6 +2032,8 @@ fn discardMovieModes(
     if (rec.*) |*r| {
         r.deinit();
         rec.* = null;
+        if (rec_anchor.*) |a| gpa.free(a);
+        rec_anchor.* = null;
         err.print("movie: recording discarded ({s} breaks replay determinism)\n", .{why}) catch {};
         err.flush() catch {};
     }
@@ -1755,6 +2053,7 @@ fn writeMovie(
     opts: *const Options,
     con: *core.AnyConsole,
     frames: []const [2]u16,
+    anchor: ?[]u8,
     audio_hash: u64,
     err: *std.Io.Writer,
 ) void {
@@ -1773,6 +2072,7 @@ fn writeMovie(
         .end_frame_hash = core.console.hashFrame(con.framebuffer()),
         .end_audio_hash = audio_hash,
         .frames = @constCast(frames),
+        .anchor = anchor,
     };
     const data = util.movie.encode(gpa, m) catch |e| {
         err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
@@ -1785,7 +2085,9 @@ fn writeMovie(
         err.flush() catch {};
         return;
     };
-    err.print("movie: {s} ({} frames, end hashes recorded)\n", .{ path, frames.len }) catch {};
+    err.print("movie: {s} ({} frames{s}, end hashes recorded)\n", .{
+        path, frames.len, if (anchor != null) ", anchored to a start state" else ", from power-on",
+    }) catch {};
     err.flush() catch {};
 }
 
@@ -1821,7 +2123,7 @@ fn writeScreenshot(
     err.flush() catch {};
 }
 
-const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu };
+const InitGlError = error{ NoGlSymbols, NoContext, NoVariantForThisGpu, ShaderDirNotFound, ShaderNotBaked };
 
 /// Bring up a GL context and load `name` from the best profile the driver will
 /// give us. Tries GLES 3, then desktop GL 3.3, then GLES 2 — and for each, only
@@ -1839,13 +2141,29 @@ fn initGl(
     err: *std.Io.Writer,
 ) !*GlVideo {
     const sdl_gl = sdl3.loadGl() catch return InitGlError.NoGlSymbols;
+    // Base handle only for SDL_GetError diagnostics on the failure paths — a
+    // silent `continue` per profile hid WHY every GL context creation failed
+    // (measured: a machine where all three rungs returned null and the user
+    // could not tell a driver problem from a missing shader variant).
+    const base = sdl3.load() catch return InitGlError.NoGlSymbols;
+
+    // Distinguish the three ways this fails so the message is honest: the
+    // shader DIRECTORY was not found (the common one — `--shader-dir` defaults
+    // to "shaders" relative to the working directory, so launching the exe
+    // from anywhere but the repo root finds nothing), the requested preset is
+    // not among the baked ones, or every GL context genuinely failed. Blaming
+    // the GPU for a missing directory cost a real debugging cycle.
+    var any_dir_listed = false;
+    var name_seen = false;
 
     for (profiles) |prof| {
         // Which presets exist for this profile is the gate: no point holding a
         // context we cannot use. The listing doubles as the `,`/`.` cycle order.
         const profile_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ shader_root, prof.dir });
         const names = listPresets(io, gpa, profile_dir) catch continue;
+        any_dir_listed = true;
         const start = indexOfName(names, name) orelse continue;
+        name_seen = true;
 
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_profile_mask, prof.profile_mask);
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_major_version, prof.major);
@@ -1854,7 +2172,13 @@ fn initGl(
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.depth_size, 0);
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.stencil_size, 0);
 
-        const ctx = sdl_gl.SDL_GL_CreateContext(window) orelse continue;
+        const ctx = sdl_gl.SDL_GL_CreateContext(window) orelse {
+            err.print("  gl: {s} (GL {d}.{d}) context creation failed: {s}\n", .{
+                prof.dir, prof.major, prof.minor, base.SDL_GetError(),
+            }) catch {};
+            err.flush() catch {};
+            continue;
+        };
         _ = sdl_gl.SDL_GL_MakeCurrent(window, ctx);
         // Pacing is ours, as in the software path: never vsync-throttle here or
         // the game clock follows the display refresh.
@@ -1903,6 +2227,12 @@ fn initGl(
 
         return g;
     }
+    if (!any_dir_listed) {
+        err.print("  gl: no baked shader presets under '{s}' (set --shader-dir to the yamabuki 'shaders' directory)\n", .{shader_root}) catch {};
+        err.flush() catch {};
+        return InitGlError.ShaderDirNotFound;
+    }
+    if (!name_seen) return InitGlError.ShaderNotBaked;
     return InitGlError.NoVariantForThisGpu;
 }
 
@@ -2002,4 +2332,18 @@ fn cycleShader(
         @tagName(g.chain().p.tier),
     }) catch {};
     err.flush() catch {};
+}
+
+test "rec marks: rewinding forgets the branch it deleted" {
+    // Slot 1 at frame 100, slot 2 at 500. Rewinding to 100 keeps slot 1 and
+    // drops slot 2 — after the cut the take never reaches frame 500, so a
+    // load of slot 2 could only desync the recording.
+    var marks: [9]?u32 = @splat(null);
+    marks[1] = 100;
+    marks[2] = 500;
+    marks[3] = 100; // exactly at the cut survives: the log still reaches it
+    cutMarks(&marks, 100);
+    try std.testing.expectEqual(@as(?u32, 100), marks[1]);
+    try std.testing.expectEqual(@as(?u32, null), marks[2]);
+    try std.testing.expectEqual(@as(?u32, 100), marks[3]);
 }

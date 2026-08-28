@@ -56,6 +56,52 @@ pub const Regs = struct {
 
 pub const ExecState = enum(u8) { running, waiting, stopped };
 
+/// TEMP calibration: print bus.clock at the first fetch of this PC
+/// (24-bit; the bank folds through $7F so fast mirrors match).
+pub var dbg_clock_pc: u24 = 0;
+pub var dbg_clock_fired: bool = false;
+/// TEMP diagnostics: log writes to this WRAM-offset range (banks $7E/$40).
+/// See `--dma-bank-pc`. Which instruction hands a DMA channel its A-bus bank
+/// byte ($43x4). A window conversion that missed one leaves the transfer
+/// reading memory the game abandoned, and nothing in the CPU's own accesses
+/// shows it — the DMA does the reading.
+pub var dbg_dmabank: usize = 0;
+var dbg_dmabank_seen: [128]u32 = @splat(0);
+var dbg_dmabank_n: usize = 0;
+
+pub var dbg_watch_lo: u16 = 0;
+pub var dbg_watch_hi: u16 = 0;
+pub var dbg_watch_from: u64 = 0;
+/// Only log watched writes of values >= this (0 = all).
+pub var dbg_watch_val_min: u8 = 0;
+var dbg_watch_n: usize = 0;
+var dbg_watch_armed: bool = false;
+/// TEMP diagnostics: instruction trace over a clock window.
+pub var dbg_trace_from: u64 = 0;
+pub var dbg_trace_to: u64 = 0;
+/// TEMP diagnostics: trace up to N SA-1 instructions once the watch arms.
+pub var dbg_trace_sa1: usize = 0;
+var dbg_trace_sa1_n: usize = 0;
+/// TEMP diagnostics, BW-RAM window conversions: report data accesses to the
+/// ABANDONED WRAM homes. Once the low 8 KiB moves to $6000-$7FFF and banks
+/// $7E/$7F move to $40/$41, nothing the game runs should ever touch real
+/// WRAM again — so every hit here is a site the rewrite failed to move, and
+/// the PC names it. Reports each (PBR,PC) once; the value is the ceiling on
+/// distinct sites, not on accesses.
+pub var dbg_stale: usize = 0;
+pub var dbg_stale_from: u64 = 0;
+var dbg_stale_seen: [512]u32 = @splat(0);
+var dbg_stale_n: usize = 0;
+/// TEMP diagnostics: with `dbg_stale` armed, the clockless (SA-1) core
+/// keeps a ring of its last instructions and dumps it on the FIRST stale
+/// hit — the history that led into the bad path, which a forward trace
+/// can never afford to keep.
+pub var dbg_stale_ring: bool = false;
+const StaleRingEntry = struct { pbr: u8, pc: u16, c: u16, x: u16, y: u16, d: u16, dbr: u8, p: u8 };
+var dbg_ring: [8192]StaleRingEntry = undefined;
+var dbg_ring_n: usize = 0;
+var dbg_ring_dumped: bool = false;
+
 pub fn Cpu(comptime BusT: type) type {
     return struct {
         const Self = @This();
@@ -148,6 +194,28 @@ pub fn Cpu(comptime BusT: type) type {
                 return;
             }
 
+            if (dbg_clock_pc != 0 and !dbg_clock_fired and
+                (self.regs.pbr & 0x7F) == (dbg_clock_pc >> 16) and
+                self.regs.pc == @as(u16, @truncate(dbg_clock_pc)) and
+                @hasField(BusT, "clock"))
+            {
+                dbg_clock_fired = true;
+                std.debug.print("[clk] pc={x:0>2}:{x:0>4} clock={}\n", .{ self.regs.pbr, self.regs.pc, self.bus.clock });
+            }
+            if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
+                const clk = self.bus.clock;
+                if (clk >= dbg_trace_from and clk < dbg_trace_to)
+                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} s={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.s, self.regs.d, self.regs.dbr, self.regs.p, clk });
+            }
+            if (dbg_stale_ring and !@hasField(BusT, "clock")) {
+                dbg_ring[dbg_ring_n % dbg_ring.len] = .{ .pbr = self.regs.pbr, .pc = self.regs.pc, .c = self.regs.c, .x = self.regs.x, .y = self.regs.y, .d = self.regs.d, .dbr = self.regs.dbr, .p = self.regs.p };
+                dbg_ring_n += 1;
+            }
+            // SA-1-side trace: fires once the S-CPU-side watch has armed.
+            if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {
+                dbg_trace_sa1_n += 1;
+                std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p });
+            }
             const m8 = self.regs.e or (self.regs.p & Flags.m) != 0;
             const x8 = self.regs.e or (self.regs.p & Flags.x) != 0;
             if (m8) {
@@ -190,7 +258,35 @@ pub fn Cpu(comptime BusT: type) type {
         /// That distinction is what lets the frame-budget profiler tell a wait
         /// loop from a working one: a wait polls the same address every time
         /// round, and a loop that is computing something walks memory.
+        /// See `dbg_stale`. Off unless armed, and deliberately not inlined
+        /// into the hot path's fast case.
+        fn noteStale(self: *Self, addr: u24, comptime kind: u8) void {
+            const bank: u8 = @intCast(addr >> 16);
+            const a16: u16 = @truncate(addr);
+            const abandoned = bank == 0x7E or bank == 0x7F or
+                ((bank & 0x7F) < 0x40 and a16 < 0x2000);
+            if (!abandoned) return;
+            if (@hasField(BusT, "clock") and self.bus.clock < dbg_stale_from) return;
+            const key: u32 = @as(u32, self.regs.pbr) << 16 | self.regs.pc;
+            for (dbg_stale_seen[0..dbg_stale_n]) |k| if (k == key) return;
+            if (dbg_stale_n == dbg_stale_seen.len or dbg_stale_n == dbg_stale) return;
+            dbg_stale_seen[dbg_stale_n] = key;
+            dbg_stale_n += 1;
+            const clk: u64 = if (@hasField(BusT, "clock")) self.bus.clock else 0;
+            std.debug.print("[stale] {c} pc={x:0>2}:{x:0>4} addr={x:0>6} d={x:0>4} db={x:0>2} x={x:0>4} y={x:0>4} clk={d}\n", .{ kind, self.regs.pbr, self.regs.pc, addr, self.regs.d, self.regs.dbr, self.regs.x, self.regs.y, clk });
+            if (dbg_stale_ring and !@hasField(BusT, "clock") and !dbg_ring_dumped) {
+                dbg_ring_dumped = true;
+                const n = @min(dbg_ring_n, dbg_ring.len);
+                var ri: usize = dbg_ring_n -| n;
+                while (ri < dbg_ring_n) : (ri += 1) {
+                    const e = dbg_ring[ri % dbg_ring.len];
+                    std.debug.print("[ring] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2}\n", .{ e.pbr, e.pc, e.c, e.x, e.y, e.d, e.dbr, e.p });
+                }
+            }
+        }
+
         pub inline fn read8(self: *Self, addr: u24) u8 {
+            if (dbg_stale != 0) self.noteStale(addr, 'r');
             if (@hasField(BusT, "last_data_read")) self.bus.last_data_read = addr;
             if (@hasDecl(BusT, "noteTickRead")) self.bus.noteTickRead(addr);
             return self.bus.read8(addr);
@@ -199,7 +295,67 @@ pub fn Cpu(comptime BusT: type) type {
         /// A *data* write. Stack pushes deliberately do not come through here
         /// (see `push8`), so `last_data_write` records only writes that change
         /// the machine's state, never call/return bookkeeping.
+        fn noteDmaBank(self: *Self, addr: u24, value: u8) void {
+            const a16: u16 = @truncate(addr);
+            if (a16 < 0x4300 or a16 > 0x437F or (a16 & 0xF != 4 and a16 & 0xF != 7)) return;
+            // Keyed on the VALUE too: a site that hands over $40 on one pass
+            // and $7F on another is exactly the bug being hunted, and a
+            // PC-only key would report only whichever came first.
+            const key: u32 = @as(u32, self.regs.pbr) << 24 | @as(u32, self.regs.pc) << 8 | value;
+            for (dbg_dmabank_seen[0..dbg_dmabank_n]) |k| if (k == key) return;
+            if (dbg_dmabank_n == dbg_dmabank_seen.len or dbg_dmabank_n == dbg_dmabank) return;
+            dbg_dmabank_seen[dbg_dmabank_n] = key;
+            dbg_dmabank_n += 1;
+            const dead = value == 0x7E or value == 0x7F;
+            std.debug.print("[dmabank] pc={x:0>2}:{x:0>4} ch{d} bank<={x:0>2} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2}{s}\n", .{
+                self.regs.pbr,                       self.regs.pc, (a16 >> 4) & 7, value, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr,
+                if (dead) "  <-- ABANDONED" else "",
+            });
+        }
+
+        /// The --watch write hook, shared by data writes AND stack
+        /// pushes (pushes bypass the data wrapper by design — they must
+        /// not pollute last_data_write — but the WATCH must see them:
+        /// a corrupted pushed byte was invisible for a whole campaign).
+        fn dbgWatchWrite(self: *Self, addr: u24, value: u8) void {
+            if (dbg_watch_lo != 0) {
+                if (@hasField(BusT, "clock") and self.bus.clock >= dbg_watch_from) dbg_watch_armed = true;
+                const bank: u8 = @intCast(addr >> 16);
+                const a16: u16 = @truncate(addr);
+                // Normalized low-WRAM offset across every addressing home:
+                // banks $7E/$40 directly, the system-bank mirror below
+                // $2000, and the relocated window $6000-$7FFF.
+                const off: ?u16 = if (bank == 0x7E or bank == 0x40)
+                    a16
+                else if ((bank & 0x7F) < 0x40 and a16 < 0x2000)
+                    a16
+                else if ((bank & 0x7F) < 0x40 and a16 >= 0x6000 and a16 < 0x8000)
+                    a16 - 0x6000
+                        // MMIO passes through as itself: a --watch range above
+                        // $2000 names PPU/DMA registers (the VRAM address, a
+                        // DMA channel), which no WRAM home could alias.
+                else if ((bank & 0x7F) < 0x40 and a16 >= 0x2100 and a16 < 0x4400)
+                    a16
+                else
+                    null;
+                if (off) |o| if (o >= dbg_watch_lo and o <= dbg_watch_hi and dbg_watch_n < 4096 and
+                    value >= dbg_watch_val_min)
+                {
+                    const has_clk = @hasField(BusT, "clock");
+                    const clk: u64 = if (has_clk) self.bus.clock else 0;
+                    if (has_clk and clk >= dbg_watch_from) dbg_watch_armed = true;
+                    if ((has_clk and clk >= dbg_watch_from) or (!has_clk and dbg_watch_armed)) {
+                        dbg_watch_n += 1;
+                        std.debug.print("[ww{s}] pc={x:0>2}:{x:0>4} {x:0>6} <= {x:0>2} clk={}\n", .{ if (has_clk) "" else "-sa1", self.regs.pbr, self.regs.pc, addr, value, clk });
+                    }
+                };
+            }
+        }
+
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (dbg_stale != 0) self.noteStale(addr, 'w');
+            if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
+            if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);
@@ -275,6 +431,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// how most SNES main loops are written — must not look like a loop with
         /// side effects just because it pushed a return address.
         pub fn push8(self: *Self, value: u8) void {
+            if (dbg_watch_lo != 0) self.dbgWatchWrite(self.regs.s, value);
             self.bus.write8(self.regs.s, value);
             if (self.regs.e) {
                 self.regs.s = 0x0100 | ((self.regs.s -% 1) & 0xFF);

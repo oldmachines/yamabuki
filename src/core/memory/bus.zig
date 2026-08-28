@@ -70,6 +70,12 @@ pub const Bus = struct {
         /// comparator ignore it without knowing what any byte means.
         live: [wram_len / 8]u8 = undefined,
         written: [wram_len / 8]u8 = undefined,
+        /// Bytes written MORE THAN ONCE this tick: intra-frame streams
+        /// (an APU pump's cursor and buffers, a handshake cell). Their
+        /// instantaneous value at any single snapshot instant is phase,
+        /// not logic — a timing-shifted twin can never match them at the
+        /// same tick, and no state comparison should ask it to.
+        multi: [wram_len / 8]u8 = undefined,
         wram: [wram_len]u8 = undefined,
         /// Cartridge RAM (BW-RAM on an SA-1 cart) and SA-1 I-RAM, captured
         /// at the same instant: a conversion RELOCATES state into these, so
@@ -220,7 +226,7 @@ pub const Bus = struct {
     /// Wire the SA-1 to the cartridge's ROM and BW-RAM (after init or load).
     fn attachSa1(self: *Bus) void {
         if (self.cart.chip != .sa1) return;
-        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask);
+        self.sa1.attach(self.cart.rom, self.cart.rom_mask, &self.cart.sram, self.cart.sram_mask, &self.cart.sram_hi, self.cart.sram_hi_mask);
     }
 
     /// Wire the Cx4 to the cartridge's ROM (after init or load).
@@ -321,6 +327,32 @@ pub const Bus = struct {
         return null;
     }
 
+    /// Read an instruction byte for INSTRUMENTATION: no clock, no MDR, no
+    /// side effects, so emulation stays bit-identical whether or not anyone
+    /// is watching.
+    ///
+    /// `peek8` sees only the fast page table, and an SA-1 cart deliberately
+    /// keeps the $E000-$FFFF vector page of banks $00/$80 off it so a vector
+    /// PULL can be substituted. The profiler used `peek8` and treated a null
+    /// as "not an instruction", so every instruction living in that page was
+    /// invisible to the usage map — and code the rewriter never sees execute
+    /// is code it will never convert. Measured on Gradius III: coverage in
+    /// banks $00/$80 stopped dead at $DFFF, stranding real gameplay routines
+    /// at $E3xx across a dozen conversion rounds.
+    ///
+    /// This resolves that page the way the game itself sees it — as ROM,
+    /// which is the same distinction `slowRead` makes for a non-vector read.
+    /// Null still means "no instruction byte here", which is true only of
+    /// registers and open bus, and nothing is ever fetched from those.
+    pub fn peekCode8(self: *const Bus, addr: u24) ?u8 {
+        if (self.page_read[addr >> 13]) |p| return p[addr & (page_size - 1)];
+        const bank: u8 = @intCast(addr >> 16);
+        const a16: u16 = @truncate(addr);
+        if (self.cart.chip == .sa1 and a16 >= 0xE000 and bank & 0x7F == 0)
+            return self.sa1.romRead(addr);
+        return null;
+    }
+
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {
@@ -340,6 +372,37 @@ pub const Bus = struct {
         self.vector_pull = true;
         defer self.vector_pull = false;
         return self.read8(addr);
+    }
+
+    /// Write a byte the way a cheat device does: straight into mapped RAM,
+    /// charging no clock and running no MMIO side effect. The clock is
+    /// deliberately untouched — a cheat that stole cycles would change the
+    /// timing it is meant to observe, and every determinism guarantee in
+    /// this codebase rests on the frame's cycle count.
+    ///
+    /// Returns false when the address is not plain writable memory: an
+    /// unmapped address or a hardware register is refused rather than poked
+    /// blind, since a register write has consequences a cheat cannot model.
+    pub inline fn poke8(self: *Bus, addr: u24, value: u8) bool {
+        if (self.page_write[addr >> 13]) |p| {
+            p[addr & (page_size - 1)] = value;
+            return true;
+        }
+        // BW-RAM is not fast-paged (its writes are arbitrated and SWEN-gated),
+        // so a cheat reaches it directly. Bypassing SWEN is deliberate: a
+        // cheat device sits outside the machine and does not ask the game's
+        // permission. This is the route that matters on an SA-1 window
+        // conversion, where the game's low WRAM now lives here.
+        const bank: u8 = @intCast(addr >> 16);
+        if (self.cart.chip == .sa1 and bank >= 0x40 and bank <= 0x4F) {
+            const off = addr & 0x3_FFFF;
+            if (self.sa1.bwram_hi_mask != 0 and off & 0x2_0000 != 0)
+                self.sa1.bwram_hi[off & self.sa1.bwram_hi_mask] = value
+            else
+                self.sa1.bwram[off & self.sa1.bwram_mask] = value;
+            return true;
+        }
+        return false;
     }
 
     pub inline fn write8(self: *Bus, addr: u24, value: u8) void {
@@ -377,7 +440,9 @@ pub const Bus = struct {
     pub fn noteTickWrite(self: *Bus, addr: u24) void {
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
-        t.written[off >> 3] |= @as(u8, 1) << @intCast(off & 7);
+        const bit = @as(u8, 1) << @intCast(off & 7);
+        if (t.written[off >> 3] & bit != 0) t.multi[off >> 3] |= bit;
+        t.written[off >> 3] |= bit;
     }
 
     /// A controller poll: the lag-detection flag, and — under the

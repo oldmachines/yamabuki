@@ -74,6 +74,9 @@ const Args = struct {
     /// `--movie <file>`: replay a recorded playthrough (.ymv) from power-on;
     /// live input takes over when it ends. Needs an explicit ROM argument.
     movie: ?[]const u8 = null,
+    /// `--poke ADDR=VAL`: cheat writes held after every frame.
+    pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
+    n_pokes: usize = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -106,6 +109,10 @@ pub fn main(init: std.process.Init) !void {
                 "  --region r  ntsc|pal|auto (default auto: detect from the cart header)\n" ++
                 "  --wide N    widen the framebuffer by N columns on each side, e.g. 32 -> 320x224\n" ++
                 "              (fast core only; for widescreen game patches such as wide-snes)\n" ++
+                "  --cheat c   Action-Replay-style code (ADDRVV, join parts with +), held\n" ++
+                "              every frame; a WRAM code is also applied where relocation\n" ++
+                "              moved that byte, so cheat-list codes work on conversions\n" ++
+                "  --poke a=v  same, but exact: no relocation mirror\n" ++
                 "  --movie f   replay a recorded playthrough (.ymv) from power-on; live input\n" ++
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
@@ -240,6 +247,9 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .pokes = args.pokes,
+        .n_pokes = args.n_pokes,
+        .patch_name = booted.patch_name,
     };
 }
 
@@ -281,7 +291,20 @@ fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted,
         try err.flush();
         return error.BootFailed;
     }
-    try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+    // An anchored movie's inputs mean nothing without the machine they were
+    // recorded against, so restoring it is part of loading the movie — and a
+    // state this console refuses is as fatal as a CRC mismatch.
+    if (m.anchor) |a| {
+        b.con.loadState(a) catch |e| {
+            try err.print("error: movie '{s}' carries a start state this build cannot restore: {s}\n" ++
+                "       (a save state is tied to the core's layout — re-record on this build)\n", .{ path, @errorName(e) });
+            try err.flush();
+            return error.BootFailed;
+        };
+        try err.print("movie: {s} — {} frames, replaying from its start state\n", .{ path, m.frames.len });
+    } else {
+        try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+    }
     try err.flush();
     return m;
 }
@@ -366,6 +389,9 @@ const Booted = struct {
     rom_crc: u32,
     /// The core the console was built on (movies replay only on their own).
     accuracy: core.Accuracy,
+    /// Basename of the soft-patch applied at load, null when the image is
+    /// as dumped — the info palette's PATCH row.
+    patch_name: ?[]const u8,
 };
 
 /// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
@@ -406,8 +432,10 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         try err.flush();
         return error.BootFailed;
     };
+    var patch_name: ?[]const u8 = null;
     if (args.patch) |patch_path| {
         image = try applySoftPatch(io, gpa, image, patch_path, err);
+        patch_name = std.fs.path.basename(patch_path);
     } else if (args.frames == 0) {
         // Launch discovery: a same-basename softpatch, a patch-folder match,
         // or a registry entry. Whether it is used is the per-game choice the
@@ -422,6 +450,7 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
                 if (pref) |choice| switch (choice) {
                     .patched => {
                         image = try applySoftPatch(io, gpa, image, found.path, err);
+                        patch_name = std.fs.path.basename(found.path);
                         try err.print("patch applied: {s}\n", .{found.path});
                         try err.flush();
                     },
@@ -496,6 +525,7 @@ fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: A
         .rewind = if (pg) |p| p.rewind else null,
         .rom_crc = util.movie.imageCrc(core.header.stripCopierHeader(image)),
         .accuracy = accuracy,
+        .patch_name = patch_name,
     };
 }
 
@@ -547,6 +577,14 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--wide")) {
             const v = it.next() orelse return error.MissingValue;
             args.wide = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--cheat")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.n_pokes = util.cheat.parseCodes(v, &args.pokes, args.n_pokes) catch
+                return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--poke")) {
+            const v = it.next() orelse return error.MissingValue;
+            args.n_pokes = util.cheat.parseList(v, &args.pokes, args.n_pokes) catch
+                return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--movie")) {
             args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
@@ -584,4 +622,10 @@ test {
     _ = @import("png.zig");
     _ = @import("rewind.zig");
     _ = @import("library.zig");
+    _ = @import("infopanel.zig");
+    _ = @import("dirpicker.zig");
+    _ = @import("patchfind.zig");
+    _ = @import("osd.zig");
+    _ = @import("preset.zig");
+    _ = @import("gl.zig");
 }
