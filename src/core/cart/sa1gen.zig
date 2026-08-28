@@ -6488,7 +6488,14 @@ pub fn convertWholeGame(
     // untouched. Both idioms span 4 bytes at the site.
     if (bwram) if (ptr_ev) |pe| {
         const map_body = [_]u8{
-            0xC9, 0xA0, 0x90, 0x08, // CMP #$A0 / BCC set
+            // A bank below $A0 must pass through UNTOUCHED. The original
+            // `BCC +8` here landed on the a0 arm and subtracted $80 from it
+            // — harmless for the measured single-bank pins this map first
+            // served (their runtime banks were always misfit), fatal once
+            // the abs,X pin shape ran the map on every iteration of a loop
+            // that pulls ordinary banks too (measured: Super Metroid's
+            // escape builder derailed and the conversion stopped polling).
+            0xC9, 0xA0, 0x90, 0x0A, // CMP #$A0 / BCC set
             0xC9, 0xC0, 0x90, 0x04, // CMP #$C0 / BCC a0
             0xE9, 0x20, 0x80, 0x02, // SBC #$20 / BRA set
             0xE9, 0x7F, // a0: SBC #$7F (carry clear: -$80)
@@ -6526,19 +6533,68 @@ pub fn convertWholeGame(
                 body[bl] = 0x48; // PHA
                 body[bl + 1] = 0xAB; // PLB
                 bl += 2;
+            } else if (out[plb] == 0xAB and out[plb - 1] == 0xAB and out[plb - 2] == 0x48 and
+                out[plb - 5] == 0xBD)
+            {
+                // LDA $abs,X / PHA / PLB / PLB — the 16-bit HIGH-byte pin
+                // whose table word is dual-role (low = addr half, high =
+                // bank). The site runs M16 (a 16-bit table load), so the
+                // 8-bit map runs under a SEP/REP bracket; A is left holding
+                // the mapped high byte, which S4 arbitrates (the measured
+                // consumer reloads A immediately — Super Metroid's escape
+                // tile builder does TXA right after). Six site bytes: the
+                // JML covers four, the trailing PLB pair is skipped by
+                // returning to site+6.
+                site = plb - 5;
+                body[0] = 0xBD; // LDA $abs,X (m16)
+                body[1] = out[plb - 4];
+                body[2] = out[plb - 3];
+                body[3] = 0x48; // PHA (16-bit)
+                body[4] = 0xAB; // PLB — transient low pull, as stock
+                body[5] = 0xE2;
+                body[6] = 0x20; // SEP #$20 — the map compares are 8-bit
+                body[7] = 0x68; // PLA — the high byte
+                @memcpy(body[8..][0..map_body.len], &map_body);
+                bl = 8 + map_body.len;
+                body[bl] = 0x48; // PHA
+                body[bl + 1] = 0xAB; // PLB = mapped bank
+                body[bl + 2] = 0xC2;
+                body[bl + 3] = 0x20; // REP #$20 — restore the caller's M
+                bl += 4;
             } else continue;
-            const back: u32 = (sbank << 16) | (sa16 + 1);
-            body[bl] = 0x5C; // JML site+4
-            body[bl + 1] = @truncate(back);
-            body[bl + 2] = @truncate(back >> 8);
-            body[bl + 3] = @truncate((back >> 16) | 0x80);
+            // All shapes return to the byte after the final PLB: site+4 for
+            // the 4-byte idioms, site+6 for the 6-byte BD form — both are
+            // plb+1, i.e. sa16+1.
+            //
+            // BANK BYTES RIDE THE SHIM MAP, not the stock mirror. `| $80`
+            // was a mirror assumption: true on a <= 2 MiB image, and true
+            // for file bank $00-$1F on the shim map (region 2 restores that
+            // mirror) — which is why the bank-$00 music pins always worked.
+            // A body or site in file bank $20-$3F must be addressed at its
+            // IDENTITY bank: $A0-$BF is MB2 under the shim, and a JML there
+            // executes the wrong megabyte (measured: the first bank-$20 xl
+            // bodies — Super Metroid's escape builder pin — jumped into MB2
+            // garbage and the conversion stopped polling).
+            const idBank = struct {
+                fn f(image_len: usize, fb: u32) u8 {
+                    return if (image_len <= 0x20_0000 or fb < 0x20)
+                        @intCast(fb | 0x80)
+                    else
+                        @intCast(fb);
+                }
+            }.f;
+            const back16: u32 = sa16 + 1;
+            body[bl] = 0x5C; // JML site+4/+6
+            body[bl + 1] = @truncate(back16);
+            body[bl + 2] = @truncate(back16 >> 8);
+            body[bl + 3] = idBank(out.len, sbank);
             bl += 4;
             var xpad = padAllocFor(out, header.offset, sbank, 0, 0);
             const at = xpad.next(@intCast(bl)) orelse continue;
             @memcpy(out[at..][0..bl], body[0..bl]);
             out[site] = 0x5C; // JML body
             std.mem.writeInt(u16, out[site + 1 ..][0..2], @intCast(0x8000 + (at % 0x8000)), .little);
-            out[site + 3] = @intCast((at / 0x8000) | 0x80);
+            out[site + 3] = idBank(out.len, at / 0x8000);
             res.stats.xl_pins += 1;
         }
     };
@@ -10192,4 +10248,66 @@ test "window: a $C0-$DF table bank byte proves through the dp-staged PLB pin" {
     try testing.expectEqual(@as(u32, 1), res.stats.xl_pins);
     try testing.expectEqual(@as(u8, 0xD0), res.image[0x0022]); // byte stays stock
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x000F]); // site is a JML thunk
+}
+
+test "window: the abs,X-loaded HIGH-byte PLB pin translates instead of value-proving" {
+    // Super Metroid's Ceres escape tile builder, reduced: a 16-bit table
+    // word holds an ADDRESS HALF in its low byte and the bank in its high
+    // byte; `LDA $abs,X / PHA / PLB / PLB` pins the high byte as DBR. The
+    // old value-proof credited the word's staged source and re-banked the
+    // ADDRESS half -$80 (measured: ROM $20:E276, $BA -> $3A — the builder
+    // then read $B0:3Axx zeros and the escape's beam/door sprites went
+    // blank). The dual-role word must stay stock; the pin site translates.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+
+    const rom = try makeWgRom(gpa);
+    defer gpa.free(rom);
+    @memcpy(rom[0x0000..0x001B], &[_]u8{
+        0x18, 0xFB, 0xC2, 0x30, // CLC / XCE / REP #$30
+        0xA9, 0xBA, 0xB0, // LDA #$B0BA — the dual-role table word
+        0x8D, 0x40, 0x01, // STA $0140
+        0xA2, 0x00, 0x00, // LDX #$0000
+        0xBD, 0x40, 0x01, // LDA $0140,X — the abs,X pin load
+        0x48, 0xAB, 0xAB, // PHA / PLB / PLB -> DBR = $B0 (misfit)
+        0xA0, 0x00, 0x90, // LDY #$9000
+        0xB9, 0x00, 0x00, // LDA $0000,Y — access under the $B0 DBR
+        0x80, 0xFE, // spin
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const pe = try gpa.create(usage_map.PtrBankEvidence);
+    defer gpa.destroy(pe);
+    pe.* = .init;
+    const map: usage_map.UsageMap = .{ .bytes = bytes, .ptr_banks = pe };
+    {
+        const cart = try cartridge.Cartridge.load(gpa, rom);
+        const con = try gpa.create(console.ProfilingConsole);
+        defer {
+            con.cart.deinit(gpa);
+            gpa.destroy(con);
+        }
+        con.init(cart);
+        con.usage = &map;
+        for (0..2) |_| con.runFrame();
+    }
+    // No value proof — the word is dual-role; the pin records a translate
+    // site at the SECOND PLB.
+    if (pe.n_a0 != 0 or pe.n_xl != 1) {
+        for (pe.a0_proven[0..pe.n_a0]) |a| std.debug.print("[dbg] a0_proven ${x:0>6}\n", .{a});
+        for (pe.xl_sites[0..pe.n_xl]) |a| std.debug.print("[dbg] xl_site   ${x:0>6}\n", .{a});
+    }
+    try testing.expectEqual(@as(usize, 0), pe.n_a0);
+    try testing.expectEqual(@as(usize, 1), pe.n_xl);
+    try testing.expectEqual(@as(u32, 0x8012), pe.xl_sites[0]);
+
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, pe, false, true, &.{}, false, 0, copy_reserve, null, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u32, 1), res.stats.xl_pins);
+    try testing.expectEqual(@as(u8, 0xBA), res.image[0x0005]); // addr half stays stock
+    try testing.expectEqual(@as(u8, 0xB0), res.image[0x0006]); // bank byte stays stock
+    try testing.expectEqual(@as(u8, 0x5C), res.image[0x000D]); // BD site is a JML thunk
 }

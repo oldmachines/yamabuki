@@ -733,7 +733,25 @@ pub fn Console(comptime cfg: CoreConfig) type {
                             (self.bus.peek8(@intCast(ppc -% 3)) orelse 0) == 0xA5) or
                             ((self.bus.peek8(@intCast(ppc -% 1)) orelse 0) == 0xAB and
                                 (self.bus.peek8(@intCast(ppc -% 3)) orelse 0) == 0xD4);
-                        if (shp and dp_op < 0x10) {
+                        // The `LDA $abs,X / PHA / PLB / PLB` HIGH-byte pin: a
+                        // 16-bit table word whose LOW byte is an ADDRESS HALF
+                        // and whose high byte is the bank. Value-proving the
+                        // chain here credits whichever half the staging ended
+                        // on — measured: Super Metroid's door tilesheet
+                        // record at $20:E276, whose addr-hi $BA was re-banked
+                        // -$80 as if it were a bank, so the Ceres escape's
+                        // sprite-tile builder read $B0:3Axx (zeros) and the
+                        // beam/door sprites rendered blank. A dual-role table
+                        // word can never be value-rewritten; the pin site
+                        // gets a translate-in thunk instead.
+                        const shp_absx = (self.bus.peek8(@intCast(ppc -% 1)) orelse 0) == 0xAB and
+                            (self.bus.peek8(@intCast(ppc -% 2)) orelse 0) == 0x48 and
+                            (self.bus.peek8(@intCast(ppc -% 5)) orelse 0) == 0xBD and
+                            (std.mem.readInt(u16, &[2]u8{
+                                self.bus.peek8(@intCast(ppc -% 4)) orelse 0xFF,
+                                self.bus.peek8(@intCast(ppc -% 3)) orelse 0xFF,
+                            }, .little)) < 0x2000;
+                        if ((shp and dp_op < 0x10) or shp_absx) {
                             pb.addXlSite(ppc);
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == tb)
@@ -811,7 +829,27 @@ pub fn Console(comptime cfg: CoreConfig) type {
                             self.pei_dp
                         else
                             self.bus.peek8(pc -% 2) orelse 0xFF;
-                        if ((shape_lda or pei_pin) and dp_op < 0x10) {
+                        // The `LDA $abs,X / PHA / PLB / PLB` HIGH-byte pin
+                        // over a low-WRAM table: the 16-bit word is
+                        // dual-role (low = an address half, high = the
+                        // bank), so NEITHER half may value-prove — the
+                        // eager prove here is what re-banked SM's door
+                        // tilesheet addr-hi $BA at $20:E276 to $3A and
+                        // blanked the Ceres escape's beam/door sprites. The
+                        // SECOND pull records a translate site; the FIRST
+                        // (the transient low byte in DBR) records nothing.
+                        const absx_hi = (self.bus.peek8(pc -% 1) orelse 0) == 0xAB and
+                            (self.bus.peek8(pc -% 2) orelse 0) == 0x48 and
+                            (self.bus.peek8(pc -% 5) orelse 0) == 0xBD and
+                            (@as(u16, self.bus.peek8(pc -% 3) orelse 0xFF) << 8 |
+                                (self.bus.peek8(pc -% 4) orelse 0xFF)) < 0x2000;
+                        const absx_lo = (self.bus.peek8(pc -% 1) orelse 0) == 0x48 and
+                            (self.bus.peek8(pc -% 4) orelse 0) == 0xBD and
+                            (@as(u16, self.bus.peek8(pc -% 2) orelse 0xFF) << 8 |
+                                (self.bus.peek8(pc -% 3) orelse 0xFF)) < 0x2000;
+                        if (absx_lo) {
+                            // transient low pull — the next PLB decides
+                        } else if ((shape_lda or pei_pin) and dp_op < 0x10 or absx_hi) {
                             pb.addXlSite(pc);
                         } else if (self.dbr_src != none and
                             self.bus.peek8(@intCast(self.dbr_src)) == self.cpu.regs.dbr)
