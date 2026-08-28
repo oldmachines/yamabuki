@@ -283,6 +283,84 @@ harvested. Method note: a save-state-anchored recording restores the OLD
 build's VRAM - it can prove a bug but never a fix; power-on surfaces prove
 fixes.
 
+### 4d. The door: a freeze and a confetti column (player report #6)
+
+The first playthrough ever to WALK THROUGH the Ceres door ("bullets are now
+fired, door still garbled, game freezes when going through the door") surfaced
+four more defects - the door path had never been covered by any surface:
+
+1. **The freeze: an uncovered JSL chain.** The door transition at `$82:E1CA`
+   is three literal `JSL $A0:xxxx` calls; none were covered, so none were
+   de-mirrored, and the first jumped into MB2 garbage - straight to SM's
+   crash trap (decoded from the frozen machine's un-pulled stack frames).
+   Harvesting the crash recording fixed call #1 only: the recording died
+   inside the callee, so the frontier froze one call further each time.
+2. **The walker guard froze the coverage frontier.** The inline-params rule
+   (stop a covered JSL's fall-through when the return is uncovered) is
+   correct for calls that skip parameter blocks - the profile marks the
+   real return a few bytes on - but it also stopped at calls the profiled
+   run DIED inside. The guard now discriminates by dynamic coverage within
+   32 bytes after the call: present = params (stop); dead = never returned
+   (fall through). One regeneration then de-mirrored all three JSLs.
+3. **The uncapped dispatcher scan was planting rewrites in data,
+   image-wide.** The pointer-literal descent's raw scans match any
+   `$6C/$7C/$FC/$DC` byte naming an active low-WRAM cell. Three megabytes
+   of data supply those coincidences by the thousand: the census found
+   **3,526 planted bytes** in the data half alone - each a fake dispatcher
+   whose "operand" the window shift then rewrote (+$60 on the high byte).
+   The uncap in `22fd4a2` unleashed this: the old 64-slot list was
+   accidental protection. One plant sat in the door's own tile stream
+   (`FC FC 0A` read as `JSR ($0AFC,X)`, `$0A -> $6A` at file `0x1C8D09`)
+   and the decompressor's back-references would have cascaded it; the
+   other plants garble tilesets of rooms the profiled surfaces never
+   visit. Two-layer fix: bytes the profile READ without executing are
+   never dispatcher candidates, and the raw scans run only in banks
+   containing at least one dynamically-executed opcode - dispatchers are
+   code, and real ones (the cutscene chain at `$02:E16F/$02:E28F`) live
+   amid covered code; pure data banks supply only coincidences. Real,
+   necessary - and NOT the confetti's cause: with every plant reverted
+   the door band was still garbage. The money check exposed it.
+4. **The confetti itself: an unproven bank staged through a 16-bit
+   `STA $4313`.** The door tile-sheet upload is a DMA from `$B0:C400`.
+   SM arms it from its DMA job queue: three overlapping 16-bit stores
+   (`$4312`, then `$4313` = A1T-hi low half + A1B high half), each fed by
+   `LDA $00D3,Y` from the low-WRAM queue cell - the bank byte never
+   touches an 8-bit store or a direct ROM load, so no existing provenance
+   family saw it. Unproven, `$B0` kept mirror-intent semantics and the
+   conversion's DMA read the MB2 home (file `0x284400` - note the MB2
+   file math is `0x200000 + (bank-0xA0)*0x8000 + off`, an early slip
+   used `0x204400` and hid the match) instead of the MB1 identity home
+   (`0x184400`) that stock reads. Band after the arming DMA: 24/1024
+   bytes correct, every conversion since the beginning. The fix is a new
+   provenance arm for 16-bit `$43x3`-family stores with mdr in
+   `$A0-$DF`: prefer a direct ROM load's end, else the queue cell's high
+   byte resolved through the `src_any` copy-chain (the resolution that
+   survives RAM staging - the strict chain is already broken there),
+   guarded by `peek8(src) == mdr`, misses logged as unresolved sites.
+   One new proof (`$26:F74C`, the room record's bank byte), zero
+   unresolved, and the band went **1024/1024**. A belt-and-braces
+   runtime thunk (`$43x4` column, full misfit map, >2MiB images) now
+   also rides `rebankDasbWrites` for 8-bit A1B stores the static proof
+   may miss.
+
+Diagnostic path worth keeping: paired port-write value streams with offset
+alignment found a seed write; a clock bisect over paired short captures
+bracketed it to one frame; the decompressor's dp `$47` pointer at that
+moment named the stream's ROM home; a windowed diff found the byte - and a
+whole-image census then revealed the byte was one of thousands. Fixing the
+mechanism STILL left the band broken, which only a standing money check
+caught: define the one decisive comparison up front (band bytes vs their
+stock file home, the frame after the arming DMA) and re-run it after every
+candidate fix. Two mechanisms can share one symptom; the census closes the
+first, the money check refuses to let you stop there. Traps recorded:
+aligned value tails can match while the machines sit at different stream
+positions (the X register differed by $15 - compare state, not just
+values); anchored recordings replay the OLD build's VRAM (they prove bugs,
+never fixes); an anchored movie's clock starts at the anchor's saved
+value, so frame-times computed as N x 357366 miss trace windows entirely;
+and when a band matches NEITHER candidate home, re-derive the file math
+before inventing a third mechanism.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
