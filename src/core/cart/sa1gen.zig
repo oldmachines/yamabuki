@@ -266,6 +266,10 @@ pub const Stats = struct {
     rewritten_hi_banks: u32 = 0,
     /// Measured $A0-$BF bank values re-banked -$80 (>2 MiB window mode).
     rewritten_a0_banks: u32 = 0,
+    /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
+    /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
+    /// by later code — see `demirrorQueueBankImms`.
+    rewritten_queue_imms: u32 = 0,
     /// Misfit-bank DBR-pin sites patched with a translate-in thunk
     /// (window mode): the pinned bank maps -$20/-$80 at runtime, the
     /// table byte stays stock.
@@ -3480,7 +3484,7 @@ fn rebankDasbWrites(
 /// the shim's Super-MMC programming ($00-$1F/$80-$9F -> MB0, $20-$3F -> MB1,
 /// $A0-$BF -> MB2), which is where the de-mirror pass parks the content.
 /// Only ROM homes are mapped; a bank with no fixed ROM home returns null.
-fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
+pub fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
     const bank: u32 = (cpu >> 16) & 0xFF;
     const a16: u32 = cpu & 0xFFFF;
     if (a16 < 0x8000) return null;
@@ -3522,6 +3526,106 @@ fn relocateHdmaIndirect(out: []u8, tables: []const u24, res: *Result) void {
             f += 3;
         }
     }
+}
+
+/// Bank immediates bound for a dispatch queue, BY SIGNATURE, coverage or
+/// not — the same stance as the `STA $00 / JMP ($0000)` macro net, and for
+/// the same reason: post-fork trajectories pull queue entries no finite
+/// stock profile can lead to. The shape is Super Metroid's sound-library
+/// enqueue:
+///
+///     consumer:  LDA $6FA6,X ... XBA / PHA / PLB / PLB
+///                (bank in the loaded word's LOW byte: the column it
+///                loads from is a BANK COLUMN)
+///     producer:  LDA #$00A3 ... STA $6FA6,X
+///                (the bank travels as a 16-bit immediate, consumed
+///                thousands of cycles later by different code)
+///
+/// The measured pointer-bank net re-banks the producers a profiled run
+/// executed; a missed one BRKs into the game's crash trap on the first
+/// off-profile timeline that pulls its entry (measured: Super Metroid's
+/// attract, where the conversion's own lag differential queues a handler
+/// stock timing never queues — and the evidence loop can never close it,
+/// because every cover replay dies at that BRK before the PLB proves the
+/// byte). The consumer's XBA/PHA/PLB/PLB tail names the column
+/// statically; every producer keyed on that exact column then re-banks by
+/// the same de-mirror map as the measured net. Columns are matched in
+/// their POST-rewrite window form ($6000-$7FFF), so the pass runs after
+/// the operand rewrites and never invents a column the walk did not
+/// already move.
+fn demirrorQueueBankImms(out: []u8, wide: bool) u32 {
+    // Pass 1: bank columns, from the consumer signature. The XBA/PHA/
+    // PLB/PLB tail is the key; the column is the last `LDA abs,X` with a
+    // window operand in the handful of bytes before it.
+    var cols: [16]u16 = undefined;
+    var n_cols: usize = 0;
+    var f: usize = 0;
+    while (f + 4 <= out.len) : (f += 1) {
+        if (!(out[f] == 0xEB and out[f + 1] == 0x48 and out[f + 2] == 0xAB and out[f + 3] == 0xAB)) continue;
+        var col: ?u16 = null;
+        var b: usize = f -| 12;
+        while (b + 3 <= f) : (b += 1) {
+            if (out[b] != 0xBD) continue;
+            const v = std.mem.readInt(u16, out[b + 1 ..][0..2], .little);
+            if (v >= wg_bw_window and v < wg_bw_window + 0x2000) col = v;
+        }
+        const c = col orelse continue;
+        var known = false;
+        for (cols[0..n_cols]) |e| {
+            if (e == c) known = true;
+        }
+        if (!known and n_cols < cols.len) {
+            cols[n_cols] = c;
+            n_cols += 1;
+        }
+    }
+    // Pass 2: producers keyed on those exact columns.
+    var n: u32 = 0;
+    for (cols[0..n_cols]) |c| {
+        f = 0;
+        while (f + 6 <= out.len) : (f += 1) {
+            if (out[f] != 0xA9 or out[f + 2] != 0x00 or out[f + 3] != 0x9D) continue;
+            if (std.mem.readInt(u16, out[f + 4 ..][0..2], .little) != c) continue;
+            const bank = out[f + 1];
+            if (bank == 0x7E or bank == 0x7F) {
+                out[f + 1] = bank - 0x3E; // WRAM -> BW-RAM $40/$41
+            } else if (wide and bank >= 0xA0 and bank <= 0xBF) {
+                out[f + 1] = bank - 0x80; // MB1 mirror -> its de-mirror home
+            } else if (wide and bank >= 0xC0 and bank <= 0xDF) {
+                out[f + 1] = bank - 0x20; // misfit bank -> its parked home
+            } else continue;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "demirrorQueueBankImms: consumer names the column, producers re-bank" {
+    var buf: [64]u8 = @splat(0x60); // RTS filler
+    // consumer: LDA $6FA6,X / STA $7786 / XBA / PHA / PLB / PLB
+    @memcpy(buf[4..14], &[_]u8{ 0xBD, 0xA6, 0x6F, 0x8D, 0x86, 0x77, 0xEB, 0x48, 0xAB, 0xAB });
+    // producers against the same column: mirror, WRAM, misfit, and native
+    @memcpy(buf[20..26], &[_]u8{ 0xA9, 0xA3, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[26..32], &[_]u8{ 0xA9, 0x7E, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[32..38], &[_]u8{ 0xA9, 0xC5, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[38..44], &[_]u8{ 0xA9, 0x33, 0x00, 0x9D, 0xA6, 0x6F }); // already native: untouched
+    // a producer against a DIFFERENT column: untouched
+    @memcpy(buf[44..50], &[_]u8{ 0xA9, 0xA3, 0x00, 0x9D, 0xB0, 0x6F });
+    try testing.expectEqual(@as(u32, 3), demirrorQueueBankImms(&buf, true));
+    try testing.expectEqual(@as(u8, 0x23), buf[21]);
+    try testing.expectEqual(@as(u8, 0x40), buf[27]);
+    try testing.expectEqual(@as(u8, 0xA5), buf[33]);
+    try testing.expectEqual(@as(u8, 0x33), buf[39]);
+    try testing.expectEqual(@as(u8, 0xA3), buf[45]);
+    // narrow image: the de-mirror arms stay put, WRAM still re-banks
+    var buf2: [64]u8 = buf;
+    buf2[21] = 0xA3;
+    buf2[27] = 0x7E;
+    buf2[33] = 0xC5;
+    try testing.expectEqual(@as(u32, 1), demirrorQueueBankImms(&buf2, false));
+    try testing.expectEqual(@as(u8, 0xA3), buf2[21]);
+    try testing.expectEqual(@as(u8, 0x40), buf2[27]);
+    try testing.expectEqual(@as(u8, 0xC5), buf2[33]);
 }
 
 /// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
@@ -5740,10 +5844,25 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         sites[n_sites] = .{ .file = file, .kind = kind, .reg = v, .idx = idx };
                         n_sites += 1;
-                    } else return refuse(refusal, .{
-                        .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
-                        .detail = cpu_addr,
-                    });
+                    } else {
+                        // Window mode: leave the site native rather than
+                        // refuse. If DBR is really WRAM at runtime, the
+                        // value re-bank to $40/$41 makes the native absolute
+                        // read the moved byte anyway — linear BW-RAM carries
+                        // the whole 64 KiB, not just the window's 8 —  and
+                        // under any other DBR the read returns what stock's
+                        // bus returned (open bus, cart space), except the
+                        // window range itself, which verification arbitrates.
+                        // Measured on Super Metroid: Ridley's AI does
+                        // LDA $7820 under an unproven DBR (open bus on the
+                        // stock cart) and refused the whole conversion over
+                        // a read the game discards.
+                        if (window) continue;
+                        return refuse(refusal, .{
+                            .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
+                            .detail = cpu_addr,
+                        });
+                    }
                 },
                 .long, .long_x => {
                     const b = image[file + 3];
@@ -6514,6 +6633,7 @@ pub fn convertWholeGame(
             }
         }
     }
+    if (bwram) res.stats.rewritten_queue_imms += demirrorQueueBankImms(out, out.len > 0x20_0000);
     // Measured pointer-bank sources: table bytes (and immediate operands
     // the shape pass above didn't already reach) that carry $7E/$7F into
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is

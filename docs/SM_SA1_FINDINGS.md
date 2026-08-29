@@ -369,6 +369,81 @@ and `$7F:B0B8` - and the f14999 frames are otherwise pixel-identical.
 Cosmetic, one cell, invisible to `--verify-behavioral`; the blink
 routine's data source is the suspect for a future pass.
 
+## 4e. The attract-demo arc: off-profile timelines and two new nets
+
+A fresh regeneration campaign (2026-08-29, this time from the merged
+generator on main) chased the OTHER surface nobody had verified: power-on
+with no input. v8 froze black at f2779 forever; stock is pixel-identical
+through f2935 (the title fade is stock behavior) and comes back with the
+intro at f2936. Root cause was the familiar one — the intro/attract loaders
+in banks $8F-$91 were byte-identical to stock, unrewritten, because every
+campaign surface pressed Start — and the familiar fix (an idle 36,000-frame
+attract surface; coverage is the union of surfaces) covered them. What the
+arc then surfaced was new, and both holes shared one shape: **the
+conversion's own lag differential forks its timeline onto paths no stock
+profile can lead**, where evidence-gated rewrites can never fire.
+
+1. **Queue-bank immediates** (`a9 a3 00 9d a6 6f` at file 0x102404): the
+   sound library enqueues a handler bank as a 16-bit immediate into the
+   queue column $0FA6/$6FA6,X; the `$20:9088` XBA dispatch PLBs it
+   thousands of cycles later. The measured pointer-bank net had re-banked
+   the SIX sibling enqueue sites the profiled runs executed; the seventh
+   fired only on the conversion's laggy attract, jumped to `$A3:804C` (MB2
+   garbage on the shim map), and BRK'd into the crash trap — and the
+   evidence loop can NEVER close it, because every cover replay dies at
+   that BRK before the PLB proves the byte. Now rewritten BY SIGNATURE
+   (`demirrorQueueBankImms`): the consumer's XBA/PHA/PLB/PLB tail names
+   the bank column statically, and every `LDA #imm16 / STA column,X`
+   producer re-banks by the same de-mirror map. Same stance as the
+   `STA $00 / JMP ($0000)` macro net, for the same reason.
+
+2. **Indirect-HDMA table evidence starved by scroll-effect churn**
+   ($88:D932, per-scanline $2105 pointers $07EB/$07EC): the Ceres ARRIVAL
+   arms the same class of table the escape's fix (§4a) relocated, and the
+   gameplay surface evidenced it 14,680 times — yet it never reached the
+   relocation pass. `addHdmaTable` was a silent drop at capacity, and a
+   scrolling HDMA effect re-arms with a SHIFTED table base every frame,
+   so its distinct-address family is unbounded: the attract surface's
+   scroll churn ($88:B6xx/$88:C0xx at 3-byte strides) fills ANY fixed
+   list before a later surface's table arms — a cap bump to 128 changed
+   nothing. Symptom: game logic byte-identical (state, every PPU register
+   write, VRAM, OAM), picture a full-screen striped tile-sheet — the
+   per-scanline BG-mode HDMA fetching the abandoned low-WRAM mirror. The
+   list is a FIFO ring now: re-arms are dedup no-ops, so a table that
+   still arms re-enters at worst one eviction later, and the relocation
+   walk is idempotent, so a shifted base costs a slot but never a wrong
+   byte. Cover harvests also MERGE armed HDMA tables from the
+   conversion-side replay (guarded on the table's first byte), for a
+   table only an off-profile timeline arms.
+
+Diagnostics that earned their keep on #2, in order: `--hash-stream` tail
+repeat-length (a "distinct pictures" count hides a freeze; the tail run
+does not); set-intersection of picture streams against stock to find the
+first permanently-divergent frame; `--bg-disable`/`--hdma-disable` layer
+bisection (Samus rendered perfectly under the garbage — logic was never
+suspect); a save-state reload to rule out stale renderer caches; and
+`--dump-ppu`'s new full-CGRAM line. Two traps: identical POST-frame
+register dumps prove nothing about per-scanline HDMA state, and a
+hand-fixed cover image fails the byte-identity guard for exactly the bytes
+it fixed — guard on the table's count byte, not its pointers.
+
+Also landed on this arc: window mode leaves $2000-$7FFF absolutes under an
+unproven DBR native instead of refusing the whole conversion
+(`wg_wram_beyond_bwram`). Ridley's AI does `LDA $7820` under a low DBR —
+open bus on the stock cart, a read the game discards. Leaving the site
+native is sound: a runtime-WRAM DBR re-banks to $40/$41, where the linear
+BW-RAM image carries the whole 64 KiB, so the native absolute reads the
+moved byte anyway; any other DBR reads what stock's bus returned, except
+the window range itself, which behavioral verification arbitrates.
+Whole-game mode still refuses.
+
+The surfaces this arc verifies with: `sm-attract36k.ymv` (36,000 zero-input
+frames) and `sm-play-death.ymv` (38,000 frames: intro, Ceres arrival, five
+rooms, the Ridley fight taken to a death, game over, CONTINUE, respawn —
+scripted blind against position telemetry at `$0AF6/$0AFA/$079B/$09C2`,
+end-hash verified), plus a Start-path cover pair on the previous
+conversion to arm the arrival table.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:

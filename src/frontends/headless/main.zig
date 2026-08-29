@@ -651,7 +651,7 @@ fn dumpVram(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
 /// is actually non-empty.
 fn dumpPpu(io: std.Io, out: *std.Io.Writer, con: *core.AnyConsole, path: []const u8) void {
     const p = &con.fast.bus.ppu;
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     w.print("bg_mode={d} force_blank={} brightness={d} main_screen(TM)=0x{x:0>2} sub_screen(TS)=0x{x:0>2}\n", .{
         p.bg_mode, p.force_blank, p.brightness, p.main_screen, p.sub_screen,
@@ -714,6 +714,9 @@ fn dumpPpu(io: std.Io, out: *std.Io.Writer, con: *core.AnyConsole, path: []const
     // CGRAM digest: same tiles + same tilemap rendering differently can
     // only be the palette (measured: SM's Ceres room corrupts to stripes
     // when CGRAM diverges while VRAM stays identical).
+    w.print("cgram_full=", .{}) catch {};
+    for (p.cgram) |cw| w.print("{x:0>4}", .{cw}) catch {};
+    w.print("\n", .{}) catch {};
     var cgsum: u32 = 0;
     for (p.cgram) |c| cgsum +%= c;
     w.print("cgram_sum={x:0>8} bg1pal={x:0>4},{x:0>4},{x:0>4},{x:0>4} bg2pal={x:0>4},{x:0>4}\n", .{
@@ -2318,7 +2321,23 @@ fn runSa1Gen(
             ptr_ev.addProven(ca);
             if (ptr_ev.n_proven != before) merged_pb += 1;
         }
-        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb });
+        // Armed indirect-HDMA tables merge too: a table armed only on the
+        // conversion's own post-fork timeline (a cutscene skip, a lag-only
+        // path) is exactly the one whose low-WRAM pointers the stock-side
+        // profile can never evidence — the Ceres ARRIVAL's per-scanline
+        // $2105 table, where the escape's had already been caught by the
+        // stock surfaces. Guarded on the table's first byte the way the
+        // other merges are guarded: a home whose count byte differs
+        // between the images is this conversion's own scaffolding.
+        var merged_ht: u32 = 0;
+        for (cover_pb.hdma_tables[0..cover_pb.n_hdma_tables]) |t| {
+            const file = core.sa1gen.loromFileOffset(image.len, t) orelse continue;
+            if (file >= ci.len or image[file] != ci[file]) continue;
+            const before = ptr_ev.n_hdma_tables;
+            ptr_ev.addHdmaTable(t);
+            if (ptr_ev.n_hdma_tables != before) merged_ht += 1;
+        }
+        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven, {} armed HDMA table(s) from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb, merged_ht });
         try out.flush();
     }
     for (dbg_site_ev[0..dbg_n_site_ev]) |p| {
@@ -3366,6 +3385,11 @@ fn reportSa1(
             try out.print(
                 "  measured value rewrites: {} pointer-bank byte(s) re-banked, {} dp,X\n  pointer word(s) pre-shifted -$6000, {} dma-addr word(s) pre-shifted\n  +$6000 (addressing state travelling as data — the idioms operand\n  rewrites cannot reach)\n",
                 .{ res.stats.rewritten_ptr_banks, res.stats.rewritten_idx_words, res.stats.rewritten_dma_addrs },
+            );
+        if (res.stats.rewritten_queue_imms != 0)
+            try out.print(
+                "  {} queue-bank immediate(s) re-banked BY SIGNATURE (LDA #imm16 staged\n  into a dispatch queue's bank column and PLB'd by later code — the\n  XBA/PHA/PLB/PLB consumer names the column; no coverage required)\n",
+                .{res.stats.rewritten_queue_imms},
             );
         if (res.stats.rewritten_dasb != 0)
             try out.print(
