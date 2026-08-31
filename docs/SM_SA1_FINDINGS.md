@@ -444,6 +444,122 @@ scripted blind against position telemetry at `$0AF6/$0AFA/$079B/$09C2`,
 end-hash verified), plus a Start-path cover pair on the previous
 conversion to arm the arrival table.
 
+## 4f. The player-driven arc: six bugs found by playing (v19-v24)
+
+The attract arc (§4e) closed the no-input surface. What followed was the
+opposite method: a person played the conversion in the SDL player, recorded
+`.ymv` movies when it broke, and each recording became a coverage surface.
+Six failures fell out, and every one was code no surface had executed. The
+loop is cheap and it works — but §4f exists mostly to record where it
+*stopped* working, because that is the part worth knowing next time.
+
+| conv | failure | site | closed by |
+|---|---|---|---|
+| v18 | Start pressed DURING the title fade takes SM's intro-SKIP path (stock warps to Zebes's gunship landing, no Ceres); the conversion idled black forever at the `$80:8346` NMI wait | uncovered intro-skip loader | `sm-titleskip.ymv` surface |
+| v19 | Ridley's grab attack BRK'd into the crash trap | `$26:DF59 JSL $A0:A497`, byte-identical to stock | player recording as a cover pair |
+| v20 | after the escape countdown starts, Samus never regains control — game running, pad polled, input landing correctly in the moved home | `$90:E200 LDA $0DD0` read the ABANDONED home; the escape flag lives at `$6DD0`, so the `BEQ` was always taken | player recording as a cover pair |
+| v22 | "the decor is wrong and Samus cannot progress" in the room behind Ridley's | NOT a room bug — see below | player recording as a cover pair |
+| v22 | backtrack loader ran its countdown past zero in MB2 garbage | `$26:E877 JSL $A0:C0AE`, byte-identical to stock | hand byte (see the poisoning note) |
+
+### The misdiagnosis worth remembering
+
+"The decor is wrong and Samus cannot progress" reads as a room-load bug, and
+three probes were spent there: the level-data buffer (healthy — 16.5k live
+bytes, correct moved home, nothing in the abandoned mirror), the BG tilemaps
+(healthy — 80 distinct tile indices, max `$219`, sane palette selectors,
+structured fills), and the CGRAM upload DMA (correct — `$40:C000`, 512 bytes,
+all three differing bytes vs stock are proper window rewrites).
+
+It was none of those. The player had **died during the escape**, and the
+death sequence was wedged:
+
+```
+$0998 = 0013   (death sequence, not $0008 gameplay)
+$09C2 = 0      $0A1C = 0054 (death pose)
+$0DD0 = 0000   (escape flag cleared by the death handler)
+palette buffer $40:C000 = 182/512 bytes, FROZEN
+```
+
+The "garbled decor" was the death fade stopped part-way; "cannot progress"
+was the death pose frozen. Dying to Ridley in a normal room — which
+`sm-play-death.ymv` covers — is a DIFFERENT handler from dying during the
+escape, which nothing covered. The discriminator that cracked it: advance a
+save state 900 frames and diff. Palette, position, HP and state all
+identical means a stalled state machine, which no room-load bug produces. A
+healthy tilemap under a wrong-coloured screen says the same thing and says
+it earlier — weight it.
+
+### Harvesting a CRASHED run poisons coverage
+
+The `$26:E877` crash could not be closed by coverage, because **the run that
+covers the site is the run that crashes on it**. Feeding that recording to
+`--cover-movie` made three consecutive generations refuse:
+
+```
+refused: an executed instruction (block move, BRK/COP, STP) cannot run on
+the SA-1 side  at $20:c0b3
+```
+
+`$20:C0B3` is the OPERAND byte of `LDX #$0000`, not an instruction. The
+crash's garbage execution ran at `$A0:C0Bx`, and the harvest's file mapping
+is `(pc >> 16) & 0x7F` — a true mirror on a <=2 MiB LoROM, but on a >2 MiB
+shim-mapped image `$A0-$BF` is **MB2**, a different megabyte. So garbage
+executed in one bank was credited to another bank's file bytes, marking an
+operand as an instruction start. Statically-walked code SKIPS these opcodes
+(`sa1gen.zig`, the `static_skipped` arm); code the map calls *executed*
+refuses on them.
+
+The refusal reproduced identically with an experimental net applied, with
+that net plus a partial mapping fix, and with **both reverted** — which is
+what proved the recording itself was the cause. Fixing the guard is not
+enough: coverage is merged at the raw CPU address, so conversion-side
+coverage must be translated through the shim map back to stock CPU addresses
+before merging, not masked. Until then, do not pass a crashed recording as a
+cover surface.
+
+Two happier notes from the same mechanism. A cover pair whose image already
+contains a hand fix lets the generator *derive* that fix: v23 carried one
+hand byte at file `0x13687A`, the site then executed correctly under
+`--cover-movie`, and v24 emitted `22 ae c0 20` on its own — zero hand bytes,
+the first fully machine-generated build since v18. And a HUNG recording is
+safe to harvest; only a crashed one poisons.
+
+### The mirror-JSL class is large and still open
+
+Three of the six failures were the same shape: an uncovered
+`JSL $A0-$BF:addr` that lands in MB2 and BRKs. A census of v22 found **51
+distinct mirror-bank targets across 628 call sites** whose de-mirrored twin
+`JSL $20-$3F:addr` ALREADY appears in the converted image — including
+`$A0:A497`, the Ridley routine proved by hand. The repetition (20-77 calls
+per target) is what distinguishes them from data noise, and the bytes settle
+it: `$20:C0AE` is a real prologue (`PHP / REP #$30 / PHX / LDX #$0000`),
+while `$A0:C0AE` under the shim is garbage containing a `$44` block move.
+
+A twin-evidence net was drafted (rewrite the mirror form when its
+de-mirrored twin exists, guarded on target `>= $8000`) and NOT landed. It
+rewrites 628 bytes, which makes ~51 routines newly reachable, and the walk
+then descends into them treating net-discovered entries as executed code —
+refusing on ops it would have skipped had it found them statically. The
+prerequisite is teaching the walk to apply static-walk rules to
+net-discovered entries. Sequence for whoever picks this up: fix the harvest
+bank translation, which unblocks harvesting crashed runs, which unblocks the
+net, which closes all 51 at once instead of one per play session.
+
+### The surface set these conversions verify with
+
+Stock-side (`--movie`): `sm-attract36k.ymv` (36,000 zero-input frames),
+`sm-play-death.ymv` (38,000f: intro, Ceres, five rooms, the Ridley fight
+taken to a death, game over, CONTINUE, respawn), `sm-titleskip.ymv`
+(15,000f: Start during the title fade, then the Zebes landing).
+Conversion-side (`--cover-image` + `--cover-movie`), each pairing a previous
+conversion with a recording made on it: v9/v10 idle runs, a v15 Start-path
+run, and player recordings on v19, v20, v21 and v23. The exact invocation is
+written beside every generated patch as `<out>.bps.cmd`.
+
+**These movies are not in the repo and are not reproducible by hand** — they
+are hours of real play. Keep them somewhere durable and reference them from
+the `.cmd`; a scratchpad does not survive the session.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -516,6 +632,13 @@ different" dead-ends were just a register the dump didn't yet print.
 
 - The `$94:98E9` twin cutscene handler and the `$00:840F` `$7F`-fill loop are
   still uncovered/stock (never executed by any surface).
+- **51 mirror-bank `JSL` targets / 628 call sites remain unrewritten** (§4f):
+  each is a latent BRK on the first play that reaches it. Three have been
+  closed one at a time by coverage; the general net is blocked on the
+  harvest bank translation.
+- The cover harvest maps conversion-side coverage with `(pc >> 16) & 0x7F`,
+  which is wrong for >2 MiB images where `$A0-$BF` is MB2 (§4f). This
+  silently mis-credits any coverage harvested from those banks.
 - Tiny-base `abs,X` reads under mirror DBRs in the door path
   (`$02:DE06`, `$02:DF44+`) are left stock with pure-ROM evidence; safe on the
   recorded paths, same split class if a path ever lands them in low WRAM.
