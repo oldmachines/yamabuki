@@ -3391,6 +3391,11 @@ fn reportSa1(
                 "  {} queue-bank immediate(s) re-banked BY SIGNATURE (LDA #imm16 staged\n  into a dispatch queue's bank column and PLB'd by later code — the\n  XBA/PHA/PLB/PLB consumer names the column; no coverage required)\n",
                 .{res.stats.rewritten_queue_imms},
             );
+        if (res.stats.rewritten_twin_jsls != 0)
+            try out.print(
+                "  {} mirror-bank JSL(s) re-banked on their DE-MIRRORED TWIN's\n  evidence — uncovered call sites whose target is already called in\n  its $20-$3F form by covered code (>=2 calls). The class that cost\n  three player-found freezes; no coverage required\n",
+                .{res.stats.rewritten_twin_jsls},
+            );
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",

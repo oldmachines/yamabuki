@@ -32,8 +32,3 @@ patches/*.ips
 zig-out-cli/
 zig-out-gen/
 *.log
-
-# Generated SA-1 conversion payloads. Same rule as patches/: the repo carries
-# the recipe (the .bps.cmd written beside each patch) and the surfaces that
-# produced it, never the patch itself.
-tests/surfaces/**/*.bps

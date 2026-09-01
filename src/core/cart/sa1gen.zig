@@ -226,6 +226,9 @@ pub const Stats = struct {
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
+    /// Mirror-bank `JSL`s re-banked on their de-mirrored twin's evidence,
+    /// at sites no coverage reached — see `demirrorTwinJsls`.
+    rewritten_twin_jsls: u32 = 0,
     /// Battery-SRAM sites re-banked into BW-RAM $20000+ (bank $42), offsets
     /// normalized by the chip's mirror mask.
     rewritten_sram: u32 = 0,
@@ -3600,6 +3603,141 @@ fn demirrorQueueBankImms(out: []u8, wide: bool) u32 {
     return n;
 }
 
+/// Mirror-bank `JSL`s in code no surface reached, re-banked on the evidence
+/// of their own de-mirrored twin.
+///
+/// Three of the six freezes Super Metroid's players found (findings §4f)
+/// were one shape: a `JSL $A0-$BF:addr` at a site byte-identical to stock.
+/// Nothing flags it — it is simply code no surface executed and the static
+/// walk never reached, and the de-mirror pass above is coverage-gated.
+/// Under the shim, region 3 carries MB2, so the call lands in a different
+/// megabyte and BRKs. A census of one build found 51 distinct targets
+/// across 628 call sites: one freeze per play session, indefinitely.
+///
+/// The proof that needs no coverage is the routine's OWN de-mirrored form.
+/// In the CONVERTED image the same entry is already called as
+/// `JSL $20-$3F:addr` by code that IS covered, and called repeatedly — the
+/// observed counts run 20-77 per target. (Stock has no such call: Super
+/// Metroid reaches everything through $80-$DF. The twin is minted by the
+/// coverage-gated de-mirror pass, and this pass spends it.) So the mirror form names MB1 content, and re-banking it -$80 is
+/// exactly the rewrite the de-mirror pass would have made had a surface
+/// reached the site.
+///
+/// Two consequences of keying on the twin, both load-bearing:
+///
+///   * It stays off data. A byte triple in compressed graphics must be
+///     preceded by `$22` AND match one of a few dozen specific 24-bit entry
+///     addresses; over a 3 MiB image that is ~0.04 expected false hits.
+///   * It introduces no new code for the walk to arbitrate. A covered call
+///     to the twin is *why* the body is evidenced, so `extendCoverage` has
+///     already walked and rewritten it (`$A0 & 0x7F` is `$20` — the walk's
+///     LoROM fold happens to be the de-mirror for this range). This net
+///     rewrites operands only, which is what makes it landable where a
+///     blind 628-byte rewrite was not.
+fn demirrorTwinJsls(gpa: std.mem.Allocator, image: []const u8, out: []u8, cov: []const u8) !u32 {
+    // Covered calls per de-mirrored target, indexed by bank $20-$3F and
+    // addr16 >= $8000 — the only shape a twin can have. Saturating u8.
+    const calls = try gpa.alloc(u8, 0x20 * 0x8000);
+    defer gpa.free(calls);
+    @memset(calls, 0);
+
+    var bank: u32 = 0;
+    while (bank < 0x40) : (bank += 1) {
+        const bank_file = bank * 0x8000;
+        if (bank_file >= image.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x1_0000) : (a16 += 1) {
+            const cpu = (bank << 16) | a16;
+            if ((cov[cpu] | cov[0x80_0000 | cpu]) & usage_map.flag_opcode == 0) continue;
+            const file = bank_file + (a16 - 0x8000);
+            // Read the CONVERTED image: stock never writes the $20-$3F form
+            // (Super Metroid calls everything through $80-$DF), so the twin
+            // exists only after the coverage-gated de-mirror pass above has
+            // rewritten the covered sites. That pass is what mints the
+            // evidence this one spends.
+            if (file + 3 >= image.len or out[file] != 0x22) continue;
+            const tb = out[file + 3];
+            if (tb < 0x20 or tb > 0x3F) continue;
+            const t = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            if (t < 0x8000) continue;
+            const idx = (@as(usize, tb - 0x20) << 15) | (t - 0x8000);
+            if (calls[idx] != 0xFF) calls[idx] += 1;
+        }
+    }
+
+    // Now the sites nothing reached. Scanned over the whole file, because
+    // "the walk never got here" is the defining property of the class.
+    var n: u32 = 0;
+    var file: usize = 0;
+    while (file + 3 < image.len) : (file += 1) {
+        if (image[file] != 0x22) continue;
+        const bk = image[file + 3];
+        if (bk < 0xA0 or bk > 0xBF) continue;
+        if (out[file + 3] != bk) continue; // already rewritten; not ours
+        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+        if (t < 0x8000) continue;
+        const idx = (@as(usize, bk - 0xA0) << 15) | (t - 0x8000);
+        if (calls[idx] < 2) continue; // one call is a coincidence
+        out[file + 3] = bk - 0x80;
+        n += 1;
+    }
+    return n;
+}
+
+test "demirrorTwinJsls: twin evidence re-banks the mirror form, once is not enough" {
+    const gpa = testing.allocator;
+    var img: [0x18_0000]u8 = @splat(0);
+    // Two covered calls to $A0:C0AE, in bank $00 at $8000 and $8004. Stock
+    // spells them the mirror way; the de-mirror pass has already re-banked
+    // them in `out`, which is the only place the twin evidence exists.
+    img[0] = 0x22;
+    img[1] = 0xAE;
+    img[2] = 0xC0;
+    img[3] = 0xA0;
+    img[4] = 0x22;
+    img[5] = 0xAE;
+    img[6] = 0xC0;
+    img[7] = 0xA0;
+    // One covered call to $21:9000 — evidenced only once.
+    img[8] = 0x22;
+    img[9] = 0x00;
+    img[10] = 0x90;
+    img[11] = 0x21;
+    // Uncovered mirror forms of both, plus a mirror JSL to an unevidenced
+    // target and one whose addr16 is not in the ROM half.
+    const u = 0x10_0000;
+    img[u + 0] = 0x22;
+    img[u + 1] = 0xAE;
+    img[u + 2] = 0xC0;
+    img[u + 3] = 0xA0; // -> re-banked
+    img[u + 4] = 0x22;
+    img[u + 5] = 0x00;
+    img[u + 6] = 0x90;
+    img[u + 7] = 0xA1; // one twin call only -> left alone
+    img[u + 8] = 0x22;
+    img[u + 9] = 0x34;
+    img[u + 10] = 0xD2;
+    img[u + 11] = 0xB7; // no twin evidence -> left alone
+    img[u + 12] = 0x22;
+    img[u + 13] = 0x10;
+    img[u + 14] = 0x00;
+    img[u + 15] = 0xA0; // addr16 below $8000 -> left alone
+
+    const cov = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(cov);
+    @memset(cov, 0);
+    for ([_]u32{ 0x008000, 0x008004, 0x008008 }) |c| cov[c] = usage_map.flag_opcode;
+
+    var out: [0x18_0000]u8 = img;
+    out[3] = 0x20; // what the coverage-gated de-mirror pass produced
+    out[7] = 0x20;
+    try testing.expectEqual(@as(u32, 1), try demirrorTwinJsls(gpa, &img, &out, cov));
+    try testing.expectEqual(@as(u8, 0x20), out[u + 3]);
+    try testing.expectEqual(@as(u8, 0xA1), out[u + 7]);
+    try testing.expectEqual(@as(u8, 0xB7), out[u + 11]);
+    try testing.expectEqual(@as(u8, 0xA0), out[u + 15]);
+}
+
 test "demirrorQueueBankImms: consumer names the column, producers re-bank" {
     var buf: [64]u8 = @splat(0x60); // RTS filler
     // consumer: LDA $6FA6,X / STA $7786 / XBA / PHA / PLB / PLB
@@ -6078,6 +6216,10 @@ pub fn convertWholeGame(
         }
     }
     res.stats.rewritten_demirror = n_demirror;
+    // The class the coverage-gated pass above structurally cannot see:
+    // mirror JSLs at sites no surface and no walk ever reached.
+    if (image.len > 0x20_0000)
+        res.stats.rewritten_twin_jsls = try demirrorTwinJsls(gpa, image, out, cov);
     res.stats.expanded_to = if (win_expand_to > image.len) win_expand_to else 0;
     {
         var ab: u32 = 0;

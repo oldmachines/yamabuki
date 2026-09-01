@@ -16,12 +16,17 @@ Treat deletion as a code change.
 
 | kind | origin | replaceable? |
 |---|---|---|
-| `*.bps.cmd` | written by the generator beside its own patch | yes, by re-running |
+| `*.bps` + `*.bps.cmd` | the generated patch and the exact invocation that made it | yes, by re-running the `.cmd` |
 | `scripted/*.ymv` | `tools/sm_surfaces.py` | yes, bit-identically |
 | `recordings/*.ymv` | a person playing in the SDL player | **no. Never.** |
 
-`.bps` payloads are deliberately absent, matching `patches/`: this repo
-carries the recipe, not the artifact. Regenerate a patch from its `.cmd`.
+`patches/` keeps payloads out and commits only an index, because those are
+third-party patches fetchable from their upstreams. These are ours and have
+no upstream: the campaign already lost one build to a cleared scratchpad, so
+the patch ships beside the recipe that made it. They are ~60 KB.
+
+A `.bps` here is only as good as its `.cmd`. If you regenerate and the two
+stop agreeing, the `.cmd` is the truth — it is the reproducible half.
 
 ### scripted/
 

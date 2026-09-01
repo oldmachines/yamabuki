@@ -524,7 +524,7 @@ hand byte at file `0x13687A`, the site then executed correctly under
 the first fully machine-generated build since v18. And a HUNG recording is
 safe to harvest; only a crashed one poisons.
 
-### The mirror-JSL class is large and still open
+### The mirror-JSL class, closed by its own twin
 
 Three of the six failures were the same shape: an uncovered
 `JSL $A0-$BF:addr` that lands in MB2 and BRKs. A census of v22 found **51
@@ -535,15 +535,40 @@ per target) is what distinguishes them from data noise, and the bytes settle
 it: `$20:C0AE` is a real prologue (`PHP / REP #$30 / PHX / LDX #$0000`),
 while `$A0:C0AE` under the shim is garbage containing a `$44` block move.
 
-A twin-evidence net was drafted (rewrite the mirror form when its
-de-mirrored twin exists, guarded on target `>= $8000`) and NOT landed. It
-rewrites 628 bytes, which makes ~51 routines newly reachable, and the walk
-then descends into them treating net-discovered entries as executed code —
-refusing on ops it would have skipped had it found them statically. The
-prerequisite is teaching the walk to apply static-walk rules to
-net-discovered entries. Sequence for whoever picks this up: fix the harvest
-bank translation, which unblocks harvesting crashed runs, which unblocks the
-net, which closes all 51 at once instead of one per play session.
+A twin-evidence net (`demirrorTwinJsls`) now closes the class without any
+coverage at all. In the CONVERTED image the same entry is already called as
+`JSL $20-$3F:addr` by code that IS covered — stock never spells it that way,
+so the twin is minted by the coverage-gated de-mirror pass, and this pass
+spends what that one minted. A mirror JSL whose twin is called twice or more
+is re-banked -$80.
+
+The blocker recorded here earlier — "the walk descends into net-discovered
+entries treating them as executed code" — was a misdiagnosis. Keying on the
+twin means every body the net makes callable was ALREADY walked and
+rewritten: a covered call to the twin is precisely what put it in coverage,
+and the walk's LoROM fold (`$A0 & 0x7F` is `$20`) happens to equal the
+de-mirror over this range. The net rewrites operands only and hands the walk
+nothing new to arbitrate, which is why it lands where a blind 628-byte
+rewrite could not.
+
+Measured on v25: **505 sites across 31 targets**, led by `$A0:C786` (77
+sites, twin called 17x). The image diff is exactly those 505 bank bytes plus
+the 4 header checksum/complement bytes — nothing else moved.
+
+The evidence that the direction is right, since no surface executes these
+sites: decode both addresses. All 31 twins decode cleanly; 25 of the 31
+mirrors hit a fatal opcode within a few instructions (`$A0:C0AE` at
+instruction 1, `$A0:B067` at 0). The remaining 6 decode clean on both sides
+— MB2 data that a 12-instruction linear decode cannot condemn, not a
+counter-example.
+
+What this does NOT establish: the three scripted surfaces cannot execute
+these sites, that being the definition of the class, so a passing gauntlet
+shows no REGRESSION rather than a fix. Confirming the fix wants the Ridley
+grab, one of the lost recordings. And the harvest bank translation
+(`(pc >> 16) & 0x7F` on a shim-mapped image) is still wrong and still blocks
+harvesting a crashed run — the net removed the need for that on THIS class,
+not the bug.
 
 ### The surface set these conversions verify with
 
