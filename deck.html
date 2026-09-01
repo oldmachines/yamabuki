@@ -7912,6 +7912,34 @@ MMIO-touching 26 of 628 routines</code></pre>
       </aside>
     </section>
 
+    <section>
+      <h2>Why move WRAM at all?</h2>
+      <p>The SA-1 cannot address WRAM, and WRAM is where every variable of the game lives. Something has to give.</p>
+      <ul data-build="fade-up" style="font-size:0.85em">
+        <li><b class="term">Bring the data to the routine?</b> Copy its working set per call: the copies cost as much as the work. Death 1.</li>
+        <li><b class="term">Bring the routine to the data?</b> It cannot come: nothing the SA-1 executes can name a WRAM byte. Death 3.</li>
+        <li><b class="term">Put the data where both can reach it.</b> BW-RAM is the only writable memory both processors address. Move the state there once, at boot.</li>
+        <li><b class="term">All of it, not just the hot parts.</b> A partial move breaks every index that reaches across the seam (death 2). One constant keeps every distance intact.</li>
+      </ul>
+      <aside class="notes">
+        <p>Before the survivor, the question people ask at this point: why move the game's memory at all? It looks drastic. The reason is the hardware fact from part two: the SA-1 cannot address WRAM, and WRAM is where every variable of the game lives. So something has to give, and there are only three things you can move.</p>
+        <p>⟨CLICK⟩</p>
+        <p>You can bring the data to the routine: copy its working set into BW-RAM before each call and copy the results back after. That is the first death. The copies cost as much as the work they hand over, and the S-CPU stands still while they happen.</p>
+        <p>⟨CLICK⟩</p>
+        <p>You can try to bring the routine to the data. It cannot come. Nothing the SA-1 executes can name a byte of WRAM, not slowly, not at all. And pushing that idea to its limit, running the whole game on the SA-1 and forwarding every hardware access, is the third death.</p>
+        <p>⟨CLICK⟩</p>
+        <p>What is left is to put the data where both processors can reach it. BW-RAM is the only writable memory both of them address. Move the game's state there once, at boot, and from then on every routine finds its variables whichever processor runs it. No copies, no forwarding, no mailbox in the hot path.</p>
+        <p>⟨CLICK⟩</p>
+        <p>And it has to be all of the memory, not just the hot regions. The second death showed why: an indexed access based below a moved region reaches across the boundary into it. Moving everything by one constant preserves every distance between two bytes, so no index can be caught on a seam. That is the survivor.</p>
+      </aside>
+      <aside class="rehearse">
+        <p>Data to routine: copies cost as much as the work (death 1)</p>
+        <p>Routine to data: cannot name a WRAM byte (death 3)</p>
+        <p>Data to BW-RAM: the only writable memory both address; move once at boot</p>
+        <p>All of it, one constant: no index caught on a seam (death 2)</p>
+      </aside>
+    </section>
+
     <section data-auto-animate>
       <h2>The survivor: move everything by one constant</h2>
       <svg class="diag" viewBox="0 0 900 300" role="img" aria-label="Before: WRAM's low 8 KiB at $0000 to $1FFF and the long form at $7E:0000 to $7F:FFFF.">
