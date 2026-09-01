@@ -36,10 +36,9 @@ two `.sfc` files wherever you keep the stock ROM. If they are lost,
 `user-play1`/`user-play2` become unusable and the other two recipes stop
 running, even though every `.ymv` here survives.
 
-Those recipes also consume five older surfaces that are **not** committed here
-(`sm-start.ymv`, `sm-game.ymv`, `mash-st.ymv`, `newg2-st.ymv`,
-`newg2-cv.ymv`). They survive in the Aug 2026 working set; commit them if the
-cover chain is ever to be rebuilt from scratch.
+Those recipes also consume five older surfaces, kept in `../legacy/` for that
+purpose alone. With them the chain rebuilds down to `cover39`/`cover40`, and
+no further.
 
 ## Still missing
 

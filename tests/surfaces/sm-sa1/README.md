@@ -19,6 +19,7 @@ Treat deletion as a code change.
 | `*.bps` + `*.bps.cmd` | the generated patch and the exact invocation that made it | yes, by re-running the `.cmd` |
 | `scripted/*.ymv` | `tools/sm_surfaces.py` | yes, bit-identically |
 | `recordings/*.ymv` | a person playing in the SDL player | **no. Never.** |
+| `legacy/*.ymv` | the v8-era working set | **no** — nothing emits them |
 
 `patches/` keeps payloads out and commits only an index, because those are
 third-party patches fetchable from their upstreams. These are ours and have
@@ -101,6 +102,9 @@ Applying any patch, from anywhere:
 | `sm-sa1-v25.bps.cmd` | `sm-sa1-v25.bps`, committed beside it | `scripted/` only |
 | `sm-conv-final.bps.cmd` | `sm-conv-final.sfc`, a cover image | `legacy/`, `cover39`, `cover40`, `sm-conv-hdmafix2.sfc` |
 | `sm-conv-hdmafix2.bps.cmd` | `sm-conv-hdmafix2.sfc`, likewise | `legacy/`, `cover39`, `cover40` |
+
+Those two recipes read their surfaces from `legacy/` — five files no tool
+regenerates, kept solely so the chain can run.
 
 The chain bottoms out at `cover39.sfc`/`cover40.sfc`, which have no recipe —
 see `recordings/README.md`. Everything else rebuilds from this directory.
