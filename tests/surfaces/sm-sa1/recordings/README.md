@@ -31,10 +31,9 @@ in the parent directory; two cannot:
 | `cover40.sfc` | **no recipe exists** |
 
 `cover39`/`cover40` are the root of the whole chain — both rebuildable recipes
-above consume them — and no `.bps.cmd` was ever written for either. Keep those
-two `.sfc` files wherever you keep the stock ROM. If they are lost,
-`user-play1`/`user-play2` become unusable and the other two recipes stop
-running, even though every `.ymv` here survives.
+above consume them — and no `.bps.cmd` was ever written for either. All four
+live in `../generated/`, untracked; see that directory's README for md5s and a
+standing reminder to back the two irreplaceable ones up off this machine.
 
 Those recipes also consume five older surfaces, kept in `../legacy/` for that
 purpose alone. With them the chain rebuilds down to `cover39`/`cover40`, and

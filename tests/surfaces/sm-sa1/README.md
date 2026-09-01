@@ -72,14 +72,21 @@ beside its own patch. They come in two shapes, and the difference matters
 because it decides what directory you run them from.
 
 **Repo-relative** (`sm-sa1-v25.bps.cmd`) names its surfaces as paths under
-this repo, so run it from the repo root:
+this repo, and its stock ROM as `"$STOCK"`, so point that at your own dump and
+run it from the repo root:
 
+    export STOCK="/path/to/Super Metroid (JU) [!].smc"
     zig build -Doptimize=ReleaseFast
-    zig-out/bin/yamabuki-headless $(cat tests/surfaces/sm-sa1/sm-sa1-v25.bps.cmd)
+    eval zig-out/bin/yamabuki-headless $(cat tests/surfaces/sm-sa1/sm-sa1-v25.bps.cmd)
 
-One caveat: it names the stock ROM by **absolute path on the machine that
-made it** (`/Users/gilles/...`). Substitute your own before running, or the
-first argument will not resolve.
+The `eval` is load-bearing: command substitution does not re-expand variables
+in what it substitutes, so without it `$STOCK` reaches the binary as six
+literal characters and the ROM will not open. The quotes inside the `.cmd`
+survive `eval`, so a path with spaces is fine.
+
+Note that the generator writes this file verbatim from its own argv, so a
+regeneration will put an absolute path back. Re-apply `$STOCK` when that
+happens.
 
 **Flat working directory** (`sm-conv-*.bps.cmd`) names every input as a bare
 filename, so stage one first:
