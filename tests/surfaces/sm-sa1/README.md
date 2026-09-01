@@ -66,13 +66,66 @@ not pass a crashed recording as a cover surface.
 
 ## Regenerating a conversion
 
-Every `.cmd` here is a complete invocation. The current code-only build:
+Every `.cmd` here is a complete invocation, written verbatim by the generator
+beside its own patch. They come in two shapes, and the difference matters
+because it decides what directory you run them from.
 
-    zig build
-    tools/sm_surfaces.py "$STOCK" tests/surfaces/sm-sa1/scripted
-    $(cat tests/surfaces/sm-sa1/sm-sa1-v25.bps.cmd)
+**Repo-relative** (`sm-sa1-v25.bps.cmd`) names its surfaces as paths under
+this repo, so run it from the repo root:
 
-then apply it:
+    zig build -Doptimize=ReleaseFast
+    zig-out/bin/yamabuki-headless $(cat tests/surfaces/sm-sa1/sm-sa1-v25.bps.cmd)
 
-    zig-out/bin/yamabuki-headless "$STOCK" \
-      --patch <out>.bps --save-patched <out>.sfc
+One caveat: it names the stock ROM by **absolute path on the machine that
+made it** (`/Users/gilles/...`). Substitute your own before running, or the
+first argument will not resolve.
+
+**Flat working directory** (`sm-conv-*.bps.cmd`) names every input as a bare
+filename, so stage one first:
+
+    mkdir -p /tmp/smgen && cd /tmp/smgen
+    cp "$STOCK" sm.sfc
+    cp <repo>/tests/surfaces/sm-sa1/legacy/*.ymv .
+    cp <repo>/tests/surfaces/sm-sa1/recordings/*.ymv .
+    cp <the cover images> .          # see recordings/README.md
+    <repo>/zig-out/bin/yamabuki-headless $(cat <repo>/tests/surfaces/sm-sa1/sm-conv-final.bps.cmd)
+
+Applying any patch, from anywhere:
+
+    zig-out/bin/yamabuki-headless "$STOCK"       --patch tests/surfaces/sm-sa1/sm-sa1-v25.bps --save-patched v25.sfc
+
+### The recipes here
+
+| `.cmd` | produces | needs |
+|---|---|---|
+| `sm-sa1-v25.bps.cmd` | `sm-sa1-v25.bps`, committed beside it | `scripted/` only |
+| `sm-conv-final.bps.cmd` | `sm-conv-final.sfc`, a cover image | `legacy/`, `cover39`, `cover40`, `sm-conv-hdmafix2.sfc` |
+| `sm-conv-hdmafix2.bps.cmd` | `sm-conv-hdmafix2.sfc`, likewise | `legacy/`, `cover39`, `cover40` |
+
+The chain bottoms out at `cover39.sfc`/`cover40.sfc`, which have no recipe —
+see `recordings/README.md`. Everything else rebuilds from this directory.
+
+### What v25 does not include
+
+`sm-sa1-v25.bps.cmd` passes the three scripted surfaces and nothing else: no
+`--evidence-movie`, and no `--cover-image`/`--cover-movie` pair. The four
+recordings in `recordings/` were not harvested into it. That is the coverage
+narrowing this directory exists to make visible, not a defect in the patch —
+but a regeneration that adds the cover pairs sees more, and the two images
+differ.
+
+### A timing note, from a separate generation
+
+A cover-harvesting generation made 2026-08-31 (all five surface kinds, zero
+hand bytes, behaviorally equivalent) reported:
+
+    dropped frames 2342 -> 28969, mean utilisation 41% -> 9%
+
+Window mode is the *enabler* for resident offloads, not itself a speedup: the
+SA-1 never leaves reset, greedy found no offload trees, so the run pays 449
+thunk dispatches and collects nothing back. The v8-era figure of `25 -> 25`
+is not a counterexample — it was measured over `legacy/sm-start.ymv`, which
+is 3,600 frames, too short to reach the demo gameplay where the lag lives.
+Whether the overhead is a regression or a property window mode always had is
+still open; the test is to replay a v8 image over `scripted/sm-attract36k.ymv`
+and compare like with like.
