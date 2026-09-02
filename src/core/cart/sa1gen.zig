@@ -269,6 +269,15 @@ pub const Stats = struct {
     rewritten_hi_banks: u32 = 0,
     /// Measured $A0-$BF bank values re-banked -$80 (>2 MiB window mode).
     rewritten_a0_banks: u32 = 0,
+    /// Super Metroid room-state level-data pointer banks re-banked -$20 by
+    /// the room-graph walk (`rebankSmRoomLevelPointers`) at states no
+    /// surface loaded; the rooms/states counts are what the walk reached.
+    rewritten_room_level_banks: u32 = 0,
+    room_walk_rooms: u32 = 0,
+    room_walk_states: u32 = 0,
+    /// Non-zero when the walk refused: the $8F address that failed
+    /// validation. Nothing was rewritten.
+    room_walk_refused_at: u32 = 0,
     /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
     /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
     /// by later code — see `demirrorQueueBankImms`.
@@ -3738,6 +3747,269 @@ test "demirrorTwinJsls: twin evidence re-banks the mirror form, once is not enou
     try testing.expectEqual(@as(u8, 0xA0), out[u + 15]);
 }
 
+
+/// Super Metroid's room-state level-data pointers, re-banked by walking the
+/// room graph instead of waiting for a surface to load each state.
+///
+/// Every room state carries a 3-byte pointer to its compressed level data,
+/// and every one of them names MB2 ($C2-$CE). Under the >2 MiB shim MB2
+/// lives $20 lower, so the byte must become $A2-$AE — and the only pass
+/// that does that is `hi_proven`, which needs the profile to have watched
+/// the loader read that exact byte. A state no surface ever loaded keeps
+/// its stock bank, the decompressor ($80:B0FF) reads the wrong megabyte,
+/// and the room arrives with no geometry at all: Samus walks through walls
+/// into a phantom special block and Super Metroid's own `BRA *` assertion
+/// at $84:B3A6 (measured 2026-09-02 on the Ceres escape states). One build
+/// had 40 such bytes proven against ~750 untouched — every room past the
+/// first door off the landing site.
+///
+/// No shape identifies the byte on its own (a `$CD` after a word is common
+/// in a bank of tables), but the structure that reaches it is exact and
+/// finite: door headers ($83) name rooms ($8F); a room's condition list
+/// names its states; a state's first three bytes are the pointer. The walk
+/// starts at the landing site and follows doors until it runs out. It is
+/// all-or-nothing on the rewrite side: any state that fails validation
+/// refuses the whole pass, because a misparse here rewrites data. A door
+/// whose destination does not look like a room header is skipped, not
+/// fatal — elevators and one-way transitions name no room.
+///
+/// Reads STOCK bytes (`image`); a bank byte `hi_proven` already re-banked
+/// in `out` is left as it is.
+pub const SmRoomWalk = struct {
+    rooms: u32 = 0,
+    states: u32 = 0,
+    rebanked: u32 = 0,
+    /// Non-zero when the pass refused: the $8F address of the header that
+    /// failed validation. Nothing was rewritten.
+    refused_at: u32 = 0,
+};
+
+fn smConditionArgBytes(cond: u16) ?u8 {
+    // Each condition routine's skip path is `INX` x (args + 2) / `RTS`; these
+    // widths are read off those routines in bank $8F.
+    return switch (cond) {
+        0xE5EB => 2, // entered through door X
+        0xE612, 0xE629 => 1, // boss bit / event bit in the current area
+        0xE5FF, 0xE640, 0xE652, 0xE669, 0xE678 => 0,
+        else => null,
+    };
+}
+
+fn rebankSmRoomLevelPointers(gpa: std.mem.Allocator, image: []const u8, out: []u8) !SmRoomWalk {
+    const f8f: usize = 0x0F * 0x8000; // bank $8F: room + state headers
+    const f83: usize = 0x03 * 0x8000; // bank $83: door headers
+    var walk: SmRoomWalk = .{};
+    if (image.len < f8f + 0x8000) return walk;
+    const R = struct {
+        img: []const u8,
+        fn b(self: @This(), base: usize, a16: u32) u8 {
+            return self.img[base + (a16 - 0x8000)];
+        }
+        fn w(self: @This(), base: usize, a16: u32) u16 {
+            return std.mem.readInt(u16, self.img[base + (a16 - 0x8000) ..][0..2], .little);
+        }
+        fn looksLikeRoom(self: @This(), a16: u32) bool {
+            if (a16 < 0x8000 or a16 > 0xFFFF - 0x0B - 2) return false;
+            const area = self.b(f8f, a16 + 1);
+            const wd = self.b(f8f, a16 + 4);
+            const ht = self.b(f8f, a16 + 5);
+            return area < 8 and wd >= 1 and wd <= 16 and ht >= 1 and ht <= 16 and self.w(f8f, a16 + 9) >= 0x8000;
+        }
+    };
+    const r: R = .{ .img = image };
+
+    const visited = try gpa.alloc(bool, 0x8000);
+    defer gpa.free(visited);
+    @memset(visited, false);
+    var queue: [1024]u16 = undefined;
+    var qn: usize = 0;
+    var states: [2048]u32 = undefined;
+    var sn: usize = 0;
+
+    // Two roots, because the door graph has two components: Zebes hangs
+    // off the landing site, and Ceres is entered by the new-game warp and
+    // left by the escape warp — no door crosses between them. A root that
+    // does not parse as a room is skipped (a different revision), not fatal.
+    for ([_]u16{ 0x91F8, 0xDF45 }) |root| {
+        if (!r.looksLikeRoom(root) or visited[root - 0x8000]) continue;
+        visited[root - 0x8000] = true;
+        queue[qn] = root;
+        qn += 1;
+    }
+    if (qn == 0) return walk;
+
+    var qi: usize = 0;
+    while (qi < qn) : (qi += 1) {
+        const room: u32 = queue[qi];
+        walk.rooms += 1;
+        // Condition list -> states, then the inline default state.
+        var p: u32 = room + 11;
+        var guard: u8 = 0;
+        while (true) : (guard += 1) {
+            if (guard > 16 or p > 0xFFFF - 2) {
+                walk.refused_at = room;
+                return walk;
+            }
+            const cond = r.w(f8f, p);
+            if (cond == 0xE5E6) {
+                if (sn == states.len) {
+                    walk.refused_at = room;
+                    return walk;
+                }
+                states[sn] = p + 2;
+                sn += 1;
+                break;
+            }
+            const nargs = smConditionArgBytes(cond) orelse {
+                walk.refused_at = room;
+                return walk;
+            };
+            const st = r.w(f8f, p + 2 + nargs);
+            if (st < 0x8000 or sn == states.len) {
+                walk.refused_at = room;
+                return walk;
+            }
+            states[sn] = st;
+            sn += 1;
+            p += 2 + @as(u32, nargs) + 2;
+        }
+        // Door list: words naming door headers in $83, ended by whatever
+        // follows (the next room header's index/area word is < $8000).
+        var d: u32 = r.w(f8f, room + 9);
+        var di: u8 = 0;
+        while (di < 32 and d <= 0xFFFF - 1) : ({
+            di += 1;
+            d += 2;
+        }) {
+            const dp = r.w(f8f, d);
+            if (dp < 0x8000 or dp > 0xFFFF - 12) break;
+            const dest = r.w(f83, dp);
+            if (dest == 0) continue; // elevator / no room
+            if (!r.looksLikeRoom(dest)) continue;
+            if (visited[dest - 0x8000]) continue;
+            visited[dest - 0x8000] = true;
+            if (qn == queue.len) {
+                walk.refused_at = room;
+                return walk;
+            }
+            queue[qn] = dest;
+            qn += 1;
+        }
+    }
+    walk.states = @intCast(sn);
+
+    // Validate every state before touching a byte: level pointer into
+    // MB2's ROM half, tileset index in range.
+    for (states[0..sn]) |st| {
+        if (st > 0xFFFF - 26) {
+            walk.refused_at = st;
+            return walk;
+        }
+        const lo = r.w(f8f, st);
+        const bk = r.b(f8f, st + 2);
+        const tileset = r.b(f8f, st + 3);
+        if (lo < 0x8000 or bk < 0xC2 or bk > 0xCE or tileset >= 0x1D) {
+            walk.refused_at = st;
+            return walk;
+        }
+    }
+    for (states[0..sn]) |st| {
+        const f = f8f + (st - 0x8000) + 2;
+        if (out[f] != image[f]) continue; // hi_proven got here first
+        out[f] -= 0x20;
+        walk.rebanked += 1;
+    }
+    return walk;
+}
+
+test "rebankSmRoomLevelPointers: every state reached through doors, proven bytes left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const f83: usize = 0x03 * 0x8000;
+    const put16 = struct {
+        fn f(buf: []u8, base: usize, a16: u32, v: u16) void {
+            std.mem.writeInt(u16, buf[base + (a16 - 0x8000) ..][0..2], v, .little);
+        }
+    }.f;
+    // Room A at $91F8: area 0, 1x1, door list at $9260; conditions:
+    // E629 <event 1> -> state $9240 ; E5E6 -> default state inline.
+    const a: u32 = 0x91F8;
+    img[f8f + (a - 0x8000) + 1] = 0; // area
+    img[f8f + (a - 0x8000) + 4] = 1; // width
+    img[f8f + (a - 0x8000) + 5] = 1; // height
+    put16(img, f8f, a + 9, 0x9260);
+    put16(img, f8f, a + 11, 0xE629);
+    img[f8f + (a + 13 - 0x8000)] = 1;
+    put16(img, f8f, a + 14, 0x9240);
+    put16(img, f8f, a + 16, 0xE5E6);
+    const a_def: u32 = a + 18;
+    put16(img, f8f, a_def, 0xC330);
+    img[f8f + (a_def + 2 - 0x8000)] = 0xCD;
+    img[f8f + (a_def + 3 - 0x8000)] = 0x0F;
+    // A's event state at $9240: level $C2:9000, tileset 3
+    put16(img, f8f, 0x9240, 0x9000);
+    img[f8f + (0x9242 - 0x8000)] = 0xC2;
+    img[f8f + (0x9243 - 0x8000)] = 0x03;
+    // A's door list: a door to room B, an elevator door, then the next header word (< $8000)
+    put16(img, f8f, 0x9260, 0x9000);
+    put16(img, f8f, 0x9262, 0x9010);
+    put16(img, f8f, 0x9264, 0x0102);
+    put16(img, f83, 0x9000, 0x9300); // door -> room B
+    put16(img, f83, 0x9010, 0x0000); // elevator
+    // Room B at $9300: area 1, 2x1, default state only, one door back to A
+    const b: u32 = 0x9300;
+    img[f8f + (b - 0x8000) + 1] = 1;
+    img[f8f + (b - 0x8000) + 4] = 2;
+    img[f8f + (b - 0x8000) + 5] = 1;
+    put16(img, f8f, b + 9, 0x9340);
+    put16(img, f8f, b + 11, 0xE5E6);
+    const b_def: u32 = b + 13;
+    put16(img, f8f, b_def, 0xB846);
+    img[f8f + (b_def + 2 - 0x8000)] = 0xC5;
+    img[f8f + (b_def + 3 - 0x8000)] = 0x10;
+    put16(img, f8f, 0x9340, 0x9020);
+    put16(img, f8f, 0x9342, 0x0000);
+    put16(img, f83, 0x9020, 0x91F8);
+
+    // Room C at $DF45 (the Ceres root): no door reaches it from A or B.
+    const c: u32 = 0xDF45;
+    img[f8f + (c - 0x8000) + 1] = 6;
+    img[f8f + (c - 0x8000) + 4] = 1;
+    img[f8f + (c - 0x8000) + 5] = 1;
+    put16(img, f8f, c + 9, 0xDF80);
+    put16(img, f8f, c + 11, 0xE5E6);
+    const c_def: u32 = c + 13;
+    put16(img, f8f, c_def, 0xB000);
+    img[f8f + (c_def + 2 - 0x8000)] = 0xCD;
+    img[f8f + (c_def + 3 - 0x8000)] = 0x0F;
+    put16(img, f8f, 0xDF80, 0x0000);
+
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[f8f + (a_def + 2 - 0x8000)] = 0xAD; // hi_proven already re-banked A's default
+
+    const w = try rebankSmRoomLevelPointers(gpa, img, out);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    try testing.expectEqual(@as(u32, 3), w.rooms);
+    try testing.expectEqual(@as(u32, 4), w.states);
+    try testing.expectEqual(@as(u32, 3), w.rebanked);
+    try testing.expectEqual(@as(u8, 0xAD), out[f8f + (c_def + 2 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xAD), out[f8f + (a_def + 2 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xA2), out[f8f + (0x9242 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xA5), out[f8f + (b_def + 2 - 0x8000)]);
+    // A state whose level pointer is outside MB2 refuses the whole pass and rewrites nothing.
+    img[f8f + (b_def + 2 - 0x8000)] = 0x8F;
+    @memcpy(out, img);
+    const w2 = try rebankSmRoomLevelPointers(gpa, img, out);
+    try testing.expectEqual(b_def, w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqual(@as(u8, 0xC2), out[f8f + (0x9242 - 0x8000)]);
+}
+
 test "demirrorQueueBankImms: consumer names the column, producers re-bank" {
     var buf: [64]u8 = @splat(0x60); // RTS filler
     // consumer: LDA $6FA6,X / STA $7786 / XBA / PHA / PLB / PLB
@@ -6853,6 +7125,19 @@ pub fn convertWholeGame(
             }
         }
     };
+    // Data no evidence can reach in full: Super Metroid's room-state level
+    // pointers, one per state, each naming MB2. The profile proves the
+    // states it loaded; the room graph names all of them.
+    if (bwram and image.len > 0x20_0000) {
+        const hdr = header_mod.detect(image) catch null;
+        if (hdr != null and std.mem.startsWith(u8, &hdr.?.title, "Super Metroid")) {
+            const walk = try rebankSmRoomLevelPointers(gpa, image, out);
+            res.stats.rewritten_room_level_banks = walk.rebanked;
+            res.stats.room_walk_rooms = walk.rooms;
+            res.stats.room_walk_states = walk.states;
+            res.stats.room_walk_refused_at = walk.refused_at;
+        }
+    }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
     // $A0-$BF -> -$80 (MB1's home), $C0-$DF -> -$20 (MB2's home), else
     // untouched. Both idioms span 4 bytes at the site.

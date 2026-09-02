@@ -1380,7 +1380,7 @@ fn verifyBehavioral(
         // frames and cell values — the tick<->wall mapping is nonlinear
         // (loads stretch hundreds of wall frames per tick) and chasing a
         // tick-domain divergence with wall-domain probes wastes hours.
-        if (n_bad > 0 and prev_n_bad == 0) {
+        if (n_bad > 0 and (prev_n_bad == 0 or out.ticks_base % 50 == 0)) {
             std.debug.print("[bfx] run start tick={} base_wall={} conv_wall={} n_bad={}:", .{ out.ticks_base, base.frame, conv.frame, n_bad });
             for (bad[0..@min(8, n_bad)]) |b| {
                 const cv = b.addr; // conv value recomputed below for the print
@@ -3396,6 +3396,13 @@ fn reportSa1(
                 "  {} mirror-bank JSL(s) re-banked on their DE-MIRRORED TWIN's\n  evidence — uncovered call sites whose target is already called in\n  its $20-$3F form by covered code (>=2 calls). The class that cost\n  three player-found freezes; no coverage required\n",
                 .{res.stats.rewritten_twin_jsls},
             );
+        if (res.stats.room_walk_states != 0)
+            try out.print(
+                "  {} room-state level-data bank(s) re-banked by the ROOM-GRAPH WALK\n  ({} rooms, {} states reached through doors from the landing site —\n  Super Metroid's structure, not coverage: a state no surface loaded\n  kept its stock MB2 bank and decompressed garbage geometry)\n",
+                .{ res.stats.rewritten_room_level_banks, res.stats.room_walk_rooms, res.stats.room_walk_states },
+            );
+        if (res.stats.room_walk_refused_at != 0)
+            try out.print("  room-graph walk REFUSED at $8F:{X:0>4} (a header failed validation);\n  level pointers left to evidence alone\n", .{res.stats.room_walk_refused_at});
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
