@@ -278,6 +278,10 @@ pub const Stats = struct {
     /// Non-zero when the walk refused: the $8F address that failed
     /// validation. Nothing was rewritten.
     room_walk_refused_at: u32 = 0,
+    /// Super Metroid background (library) DMA-list source banks de-mirrored
+    /// (the BG2 picture) across the records the room walk reached.
+    rewritten_bg_banks: u32 = 0,
+    bg_records: u32 = 0,
     /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
     /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
     /// by later code — see `demirrorQueueBankImms`.
@@ -3779,6 +3783,10 @@ pub const SmRoomWalk = struct {
     rooms: u32 = 0,
     states: u32 = 0,
     rebanked: u32 = 0,
+    /// Background (library) records processed, and their source banks
+    /// de-mirrored (see the BG pass in `rebankSmRoomLevelPointers`).
+    bg_records: u32 = 0,
+    bg_banks: u32 = 0,
     /// Non-zero when the pass refused: the $8F address of the header that
     /// failed validation. Nothing was rewritten.
     refused_at: u32 = 0,
@@ -3919,7 +3927,121 @@ fn rebankSmRoomLevelPointers(gpa: std.mem.Allocator, image: []const u8, out: []u
         out[f] -= 0x20;
         walk.rebanked += 1;
     }
+
+    // Each state also names a BACKGROUND (library) record at +$16 — a DMA
+    // list that paints BG2. Its source banks are the same evidence-gated
+    // class as the level pointer: a record no surface loaded keeps its stock
+    // banks and the DMA reads the wrong megabyte, so the room renders correct
+    // foreground over garbage background (measured 2026-09-02 on the Parlor,
+    // $92FD; a three-byte hand-patch of this record's banks made it clean).
+    // Unlike the level pointer this pass is PER-RECORD graceful, not
+    // all-or-nothing: a state's BG word legitimately points at code or
+    // nothing, so a record that does not parse as a clean list is skipped,
+    // never fatal — exactly the door-walk's "names no room" rule. The list's
+    // command widths are read off Super Metroid's own BG interpreter.
+    for (states[0..sn]) |st| {
+        const bg = r.w(f8f, st + 0x16);
+        if (bg < 0x8000 or bg > 0xFFF0) continue;
+        const ok = rebankSmBgRecord(image, out, bg, &walk);
+        if (ok) walk.bg_records += 1;
+    }
     return walk;
+}
+
+/// Walk one Super Metroid background (library) record and de-mirror the
+/// source bank of every copy command. Returns false — translating nothing —
+/// the instant the bytes stop looking like a BG list (an unknown command, an
+/// out-of-range source bank, or no terminator within the cap), so a state
+/// whose +$16 points at code or data is left untouched. Widths are Super
+/// Metroid's: $0002 src+dest+size (7), $0004 src+dest (5), $0008 (7), $000A
+/// (2), $000C (2), $000E src+3 words (9), $0000 ends. Only $0002/$0004/$0008/
+/// $000E carry a 3-byte source at payload +0; its bank is payload byte 2.
+fn rebankSmBgRecord(image: []const u8, out: []u8, ptr: u16, walk: *SmRoomWalk) bool {
+    const f8f: usize = 0x0F * 0x8000;
+    var pending: [64]usize = undefined; // byte offsets staged for translation
+    var np: usize = 0;
+    var a: u32 = ptr;
+    var steps: u8 = 0;
+    while (steps < 64) : (steps += 1) {
+        if (a + 2 > 0x1_0000) return false;
+        const cmd = std.mem.readInt(u16, image[f8f + (a - 0x8000) ..][0..2], .little);
+        if (cmd == 0x0000) {
+            // A clean list. Commit the staged source banks now — nothing was
+            // written while the parse could still fail.
+            for (pending[0..np]) |f| {
+                if (out[f] != image[f]) continue; // hi_proven got here first
+                const bank = out[f];
+                out[f] = if (bank >= 0xC0 and bank <= 0xDF)
+                    bank - 0x20
+                else if (bank >= 0xA0 and bank <= 0xBF)
+                    bank - 0x80
+                else
+                    bank - 0x3E; // $7E/$7F -> $40/$41
+                walk.bg_banks += 1;
+            }
+            return true;
+        }
+        const payload: u32 = switch (cmd) {
+            0x0002, 0x0008 => 7,
+            0x0004 => 5,
+            0x000A, 0x000C => 2,
+            0x000E => 9,
+            else => return false,
+        };
+        if (cmd == 0x0002 or cmd == 0x0004 or cmd == 0x0008 or cmd == 0x000E) {
+            const bf = a + 2 + 2; // command word, then source lo/hi, then bank
+            if (bf >= 0x1_0000) return false;
+            const bank = image[f8f + (bf - 0x8000)];
+            // A real source bank is WRAM or ROM; anything else means a
+            // misparse, and we must not translate the byte we mistook.
+            if (!(bank == 0x7E or bank == 0x7F or (bank >= 0x80 and bank <= 0xDF))) return false;
+            if ((bank == 0x7E or bank == 0x7F or (bank >= 0xA0 and bank <= 0xDF)) and np < pending.len) {
+                pending[np] = f8f + (bf - 0x8000);
+                np += 1;
+            }
+        }
+        a += 2 + payload;
+    }
+    return false; // no terminator within the cap — not a list we understand
+}
+
+test "rebankSmBgRecord: copy-command source banks de-mirrored, non-list skipped" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const wr = struct {
+        fn b(buf: []u8, a16: u16, v: u8) void {
+            buf[0x0F * 0x8000 + (@as(usize, a16) - 0x8000)] = v;
+        }
+    }.b;
+    // A clean list at $B000: $0004 src $BA:8DE7 dest $4000 ; $0002 src $7E:4000
+    // dest $4800 size $0800 ; $0000. Bank bytes at $B004 ($BA) and $B00B ($7E).
+    const rec = [_]u8{ 0x04, 0x00, 0xE7, 0x8D, 0xBA, 0x00, 0x40, 0x02, 0x00, 0x00, 0x40, 0x7E, 0x00, 0x48, 0x00, 0x08, 0x00, 0x00 };
+    for (rec, 0..) |v, i| wr(img, 0xB000 + @as(u16, @intCast(i)), v);
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    var walk: SmRoomWalk = .{};
+    try testing.expect(rebankSmBgRecord(img, out, 0xB000, &walk));
+    try testing.expectEqual(@as(u32, 2), walk.bg_banks);
+    try testing.expectEqual(@as(u8, 0x3A), out[f8f + (0xB004 - 0x8000)]); // BA -> 3A
+    try testing.expectEqual(@as(u8, 0x40), out[f8f + (0xB00B - 0x8000)]); // 7E -> 40
+    // hi_proven already took the first bank: it is left alone.
+    @memcpy(out, img);
+    out[f8f + (0xB004 - 0x8000)] = 0x3A;
+    var w2: SmRoomWalk = .{};
+    try testing.expect(rebankSmBgRecord(img, out, 0xB000, &w2));
+    try testing.expectEqual(@as(u32, 1), w2.bg_banks); // only the $7E one
+    // A pointer into code ($000A then a non-command word) is not a list:
+    // nothing is translated.
+    for ([_]u8{ 0x0A, 0x00, 0x00, 0x00, 0xA0, 0x7B, 0x82, 0x22 }, 0..) |v, i|
+        wr(img, 0xC000 + @as(u16, @intCast(i)), v);
+    @memcpy(out, img);
+    var w3: SmRoomWalk = .{};
+    try testing.expect(!rebankSmBgRecord(img, out, 0xC000, &w3));
+    try testing.expectEqual(@as(u32, 0), w3.bg_banks);
 }
 
 test "rebankSmRoomLevelPointers: every state reached through doors, proven bytes left alone" {
@@ -7136,6 +7258,8 @@ pub fn convertWholeGame(
             res.stats.room_walk_rooms = walk.rooms;
             res.stats.room_walk_states = walk.states;
             res.stats.room_walk_refused_at = walk.refused_at;
+            res.stats.rewritten_bg_banks = walk.bg_banks;
+            res.stats.bg_records = walk.bg_records;
         }
     }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:

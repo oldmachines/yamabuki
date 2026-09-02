@@ -3403,6 +3403,11 @@ fn reportSa1(
             );
         if (res.stats.room_walk_refused_at != 0)
             try out.print("  room-graph walk REFUSED at $8F:{X:0>4} (a header failed validation);\n  level pointers left to evidence alone\n", .{res.stats.room_walk_refused_at});
+        if (res.stats.bg_records != 0)
+            try out.print(
+                "  {} background DMA-list source bank(s) de-mirrored across {} record(s)\n  — the BG2 picture for rooms no surface loaded (else correct foreground\n  over garbage background)\n",
+                .{ res.stats.rewritten_bg_banks, res.stats.bg_records },
+            );
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
