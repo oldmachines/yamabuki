@@ -4,18 +4,269 @@ Campaign log for converting Super Metroid (3 MiB LoROM) with the v17 window
 architecture (`--gen-sa1-patch --window --wg-static`). Every finding below was
 measured on the real game; commits are on `claude/sa1-async-offload`.
 
-Status at time of writing: **both verify surfaces pass** (boot 3600f
-pixel-identical; in-game 15000f behaviorally equivalent modulo one genuine RNG
-gameplay fork at wall frame 13,901 — prefix of 13,394 ticks verified,
-off-episode divergence 8 ticks, every run ≤ 30). Two player-reported freezes
-were fixed via coverage surfaces; a third (new-game cutscene → black room) is
-fixed by the `src_any` propagation fix (`38f0d7d`). The last display bug — the
-Ceres escape rendering as a full-screen garbage tile-sheet — is now **fixed**
-(§4a): two indirect HDMA channels fetched per-scanline data from relocated WRAM
-buffers the DMA unit could not follow, closed by relocating low-WRAM HDMA-table
-indirect addresses into the window (hdma3, the tile-sheet) and the `$43x7` DASB
-rebank thunk (hdma2, the colour). The conversion now renders the escape
-pixel-identical to stock and still verifies BEHAVIORALLY EQUIVALENT.
+Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
+its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
+escape evidence surface. The current build is **v38** (`tests/surfaces/sm-sa1/
+sm-sa1-v38.bps`): the room-graph level-pointer net, the background-record net,
+the Zebes foreground via cover pairs, and the escape palette via an
+`--evidence-movie`. Ceres (including the escape) and the first Zebes rooms off
+the landing site render correctly. The open frontier is every room-type not
+yet visited — its data pointers net structurally as they are found, its
+uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
+Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
+commit below were on `claude/sa1-async-offload`.
+
+---
+
+## 0. Synthesis — everything learned about converting Super Metroid to SA-1
+
+This section is the distilled, transferable picture: what makes the
+conversion hard, the one architecture that works, the complete taxonomy of
+what breaks and why, the two fix mechanisms and the line that divides them,
+and the process that found it all. The sections after it are the chronological
+evidence; this is the map. If you read only one section, read this one.
+
+### 0.1 The target
+
+Super Metroid is a 3 MiB LoROM with a battery save, heavy interrupt-time work
+(room loads decompress inline for ~80 frames; the music engine streams across
+many frames; the NMI does per-frame slot maintenance), and bank-in-data idioms
+throughout (pointer tables with dual-role bytes, `PEA $xx00/PLB/PLB` bank
+pins, `LDA table/XBA/PHA/PLB/PLB` dispatches, JSL calls with inline parameter
+blocks, a decompressor whose source bank arrives via a WRAM-staged copy of a
+ROM record). Any divergence stalls quietly rather than crashing, so bugs
+present as freezes and black/garbage screens, never as clean error states.
+
+### 0.2 The one architecture that works: window relocation (v17)
+
+Whole-game migration — running the game's code ON the SA-1 — was tried and
+does not fit Super Metroid. The architecture that works keeps the game
+running on the **S-CPU** and uses the SA-1 cart purely for its RAM:
+
+- A boot shim (at `$00:fc8f` on this build) installs the SA-1 map mode, then
+  the game keeps executing on the S-CPU exactly as stock.
+- The game's low 8 KiB of WRAM is moved wholesale into the S-CPU's BW-RAM
+  window at `$6000-$7FFF`, every relative distance preserved so indexed
+  bases rewrite soundly. `$7E/$7F` long references re-bank to `$40/$41`,
+  where linear BW-RAM carries the whole 64 KiB.
+- MMIO stays native. The SA-1 never leaves reset — the cart is *carried* for
+  its RAM. This is what makes resident offloads over the whole working set
+  possible in principle, though on Super Metroid greedy finds no offload
+  trees worth taking, so the shipped conversion is the relocation alone.
+
+The measured effect: dropped frames go from stock's ~2,342 to ~2,416 over a
+36,000-frame profile (about +3%), utilisation 41% -> 43%. Window mode is not
+itself a speedup; it is the *enabler* for offloads, and its own overhead is
+the thunk-dispatch toll. (An early build showed `2342 -> 28969` — that was
+NOT window overhead; it was unfixed mirror-JSL sites trapping the CPU. When a
+timing number looks catastrophic, suspect a correctness bug, not the
+architecture.)
+
+### 0.3 The heart of it: the de-mirror (bank-translation) map
+
+On a padded <= 2 MiB game the Super MMC's power-on map folds `$80-$FF` onto
+the image quarters as a genuine mirror (which is why Gradius III never hit any
+of this). On a 3 MiB image that fold is *real, different data*. The shim
+programs region 2 := MB0 and region 3 := MB2, giving the map that governs
+every bug below:
+
+| stock bank | content | converted bank | rule |
+|---|---|---|---|
+| `$80-$9F` | MB0 | `$80-$9F` | native (region 2 restores the mirror) |
+| `$A0-$BF` | MB1 | `$20-$3F` | `-$80` |
+| `$C0-$DF` | MB2 | `$A0-$BF` | `-$20` |
+| `$40-$5F` | MB2 | `$A0-$BF` | `+$60` |
+| `$7E/$7F` | WRAM | `$40/$41` | into linear BW-RAM |
+
+**Every carrier of a bank must ride this map.** Operands, immediates, thunk
+bodies, and — the hard part — *data*: pointer table bank bytes, DMA source
+banks, decompressor source banks, level/tileset/background pointers. Nearly
+every bug in this document is one place a carrier was missed.
+
+### 0.4 The failure taxonomy
+
+Every failure reduces to a bank carrier that did not ride the map. Grouped by
+how the carrier reaches the CPU:
+
+1. **Static operands** — `LDA $C0:xxxx` and friends. Rewritten by the main
+   relocation walk. The subtle ones: `long,X` wraps (`X >= $10000-v`),
+   tiny-base indexed absolutes needing a thunk (no single operand serves both
+   a data base and a ROM walk), and pin contradictions.
+2. **Immediates staged as banks** — `PEA $xx00/PLB/PLB`, `LDA #imm/PHA/PLB`,
+   and the XBA-carried variant where the bank rides the *low* half of a
+   16-bit load. These need provenance tracking through the staging (the
+   `a_lo_src`/`a_hi_src` machinery); XBA breaks a naive chain.
+3. **Queue-bank immediates** — an `LDA #imm16` staged into a dispatch queue's
+   bank column and PLB'd by later code. Rewritten BY SIGNATURE: the
+   `XBA/PHA/PLB/PLB` consumer names the column, no coverage required.
+4. **Mirror JSLs at uncovered sites** — `JSL $A0-$BF:addr` byte-identical to
+   stock, landing in MB2 under the shim and BRK'ing. Closed by the
+   **twin-JSL net**: in the converted image the same target is already called
+   as `JSL $20-$3F` by covered code (the de-mirror pass mints the twin), so a
+   mirror JSL whose de-mirrored twin is called twice or more is re-banked
+   `-$80` with no coverage. 505 sites in one build.
+5. **Value provenance** — bytes a profiled run PROVED feed addressing state
+   the operand rewriters cannot reach: `[dp]` pointer bank bytes, DMA A-bus
+   bank registers carrying `$7E/$7F`, dp,X pointer table words, HDMA indirect
+   addresses. Re-banked from the profile's evidence.
+6. **HDMA indirect banks** — the `$43x7` DASB carrying `$7E/$7F`, wrapped in a
+   runtime rebank thunk that maps `$7E/$7F -> $40/$41` as the write happens,
+   so an indirect HDMA whose source is WRAM follows its data into BW-RAM.
+7. **Room data pointers (the deepest and most numerous)** — the level-data
+   pointer, tileset records, and background (library) records each name MB2
+   banks a room needs. Closed by **structural nets** (§0.6). This is the
+   class that made most of the game unplayable and was invisible until the
+   rooms became reachable.
+
+### 0.5 The dividing line: coverage fixes code, nets fix data
+
+The single most useful principle the campaign produced. A bug is fixed by one
+of two mechanisms, and which one is decided by whether the un-relocated
+carrier is **code or data**:
+
+- **Uncovered CODE** (a mirror JSL, a room-load routine, a handler no surface
+  reached) is fixed by **coverage**. Relocation follows execution: give the
+  generator a surface or a cover pair that runs the code, and it walks and
+  rewrites it. The Zebes foreground was this — a playthrough's coverage let
+  the generator relocate the room-load path (new thunks in bank `$81`).
+- **Uncovered DATA** (a bank byte a pointer table or DMA record *carries*) is
+  fixed only by a **structural net that knows the layout**, because no
+  execution moves a byte the code merely reads. The level pointers, the
+  tileset banks, and the background records are all data. v37 proved the
+  point: with the Parlor fully covered, it verified but left the BG record's
+  banks raw — coverage cannot reach a byte the DMA reads as data.
+
+**And the durability corollary:** a net survives a lost recording; coverage
+does not. A structural fix is permanent and needs no artifacts; a
+coverage-driven fix evaporates if its recording is lost (measured: the escape
+flag regressed across a cleared scratchpad because it had only ever been
+closed by a recording, while the twin-JSL class stayed fixed because the
+generator closed it). Prefer a net wherever the class is structural.
+
+### 0.6 The structural pointer-family nets
+
+Super Metroid's room data is reachable by an exact, finite graph, which is
+what makes structural nets possible. The pattern, once, so the next family is
+mechanical:
+
+- **The room graph.** Door headers (`$83`) name rooms (`$8F`); a room's
+  condition list names its states; each state is a fixed header. The walk
+  starts at TWO roots — the landing site (`$91F8`) for Zebes and `$DF45` for
+  Ceres, because no door crosses between them (Ceres is entered by the
+  new-game warp and left by the escape warp). It follows doors, skipping any
+  that name no room (elevators, `$0000`). Reaches 261 rooms / 322 states.
+- **Level pointer** (state `+$0`): 3 bytes naming MB2; translate the bank
+  `$C2-$CE -> $A2-$AE`. All-or-nothing: validate every state (pointer in
+  MB2's ROM half, tileset index in range) before writing a byte, refuse the
+  whole pass on the first anomaly, because a misparse rewrites data.
+- **Background record** (state `+$16`): a DMA list. Command widths, read off
+  SM's own interpreter and validated against every reachable record:
+  `$0002` src+dest+size = 7, `$0004` src+dest = 5, `$0008` = 7, `$000A`/
+  `$000C` = 2, `$000E` = 9, `$0000` ends. `$0002/$0004/$0008/$000E` carry a
+  3-byte source; its bank (payload byte 2) is de-mirrored. PER-RECORD
+  graceful, not all-or-nothing: a state's `+$16` legitimately points at code
+  or nothing, so a record that stops parsing as a list is skipped.
+
+**The gate on every SM-specific net:** the ROM title starts with
+`Super Metroid` and the image is a > 2 MiB window conversion. Reads STOCK
+bytes; leaves any byte value-provenance already re-banked alone, so the
+structural and evidence passes compose.
+
+**Two rules learned expensively here.** (a) Read the structure from the
+game's own code, never guess command widths — a tileset-table net built on
+guessed lengths translated the wrong bytes and changed nothing; the working
+BG net was built only after validating widths against all 67 records. (b)
+Stage translations and commit only on a clean parse, so a mid-parse failure
+never writes a byte.
+
+### 0.7 Verification: the behavioral tier
+
+A slowdown-removing conversion CANNOT be frame-identical to a slowed-down
+baseline — different lag means different pictures, and the pixel gate rightly
+calls that divergent. What lag cannot legitimately change is the game's LOGIC
+state at each logic tick. So the behavioral tier (`--verify-behavioral`) runs
+both images tick-locked (a tick = the frame's first controller poll, the one
+phase-aligned instant two runs with different lag share) and compares the
+bytes the baseline's NEXT tick actually consumes, each read from wherever the
+conversion relocated it, excluding a lag-learned wall-coupled mask.
+
+Load-bearing details:
+- **Tick-locking, not frame-locking.** Inputs applied by wall-frame index
+  would land on different logic ticks and desync; the tier realigns per input
+  EPOCH so the same *game* drives both images.
+- **The persistence verdict.** Wall-derived values (pass counters, timers)
+  leak one hop past the mask; the verdict keys on persistence — echoes
+  self-heal within ticks over a bounded set, corruption persists, spreads, or
+  floods. A held constant offset (state carried across an input edge from
+  wall-time origins) is excused; nothing else.
+- **RNG-fork episodes.** A timing-changed conversion forks the game at each
+  RNG-sensitive moment; an episode that HEALS was reconverged by a scene
+  reset (corruption never reconverges to byte-equivalence). A few bounded,
+  healed episodes are excused.
+
+**The scene that cannot verify: the Ceres escape.** Its explosion/debris/
+enemy chaos is RNG- and timer-driven and forks under lag — the same signature
+the tier excuses on the attract surface — but it runs to the movie's end with
+no mid-scene reset, so the fork never heals and the verdict fails it. This is
+not a defect; it is a scene that is unverifiable by construction.
+
+### 0.8 `--movie` vs `--evidence-movie`: profile without verifying
+
+The escape must be PROFILED (to prove its palette-decompress banks) but cannot
+be VERIFIED. The resolution is `--evidence-movie`, not a change to the tier: a
+movie flagged evidence-only feeds the shared coverage/evidence/provenance
+union that proves the banks, but `movie_verify[s]` skips its behavioral tier.
+So a scene the tier cannot tick-lock still contributes its coverage. This is
+why the escape renders correctly AND the conversion verifies — and why the
+correctness gate that every other game depends on was left untouched.
+
+### 0.9 The surface-and-recording discipline
+
+A conversion is a function of three inputs — the stock ROM, the generator, and
+**the surfaces**. The first two are durable; the surfaces must be made so.
+
+- **Scripted surfaces are code.** `tools/sm_surfaces.py` re-emits the three
+  deterministic ones (attract 36k, title-skip, play-death) bit-for-bit and
+  replays each to embed its end hashes, so a later replay prints "sync
+  verified". Kept in `tests/surfaces/sm-sa1/scripted/`.
+- **Player recordings are irreplaceable.** Each exists because it walked a
+  path no script had. They bind by CRC (offset `0x08`) to the image they were
+  recorded on; a recording without its image is inert. Kept in `recordings/`,
+  their images (patched commercial ROMs, so untracked) in `generated/`.
+- **The recorder.** `--record` in the SDL player opens a take BEFORE the first
+  frame (F10 alone cannot promise frame 0 — the "power-on" label keys on a
+  state load, not on frames run), starts with blank battery SRAM (headless
+  loads none, so a take made against a save file could never replay), and
+  saves on exit. A stock power-on take is the only recording that verifies on
+  any image, CRC-independent.
+- **Harvesting rule.** A HUNG run is safe to harvest as a cover pair; a
+  CRASHED run poisons coverage (the harvest mis-credits the crash's garbage
+  execution to the wrong file bytes on a > 2 MiB shim map). Prefer a net over
+  a recording for any structural class.
+
+### 0.10 The process lessons
+
+- **Hand-patch to prove a root cause before writing a net.** Three bytes in a
+  copy of the image settled the background cause before a single generation.
+  The cheapest proof there is.
+- **Compare trajectory when every link checks out.** A halt where every code
+  path is correct on correctly-relocated data is a *stalled state machine* or
+  a *timing/RNG fork*, not a room-load bug. The discriminators: advance a save
+  state ~900 frames and diff (48 bytes moving means stalled); and compare
+  where the player IS on both images (a position stock never occupies at that
+  X points upstream). Both cracked cases three probes had failed to.
+- **A confident wrong theory costs the most.** Two of this campaign's longest
+  dead-ends (the §4f "decor is wrong" misdiagnosis, the tileset-table net)
+  were confident theories pursued without a discriminating measurement first.
+  When every link checks out, get evidence, do not generate.
+- **"Money-check" discipline.** Verify the fix touched the thing you think it
+  did — diff the image, confirm the byte, render the frame — before believing
+  a green verdict. A verified conversion can still render a room black if the
+  bug is in a surface the tier never exercised.
+- **The chain is finite but reaches as far as you play.** Making the game
+  reachable exposes per-room pointer families no surface had hit. Each is
+  real; the mechanism for closing it (net if data, coverage if code) is now
+  known. The open frontier is every room-type still unvisited.
 
 ---
 
