@@ -13,9 +13,16 @@ as a **cover pair** against that image:
 | `user-play2.ymv` | 6,992 | `cover40.sfc` | general play, second pass |
 | `rec4.ymv` | 14,041 | `sm-conv-hdmafix2.sfc` | the longest run held — play after the HDMA-table fix |
 | `rec5.ymv` | 1,718 | `sm-conv-final.sfc` | short confirmation run on the v8 candidate |
+| `ridley-no-damage.ymv` | 11,268 | `sm-sa1-v26.sfc` | the Ridley fight: projectile/enemy tables on the abandoned home (bullets did no damage); 2,417 instructions newly covered |
+| `escape-stuck.ymv` | 6,048 | `sm-sa1-v27.sfc` | the Ceres escape from Ridley's room: `$90:E200 LDA $0DD0` re-opened (§4f's v20) |
+| `plm-halt.ymv` | 7,662 | `sm-sa1-v28.sfc` | through Ridley's room into the falling-tile room: the level-pointer class (§4g); a hung run, safe to harvest |
+| `stock-escape-anchored.ymv` | 13,585 | `sm.sfc` (anchored) | STOCK, Ridley through the escape to the landing site; anchored to a menu state, so cover-pair only |
+| `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. A cover pair, not a `--movie`: the escape is an RNG-forked scene the behavioral tier cannot verify (§4g) |
 
-All four fed the v8 generation. They are **not** in `sm-sa1-v25.bps.cmd`,
-which passes the scripted surfaces only — see the parent README.
+The first four fed the v8 generation; the five before it feed `sm-sa1-v32.bps.cmd` as cover pairs.
+Recorded with `--record` where noted as power-on: the player opens the take
+before the first frame and starts with blank battery SRAM, which is the
+machine headless replays it on.
 
 ## The images they need
 
@@ -27,6 +34,9 @@ in the parent directory; two cannot:
 |---|---|
 | `sm-conv-hdmafix2.sfc` | yes — `../sm-conv-hdmafix2.bps.cmd` |
 | `sm-conv-final.sfc` | yes — `../sm-conv-final.bps.cmd` |
+| `sm-sa1-v26.sfc` | yes — regenerate v26's recipe (the v25 `.cmd` plus the four cover pairs) |
+| `sm-sa1-v27.sfc` | yes — v26's recipe plus `ridley-no-damage` |
+| `sm-sa1-v28.sfc` | yes — v27's recipe plus `escape-stuck` |
 | `cover39.sfc` | **no recipe exists** |
 | `cover40.sfc` | **no recipe exists** |
 
