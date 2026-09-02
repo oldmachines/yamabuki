@@ -88,6 +88,8 @@ pub const Options = struct {
     /// `--movie`: a validated recorded playthrough to replay from power-on.
     /// Live input takes over when it ends.
     movie: ?util.movie.Movie,
+    /// `--record`: begin a power-on take before the first frame runs.
+    record: bool = false,
     /// Cheat pokes held after every executed frame; see cheat.zig.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -345,7 +347,13 @@ pub fn run(
     var sram: ?saves.Sram = null;
     if (opts.saves_dir) |dir| {
         if (con.cartridge().hasBattery()) {
-            sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
+            // A --record session starts from the machine headless will replay
+            // the take on, and headless loads no battery save: blank SRAM in,
+            // and the take's in-game saves never reach the real .srm.
+            if (opts.record) {
+                try err.print("movie: --record starts with blank battery SRAM (the .srm is left untouched)\n", .{});
+                try err.flush();
+            } else sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
             if (sram) |*s| s.load(io, con, err);
         }
     }
@@ -424,6 +432,26 @@ pub fn run(
     var play_idx: usize = 0;
     var movie_end_check = false;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
+
+    // --record: open the take here, before any frame has run, so the movie
+    // is a true power-on take with the boot frames in it. The F10 path can
+    // only start when the hand gets there, and `at_power_on` cannot tell how
+    // many frames slipped by first; a take that starts late but claims frame
+    // 0 replays its inputs early and desyncs at the first branch.
+    if (opts.record) {
+        if (opts.movies_dir == null) {
+            try err.print("movie: --record unavailable — no per-user data directory\n", .{});
+            try err.flush();
+        } else if (play_movie != null) {
+            try err.print("movie: --record cannot combine with --movie playback\n", .{});
+            try err.flush();
+        } else {
+            rec = .init(gpa);
+            try err.print("movie: recording from power-on (--record; F10 stops and saves)\n", .{});
+            try err.flush();
+            toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
+        }
+    }
 
     while (running) {
         if (mnu) |*m| m.tick() else repeater = .{};
@@ -1020,6 +1048,15 @@ pub fn run(
         }
     }
 
+    // A take still open when the window closes is saved, not dropped: with
+    // --record the take IS the point of the session, and F10 is easy to
+    // miss. Its hashes describe the machine as it stands now, which is
+    // exactly what a stop would have recorded.
+    if (rec) |*r| {
+        writeMovie(io, gpa, &opts, con, r.items, rec_anchor, audio_hash, err);
+        r.deinit();
+        rec = null;
+    }
     // The battery save's last chance before the process ends.
     if (sram) |*s| s.flush(io, con, err);
 

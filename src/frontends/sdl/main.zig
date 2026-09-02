@@ -74,6 +74,9 @@ const Args = struct {
     /// `--movie <file>`: replay a recorded playthrough (.ymv) from power-on;
     /// live input takes over when it ends. Needs an explicit ROM argument.
     movie: ?[]const u8 = null,
+    /// `--record`: start an input-movie take at power-on, before the first
+    /// frame runs, so the boot frames are in it and no anchor is needed.
+    record: bool = false,
     /// `--poke ADDR=VAL`: cheat writes held after every frame.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -115,6 +118,8 @@ pub fn main(init: std.process.Init) !void {
                 "  --poke a=v  same, but exact: no relocation mirror\n" ++
                 "  --movie f   replay a recorded playthrough (.ymv) from power-on; live input\n" ++
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
+                "  --record    start recording a .ymv at power-on, before the first frame;\n" ++
+                "              F10 stops and saves it (F10 alone cannot promise frame 0)\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -247,6 +252,7 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .record = args.record,
         .pokes = args.pokes,
         .n_pokes = args.n_pokes,
         .patch_name = booted.patch_name,
@@ -585,6 +591,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             args.n_pokes = util.cheat.parseList(v, &args.pokes, args.n_pokes) catch
                 return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--record")) {
+            args.record = true;
         } else if (std.mem.eql(u8, a, "--movie")) {
             args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {
