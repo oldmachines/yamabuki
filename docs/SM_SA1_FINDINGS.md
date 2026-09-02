@@ -738,14 +738,29 @@ the attract surface (surface 1). The attract healed at a scene reset; the
 escape runs to the movie's end with no reset inside the window, so the fork
 never heals and the persistence verdict fails it.
 
-So the escape is a cover pair, not a verification surface — it donates
-coverage (the v33 profile proved 18 more bytes, including three non-state
-level pointers at `$8F:E734/E737/E73A` the door-walk does not reach, since it
-walks state-header pointers only and these belong to the scrolling-sky FX).
-The shippable net image is **v32**: net in, all its surfaces behaviorally
-equivalent, halt gone, round-trip verified. A tick-locked verifier that
-resets its RNG-fork ledger on a room transition would let the escape verify
-too; that is the follow-up, not a blocker.
+So the escape is coverage, not a verification surface. But it must not be
+LOST as coverage: v32 (net in, all surfaces verified) shipped the escape
+BLACK — correct geometry, CGRAM all zeros. Root, one layer up from the level
+pointers: three `$7F` bank bytes at `$8B:C3E9/C6BD/C6CE`, in the escape's
+graphics/palette decompress-output path (right after `JSL $80:B0FF`), stayed
+raw because no surface PROFILED the escape, so the palette decompressed into
+the abandoned bank. Same evidence-gated shape, the CGRAM-destination bank
+instead of the level pointer. The v33 profile proved them and rendered the
+escape identical to stock — but v33 was a `--movie` and REFUSED on the fork.
+
+The resolution is `--evidence-movie`, not a verifier change. It feeds the
+same profile — coverage, site evidence, value provenance — into the shared
+union, but `movie_verify[s]` (main.zig) skips its behavioral tier. So the
+escape take profiles the escape (proving the `$8B` palette banks AND the
+three non-state FX pointers at `$8F:E734/E737/E73A` the door-walk cannot
+reach) while never being tick-locked against a scene it cannot match.
+
+**v34** is the ship: net in, escape take as `--evidence-movie`, all three
+verification surfaces behaviorally equivalent, DFD7-escape palette
+`cgram_sum=00230fa4` identical to stock, room renders, round-trip verified.
+The verifier is untouched — weakening the gate every game depends on, to pass
+one RNG-forked surface, was the wrong trade when a coverage-only surface does
+the whole job.
 
 ## 5. Instruments and technique notes
 
@@ -857,8 +872,10 @@ JSLs had been trapping the CPU) · v27 Ridley takes damage · v28 the escape
 resumes · v29-v30 the falling-tile halt does not move under any coverage ·
 v31 the room-graph walk (292 banks) · v32 the Ceres root (298; the halt is
 gone) · v33 the power-on escape take as a fourth `--movie` — REFUSED, the
-escape is an RNG-forked scene and cannot be a verification surface; it is a
-cover pair, and v32 is the shippable net image (§4g).
+escape is an RNG-forked scene and cannot be a verification surface · v32 the
+net image, verified but the escape rendered BLACK (an evidence-gated palette
+bank the escape never profiled) · v34 the escape take as `--evidence-movie`:
+palette proven, escape renders, all verification surfaces pass — the ship (§4g).
 
 ## 8. Cross-cutting learnings
 
