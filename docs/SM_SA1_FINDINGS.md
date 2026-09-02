@@ -762,6 +762,44 @@ The verifier is untouched — weakening the gate every game depends on, to pass
 one RNG-forked surface, was the wrong trade when a coverage-only surface does
 the whole job.
 
+### The chain keeps going: foreground code, then background data (v36-v38)
+
+Making the game REACHABLE exposed a run of per-room pointers no surface had
+ever hit, because you could not get to those rooms before. Playing v34 into
+the Parlor ($92FD, the first Zebes room off the landing site) rendered it as
+COMPLETE tile garbage. Three layers, each found by playing one room further:
+
+- **Level geometry** — the room-graph walk (already shipped). Correct.
+- **Foreground tiles** — uncovered CODE. v34's playthrough, harvested as a
+  cover pair, let the generator relocate the Zebes room-load path (new
+  thunks in bank $81); v36 rendered the foreground. This is coverage, not
+  structure: a lost recording reopens it.
+- **Background (BG2)** — DATA, and coverage does NOT reach it. v37 (with the
+  Parlor now covered) verified but left the BG record's source banks raw,
+  because the BG DMA reads its source bank straight from the record as data;
+  no code relocation moves a data byte. A three-byte hand-patch of the
+  Parlor's BG record ($8F:B8B4: $BA->$3A, $7E->$40) made the room clean,
+  proving the whole cause.
+
+The BG record is the same shape as the level pointer, one table deeper: each
+state names it at +$16, and it is a DMA list whose copy commands carry source
+banks. `rebankSmBgRecord` de-mirrors them structurally, per-record graceful
+(a state's +$16 legitimately points at code or nothing, so a record that
+stops parsing as a list is skipped). Command widths read off SM's interpreter
+and validated against all 67 reachable records (66 clean, one code-pointer
+correctly rejected). v38: 130 source banks across 196 records, escape and
+Parlor both pixel-clean, verified.
+
+**The standing lesson, sharpened.** A net survives a lost recording; coverage
+does not — and the split runs along the code/data line. Uncovered CODE is
+fixed by coverage (relocation follows execution). Uncovered DATA — a pointer
+or bank byte a data structure carries — is fixed only by a structural net
+that knows the structure, because no execution moves a byte the code merely
+reads. The level pointer, the tileset banks, and the BG records are all the
+data side; the Zebes foreground was the code side. What remains open is every
+room-type still unvisited: its data pointers are structural (net them as
+found), its uncovered code wants one comprehensive playthrough as coverage.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:

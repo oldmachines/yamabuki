@@ -17,9 +17,11 @@ as a **cover pair** against that image:
 | `escape-stuck.ymv` | 6,048 | `sm-sa1-v27.sfc` | the Ceres escape from Ridley's room: `$90:E200 LDA $0DD0` re-opened (§4f's v20) |
 | `plm-halt.ymv` | 7,662 | `sm-sa1-v28.sfc` | through Ridley's room into the falling-tile room: the level-pointer class (§4g); a hung run, safe to harvest |
 | `stock-escape-anchored.ymv` | 13,585 | `sm.sfc` (anchored) | STOCK, Ridley through the escape to the landing site; anchored to a menu state, so cover-pair only |
+| `v34-play.ymv` | 12,305 | `sm-sa1-v34.sfc` | Ceres + into Zebes (the Parlor); its coverage relocated the Zebes room-load CODE that renders the foreground |
+| `v36-play.ymv` | 12,305 | `sm-sa1-v36.sfc` | the same, further; confirmed the background is DATA (a BG-record bank) that coverage does NOT reach — closed by the structural BG net instead |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the five before it feed `sm-sa1-v34.bps.cmd` as cover pairs.
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v38.bps.cmd` as cover pairs.
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on.
