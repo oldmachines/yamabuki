@@ -595,6 +595,158 @@ had. Keep them somewhere durable alongside the `.bps` and its `.cmd`; a
 scratchpad does not survive the session. Losing them does not corrupt a
 build, it silently narrows coverage, and the bugs in section 4f come back.
 
+## 4g. The level-pointer class: rooms no surface loaded (v25-v33)
+
+Three stalls in one evening, each found by a player recording and each
+closed by harvesting it — until the third one refused to close that way,
+and turned out to be the largest class this campaign has found.
+
+| conv | symptom | site | closed by |
+|---|---|---|---|
+| v26 | bullets do no damage to Ridley | projectile tables `$0B64/$0B78/$0BDC/$0BF0` and enemy cells `$0F7A/$0F7E/$0FAC` still on the abandoned home | `ridley-no-damage.ymv` as a cover pair: 2,417 instructions newly covered, 57 sites relocated (v27) |
+| v27 | Samus never regains control in the Ceres escape | `$90:E200 LDA $0DD0`, byte-identical to stock — §4f's v20 bug, re-opened because the recording that covered it was lost | `escape-stuck.ymv` as a cover pair (v28) |
+| v28 | "Samus is stuck" in the falling-tile room, no decor drawn | `$84:B3A6` `BRA *` — reached on **correct** logic over **garbage level data** | the room-graph walk (v32) |
+
+The first two are the §4f shape and the §4f loop closed them in twenty-five
+minutes each. The third is the one worth writing down.
+
+### Every link was correct
+
+`--dump-ram` 900 frames apart showed 3 bytes changing: a halt, not a
+freeze. The PC sat on `80 FE` (`BRA *`), Super Metroid's own assertion in
+the setup of PLM `$B6FF`: *find another PLM at my block, or hang*. Every
+link in the chain that reaches it was traced and was stock logic on
+correctly relocated data: the room state selected by `$80:81DC` (Ceres
+Ridley's boss bit, read through `$40:D828,X`); the room's PLM list, empty
+in stock too; the type-`$B` block reaction `$94:9139[$46] -> $B6FF`; the
+enemy `$E23F`'s AI bank byte, re-banked `$A6 -> $26` and executing there.
+Harvesting a stock recording of the same path (`stock-escape-anchored.ymv`
+as `--cover-image sm.sfc`) covered 1,987 new instructions and changed
+nothing about the halt (v30). The instinct after that — a timing race in
+stock exposed by the conversion's lower lag — was wrong too.
+
+What cracked it was comparing Samus's trajectory through the room on stock
+against the conversion: stock enters at `Y=077` on the upper level, the
+conversion at `Y=08B` on the lower — a position stock never occupies at
+that X. Then the block table: the conversion's copy of room `$E06B` was
+**0/512 words identical to stock** on the escape pass, and **512/512** on
+the first pass through the same room before Ridley. Same level-data pointer
+both times. The decompressor was producing garbage, from its first byte,
+only when loading the escape state.
+
+### The byte
+
+Tracing both decompressions to their first divergence took one instruction:
+
+```
+$82:EA95  first pass:  a=ADC3     escape pass:  a=CDC3
+```
+
+That is the room loader reading the level-data pointer's bank out of the
+state header. Every room state carries a 3-byte pointer at `+0`, and every
+one of them names MB2 (`$C2-$CE`). Under the >2 MiB shim MB2 lives `$20`
+lower, so the byte must become `$A2-$AE` — and the only pass that does that
+is `hi_proven`, which needs the profile to have watched the loader read that
+exact byte. The default state's byte at `$8F:E07F` was proven (every surface
+visits that room before Ridley). The escape state's byte at `$8F:E099` was
+not: no stock-side surface had ever loaded the escape state. `$CD:C330`
+under the shim is not level data; the block table came out as tilemap-shaped
+noise, nothing rendered, Samus walked through a wall into a phantom
+special block, and the PLM it spawned hung looking for a partner.
+
+Hand-patching the six Ceres escape-state bytes in v30 made `plm-halt.ymv`
+run through the room and end in `$E021`. Root cause closed.
+
+### Why it is a class, and why coverage cannot close it
+
+In bank `$8F`, 40 pointer-shaped `$C2-$CE` bytes were translated and ~750
+were not. All six Ceres escape states were raw in v28 *and* v30. Off the
+landing site, Gauntlet Entrance, Parlor, Crateria PB and Terminator were
+raw; the Landing Site and Brinstar Green Hall were fine only because the
+attract demo visits them. **The conversion was unplayable past the first
+door off the landing site**, and nobody had noticed because every surface
+and every recording lives in Ceres. Coverage proves the states it loads;
+nothing short of visiting every room state closes the class by evidence.
+
+### The net: walk the room graph
+
+`rebankSmRoomLevelPointers` (sa1gen) does what the twin-JSL net did for
+mirror `JSL`s — closes the class with no coverage at all — but the proof it
+spends is structure, not a twin. No shape identifies the byte on its own (a
+`$CD` after a word is common in a bank of tables), but the structure that
+reaches it is exact and finite: door headers (`$83`) name rooms (`$8F`); a
+room's condition list names its states (arg widths read off the condition
+routines: `$E5EB` 2, `$E612`/`$E629` 1, the rest 0); a state's first three
+bytes are the pointer. The walk follows doors from the landing site, stops
+where a door names no room (elevators, `$0000`), validates every state
+(pointer in MB2's ROM half, tileset index in range) before touching a byte,
+and refuses the whole pass on the first failure. It reads stock bytes and
+leaves anything `hi_proven` already re-banked alone, so the two compose.
+
+Gated on the ROM title and a >2 MiB window conversion. v31 reached 255
+rooms / 310 states and re-banked 292; the image diff against v30 was
+exactly those 292 bytes plus the checksum. Then a lesson: **Ceres is not on
+the door graph.** The game warps into `$DF45` at new-game and warps out at
+the end of the escape; no door crosses between Ceres and Zebes, so a walk
+rooted at the landing site never reaches it. With `$DF45` as a second root
+(v32): 261 rooms / 322 states / 298 re-banked, all six escape states at
+`$AD`, and `plm-halt.ymv` replays through the room with no hand patch.
+Behavioral verification unchanged, timing unchanged (2342 -> 2416 dropped).
+
+### The learning, stated once
+
+Two of the three stalls were the same lesson as §4f's twin-JSL close, and
+the third is its sharpest form: **a net survives a lost recording; coverage
+does not.** Ridley's grab stayed fixed across the lost scratchpad because
+`da19a29` closed it in the generator; the escape flag regressed because it
+had only ever been closed by a recording. The level-pointer class was ~750
+sites wide and would have cost one freeze per new room, forever, on the
+recording loop. It cost 265 lines and one unit test on the walk.
+
+Two smaller ones from the same evening:
+
+- **Trajectory comparison is a discriminator.** When every link at a halt
+  checks out, compare where the player *is* on both images. A position stock
+  never occupies at that X is the divergence, and it points upstream.
+- **A hand patch is the cheapest proof there is.** Six bytes in a copy of
+  the image settled the root cause before a single generator run.
+
+### The recorder
+
+Two stock takes were made before one usable: the first anchored to a menu
+state (F9 had been pressed), the second discarded because the window was
+closed without F10. `--record` in the SDL player now opens the take before
+the first frame runs (F10 alone cannot promise frame 0 — `at_power_on` does
+not notice frames slipping by), starts with **blank battery SRAM** (headless
+loads none, so a take made against a save file could never replay), leaves
+the real `.srm` untouched, and saves the take on exit. `sm-escape-poweron.ymv`
+— power-on, 20,807 frames, sync verified, the whole Ceres arc — is the first
+stock-side surface through the escape.
+
+### The escape does not verify as a surface, for a principled reason
+
+Adding the take as a fourth `--movie` (v33) made the generator REFUSE: the
+behavioral tier fails the escape and never heals. The forensics say why, and
+it is not the net. Divergence is near-zero until Samus enters the final Ceres
+rooms, then saturates at the print cap (65 cells) the instant the collapse
+starts, and every diverging cell is a sprite/projectile slot (`$0F78`+`$40`
+stride) or a wall-derived counter (`$05B6`) — room, health, escape flag and
+Samus's position through DFD7 all stay in sync. That is the escape's
+explosion/debris/`$E1FF`-enemy chaos, seeded from RNG and timers, forking
+under the lag differential: the SAME RNG-fork signature the tier EXCUSED on
+the attract surface (surface 1). The attract healed at a scene reset; the
+escape runs to the movie's end with no reset inside the window, so the fork
+never heals and the persistence verdict fails it.
+
+So the escape is a cover pair, not a verification surface — it donates
+coverage (the v33 profile proved 18 more bytes, including three non-state
+level pointers at `$8F:E734/E737/E73A` the door-walk does not reach, since it
+walks state-header pointers only and these belong to the scrolling-sky FX).
+The shippable net image is **v32**: net in, all its surfaces behaviorally
+equivalent, halt gone, round-trip verified. A tick-locked verifier that
+resets its RNG-fork ledger on a room transition would let the escape verify
+too; that is the follow-up, not a blocker.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -696,6 +848,17 @@ come out byte-identical to stock, and the new-game room renders. The
 black-room freeze is fixed. The Ceres-escape garble is now fixed too (§4a):
 low-WRAM HDMA-table indirect addresses relocate into the window (hdma3) and the
 `$43x7` DASB thunk rebanks the colour HDMA (hdma2) — pixel-identical to stock.
+
+
+v25-v33 (2026-09-01/02): v25 the branch's three-surface build · v26 the
+union with the recovered cover pairs (505 twin-JSL + 20 coverage sites,
+and the `2342 -> 28969` dropped-frame alarm resolved: the unfixed mirror
+JSLs had been trapping the CPU) · v27 Ridley takes damage · v28 the escape
+resumes · v29-v30 the falling-tile halt does not move under any coverage ·
+v31 the room-graph walk (292 banks) · v32 the Ceres root (298; the halt is
+gone) · v33 the power-on escape take as a fourth `--movie` — REFUSED, the
+escape is an RNG-forked scene and cannot be a verification surface; it is a
+cover pair, and v32 is the shippable net image (§4g).
 
 ## 8. Cross-cutting learnings
 
