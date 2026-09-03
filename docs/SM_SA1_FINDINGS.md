@@ -280,6 +280,20 @@ A conversion is a function of three inputs — the stock ROM, the generator, and
 
 ### 0.10 The process lessons
 
+- **Measure the generation before optimizing the game.** An hour per build
+  was 785k frames of replays on one core, most of them unchanged since the
+  last build. The harvest cache, threaded harvests and render-skipping
+  harvests (§5) took a candidate from an hour to minutes without changing a
+  byte of output; every one was proven byte-identical before it shipped.
+- **Record on stock for coverage, on the conversion for symptoms** (§4l):
+  one stock take covered more than every conversion take combined, because
+  nothing stalls on stock and provenance only traces there.
+- **Run `--stale` on every take first** (§4i): it lists every missed
+  translation the play touched, and the addressing form of each line tells
+  code from data before any trace.
+- **Keep the save**: `--record` writes `<take>.srm`; `--record --srm` starts
+  the next take from it, anchored, so a long game spans sessions.
+
 - **Hand-patch to prove a root cause before writing a net.** Three bytes in a
   copy of the image settled the background cause before a single generation.
   The cheapest proof there is.
@@ -1398,6 +1412,36 @@ byte-for-byte against `--dump-vram`/`--dump-ppu`/`--dump-ram`. That is how
 addr len [mx]`) for reading the call sites once the byte is found; mind that
 inline arguments after a JSL show up as nonsense instructions, which is the
 tell for the inline-argument class.
+
+**Where a generation's hour went, and the three flags that take it back.**
+Measured on v53's recipe (25 recordings): one thread replayed 785,000
+frames of profiles and cover harvests, then 254,000 frames of verification,
+then the same verification again for the async flavor that has lost 2419 to
+2419 on every build since v38. Three changes, each proven to leave the
+output byte-identical:
+
+- `--harvest-cache <dir>`: a cover pair's harvest — usage map, site
+  evidence, proven bank bytes, armed HDMA tables — is a pure function of
+  (cover image crc32, movie file hash, profiler version), so it is written
+  once and read back after. Cold 62 min, warm 16.7 min on the same recipe,
+  same image to the byte, same "newly covered" numbers line for line; 50 MB
+  for 19 pairs. Bump `harvest_cache_version` when the profiler changes.
+- `--harvest-jobs N` (default: cores, at most 12): pairs that still need a
+  replay run on worker threads, spawned ahead in recipe order, merged on the
+  main thread in recipe order — the union and the log are the same at any
+  N. Combined with the cache, only the new pair replays, on its own thread.
+- Harvest replays no longer paint frames (`skip_render` on the console;
+  `--harvest-render` restores it). Nothing the game can observe lives in
+  the framebuffer, and the harvest never looks at one. Measured together:
+  a cold build fell from 62 to 34 min on 12 cores, bounded by the longest
+  single replay (the 56-minute stock take), with all 19 cache files
+  byte-identical to the single-threaded rendering run's. The flag is run
+  configuration, not machine state — it sits in the console's
+  `serialize_skip`; left out, it shifted the save-state layout by a byte
+  and every anchored recording loaded a machine one byte off.
+
+And `--wg-sync` on ship builds skips the async trial. Together: a candidate
+that used to take an hour is one harvest plus one verification.
 
 ## 6. Known latent issues (not blocking the current surfaces)
 

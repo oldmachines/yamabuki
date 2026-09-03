@@ -200,6 +200,23 @@ const Args = struct {
     cover_image: [24]?[]const u8 = @splat(null),
     cover_movie: [24]?[]const u8 = @splat(null),
     n_cover: usize = 0,
+    /// --harvest-cache <dir>: keep each cover pair's harvest — the replay's
+    /// usage map, site evidence, proven bank bytes and armed HDMA tables —
+    /// in a file keyed by the cover image's crc32, the movie file's hash and
+    /// `harvest_cache_version`. A generation then replays only the pairs it
+    /// has not seen; the merge into the union runs from the file exactly as
+    /// it would from the replay. Measured before this existed: 25 recordings,
+    /// 785k frames replayed per generation, 24 of them unchanged since the
+    /// last. Bump the version whenever the profiler's semantics change.
+    harvest_cache: ?[]const u8 = null,
+    /// --harvest-jobs N: cover pairs that still need a replay run on N
+    /// threads (default: the machine's core count, at most 12). Each replay
+    /// owns its console and products; the merges stay on the main thread, in
+    /// recipe order, so the union and the log are the same at any N.
+    harvest_jobs: usize = 0,
+    /// --harvest-render: paint frames during harvest replays (the default
+    /// skips the pixel work; the harvest never looks at a frame).
+    harvest_render: bool = false,
     /// TEMP S2 debugging (undocumented): with --gen-sa1-patch --state,
     /// comma-separated plan-region indices to KEEP as live relocations
     /// (offloads disabled for the run). Bisects the relocation plan.
@@ -1614,6 +1631,123 @@ fn seedConverted(
     }
 }
 
+/// Bump when the profiler's products change meaning (usage flags, site
+/// evidence classes, what counts as a proven bank byte): every cached
+/// harvest keyed on the old version is then ignored, never misread.
+const harvest_cache_version: u32 = 1;
+const harvest_cache_magic = "YHC1";
+
+fn harvestCachePath(buf: []u8, dir: []const u8, img_crc: u32, movie_hash: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/harvest-{x:0>8}-{x:0>16}-v{d}.bin", .{ dir, img_crc, movie_hash, harvest_cache_version });
+}
+
+fn hcRead32(d: []const u8, p: *usize) ?u32 {
+    if (p.* + 4 > d.len) return null;
+    const v = std.mem.readInt(u32, d[p.*..][0..4], .little);
+    p.* += 4;
+    return v;
+}
+
+fn hcRead64(d: []const u8, p: *usize) ?u64 {
+    if (p.* + 8 > d.len) return null;
+    const v = std.mem.readInt(u64, d[p.*..][0..8], .little);
+    p.* += 8;
+    return v;
+}
+
+/// Read one cached harvest into the pair's products. False (nothing to be
+/// trusted in the outputs) on any mismatch: wrong magic, version, image or
+/// movie, a truncated body, or an address outside the map.
+fn loadHarvestCache(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    img_crc: u32,
+    movie_hash: u64,
+    usage: []u8,
+    ev: []u8,
+    pb: *core.usage_map.PtrBankEvidence,
+) bool {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024 * 1024)) catch return false;
+    defer gpa.free(data);
+    if (data.len < 4 or !std.mem.eql(u8, data[0..4], harvest_cache_magic)) return false;
+    var o: usize = 4;
+    if ((hcRead32(data, &o) orelse return false) != harvest_cache_version) return false;
+    if ((hcRead32(data, &o) orelse return false) != img_crc) return false;
+    if ((hcRead64(data, &o) orelse return false) != movie_hash) return false;
+    const n = hcRead32(data, &o) orelse return false;
+    if (o + @as(usize, n) * 6 > data.len) return false;
+    for (0..n) |_| {
+        const pc = std.mem.readInt(u32, data[o..][0..4], .little);
+        if (pc >= usage.len) return false;
+        usage[pc] = data[o + 4];
+        ev[pc] = data[o + 5];
+        o += 6;
+    }
+    const np = hcRead32(data, &o) orelse return false;
+    for (0..np) |_| pb.addProven(hcRead32(data, &o) orelse return false);
+    const nt = hcRead32(data, &o) orelse return false;
+    for (0..nt) |_| {
+        const t = hcRead32(data, &o) orelse return false;
+        pb.addHdmaTable(@intCast(t & 0xFF_FFFF));
+    }
+    return true;
+}
+
+/// Write the pair's products sparsely: only map cells that are non-zero.
+/// Best-effort — a cache that cannot be written just means a replay next
+/// time.
+fn saveHarvestCache(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    dir: []const u8,
+    path: []const u8,
+    img_crc: u32,
+    movie_hash: u64,
+    usage: []const u8,
+    ev: []const u8,
+    pb: *const core.usage_map.PtrBankEvidence,
+) void {
+    var n: usize = 0;
+    for (usage, ev) |u, e| {
+        if (u != 0 or e != 0) n += 1;
+    }
+    const size = 4 + 4 + 4 + 8 + 4 + n * 6 + 4 + pb.n_proven * 4 + 4 + pb.n_hdma_tables * 4;
+    const buf = gpa.alloc(u8, size) catch return;
+    defer gpa.free(buf);
+    @memcpy(buf[0..4], harvest_cache_magic);
+    var o: usize = 4;
+    std.mem.writeInt(u32, buf[o..][0..4], harvest_cache_version, .little);
+    o += 4;
+    std.mem.writeInt(u32, buf[o..][0..4], img_crc, .little);
+    o += 4;
+    std.mem.writeInt(u64, buf[o..][0..8], movie_hash, .little);
+    o += 8;
+    std.mem.writeInt(u32, buf[o..][0..4], @intCast(n), .little);
+    o += 4;
+    for (usage, ev, 0..) |u, e, pc| {
+        if (u == 0 and e == 0) continue;
+        std.mem.writeInt(u32, buf[o..][0..4], @intCast(pc), .little);
+        buf[o + 4] = u;
+        buf[o + 5] = e;
+        o += 6;
+    }
+    std.mem.writeInt(u32, buf[o..][0..4], @intCast(pb.n_proven), .little);
+    o += 4;
+    for (pb.proven[0..pb.n_proven]) |a| {
+        std.mem.writeInt(u32, buf[o..][0..4], a, .little);
+        o += 4;
+    }
+    std.mem.writeInt(u32, buf[o..][0..4], @intCast(pb.n_hdma_tables), .little);
+    o += 4;
+    for (pb.hdma_tables[0..pb.n_hdma_tables]) |t| {
+        std.mem.writeInt(u32, buf[o..][0..4], @as(u32, t), .little);
+        o += 4;
+    }
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf[0..o] }) catch {};
+}
+
 /// Restore the machine a movie's inputs were recorded against, before its
 /// first frame runs. A movie recorded from power-on carries no anchor and
 /// this is a no-op; an anchored one is meaningless without it, so a state
@@ -2243,65 +2377,159 @@ fn runSa1Gen(
     // opcodes; the previous build's scaffolding differs byte-for-byte
     // and filters itself out). Site evidence is NOT harvested — conv
     // effective addresses describe the post-relocation world.
+    // Every pair is an independent replay — its own image, console and
+    // products — and only the merge into the union is shared. So: pairs are
+    // loaded in recipe order; a pair whose harvest is cached is read back at
+    // merge time; a pair that needs its replay is run on a worker thread, up
+    // to `jobs` in flight, spawned ahead in recipe order; the main thread
+    // merges pair i only after joining it, in recipe order, so the union
+    // and the log come out the same at any thread count. Memory is bounded
+    // by the in-flight window: two 16 MiB maps and a console per job.
+    const HarvestJob = struct {
+        ci_raw: []u8 = &.{},
+        ci: []const u8 = &.{},
+        mb: []u8 = &.{},
+        movie: ?util.movie.Movie = null,
+        ci_crc: u32 = 0,
+        mov_hash: u64 = 0,
+        cache_path: ?[]const u8 = null,
+        cached: bool = false,
+        tmp: []u8 = &.{},
+        tmp_ev: []u8 = &.{},
+        pb: ?*core.usage_map.PtrBankEvidence = null,
+        map: core.usage_map.UsageMap = undefined,
+        con: ?*core.ProfilingConsole = null,
+        thread: ?std.Thread = null,
+        anchor_failed: bool = false,
+
+        fn replay(job: *@This()) void {
+            const c = job.con.?;
+            const m = job.movie.?;
+            if (m.anchor) |anc| c.loadState(anc) catch {
+                job.anchor_failed = true;
+                return;
+            };
+            for (0..m.frames.len + 600) |i| {
+                feedMovie(c, m, i);
+                c.runFrame();
+            }
+        }
+    };
+    var jobs: [24]HarvestJob = @splat(.{});
+    const jobs_max: usize = if (args.harvest_jobs != 0) args.harvest_jobs else @min(12, std.Thread.getCpuCount() catch 4);
+    // Phase 1: load every pair, decide cache hit or replay, and prepare the
+    // replay's console on this thread (allocation stays off the workers).
     for (0..args.n_cover) |ci_i| {
         if (args.cover_image[ci_i] == null or args.cover_movie[ci_i] == null) continue;
-        const ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+        const job = &jobs[ci_i];
+        job.ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
             try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
-        const ci = core.header.stripCopierHeader(ci_raw);
-        const mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
+        job.ci = core.header.stripCopierHeader(job.ci_raw);
+        job.mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
             try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
-        const cm = util.movie.parse(gpa, mb) catch {
+        job.movie = util.movie.parse(gpa, job.mb) catch {
             try out.print("error: '{s}' is not a valid movie\n", .{args.cover_movie[ci_i].?});
             try out.flush();
             std.process.exit(1);
         };
-        const tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
-        defer gpa.free(tmp);
-        @memset(tmp, 0);
-        // Evidence rides along, classified through the window normalizer
-        // (window -> wram_low, $40/$41 -> wram_bank): sites that ONLY the
-        // conversion-side gameplay executes would otherwise be covered
-        // yet evidence-free, and the tiny-base indexed exemption keeps
-        // evidence-free sites unshifted — measured: the boss-arrival
-        // script reads stayed dead even after the coverage harvest, so
-        // the scroll never locked and the boss never spawned.
-        const tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
-        defer gpa.free(tmp_ev);
-        @memset(tmp_ev, 0);
-        // Bank-byte provenance from the conversion side too. Without this the
-        // harvest donated coverage and site class but not WHERE a $7E/$7F bank
-        // byte came from, so an idiom that only runs in a scene no stock-side
-        // movie reaches could never be proven — the same shape of blind spot as
-        // the vector page. A byte the previous conversion already re-banked
-        // reads $40 there and simply never triggers the tracker, so what this
-        // can surface is exactly the ones still unconverted.
-        const cover_pb = try gpa.create(core.usage_map.PtrBankEvidence);
-        defer gpa.destroy(cover_pb);
-        cover_pb.* = .init;
-        var cover_map: core.usage_map.UsageMap = .{ .bytes = tmp, .sites = tmp_ev, .conv_window_homes = true, .ptr_banks = cover_pb };
-        const ccart = try core.Cartridge.load(gpa, ci);
-        const ccon = try gpa.create(core.ProfilingConsole);
-        ccon.init(ccart);
-        ccon.usage = &cover_map;
-        // SA-1-side coverage too: on a conversion image the tail's code
-        // executes on the SA-1, and this harvest exists to see it.
-        if (ccon.bus.cart.chip == .sa1) ccon.bus.sa1.usage = &cover_map;
-        // The harvest replays a recording on the very image it was made on,
-        // so an anchor restores exactly the machine it describes — this is
-        // the path that lets a LATE-GAME recording donate coverage at all.
-        try anchorMovie(ccon, cm, "cover movie", out);
-        for (0..cm.frames.len + 600) |i| {
-            feedMovie(ccon, cm, i);
-            ccon.runFrame();
+        job.ci_crc = util.movie.imageCrc(job.ci);
+        job.mov_hash = std.hash.Fnv1a_64.hash(job.mb);
+        if (args.harvest_cache) |dir| {
+            var pbuf: [1024]u8 = undefined;
+            if (harvestCachePath(&pbuf, dir, job.ci_crc, job.mov_hash)) |p| {
+                job.cache_path = try gpa.dupe(u8, p);
+                job.cached = if (std.Io.Dir.cwd().access(io, p, .{})) true else |_| false;
+            } else |_| {}
         }
-        ccon.cart.deinit(gpa);
-        gpa.destroy(ccon);
+        if (!job.cached) {
+            job.tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+            @memset(job.tmp, 0);
+            job.tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+            @memset(job.tmp_ev, 0);
+            job.pb = try gpa.create(core.usage_map.PtrBankEvidence);
+            job.pb.?.* = .init;
+            job.map = .{ .bytes = job.tmp, .sites = job.tmp_ev, .conv_window_homes = true, .ptr_banks = job.pb.? };
+            const ccart = try core.Cartridge.load(gpa, job.ci);
+            const ccon = try gpa.create(core.ProfilingConsole);
+            ccon.init(ccart);
+            ccon.usage = &job.map;
+            // SA-1-side coverage too: on a conversion image the tail's code
+            // executes on the SA-1, and this harvest exists to see it.
+            if (ccon.bus.cart.chip == .sa1) ccon.bus.sa1.usage = &job.map;
+            ccon.skip_render = !args.harvest_render;
+            job.con = ccon;
+        }
+    }
+    // Phase 2: replays in flight ahead of the merge cursor; merge in order.
+    var next_spawn: usize = 0;
+    var inflight: usize = 0;
+    for (0..args.n_cover) |ci_i| {
+        if (args.cover_image[ci_i] == null or args.cover_movie[ci_i] == null) continue;
+        while (next_spawn < args.n_cover and inflight < jobs_max) : (next_spawn += 1) {
+            const j = &jobs[next_spawn];
+            if (j.con == null) continue;
+            j.thread = try std.Thread.spawn(.{}, HarvestJob.replay, .{j});
+            inflight += 1;
+        }
+        const job = &jobs[ci_i];
+        const cm = job.movie.?;
+        var from_cache = false;
+        if (job.cached) {
+            job.tmp = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+            @memset(job.tmp, 0);
+            job.tmp_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+            @memset(job.tmp_ev, 0);
+            job.pb = try gpa.create(core.usage_map.PtrBankEvidence);
+            job.pb.?.* = .init;
+            if (loadHarvestCache(io, gpa, job.cache_path.?, job.ci_crc, job.mov_hash, job.tmp, job.tmp_ev, job.pb.?)) {
+                from_cache = true;
+            } else {
+                // A short or foreign file: replay here, on this thread, from
+                // clean maps — the window ahead is not disturbed.
+                @memset(job.tmp, 0);
+                @memset(job.tmp_ev, 0);
+                job.pb.?.* = .init;
+                job.map = .{ .bytes = job.tmp, .sites = job.tmp_ev, .conv_window_homes = true, .ptr_banks = job.pb.? };
+                const ccart = try core.Cartridge.load(gpa, job.ci);
+                const ccon = try gpa.create(core.ProfilingConsole);
+                ccon.init(ccart);
+                ccon.usage = &job.map;
+                if (ccon.bus.cart.chip == .sa1) ccon.bus.sa1.usage = &job.map;
+                ccon.skip_render = !args.harvest_render;
+                job.con = ccon;
+                job.replay();
+            }
+        } else {
+            job.thread.?.join();
+            job.thread = null;
+            inflight -= 1;
+        }
+        if (job.anchor_failed) {
+            try out.print("error: the cover movie '{s}' carries a start state this console cannot restore\n" ++
+                "       (a save state is tied to the core's layout and the image it was taken on)\n", .{args.cover_movie[ci_i].?});
+            try out.flush();
+            std.process.exit(1);
+        }
+        if (cm.anchor != null and !from_cache) {
+            try out.print("movie anchor: cover movie restored ({} frames replay from it)\n", .{cm.frames.len});
+            try out.flush();
+        }
+        if (job.con) |ccon| {
+            ccon.cart.deinit(gpa);
+            gpa.destroy(ccon);
+            job.con = null;
+            if (job.cache_path) |cp| saveHarvestCache(io, gpa, args.harvest_cache.?, cp, job.ci_crc, job.mov_hash, job.tmp, job.tmp_ev, job.pb.?);
+        }
+        const tmp = job.tmp;
+        const tmp_ev = job.tmp_ev;
+        const cover_pb = job.pb.?;
+        const ci = job.ci;
         var merged: u32 = 0;
         var merged_ev: u32 = 0;
         var pc: u32 = 0;
@@ -2351,8 +2579,14 @@ fn runSa1Gen(
             ptr_ev.addHdmaTable(t);
             if (ptr_ev.n_hdma_tables != before) merged_ht += 1;
         }
-        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven, {} armed HDMA table(s) from the conversion-side replay\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb, merged_ht });
+        try out.print("  cover harvest {s}: {} instruction(s) newly covered, {} site(s) newly evidenced, {} bank byte(s) newly proven, {} armed HDMA table(s) from the conversion-side replay{s}\n", .{ args.cover_movie[ci_i].?, merged, merged_ev, merged_pb, merged_ht, @as([]const u8, if (from_cache) " [cached]" else "") });
         try out.flush();
+        gpa.free(job.tmp);
+        gpa.free(job.tmp_ev);
+        gpa.destroy(job.pb.?);
+        job.tmp = &.{};
+        job.tmp_ev = &.{};
+        job.pb = null;
     }
     for (dbg_site_ev[0..dbg_n_site_ev]) |p| {
         try out.print("  [site-ev] ${x:0>6}: cov={x:0>2} cov80={x:0>2} ev={x:0>2} ev80={x:0>2}\n", .{
@@ -4782,6 +5016,13 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             if (out.n_cover == out.cover_image.len) return error.TooManyArgs;
             out.cover_image[out.n_cover] = it.next() orelse return error.MissingValue;
             out.n_cover += 1;
+        } else if (std.mem.eql(u8, a, "--harvest-jobs")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.harvest_jobs = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--harvest-render")) {
+            out.harvest_render = true;
+        } else if (std.mem.eql(u8, a, "--harvest-cache")) {
+            out.harvest_cache = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--cover-movie")) {
             // Fills the pair the last --cover-image opened.
             if (out.n_cover == 0) return error.MissingValue;

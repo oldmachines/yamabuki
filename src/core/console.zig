@@ -85,7 +85,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -165,6 +165,14 @@ pub fn Console(comptime cfg: CoreConfig) type {
         line_start: u64,
         /// Completed-frame counter.
         frame: u64,
+        /// Skip the fast core's per-scanline pixel rendering. Nothing the
+        /// game can observe lives in the framebuffer, so a run that never
+        /// looks at frames — a coverage harvest — can leave it unpainted and
+        /// keep every register, DMA, timing and audio step exactly as it was.
+        /// Run configuration, not machine state: listed in `serialize_skip`,
+        /// or it would shift the save-state layout by a byte and every
+        /// anchored recording would load a machine one byte off.
+        skip_render: bool,
         /// CPU instructions/interrupts retired since reset. A deterministic
         /// work proxy for perf-regression baselines (paired with bus.clock).
         steps: u64,
@@ -178,6 +186,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.cpu = Cpu(Bus).init(&self.bus);
             self.region = timing.regionFromHeaderByte(self.cart.header.region);
             self.bus.ppu.pal = self.region == .pal;
+            self.skip_render = false;
             self.reset();
         }
 
@@ -316,7 +325,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
             if (line < self.vblankLine()) {
-                if (cfg.accuracy == .fast) self.renderScanline(line) else self.bus.ppu.finishScanline(line);
+                if (cfg.accuracy == .fast) {
+                    if (!self.skip_render) self.renderScanline(line);
+                } else self.bus.ppu.finishScanline(line);
             }
 
             // Between lines the beam is in blanking: HDMA's per-line $21xx
