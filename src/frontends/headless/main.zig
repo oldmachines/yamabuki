@@ -3413,6 +3413,13 @@ fn reportSa1(
                 "  {} decompressor inline-destination bank(s) re-banked BY SIGNATURE\n  ({} `JSL $80:B0FF` sites naming WRAM) — the destination is data in the\n  code stream; a site no recording drove decompressed into real $7E\n  while the game read the stale copy at $40 (wrong tile table = right\n  geometry, wrong textures)\n",
                 .{ res.stats.rewritten_decomp_inline_banks, res.stats.decomp_inline_sites },
             );
+        if (res.stats.tileset_records != 0)
+            try out.print(
+                "  {} tileset-table bank(s) de-mirrored ({} records) — the picture\n  (tile table/GFX/palette) for tilesets no surface loaded; without it a\n  reachable room renders tile garbage over a wrong palette\n",
+                .{ res.stats.rewritten_tileset_banks, res.stats.tileset_records },
+            );
+        if (res.stats.tileset_refused_at != 0)
+            try out.print("  tileset-table pass REFUSED at $8F:{X:0>4} (a record failed validation)\n", .{res.stats.tileset_refused_at});
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",

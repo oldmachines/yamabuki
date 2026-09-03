@@ -278,6 +278,12 @@ pub const Stats = struct {
     /// Non-zero when the walk refused: the $8F address that failed
     /// validation. Nothing was rewritten.
     room_walk_refused_at: u32 = 0,
+    /// Super Metroid tileset-table pointer banks de-mirrored by
+    /// `rebankSmTilesetTable` (the picture's tile table/GFX/palette) at
+    /// tilesets no surface loaded; `tileset_records` is the table length.
+    rewritten_tileset_banks: u32 = 0,
+    tileset_records: u32 = 0,
+    tileset_refused_at: u32 = 0,
     /// Super Metroid background (library) DMA-list source banks de-mirrored
     /// (the BG2 picture) across the records the room walk reached.
     rewritten_bg_banks: u32 = 0,
@@ -4136,6 +4142,113 @@ test "rebankSmBgRecord: copy-command source banks de-mirrored, non-list skipped"
     try testing.expectEqual(@as(u32, 0), w3.bg_banks);
 }
 
+/// Super Metroid's tileset table: the room-graph walk fixes each room's
+/// LEVEL data pointer, but the room also names a TILESET, and the tileset is
+/// three more MB2 pointers — tile table, tile graphics, palette — that the
+/// loader copies into $07C0 and decompresses the picture from. A tileset no
+/// profiled surface loaded keeps its stock banks, all three decompress from
+/// the wrong megabyte, and the room renders as tile garbage over a wrong
+/// palette (measured 2026-09-03 on the Climb, $96BA, tileset 3: 15 of the 29
+/// records — half the game's tilesets — were raw in v41; a hand patch of the
+/// 45 bank bytes made the room pixel-correct). Same evidence-gated class as
+/// the level pointer, one table over. (A first version of this pass, v35,
+/// was written against the Parlor and changed nothing there — the Parlor's
+/// tileset was already proven — and was reverted as a wrong theory. The
+/// theory was wrong for that room, not wrong.)
+///
+/// The table is a fixed contiguous run of 9-byte records ($8F:E6A2..E7A7 on
+/// this ROM — the pointer list at $E7A7 begins exactly where the records
+/// end), each three 3-byte pointers into MB2. All-or-nothing, like the room
+/// walk: every record's three banks must be real MB2 ($A0-$DF) or the whole
+/// pass refuses, because a misparse rewrites graphics data. The de-mirror
+/// map: $C0-$DF content lives $20 lower, $A0-$BF (the CRE's mirror-of-MB1
+/// home) $80 lower. Reads stock bytes; leaves a byte `hi_proven` already
+/// re-banked in `out` alone.
+const sm_tileset_lo: u16 = 0xE6A2;
+const sm_tileset_hi: u16 = 0xE7A7;
+
+fn rebankSmTilesetTable(image: []const u8, out: []u8) SmRoomWalk {
+    const f8f: usize = 0x0F * 0x8000;
+    var walk: SmRoomWalk = .{};
+    if (image.len < f8f + 0x8000) return walk;
+    const b = struct {
+        fn at(img: []const u8, a16: u16) u8 {
+            return img[0x0F * 0x8000 + (@as(usize, a16) - 0x8000)];
+        }
+    }.at;
+
+    // Validate the whole table before touching a byte.
+    var a: u16 = sm_tileset_lo;
+    var recs: u32 = 0;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        inline for (.{ 2, 5, 8 }) |k| {
+            const bank = b(image, a + k);
+            if (bank < 0xA0 or bank > 0xDF) {
+                walk.refused_at = a;
+                return walk;
+            }
+        }
+        recs += 1;
+    }
+    if (recs == 0) return walk;
+
+    a = sm_tileset_lo;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        inline for (.{ 2, 5, 8 }) |k| {
+            const f = f8f + (@as(usize, a) + k - 0x8000);
+            if (out[f] == image[f]) {
+                const bank = out[f];
+                out[f] = if (bank >= 0xC0) bank - 0x20 else bank - 0x80;
+                walk.rebanked += 1;
+            }
+        }
+    }
+    walk.states = recs;
+    return walk;
+}
+
+test "rebankSmTilesetTable: every record's banks de-mirrored, proven left alone, anomaly refuses" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const putrec = struct {
+        fn f(buf: []u8, a16: u16, lo: u16, bank: u8) void {
+            const o = 0x0F * 0x8000 + (@as(usize, a16) - 0x8000);
+            std.mem.writeInt(u16, buf[o..][0..2], lo, .little);
+            buf[o + 2] = bank;
+        }
+    }.f;
+    // Fill $E6A2..E7A7 with 9-byte records (three MB2 pointers each).
+    var a: u16 = sm_tileset_lo;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        putrec(img, a + 0, 0xBEEE, 0xC1); // tile table -> A1
+        putrec(img, a + 3, 0xF911, 0xBA); // tile GFX   -> 3A
+        putrec(img, a + 6, 0xB015, 0xC2); // palette    -> A2
+    }
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    // hi_proven already re-banked the first record's tile-table bank.
+    out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)] = 0xA1;
+
+    const w = rebankSmTilesetTable(img, out);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    try testing.expectEqual(@as(u32, 29), w.states);
+    try testing.expectEqual(@as(u32, 29 * 3 - 1), w.rebanked); // all but the proven one
+    try testing.expectEqual(@as(u8, 0xA1), out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)]); // untouched
+    try testing.expectEqual(@as(u8, 0x3A), out[f8f + (@as(usize, sm_tileset_lo) + 5 - 0x8000)]); // BA -> 3A
+    try testing.expectEqual(@as(u8, 0xA2), out[f8f + (@as(usize, sm_tileset_lo) + 8 - 0x8000)]); // C2 -> A2
+    // A record with a non-MB2 bank refuses the whole pass, rewriting nothing.
+    putrec(img, sm_tileset_lo + 9 + 2, 0xBEEE, 0x12);
+    @memcpy(out, img);
+    const w2 = rebankSmTilesetTable(img, out);
+    try testing.expectEqual(sm_tileset_lo + @as(u16, 9), w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqual(@as(u8, 0xC1), out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)]);
+}
+
 test "rebankSmRoomLevelPointers: every state reached through doors, proven bytes left alone" {
     const gpa = testing.allocator;
     const img = try gpa.alloc(u8, 0x18_0000);
@@ -7355,6 +7468,10 @@ pub fn convertWholeGame(
             const inl = rebankSmDecompInlineDests(image, out);
             res.stats.rewritten_decomp_inline_banks = inl.rebanked;
             res.stats.decomp_inline_sites = inl.sites;
+            const ts = rebankSmTilesetTable(image, out);
+            res.stats.rewritten_tileset_banks = ts.rebanked;
+            res.stats.tileset_records = ts.states;
+            res.stats.tileset_refused_at = ts.refused_at;
         }
     }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
