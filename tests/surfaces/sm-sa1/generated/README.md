@@ -15,12 +15,14 @@ exists so they have one findable home in the tree instead of a scratchpad.
 | `sm-sa1-v41.sfc` | yes — v40's recipe + `v40-poweron`, sync-only, at `03c4dc7` | `recordings/v40-poweron-on-v41.ymv` |
 | `sm-sa1-v43.sfc` | yes — `../sm-sa1-v43.bps` at `37cb09e` | `recordings/v43-poweron.ymv` |
 | `v44-elev-hand.sfc` | **no recipe** — v44 with 29 operand bytes hand-relocated (§4j) | `recordings/v43-poweron-on-elevhand.ymv` |
+| `sm-sa1-v47.sfc` | yes — `../sm-sa1-v47.bps` at `c73572c` | `recordings/v47-poweron.ymv` |
+| `v47-plm-hand.sfc` | **no recipe** — v47 with 7 operand bytes hand-relocated in the `$84:E04A` PLM routine (§4k) | `recordings/v47-poweron-on-plmhand.ymv` |
 
 `cover39`/`cover40` are the root of the chain: both rebuildable recipes above
 consume them, and no `.bps.cmd` was ever written for either. If they are lost,
 `user-play1`/`user-play2` become inert and the other two recipes stop running,
 even though every `.ymv` in this directory tree survives. **Back these two up
-somewhere off this machine** (and `v44-elev-hand.sfc`, the third with no recipe). Their md5s, so a copy can be checked:
+somewhere off this machine** (and `v44-elev-hand.sfc` and `v47-plm-hand.sfc`, the two hand-relocated cover images with no recipe). Their md5s, so a copy can be checked:
 
     9f20c143538d81c7f234caed06a76eb3  cover39.sfc
     8a6f708ba9ecb4f30e6476440886420e  cover40.sfc
@@ -30,6 +32,8 @@ somewhere off this machine** (and `v44-elev-hand.sfc`, the third with no recipe)
     8adb65813e5b632077f978d26442cc19  sm-sa1-v41.sfc
     2a525d63603e21e5f73a5f25a71b18a7  sm-sa1-v43.sfc
     d1b00ca4a1936e2c34e9d935bea1cbdb  v44-elev-hand.sfc
+    c2bfb59c88bf593b72a7b4e0523dc653  sm-sa1-v47.sfc
+    82c4cd77d66dcf1fd713488936d923eb  v47-plm-hand.sfc
 
 A recording is bound by CRC to its image at offset `0x08`; pair them wrongly
 and the replay refuses. See `../recordings/README.md`.

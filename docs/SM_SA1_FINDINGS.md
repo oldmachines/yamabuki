@@ -6,14 +6,15 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v47** (`tests/surfaces/sm-sa1/
-sm-sa1-v47.bps`): five structural nets (room-graph level pointers,
+escape evidence surface. The current build is **v50** (`tests/surfaces/sm-sa1/
+sm-sa1-v50.bps`): five structural nets (room-graph level pointers,
 background records, decompressor inline destinations, the tileset table,
 the enemy headers), the Zebes foreground, the Climb's door/layer code and
 the elevator AI via cover pairs, and the escape palette via an
 `--evidence-movie`. Ceres (including the escape) and Crateria from the
 landing site through the Parlor, the Climb and the Pit Room to the Blue
-Brinstar elevator render and play correctly, and the elevator rides. The open frontier is every room-type not
+Brinstar elevator render and play correctly, the elevator rides, and
+Brinstar's arrival room comes up in play. The open frontier is every room-type not
 yet visited — its data pointers net structurally as they are found, its
 uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
 Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
@@ -1252,6 +1253,43 @@ routine in one round instead of one read per round:
   every code class on that path at once, and the conversion takes are then
   only for finding the data classes. Worth adopting as the default.
 
+## 4k. Brinstar: the arrival black screen, closed the same way (v48-v50)
+
+The v47 power-on take (35,254 frames) rode the elevator and arrived in
+Brinstar (`$9E9F`) to a black screen: the transition state never returned to
+play. `--stale` listed seven sites, all at the arrival and all code: a PLM
+routine at `$84:E04A` with five long `$7E` operands raw plus two data-bank
+mirror operands, one enemy AI read, and two `LDA $0000,Y` reads in the PLM
+draw routine whose pointer was zero because the first routine had run on
+real WRAM. Hand-relocating the seven bytes of the `$84:E04A` routine
+completed the arrival (state `$08` at frame 34,731, Brinstar in play). The
+next tier behind it was the elevator routine's arrival branch (`$A3:95B9..`)
+— the half the v43 take never executed — and one more PLM read. All of it
+executes on the hand-relocated image, so v49 harvests the take there and
+v50 verifies (BEHAVIORALLY EQUIVALENT, 2419 dropped frames — the same count
+as every build since v38). Same shape as §4j, one round, no new class: the
+five nets held for Brinstar's rooms, tilesets and species.
+
+**A thunk from the desynced tail, and how to read an early desync.** The
+harvest on the hand-relocated image also evidenced the enemy
+instruction-list reader (`$A0:C284`/`$C298`, `LDA $0000,Y` after a `PLB`
+from the species' bank) as a misfit-bank site, and the generator wrapped
+both reads in a translate-in thunk that redirects only when the pointer is
+below `$2000`. Its evidence came from the take's tail — inputs recorded
+against a black screen, now driving a live room — so it is the same kind of
+suspect as a hung run's, though nothing crashed. Functionally it is a no-op
+on every legitimate read; what it does change is timing, by a few cycles per
+enemy instruction from the first enemy in Ceres. So the plain replay of the
+take on v49 desyncs in Ceres and never escapes, which looks like a
+regression and is not one: v48, without the thunk, replays the take to
+Brinstar unchanged, and v50 passes the tick-locked tier with equal lag. A
+raw replay proves nothing once timing has moved; the behavioral tier is the
+only judge of a build whose thunks touch the hot path.
+
+A note on reading the detector: it prints the PC AFTER the instruction that
+made the access. `r pc=84:E054 addr=7EDF50` is the `LDA $7E:DF0C,X` at
+`$E050`; disassemble back one instruction from the printed PC.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1402,6 +1440,11 @@ stuck (the elevator AI, conversion-side coverage stalling one stale read per
 round) · v44 the take as a cover pair · v45 + the enemy-header net, verified
 · v46 the take harvested on a hand-relocated image to cover the whole
 elevator routine in one round (§4j).
+
+v48-v50 (2026-09-03): the v47 take arrives in Brinstar to a black screen ·
+seven stale sites, all code (a `$84:E04A` PLM routine with raw long `$7E`
+operands) · 7-byte hand patch completes the arrival · v49 the take harvested
+on the hand-relocated image · v50 verified — the ship (§4k).
 
 ## 8. Cross-cutting learnings
 
