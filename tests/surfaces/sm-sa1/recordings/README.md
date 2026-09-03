@@ -26,9 +26,10 @@ as a **cover pair** against that image:
 | `v43-poweron-on-elevhand.ymv` | 31,174 | `v44-elev-hand.sfc` | DERIVED: header crc32 rebound to the hand-relocated image (v44 with the elevator routine's 29 low-WRAM operands moved into the window by hand, §4j) |
 | `v47-poweron.ymv` | 35,254 | `sm-sa1-v47.sfc` (power-on) | power-on through Crateria, down the elevator into Brinstar (`$9E9F`), where the arrival transition never finished (black screen): a PLM routine in `$84:E04A` with five long `$7E` operands raw (§4k). In the recipe on v47, and as `v47-poweron-on-plmhand.ymv` on the hand-relocated image |
 | `v47-poweron-on-plmhand.ymv` | 35,254 | `v47-plm-hand.sfc` | DERIVED: header crc32 rebound to v47 with the 7 PLM-routine operands hand-relocated, so the arrival completes and the take covers the elevator's arrival branch and the PLM code past it |
+| `stock-poweron-brinstar.ymv` | 137,510 | `sm.sfc` (power-on) | STOCK, 38 minutes: power-on through Ceres, the escape, Crateria, the elevator and Brinstar. As a cover pair it covered 5,745 instructions and proved 12 bank bytes in one pass — more than every conversion take combined (§4l). The template for future coverage takes |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the ones before it feed `sm-sa1-v50.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v52.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on.

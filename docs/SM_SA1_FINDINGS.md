@@ -6,15 +6,17 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v50** (`tests/surfaces/sm-sa1/
-sm-sa1-v50.bps`): five structural nets (room-graph level pointers,
+escape evidence surface. The current build is **v52** (`tests/surfaces/sm-sa1/
+sm-sa1-v52.bps`): five structural nets (room-graph level pointers,
 background records, decompressor inline destinations, the tileset table,
 the enemy headers), the Zebes foreground, the Climb's door/layer code and
 the elevator AI via cover pairs, and the escape palette via an
 `--evidence-movie`. Ceres (including the escape) and Crateria from the
 landing site through the Parlor, the Climb and the Pit Room to the Blue
 Brinstar elevator render and play correctly, the elevator rides, and
-Brinstar's arrival room comes up in play. The open frontier is every room-type not
+Brinstar's arrival room comes up in play. v52 adds the first long STOCK
+recording (38 minutes, power-on into Brinstar) as a cover pair: one pass
+covered more code than every conversion take combined (§4l). The open frontier is every room-type not
 yet visited — its data pointers net structurally as they are found, its
 uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
 Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
@@ -1290,6 +1292,31 @@ A note on reading the detector: it prints the PC AFTER the instruction that
 made the access. `r pc=84:E054 addr=7EDF50` is the `LDA $7E:DF0C,X` at
 `$E050`; disassemble back one instruction from the printed PC.
 
+## 4l. The stock take: one recording, more coverage than all the others (v52)
+
+The first long recording made on the STOCK game — 137,510 frames, 38
+minutes, power-on through Ceres, the escape, Crateria and into Brinstar —
+harvested as a cover pair against the stock image on top of v50's recipe:
+
+| take | newly covered instructions | sites | bank bytes proven |
+|---|---|---|---|
+| Ridley fight on v26 (best conversion take) | 2,364 | 1,048 | 0 |
+| Brinstar arrival on v47 | 73 | 27 | 0 |
+| **stock, power-on into Brinstar** | **5,745** | **2,026** | **12** |
+
+Two reasons for the gap, both structural. Nothing stalls on stock, so a
+routine is covered end to end the first time its path runs, where a
+conversion replay covers it one stale read per round (§4j). And provenance
+traces only on the stock image, so the twelve bank bytes are the kind of
+proof no conversion replay can produce at all. v52 changed 2,097 bytes
+across 17 banks and verified BEHAVIORALLY EQUIVALENT at the same 2419
+dropped frames. The raw replay of the v47 conversion take desyncs early on
+it, as §4k predicts once that much timing has moved.
+
+The working split from here: record on stock for coverage, one long take
+per region; record on the conversion to find the data classes the nets do
+not yet know. The stock take is the one that pays.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1445,6 +1472,10 @@ v48-v50 (2026-09-03): the v47 take arrives in Brinstar to a black screen ·
 seven stale sites, all code (a `$84:E04A` PLM routine with raw long `$7E`
 operands) · 7-byte hand patch completes the arrival · v49 the take harvested
 on the hand-relocated image · v50 verified — the ship (§4k).
+
+v52 (2026-09-03): the first long stock take (38 min, into Brinstar) as a
+cover pair: 5,745 instructions, 2,026 sites, 12 bank bytes in one pass;
+verified — the ship (§4l).
 
 ## 8. Cross-cutting learnings
 
