@@ -146,6 +146,7 @@ pub const scancode = struct {
     pub const x: u32 = 27;
     pub const z: u32 = 29;
     pub const ret: u32 = 40;
+    pub const f: u32 = 9;
     pub const comma: u32 = 54;
     pub const period: u32 = 55;
     pub const escape: u32 = 41;
@@ -168,6 +169,7 @@ pub const Api = struct {
     SDL_GetError: *const fn () callconv(.c) [*:0]const u8,
 
     SDL_CreateWindow: *const fn (title: [*:0]const u8, w: c_int, h: c_int, flags: u64) callconv(.c) ?*Window,
+    SDL_SetWindowFullscreen: *const fn (win: *Window, fullscreen: bool) callconv(.c) bool,
     SDL_DestroyWindow: *const fn (win: *Window) callconv(.c) void,
 
     SDL_CreateRenderer: *const fn (win: *Window, name: ?[*:0]const u8) callconv(.c) ?*Renderer,

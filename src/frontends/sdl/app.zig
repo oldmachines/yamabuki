@@ -390,6 +390,9 @@ pub fn run(
     var audio_on = true;
     var fast_forward = false;
     var paused = false;
+    // F toggles fullscreen (borderless, desktop resolution). A fixed key like
+    // the shader keys below: a display affordance, not a game input.
+    var fullscreen = false;
     var shot_requested = false;
     var running = true;
     var exit_to_library = false;
@@ -630,6 +633,14 @@ pub fn run(
                     if (glv) |g| cycleShader(io, gpa, g, -1, err);
                 } else if (nev.key.scancode == sdl3.scancode.period) {
                     if (glv) |g| cycleShader(io, gpa, g, 1, err);
+                } else if (nev.key.scancode == sdl3.scancode.f) {
+                    fullscreen = !fullscreen;
+                    if (sdl.SDL_SetWindowFullscreen(window, fullscreen)) {
+                        if (fullscreen) toast.set("FULLSCREEN - F TO LEAVE", .{}) else toast.set("WINDOWED", .{});
+                    } else {
+                        fullscreen = !fullscreen;
+                        toast.set("FULLSCREEN FAILED", .{});
+                    }
                 }
             }
             switch (inp.handle(&binds, nev)) {
