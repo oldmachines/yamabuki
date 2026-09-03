@@ -284,6 +284,11 @@ pub const Stats = struct {
     rewritten_tileset_banks: u32 = 0,
     tileset_records: u32 = 0,
     tileset_refused_at: u32 = 0,
+    /// Super Metroid enemy-header bank bytes (+$0C) de-mirrored by
+    /// `rebankSmEnemyHeaders` at species no surface met; `enemy_headers` is
+    /// how many records validated as headers.
+    rewritten_enemy_banks: u32 = 0,
+    enemy_headers: u32 = 0,
     /// Super Metroid background (library) DMA-list source banks de-mirrored
     /// (the BG2 picture) across the records the room walk reached.
     rewritten_bg_banks: u32 = 0,
@@ -4249,6 +4254,83 @@ test "rebankSmTilesetTable: every record's banks de-mirrored, proven left alone,
     try testing.expectEqual(@as(u8, 0xC1), out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)]);
 }
 
+/// Super Metroid's enemy headers: 64-byte records at $A0:CEBF.. ($40 apart,
+/// through $F7BF), one per enemy species. Byte +$0C is the enemy's BANK —
+/// the bank its AI routines, its palette (+$02) and its instruction lists
+/// live in, $A2-$B7 on this ROM, i.e. MB1 addressed through its $A0-$BF
+/// mirror. The game reads it as data (into the enemy's RAM slot, then
+/// through long pointers and the AI dispatch), so it is the same
+/// evidence-gated class as the level pointer: an enemy no recording met
+/// keeps its stock bank, and on the converted map $A0-$BF is MB2, so its
+/// palette comes from the wrong megabyte and its AI runs from it. Measured
+/// 2026-09-03 in $9A44: the six Chozo-face sprites ($EA7F, proven) share
+/// palette slot 7 with $CEFF (raw); $CEFF's palette read from $A2:8912
+/// returned MB2's $C2:8912 and painted the faces wrong. 164 headers carry
+/// such a bank; v43 had 130 raw. A hand patch made the second load write
+/// the stock palette.
+///
+/// Per-record validated, not all-or-nothing: the run of true headers ends
+/// somewhere in $F1xx-$F7xx and is followed by 64-byte-aligned records of
+/// another shape (they carry a plausible bank byte but AI pointers below
+/// $8000), so each record must look like a header — bank in $A0-$BF and
+/// both the init AI (+$12) and main AI (+$18) pointers in ROM ($8000+) —
+/// or it is skipped untouched. Translation is -$80 ($A0-$BF -> $20-$3F).
+/// Leaves a byte `hi_proven` already re-banked in `out` alone.
+const sm_enemy_hdr_lo: u16 = 0xCEBF;
+const sm_enemy_hdr_hi: u16 = 0xF800;
+
+fn rebankSmEnemyHeaders(image: []const u8, out: []u8) SmRoomWalk {
+    const fa0: usize = 0x20 * 0x8000; // bank $A0 (= $20) file offset
+    var walk: SmRoomWalk = .{};
+    if (image.len < fa0 + 0x8000) return walk;
+    var h: u32 = sm_enemy_hdr_lo;
+    while (h + 0x40 <= sm_enemy_hdr_hi) : (h += 0x40) {
+        const o = fa0 + (h - 0x8000);
+        const bank = image[o + 0x0C];
+        const init_ai = std.mem.readInt(u16, image[o + 0x12 ..][0..2], .little);
+        const main_ai = std.mem.readInt(u16, image[o + 0x18 ..][0..2], .little);
+        if (bank < 0xA0 or bank > 0xBF or init_ai < 0x8000 or main_ai < 0x8000) continue;
+        walk.states += 1;
+        if (out[o + 0x0C] != image[o + 0x0C]) continue; // hi_proven got here first
+        out[o + 0x0C] = bank - 0x80;
+        walk.rebanked += 1;
+    }
+    return walk;
+}
+
+test "rebankSmEnemyHeaders: header banks de-mirrored, proven and non-header records left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const fa0: usize = 0x20 * 0x8000;
+    const hdr = struct {
+        fn put(buf: []u8, a16: u16, bank: u8, init_ai: u16, main_ai: u16) void {
+            const o = 0x20 * 0x8000 + (@as(usize, a16) - 0x8000);
+            buf[o + 0x0C] = bank;
+            std.mem.writeInt(u16, buf[o + 0x12 ..][0..2], init_ai, .little);
+            std.mem.writeInt(u16, buf[o + 0x18 ..][0..2], main_ai, .little);
+        }
+    }.put;
+    hdr(img, 0xCEBF, 0xA2, 0x8DBA, 0x8E30); // a real header -> $22
+    hdr(img, 0xCEFF, 0xA2, 0x8DBA, 0x8E30); // real, but already proven in `out`
+    hdr(img, 0xEA7F, 0xA8, 0xE7BC, 0xE812); // real -> $28
+    hdr(img, 0xF17F, 0xB7, 0x0000, 0x0009); // bank plausible, AI pointers not: skipped
+    hdr(img, 0xF13F, 0x02, 0x8000, 0x8000); // bank not a mirror: skipped
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[fa0 + (0xCEFF - 0x8000) + 0x0C] = 0x22;
+    const w = rebankSmEnemyHeaders(img, out);
+    try testing.expectEqual(@as(u32, 3), w.states);
+    try testing.expectEqual(@as(u32, 2), w.rebanked);
+    try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEBF - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEFF - 0x8000) + 0x0C]); // untouched
+    try testing.expectEqual(@as(u8, 0x28), out[fa0 + (0xEA7F - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0xB7), out[fa0 + (0xF17F - 0x8000) + 0x0C]); // skipped
+    try testing.expectEqual(@as(u8, 0x02), out[fa0 + (0xF13F - 0x8000) + 0x0C]); // skipped
+}
+
 test "rebankSmRoomLevelPointers: every state reached through doors, proven bytes left alone" {
     const gpa = testing.allocator;
     const img = try gpa.alloc(u8, 0x18_0000);
@@ -7472,6 +7554,9 @@ pub fn convertWholeGame(
             res.stats.rewritten_tileset_banks = ts.rebanked;
             res.stats.tileset_records = ts.states;
             res.stats.tileset_refused_at = ts.refused_at;
+            const en = rebankSmEnemyHeaders(image, out);
+            res.stats.rewritten_enemy_banks = en.rebanked;
+            res.stats.enemy_headers = en.states;
         }
     }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:

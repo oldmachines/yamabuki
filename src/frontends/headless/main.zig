@@ -3420,6 +3420,11 @@ fn reportSa1(
             );
         if (res.stats.tileset_refused_at != 0)
             try out.print("  tileset-table pass REFUSED at $8F:{X:0>4} (a record failed validation)\n", .{res.stats.tileset_refused_at});
+        if (res.stats.enemy_headers != 0)
+            try out.print(
+                "  {} enemy-header bank(s) de-mirrored ({} headers) — the species' AI,\n  palette and instruction-list bank for enemies no surface met; without\n  it a new enemy paints its palette from the wrong megabyte and runs its\n  AI from it\n",
+                .{ res.stats.rewritten_enemy_banks, res.stats.enemy_headers },
+            );
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
