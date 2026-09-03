@@ -6,12 +6,13 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v40** (`tests/surfaces/sm-sa1/
-sm-sa1-v40.bps`): the room-graph level-pointer net, the background-record net,
-the decompressor inline-destination net, the Zebes foreground via cover
-pairs, and the escape palette via an `--evidence-movie`. Ceres (including the
-escape) and Crateria from the landing site through the Parlor to the first
-new-tileset room render correctly. The open frontier is every room-type not
+escape evidence surface. The current build is **v43** (`tests/surfaces/sm-sa1/
+sm-sa1-v43.bps`): four structural nets (room-graph level pointers,
+background records, decompressor inline destinations, the tileset table),
+the Zebes foreground and the Climb's door/layer code via cover pairs, and
+the escape palette via an `--evidence-movie`. Ceres (including the escape)
+and Crateria from the landing site through the Parlor, the first
+new-tileset room and down into the Climb render and play correctly. The open frontier is every room-type not
 yet visited — its data pointers net structurally as they are found, its
 uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
 Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
@@ -176,6 +177,17 @@ mechanical:
   sites in stock; v38 had 29 raw, among them the load-game tileset loader's
   tile-table loads, which is why the first new-tileset room past the Parlor
   painted the previous tileset's blocks (§4h).
+- **Tileset table** (`$8F:E6A2..E7A7`, 29 records of three 3-byte MB2
+  pointers: tile table, tile graphics, palette): the loader copies a record
+  into `$07C0` and decompresses the whole picture from it. All-or-nothing
+  like the level pointer. 15 of the 29 records — half the game's tilesets —
+  were raw in v41; the Climb (`$96BA`, tileset 3) rendered cross-hatch
+  garbage over a wrong palette until they were translated (§4i). This net
+  was first written against the Parlor, changed nothing there because the
+  Parlor's tileset was already proven, and was reverted as a wrong theory.
+  The theory was wrong for that room, not wrong: a net that fixes nothing
+  visible is not thereby refuted — check whether the table entry the room
+  uses was raw before discarding the class.
 
 **The gate on every SM-specific net:** the ROM title starts with
 `Super Metroid` and the image is a > 2 MiB window conversion. Reads STOCK
@@ -1123,6 +1135,65 @@ which is exactly evidence-gating again. Any routine with inline arguments
 is the same shape; in SM the decompressor is the one that matters, because
 everything the picture is made of passes through it.
 
+## 4i. Running the loop fast: one take, three fixes, no new symptom (v41-v43)
+
+The v40 power-on take (27,067 frames) reached the Climb (`$96BA`) through
+the Parlor's bottom door and the game hung in the door transition: the
+screen black, the state stuck at `$0B` for 660 frames where every earlier
+door took 170. This round was run the fast way described in §0.10 and it
+changes how much a take is worth.
+
+**`--stale` first, before any trace.** One replay of the take with the
+stale-home detector listed 48 sites touching real `$7E/$7F` or the low-WRAM
+mirror through the data bank. Reading the list settled the class of every
+one in a minute: absolute low-WRAM operands in the bank-`$80` scroll code
+(`$80:AD9x..AF7C`, `$80:97xx`), the Samus code (`$90:AE9x`, `$90:B2Ax`),
+block collision (`$94:9959`), and one long `$7E` store in room setup ASM
+(`$8F:B98A`). All code. So: harvest, no net.
+
+**v41 = v40's recipe + the take as a cover pair**, generated sync-only and
+unverified (`--wg-sync`, no `--verify-behavioral`) in a fraction of a ship
+build. Its diff against v40 was exactly the 47 stale sites relocated into
+the window plus the checksum. Replayed, the door completed in 148 frames and
+the Climb played. The detector on v41 then listed the NEXT tier without
+anyone playing further: 14 sites in bank `$88` (`$88:DB3E..DB88`, the layer
+scroll code that only runs once the transition finishes). Code again. v42
+harvests the same take replayed on v41 and closes them (13 bytes, the
+detector then lists nothing new). A take is bound to its image by the
+crc32 in its header; to drive v41 with a take recorded on v40, rewrite that
+one word (`recordings/v40-poweron-on-v41.ymv` is that copy) rather than pass
+the global `--movie-ignore-crc`, which also lets anchored states cross
+builds.
+
+**A false alarm worth recording.** Built sync-only WITHOUT
+`--verify-behavioral`, v41 and v42 both end with "surface 1 of 6 FAILED:
+renders pictures the original never showed (first at frame 2936)" and write
+no `.bps`. That is the PIXEL gate, which the attract demo has never passed on
+any window conversion (lag shifts its animation); the verified builds show
+the same line as "pixel gate: divergent" and then pass on the behavioral
+tier. It is not a defect in the candidate — the hash streams of v41 and v42
+over all 36,000 attract frames are byte-identical — and the `--save-attempt`
+image is written before the gate runs, so the fast candidate is still
+usable. Read a candidate's log for the harvest lines and the summary, not
+for its verdict.
+
+**The Climb's picture was a separate, data class.** With the door fixed the
+room rendered cross-hatch tiles over a red-shifted palette. The ROM-side
+check (§5) showed the room's default state uses tileset 3, whose record in
+the tileset table still carried stock banks — and RAM `$07C0` held that raw
+record. 15 of the 29 records were raw. Hand-patching the 45 bank bytes made
+the Climb pixel-correct. `rebankSmTilesetTable` (§0.6) is the v35 pass
+reinstated with its attribution corrected: it had been reverted because the
+Parlor did not change under it, which was true and irrelevant, since the
+Parlor's tileset was one of the 14 proven records.
+
+**What the round cost.** One seven-minute take from the player; then, with
+no further play: one detector run, one candidate build, one detector run,
+one hand patch, one net, one verified build. Three classes closed (two code
+tiers by coverage, one data table by net) against the one symptom the
+player saw. The take keeps paying as long as each candidate lets it run
+further, because the detector reads what the newly reachable code touches.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1259,6 +1330,13 @@ cover pair (code) · v37 the Parlor background still raw under full coverage
 power-on take that reached `$9A44` as a cover pair: verified, 22 code bytes,
 render identical — the decor is data · v40 the decompressor inline-destination
 net, `$9A44` renders its real tileset (§4h).
+
+v41-v43 (2026-09-03): the v40 power-on take hangs in the Climb's door
+transition · `--stale` lists 48 code sites · v41 the take as a cover pair,
+sync-only: the door completes; the detector lists the next 14 (bank `$88`)
+· the Climb renders tile garbage: tileset-table record 3 raw, 15 of 29 raw ·
+v42 the take replayed on v41 as a second pair · v43 both pairs + the
+tileset-table net, verified — the ship (§4i).
 
 ## 8. Cross-cutting learnings
 
