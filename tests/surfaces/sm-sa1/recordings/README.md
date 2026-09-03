@@ -22,9 +22,11 @@ as a **cover pair** against that image:
 | `v38-poweron.ymv` | 25,120 | `sm-sa1-v38.sfc` (power-on) | the conversion from power-on through Ceres, the escape, the Parlor and into `$9A44`, the first room with a different tileset: found the decompressor inline-destination class (§4h). As a cover pair (v39) it relocated 22 code bytes and changed nothing visible — the proof the decor was DATA, closed by the inline-destination net in v40 |
 | `v40-poweron.ymv` | 27,067 | `sm-sa1-v40.sfc` (power-on) | power-on through Ceres, the escape, the Parlor, `$9A44` (correct on v40) and down into the Climb (`$96BA`), where the vertical door transition hung. In the recipe TWICE: on v40 (the scroll code, 47 sites) and, as `v40-poweron-on-v41.ymv`, on v41 (the bank-`$88` layer code the finished transition reaches). Also exposed the raw tileset-table records (§4i) |
 | `v40-poweron-on-v41.ymv` | 27,067 | `sm-sa1-v41.sfc` | DERIVED: the same take with the header crc32 (offset 8) rewritten to v41's, so it binds to v41 without the global CRC bypass. The inputs diverge from v41's game after the Climb door completes (the player was pressing at a black screen), which is harmless coverage of the Climb |
+| `v43-poweron.ymv` | 31,174 | `sm-sa1-v43.sfc` (power-on) | power-on through Crateria to the Blue Brinstar elevator (`$97B5`): found the enemy-header bank class (faces' sprites) and the elevator AI stall (§4j). In the recipe on v43, and as `v43-poweron-on-elevhand.ymv` on the hand-relocated `v44-elev-hand.sfc` to cover the whole elevator routine |
+| `v43-poweron-on-elevhand.ymv` | 31,174 | `v44-elev-hand.sfc` | DERIVED: header crc32 rebound to the hand-relocated image (v44 with the elevator routine's 29 low-WRAM operands moved into the window by hand, §4j) |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the ones before it feed `sm-sa1-v43.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v47.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on.
@@ -45,6 +47,8 @@ in the parent directory; two cannot:
 | `sm-sa1-v38.sfc` | yes — `../sm-sa1-v40.bps.cmd` on the generator before the inline-destination net (`06994e4`), or apply v38's `.bps` from that commit |
 | `sm-sa1-v40.sfc` | yes — apply `../sm-sa1-v40.bps` from `03c4dc7`, or v43's recipe minus its last two cover pairs and the tileset net |
 | `sm-sa1-v41.sfc` | yes — v40's recipe plus `v40-poweron` on `sm-sa1-v40.sfc`, sync-only (`--wg-sync`), on the generator at `03c4dc7` (before the tileset net) |
+| `sm-sa1-v43.sfc` | yes — `../sm-sa1-v43.bps` from `37cb09e` |
+| `v44-elev-hand.sfc` | **no recipe** — v44 (v43's recipe + `v43-poweron`, sync-only, at `37cb09e`) with 29 operand bytes hand-relocated in `$A3:9579..$9611` (§4j lists them); keep the image |
 | `cover39.sfc` | **no recipe exists** |
 | `cover40.sfc` | **no recipe exists** |
 

@@ -6,13 +6,14 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v43** (`tests/surfaces/sm-sa1/
-sm-sa1-v43.bps`): four structural nets (room-graph level pointers,
-background records, decompressor inline destinations, the tileset table),
-the Zebes foreground and the Climb's door/layer code via cover pairs, and
-the escape palette via an `--evidence-movie`. Ceres (including the escape)
-and Crateria from the landing site through the Parlor, the first
-new-tileset room and down into the Climb render and play correctly. The open frontier is every room-type not
+escape evidence surface. The current build is **v47** (`tests/surfaces/sm-sa1/
+sm-sa1-v47.bps`): five structural nets (room-graph level pointers,
+background records, decompressor inline destinations, the tileset table,
+the enemy headers), the Zebes foreground, the Climb's door/layer code and
+the elevator AI via cover pairs, and the escape palette via an
+`--evidence-movie`. Ceres (including the escape) and Crateria from the
+landing site through the Parlor, the Climb and the Pit Room to the Blue
+Brinstar elevator render and play correctly, and the elevator rides. The open frontier is every room-type not
 yet visited — its data pointers net structurally as they are found, its
 uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
 Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
@@ -188,6 +189,14 @@ mechanical:
   The theory was wrong for that room, not wrong: a net that fixes nothing
   visible is not thereby refuted — check whether the table entry the room
   uses was raw before discarding the class.
+- **Enemy headers** (`$A0:CEBF..`, 64-byte records, one per species): byte
+  `+$0C` is the species' bank — its AI, palette and instruction lists live
+  there — read as data into the enemy's RAM slot. 164 headers carry one;
+  v43 had 130 raw: every enemy no recording had met painted its palette
+  from the wrong megabyte and ran its AI from it (§4j). Per-record
+  validated (bank `$A0-$BF`, init and main AI pointers in ROM), because
+  the run of true headers is followed by same-aligned records of another
+  shape.
 
 **The gate on every SM-specific net:** the ROM title starts with
 `Super Metroid` and the image is a > 2 MiB window conversion. Reads STOCK
@@ -1194,6 +1203,55 @@ tiers by coverage, one data table by net) against the one symptom the
 player saw. The take keeps paying as long as each candidate lets it run
 further, because the detector reads what the newly reachable code touches.
 
+## 4j. The enemy-header class, and where conversion-side coverage stalls (v44-v46)
+
+The v43 power-on take (31,174 frames) went through the Climb and the Pit
+Room to the Blue Brinstar elevator (`$97B5`) and the player reported two
+things: "a few sprites are off" in `$9A44`, and "Samus is stuck" at the
+elevator.
+
+**The sprites: a data class the detector cannot see.** The six wall faces in
+`$9A44` are enemies (`$EA7F`), and their tiles in VRAM were correct. Their
+sprite palette slot was not: the room's enemy set names two species that
+both load into palette slot 7, `$EA7F` (proven) and `$CEFF` (raw), and the
+second load wins. `$CEFF`'s palette pointer is `$A2:8912`; with the header's
+bank byte raw, the read hit the converted map's `$A2`, which is MB2, and
+returned `$C2:8912`. The `--stale` detector is blind to this: a raw read of a
+ROM mirror is not an access to an abandoned WRAM home. It was found the
+ROM-side way — VRAM tiles matched, CGRAM did not, a write watch on the slot
+showed two loads, the set explained why, the header explained the bytes.
+Enemy header `+$0C` is the species' bank; 130 of 164 were raw in v43. With
+all of them hand-translated the second load wrote the stock palette.
+`rebankSmEnemyHeaders` (§0.6) is the net.
+
+**Samus stuck: code, and a limit of conversion-side coverage.** The elevator
+is an enemy (`$D73F`, bank `$A3`), and its AI reads the enemy RAM through
+the data-bank mirror (`LDA $0E54` with `DBR=$23`). v44 harvested the take and
+relocated the sites the detector had listed; the replay then showed the NEXT
+three lines of the same routine stale. A conversion-side harvest covers a
+routine only as far as it executes, and a routine that branches on a stale
+read stops there — one stale read per round, each round a generation.
+Disassembling the routine (`$A3:9540..$9612`, 16-bit mode) showed 29 more
+low-WRAM operands past the stall. Hand-relocating exactly those made the
+take ride the elevator into Brinstar (`$9E9F`, area 1). A first attempt had
+also "relocated" three words in the instruction-list table after `$962F`,
+which is the standing reason static relocation is not a generator feature.
+
+**The way around the stall.** Two options, both of which cover the whole
+routine in one round instead of one read per round:
+
+- Harvest the take on the HAND-RELOCATED image as a cover pair. The harvest
+  records which instructions executed; on that image the routine runs to
+  completion, so every operand in it is evidenced at once and the generator
+  relocates them from stock bytes. v46 does this. The cover image is a
+  hand-patched artifact with no recipe (like `cover39`/`cover40`), which is
+  the cost.
+- Record the same route on STOCK. Nothing stalls on stock, so a stock
+  recording as a cover pair covers everything its path executes in one
+  pass. This is the durable form: one stock playthrough per region closes
+  every code class on that path at once, and the conversion takes are then
+  only for finding the data classes. Worth adopting as the default.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1337,6 +1395,13 @@ sync-only: the door completes; the detector lists the next 14 (bank `$88`)
 · the Climb renders tile garbage: tileset-table record 3 raw, 15 of 29 raw ·
 v42 the take replayed on v41 as a second pair · v43 both pairs + the
 tileset-table net, verified — the ship (§4i).
+
+v44-v46 (2026-09-03): the v43 take reaches the Blue Brinstar elevator;
+faces' sprites off (enemy-header bank, 130 of 164 raw — the net) and Samus
+stuck (the elevator AI, conversion-side coverage stalling one stale read per
+round) · v44 the take as a cover pair · v45 + the enemy-header net, verified
+· v46 the take harvested on a hand-relocated image to cover the whole
+elevator routine in one round (§4j).
 
 ## 8. Cross-cutting learnings
 
