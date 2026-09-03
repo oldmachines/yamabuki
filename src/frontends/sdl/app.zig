@@ -353,8 +353,10 @@ pub fn run(
             // the take on, and headless loads no battery save: blank SRAM in,
             // and the take's in-game saves never reach the real .srm.
             if (opts.record) {
-                try err.print("movie: --record starts with blank battery SRAM (the .srm is left untouched)\n", .{});
-                try err.flush();
+                if (opts.srm == null) {
+                    try err.print("movie: --record starts with blank battery SRAM (the .srm is left untouched)\n", .{});
+                    try err.flush();
+                }
             } else sram = saves.Sram.init(gpa, dir, opts.game_id) catch null;
             if (sram) |*s| s.load(io, con, err);
         }

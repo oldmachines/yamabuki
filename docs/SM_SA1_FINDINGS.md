@@ -6,8 +6,8 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v52** (`tests/surfaces/sm-sa1/
-sm-sa1-v52.bps`): five structural nets (room-graph level pointers,
+escape evidence surface. The current build is **v53** (`tests/surfaces/sm-sa1/
+sm-sa1-v53.bps`): five structural nets (room-graph level pointers,
 background records, decompressor inline destinations, the tileset table,
 the enemy headers), the Zebes foreground, the Climb's door/layer code and
 the elevator AI via cover pairs, and the escape palette via an
@@ -1475,7 +1475,9 @@ on the hand-relocated image · v50 verified — the ship (§4k).
 
 v52 (2026-09-03): the first long stock take (38 min, into Brinstar) as a
 cover pair: 5,745 instructions, 2,026 sites, 12 bank bytes in one pass;
-verified — the ship (§4l).
+verified — the ship (§4l) · v53 a second stock take (56 min, continued from
+the first's battery save with the new `--record --srm`): 2,486 instructions,
+1,038 sites, 9 bank bytes; verified — the ship.
 
 ## 8. Cross-cutting learnings
 
