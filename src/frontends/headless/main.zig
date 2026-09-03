@@ -746,8 +746,7 @@ fn dumpSrm(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
     if (cart.sram_mask == 0) return;
     const sram = cart.sram[0 .. cart.sram_mask + 1];
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sram }) catch return;
-    std.debug.print("wrote {s} ({d} bytes of battery SRAM)
-", .{ path, sram.len });
+    std.debug.print("wrote {s} ({d} bytes of battery SRAM)\n", .{ path, sram.len });
 }
 
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
