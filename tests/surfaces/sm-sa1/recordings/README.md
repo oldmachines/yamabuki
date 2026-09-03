@@ -19,9 +19,10 @@ as a **cover pair** against that image:
 | `stock-escape-anchored.ymv` | 13,585 | `sm.sfc` (anchored) | STOCK, Ridley through the escape to the landing site; anchored to a menu state, so cover-pair only |
 | `v34-play.ymv` | 12,305 | `sm-sa1-v34.sfc` | Ceres + into Zebes (the Parlor); its coverage relocated the Zebes room-load CODE that renders the foreground |
 | `v36-play.ymv` | 12,305 | `sm-sa1-v36.sfc` | the same, further; confirmed the background is DATA (a BG-record bank) that coverage does NOT reach — closed by the structural BG net instead |
+| `v38-poweron.ymv` | 25,120 | `sm-sa1-v38.sfc` (power-on) | the conversion from power-on through Ceres, the escape, the Parlor and into `$9A44`, the first room with a different tileset: found the decompressor inline-destination class (§4h). As a cover pair (v39) it relocated 22 code bytes and changed nothing visible — the proof the decor was DATA, closed by the inline-destination net in v40 |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the ones before it feed `sm-sa1-v38.bps.cmd` as cover pairs.
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v40.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on.
@@ -39,6 +40,7 @@ in the parent directory; two cannot:
 | `sm-sa1-v26.sfc` | yes — regenerate v26's recipe (the v25 `.cmd` plus the four cover pairs) |
 | `sm-sa1-v27.sfc` | yes — v26's recipe plus `ridley-no-damage` |
 | `sm-sa1-v28.sfc` | yes — v27's recipe plus `escape-stuck` |
+| `sm-sa1-v38.sfc` | yes — `../sm-sa1-v40.bps.cmd` on the generator before the inline-destination net (`06994e4`), or apply v38's `.bps` from that commit |
 | `cover39.sfc` | **no recipe exists** |
 | `cover40.sfc` | **no recipe exists** |
 

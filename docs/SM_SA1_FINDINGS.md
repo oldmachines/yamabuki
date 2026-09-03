@@ -6,11 +6,12 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v38** (`tests/surfaces/sm-sa1/
-sm-sa1-v38.bps`): the room-graph level-pointer net, the background-record net,
-the Zebes foreground via cover pairs, and the escape palette via an
-`--evidence-movie`. Ceres (including the escape) and the first Zebes rooms off
-the landing site render correctly. The open frontier is every room-type not
+escape evidence surface. The current build is **v40** (`tests/surfaces/sm-sa1/
+sm-sa1-v40.bps`): the room-graph level-pointer net, the background-record net,
+the decompressor inline-destination net, the Zebes foreground via cover
+pairs, and the escape palette via an `--evidence-movie`. Ceres (including the
+escape) and Crateria from the landing site through the Parlor to the first
+new-tileset room render correctly. The open frontier is every room-type not
 yet visited — its data pointers net structurally as they are found, its
 uncovered code wants one comprehensive playthrough as coverage (§0.5, §0.10).
 Work is on `claude/sa1gen-attract-nets` (PR #117); older fixes referenced by
@@ -166,6 +167,15 @@ mechanical:
   3-byte source; its bank (payload byte 2) is de-mirrored. PER-RECORD
   graceful, not all-or-nothing: a state's `+$16` legitimately points at code
   or nothing, so a record that stops parsing as a list is skipped.
+- **Decompressor inline destination** (`JSL $80:B0FF` + 3 bytes): the
+  decompressor reads its destination long pointer from the code stream right
+  after the JSL (it pulls the return address, reads through it, advances by
+  3). The pointer is data in the middle of code, so relocation-by-execution
+  walks straight past it. Signature net: the four JSL bytes then an inline
+  bank of `$7E/$7F`, re-banked to `$40/$41`; any other bank is skipped. 63
+  sites in stock; v38 had 29 raw, among them the load-game tileset loader's
+  tile-table loads, which is why the first new-tileset room past the Parlor
+  painted the previous tileset's blocks (§4h).
 
 **The gate on every SM-specific net:** the ROM title starts with
 `Super Metroid` and the image is a > 2 MiB window conversion. Reads STOCK
@@ -1051,6 +1061,68 @@ data side; the Zebes foreground was the code side. What remains open is every
 room-type still unvisited: its data pointers are structural (net them as
 found), its uncovered code wants one comprehensive playthrough as coverage.
 
+## 4h. The inline-destination class: a pointer hiding inside code (v39-v40)
+
+The next room the v38 power-on take reached — `$9A44`, two doors past the
+Parlor, the first Crateria room with a DIFFERENT tileset (index 2) — rendered
+with correct geometry and wrong textures: the walls were the Parlor's blue
+blocks, and the Chozo-face decor came out as green-and-red figures. The
+player's report: "the decor textures are incorrect".
+
+**The harvest test settled code vs data first.** v39 = v38's recipe + this
+very take as a cover pair. It verified, changed 22 code bytes in bank `$84`,
+and rendered `$9A44` PIXEL-IDENTICAL to v38. Coverage of the exact path that
+shows the bug did nothing, so by §0.5 the byte was data. That one comparison
+saved the investigation from another coverage round.
+
+**The trace.** No stock reference existed for the room (the take desyncs on
+stock: the conversion's lag differs), so the reference was the ROM itself —
+a Python port of SM's decompressor (§5) decompressing the tileset's three
+pointers and the CRE, compared against v38's VRAM, CGRAM and RAM dumps:
+
+- Tile graphics (VRAM `$0000`), CRE graphics (`$2800`), palette (CGRAM):
+  byte-identical to the ROM. Not the problem.
+- The tile table — the 8-byte-per-block map from level block index to four
+  tilemap words — at its re-banked home `$40:A800`: WRONG. It was a
+  different tileset's table. The stock table for tileset 2 was found intact
+  in REAL WRAM `$7E:A800`, where nothing reads it.
+- `--watch BB00-BB03` (block `$360`'s entry, both homes): the decompressor's
+  own `STA [$4C],Y` at `$80:B193` wrote `$40:BB00` on one call and
+  `$7E:BB00` on the next two. Same instruction, different bank byte in `$4E`
+  — so the bank is data the CALLER supplies.
+
+**The byte.** `$80:B0FF` pulls its return address, reads the two bytes after
+the JSL into `$4C/$4D` with a 16-bit load that spills the THIRD byte into
+`$4E`, and advances the return by 3. Every `JSL $80:B0FF` is followed by an
+inline `dl $bb:aaaa` destination — a long pointer sitting in the code stream.
+SM has two copies of the tileset loader: the door-transition one
+(`$82:E7D3`, sites `$E845/$E856/$E869`) and the load-game one (`$82:EA4x`,
+sites `$EAF5/$EB06/$EB19`). The stock recordings drove the first; the Ceres
+escape lands on Zebes through the second, whose CRE and tile-table sites
+were raw. Every tileset first loaded through that path decompressed its
+table into real `$7E:A800`, and the game kept reading the previous table at
+`$40:A800`. 63 such sites in stock; 29 raw in v38 (the two loader sites, one
+in the map/pause code at `$82:E41D`, and 26 across the bank-`$8B` intro and
+cutscene code). Hand-patching those 29 bank bytes made `$9A44` render its
+brick walls and Chozo faces correctly, with the take's audio hash unchanged.
+
+**The net** (`rebankSmDecompInlineDests`): scan the image for the four JSL
+bytes; if the inline bank is `$7E/$7F`, re-bank it `$40/$41`; skip anything
+else (a ROM destination, or data that happens to spell the JSL); leave a
+byte provenance already proved alone. Title-gated like the other two.
+Unit-tested (proven site untouched, ROM destination untouched, address bytes
+never touched). v40 = v38's recipe + the net.
+
+**What this class teaches.** The room-state pointer and the BG record were
+data in data tables; this one is data INSIDE CODE — an inline argument the
+callee reads through the return address. Relocation-by-execution sees the
+JSL, relocates its target, and steps over the argument as if it were the
+next instruction's bytes. The profiler catches it only by value provenance
+(a recording that drives the call and traces the byte into a `$7E` store),
+which is exactly evidence-gating again. Any routine with inline arguments
+is the same shape; in SM the decompressor is the one that matters, because
+everything the picture is made of passes through it.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1119,6 +1191,20 @@ different" dead-ends were just a register the dump didn't yet print.
   (`disp_cells`, not `disp_sites` — which collided with an existing Stats
   field and hid a failed patch).
 
+**ROM-side references when no stock run can reach the room.** A take
+recorded on the conversion desyncs when replayed on stock (the lag differs),
+so a room only the conversion has reached has no stock VRAM to diff against.
+The reference is the ROM: `tools/sm_decomp.py` is a port of Super Metroid's
+decompressor (`$80:B0FF` — direct/byte-fill/word-fill/increment/copy/XOR-copy
+commands, `$FF` ends), so a tileset's graphics, tile table and palette, a
+room's level data, or a BG record's picture can be decompressed and compared
+byte-for-byte against `--dump-vram`/`--dump-ppu`/`--dump-ram`. That is how
+§4h separated "graphics right, palette right, tile table stale" in one pass.
+`tools/dis65816.py` is a small 65816 disassembler (`dis65816.py image bank
+addr len [mx]`) for reading the call sites once the byte is found; mind that
+inline arguments after a JSL show up as nonsense instructions, which is the
+tell for the inline-argument class.
+
 ## 6. Known latent issues (not blocking the current surfaces)
 
 - The `$94:98E9` twin cutscene handler and the `$00:840F` `$7F`-fill loop are
@@ -1165,6 +1251,14 @@ escape is an RNG-forked scene and cannot be a verification surface · v32 the
 net image, verified but the escape rendered BLACK (an evidence-gated palette
 bank the escape never profiled) · v34 the escape take as `--evidence-movie`:
 palette proven, escape renders, all verification surfaces pass — the ship (§4g).
+
+v35-v40 (2026-09-02/03): v35 a tileset-table net on guessed widths — no
+effect, reverted · v36 the Parlor foreground via the v34 playthrough as a
+cover pair (code) · v37 the Parlor background still raw under full coverage
+(data) · v38 the BG-record net, Parlor pixel-clean — the ship · v39 the
+power-on take that reached `$9A44` as a cover pair: verified, 22 code bytes,
+render identical — the decor is data · v40 the decompressor inline-destination
+net, `$9A44` renders its real tileset (§4h).
 
 ## 8. Cross-cutting learnings
 
