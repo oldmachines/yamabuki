@@ -282,6 +282,11 @@ pub const Stats = struct {
     /// (the BG2 picture) across the records the room walk reached.
     rewritten_bg_banks: u32 = 0,
     bg_records: u32 = 0,
+    /// Super Metroid `JSL $80:B0FF` inline destination banks re-banked
+    /// $7E/$7F -> $40/$41 (`rebankSmDecompInlineDests`); `decomp_inline_sites`
+    /// is every such site whose destination is WRAM.
+    rewritten_decomp_inline_banks: u32 = 0,
+    decomp_inline_sites: u32 = 0,
     /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
     /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
     /// by later code — see `demirrorQueueBankImms`.
@@ -4005,6 +4010,93 @@ fn rebankSmBgRecord(image: []const u8, out: []u8, ptr: u16, walk: *SmRoomWalk) b
     return false; // no terminator within the cap — not a list we understand
 }
 
+pub const SmInlineDests = struct {
+    /// `JSL $80:B0FF` sites whose inline destination names WRAM ($7E/$7F).
+    sites: u32 = 0,
+    /// Of those, the bank bytes this pass re-banked ($7E/$7F -> $40/$41).
+    rebanked: u32 = 0,
+};
+
+/// Super Metroid's decompressor, `JSL $80:B0FF`, takes its DESTINATION as a
+/// 3-byte long pointer sitting INLINE in the code stream right after the
+/// JSL: the routine pulls the return address, reads the pointer through it
+/// and advances the return by 3. That pointer is data — nothing executes
+/// it — so relocation-by-execution cannot see it; the profiler proves a
+/// site only when a recording drives that exact call and traces the byte
+/// into a $7E store. Measured 2026-09-03: v38 had the door-transition
+/// tileset loader's sites proven and the load-game loader's raw
+/// ($82:EAF5/$82:EB06 — the same loads, on the path the Ceres escape takes
+/// to Zebes). The tileset's tile table then decompressed into REAL WRAM
+/// $7E:A800 while the game read the stale table at $40:A800, so every room
+/// whose tileset first loads through that path painted the previous
+/// tileset's blocks ($9A44: correct geometry, wrong textures). Stock has 63
+/// sites, v38 left 29 raw; a hand patch of those 29 bank bytes made the
+/// room pixel-correct. Same class as the room-state level pointer and the
+/// background record: a bank byte a structure carries.
+///
+/// Signature-validated: the four JSL bytes, then an inline bank of $7E/$7F.
+/// Any other bank — a ROM destination, or data that merely spells the JSL
+/// — is left untouched; a byte `hi_proven` already re-banked in `out` is
+/// left alone.
+fn rebankSmDecompInlineDests(image: []const u8, out: []u8) SmInlineDests {
+    var r: SmInlineDests = .{};
+    if (image.len < 7) return r;
+    const sig = [_]u8{ 0x22, 0xFF, 0xB0, 0x80 }; // JSL $80:B0FF
+    var i: usize = 0;
+    while (i + 7 <= image.len) : (i += 1) {
+        if (!std.mem.eql(u8, image[i..][0..4], &sig)) continue;
+        const bank = image[i + 6];
+        if (bank != 0x7E and bank != 0x7F) continue;
+        r.sites += 1;
+        if (out[i + 6] != bank) continue; // hi_proven got here first
+        out[i + 6] = bank - 0x3E; // $7E/$7F -> $40/$41
+        r.rebanked += 1;
+    }
+    return r;
+}
+
+test "rebankSmDecompInlineDests: inline WRAM destinations re-banked, proven and ROM ones left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    // $82:E845 `JSL $80:B0FF` ; dl $7E:A000   (the CRE tile table)
+    // $82:E856 `JSL $80:B0FF` ; dl $7E:A800   (the tileset tile table)
+    // $82:E7F4 `JSL $80:B0FF` ; dl $7F:0000   (level data)
+    // $82:F000 `JSL $80:B0FF` ; dl $C2:1234   (not WRAM: untouched)
+    const sites = [_]struct { a: u16, lo: u16, bank: u8 }{
+        .{ .a = 0xE845, .lo = 0xA000, .bank = 0x7E },
+        .{ .a = 0xE856, .lo = 0xA800, .bank = 0x7E },
+        .{ .a = 0xE7F4, .lo = 0x0000, .bank = 0x7F },
+        .{ .a = 0xF000, .lo = 0x1234, .bank = 0xC2 },
+    };
+    const f82: usize = 0x02 * 0x8000;
+    for (sites) |s| {
+        const o = f82 + (@as(usize, s.a) - 0x8000);
+        img[o] = 0x22;
+        img[o + 1] = 0xFF;
+        img[o + 2] = 0xB0;
+        img[o + 3] = 0x80;
+        std.mem.writeInt(u16, img[o + 4 ..][0..2], s.lo, .little);
+        img[o + 6] = s.bank;
+    }
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    // hi_proven already re-banked the level-data site.
+    out[f82 + (0xE7F4 - 0x8000) + 6] = 0x41;
+    const r = rebankSmDecompInlineDests(img, out);
+    try testing.expectEqual(@as(u32, 3), r.sites);
+    try testing.expectEqual(@as(u32, 2), r.rebanked);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + (0xE845 - 0x8000) + 6]);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + (0xE856 - 0x8000) + 6]);
+    try testing.expectEqual(@as(u8, 0x41), out[f82 + (0xE7F4 - 0x8000) + 6]); // untouched
+    try testing.expectEqual(@as(u8, 0xC2), out[f82 + (0xF000 - 0x8000) + 6]); // untouched
+    // The inline address bytes are never touched.
+    try testing.expectEqual(@as(u8, 0x00), out[f82 + (0xE845 - 0x8000) + 4]);
+    try testing.expectEqual(@as(u8, 0xA0), out[f82 + (0xE845 - 0x8000) + 5]);
+}
+
 test "rebankSmBgRecord: copy-command source banks de-mirrored, non-list skipped" {
     const gpa = testing.allocator;
     const img = try gpa.alloc(u8, 0x18_0000);
@@ -7260,6 +7352,9 @@ pub fn convertWholeGame(
             res.stats.room_walk_refused_at = walk.refused_at;
             res.stats.rewritten_bg_banks = walk.bg_banks;
             res.stats.bg_records = walk.bg_records;
+            const inl = rebankSmDecompInlineDests(image, out);
+            res.stats.rewritten_decomp_inline_banks = inl.rebanked;
+            res.stats.decomp_inline_sites = inl.sites;
         }
     }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:

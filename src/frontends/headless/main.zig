@@ -3408,6 +3408,11 @@ fn reportSa1(
                 "  {} background DMA-list source bank(s) de-mirrored across {} record(s)\n  — the BG2 picture for rooms no surface loaded (else correct foreground\n  over garbage background)\n",
                 .{ res.stats.rewritten_bg_banks, res.stats.bg_records },
             );
+        if (res.stats.decomp_inline_sites != 0)
+            try out.print(
+                "  {} decompressor inline-destination bank(s) re-banked BY SIGNATURE\n  ({} `JSL $80:B0FF` sites naming WRAM) — the destination is data in the\n  code stream; a site no recording drove decompressed into real $7E\n  while the game read the stale copy at $40 (wrong tile table = right\n  geometry, wrong textures)\n",
+                .{ res.stats.rewritten_decomp_inline_banks, res.stats.decomp_inline_sites },
+            );
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",
