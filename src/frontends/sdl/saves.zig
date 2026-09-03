@@ -77,6 +77,31 @@ pub const Debounce = struct {
     }
 };
 
+/// Load a battery save from an arbitrary file into the live SRAM without
+/// wiring persistence to it — the `--record --srm` start: the take begins
+/// from this save and its anchor carries it, so the file is never written
+/// back. Size must match the cart's SRAM exactly.
+pub fn loadSramFile(io: std.Io, con: *core.AnyConsole, path: []const u8, err: *std.Io.Writer) bool {
+    const sram = sramSlice(con);
+    const data = std.Io.Dir.cwd().readFile(io, path, sram) catch |e| {
+        err.print("error: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+        err.flush() catch {};
+        return false;
+    };
+    if (data.len != sram.len) {
+        err.print("error: {s} is {d} bytes, cart wants {d}\n", .{ path, data.len, sram.len }) catch {};
+        err.flush() catch {};
+        @memset(sram, 0);
+        return false;
+    }
+    return true;
+}
+
+/// The console's live battery SRAM (the cart's mapped span).
+pub fn liveSram(con: *core.AnyConsole) []u8 {
+    return sramSlice(con);
+}
+
 fn sramSlice(con: *core.AnyConsole) []u8 {
     const cart = con.cartridge();
     return cart.sram[0 .. cart.sram_mask + 1];

@@ -122,6 +122,10 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// `--dump-srm <file>`: write the cart's battery SRAM at the end of the
+    /// run — the way to lift a save out of a state (`--state x --frames 1
+    /// --dump-srm x.srm`) for `yamabuki-sdl --record --srm`.
+    dump_srm: ?[]const u8 = null,
     /// `--dump-ppu`: the display state as text after the run. For the
     /// question a RAM dump cannot answer — a layer that is missing from
     /// the picture is either disabled, pointed somewhere empty, or fed a
@@ -520,6 +524,7 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_vram) |vpath| dumpVram(io, con, vpath);
     defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
+    defer if (args.dump_srm) |spath| dumpSrm(io, con, spath);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
     // and keep it if a WAV dump was requested.
@@ -735,6 +740,16 @@ fn dumpPpu(io: std.Io, out: *std.Io.Writer, con: *core.AnyConsole, path: []const
 /// `--dump-ram`: WRAM (128K), BW-RAM's first 64K, VRAM and I-RAM after the
 /// run, plus the CPU's resting place. The tool that found every window-mode
 /// blocker so far.
+/// `--dump-srm`: the cart's battery SRAM as a plain .srm (its mapped span).
+fn dumpSrm(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
+    const cart = con.cartridge();
+    if (cart.sram_mask == 0) return;
+    const sram = cart.sram[0 .. cart.sram_mask + 1];
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sram }) catch return;
+    std.debug.print("wrote {s} ({d} bytes of battery SRAM)
+", .{ path, sram.len });
+}
+
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
     const fc = &con.fast;
     const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
@@ -4746,6 +4761,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
 
         } else if (std.mem.eql(u8, a, "--dump-ram")) {
             out.dump_ram = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--dump-srm")) {
+            out.dump_srm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--behavioral-probe")) {
             out.behavioral_probe = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wg-sync")) {

@@ -78,6 +78,10 @@ const Args = struct {
     /// `--record`: start an input-movie take at power-on, before the first
     /// frame runs, so the boot frames are in it and no anchor is needed.
     record: bool = false,
+    /// `--srm <file>` (with `--record`): start the take from this battery save
+    /// instead of blank SRAM. The take is then anchored to the powered-on
+    /// machine holding that save, so it replays and harvests as a cover pair.
+    srm: ?[]const u8 = null,
     /// `--poke ADDR=VAL`: cheat writes held after every frame.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -121,6 +125,10 @@ pub fn main(init: std.process.Init) !void {
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --record    start recording a .ymv at power-on, before the first frame;\n" ++
                 "              F10 stops and saves it (F10 alone cannot promise frame 0)\n" ++
+                "  --srm f     with --record: start the take from this battery save (.srm)\n" ++
+                "              instead of blank SRAM; the take is anchored to it. Every\n" ++
+                "              --record session writes its own save next to the .ymv as\n" ++
+                "              <take>.srm, so the next session can continue from it\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -254,6 +262,7 @@ fn makeOptions(
         .accuracy = booted.accuracy,
         .movie = mov,
         .record = args.record,
+        .srm = args.srm,
         .pokes = args.pokes,
         .n_pokes = args.n_pokes,
         .patch_name = booted.patch_name,
@@ -594,6 +603,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--record")) {
             args.record = true;
+        } else if (std.mem.eql(u8, a, "--srm")) {
+            args.srm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--movie")) {
             args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {

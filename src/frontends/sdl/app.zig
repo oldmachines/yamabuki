@@ -90,6 +90,8 @@ pub const Options = struct {
     movie: ?util.movie.Movie,
     /// `--record`: begin a power-on take before the first frame runs.
     record: bool = false,
+    /// `--srm`: battery save to start a `--record` take from (anchored).
+    srm: ?[]const u8 = null,
     /// Cheat pokes held after every executed frame; see cheat.zig.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -450,9 +452,34 @@ pub fn run(
             try err.flush();
         } else {
             rec = .init(gpa);
-            try err.print("movie: recording from power-on (--record; F10 stops and saves)\n", .{});
-            try err.flush();
-            toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
+            if (opts.srm) |srm_path| {
+                // Continue from a battery save. The machine has not run a
+                // frame, but its SRAM is no longer blank, so the take must
+                // carry the powered-on machine as its anchor — captured here,
+                // before the first recorded frame, exactly like the F10 path.
+                if (saves.loadSramFile(io, con, srm_path, err)) {
+                    if (gpa.alloc(u8, core.AnyConsole.state_size)) |anchor| {
+                        _ = con.saveState(anchor);
+                        rec_anchor = anchor;
+                        at_power_on = false;
+                        try err.print("movie: recording from battery save {s} (anchored; F10 stops and saves)\n", .{srm_path});
+                        try err.flush();
+                        toast.set("RECORDING FROM SAVE - F10 STOPS", .{});
+                    } else |_| {
+                        try err.print("movie: cannot allocate the anchor; recording from blank SRAM instead\n", .{});
+                        try err.flush();
+                        @memset(saves.liveSram(con), 0);
+                    }
+                } else {
+                    try err.print("movie: --srm not loaded; recording from blank SRAM instead\n", .{});
+                    try err.flush();
+                }
+            }
+            if (rec_anchor == null) {
+                try err.print("movie: recording from power-on (--record; F10 stops and saves)\n", .{});
+                try err.flush();
+                toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
+            }
         }
     }
 
@@ -2133,6 +2160,21 @@ fn writeMovie(
         err.flush() catch {};
         return;
     };
+    // The take's battery save, next to the take: a --record session never
+    // touches the real .srm, so without this the in-game saves made during
+    // the take would be lost with the window. `--record --srm <this file>`
+    // continues from it.
+    if (con.cartridge().hasBattery()) {
+        var srm_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&srm_buf, "{s}.srm", .{path[0 .. path.len - util.movie.file_ext.len]})) |srm_path| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = srm_path, .data = saves.liveSram(con) }) catch |e| {
+                err.print("movie: battery save of this take not written: {s}\n", .{@errorName(e)}) catch {};
+                err.flush() catch {};
+            };
+            err.print("movie: battery save of this take: {s} (continue with --record --srm)\n", .{srm_path}) catch {};
+            err.flush() catch {};
+        } else |_| {}
+    }
     err.print("movie: {s} ({} frames{s}, end hashes recorded)\n", .{
         path, frames.len, if (anchor != null) ", anchored to a start state" else ", from power-on",
     }) catch {};
