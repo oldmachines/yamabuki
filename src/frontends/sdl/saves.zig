@@ -77,11 +77,53 @@ pub const Debounce = struct {
     }
 };
 
+/// The window conversion's lifted battery RAM. The SA-1 generator moves the
+/// game's own save chip to BW-RAM offset $20000 (bank $42) — the first 32 KiB
+/// of the cartridge's upper BW-RAM half — with the chip's mirroring kept, so
+/// the game never touches more than its own size there. Present on an SA-1
+/// image whose header declares no battery: the lift is what such a
+/// conversion has instead of one. A stock save dropped into this region is
+/// the stock game's progress, continued on the conversion.
+pub fn liftedSram(con: *core.AnyConsole) ?[]u8 {
+    const cart = con.cartridge();
+    if (cart.chip != .sa1 or cart.hasBattery() or cart.sram_hi_mask < 0x7FFF) return null;
+    return cart.sram_hi[0..0x8000];
+}
+
+/// The bytes that stand for the game's save: the cart's own SRAM, or the
+/// lifted region trimmed to the chip it stands in for (8 KiB when nothing
+/// past 8 KiB was ever written — every lifted game so far — else the whole
+/// 32 KiB window), so the file interchanges with the stock game's .srm.
+fn saveRegion(con: *core.AnyConsole) []u8 {
+    if (liftedSram(con)) |r| {
+        for (r[0x2000..]) |b| if (b != 0) return r;
+        return r[0..0x2000];
+    }
+    return sramSlice(con);
+}
+
 /// Load a battery save from an arbitrary file into the live SRAM without
 /// wiring persistence to it — the `--record --srm` start: the take begins
 /// from this save and its anchor carries it, so the file is never written
 /// back. Size must match the cart's SRAM exactly.
 pub fn loadSramFile(io: std.Io, con: *core.AnyConsole, path: []const u8, err: *std.Io.Writer) bool {
+    if (liftedSram(con)) |region| {
+        // Any chip up to the lift's 32 KiB fits; the game's own mirroring
+        // reads back whatever size it expects from the front of the region.
+        @memset(region, 0);
+        const data = std.Io.Dir.cwd().readFile(io, path, region) catch |e| {
+            err.print("error: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+            err.flush() catch {};
+            return false;
+        };
+        if (data.len == 0 or data.len > region.len) {
+            err.print("error: {s} is {d} bytes; a lifted save takes up to {d}\n", .{ path, data.len, region.len }) catch {};
+            err.flush() catch {};
+            @memset(region, 0);
+            return false;
+        }
+        return true;
+    }
     const sram = sramSlice(con);
     const data = std.Io.Dir.cwd().readFile(io, path, sram) catch |e| {
         err.print("error: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
@@ -97,9 +139,10 @@ pub fn loadSramFile(io: std.Io, con: *core.AnyConsole, path: []const u8, err: *s
     return true;
 }
 
-/// The console's live battery SRAM (the cart's mapped span).
+/// The console's live battery save: the cart's mapped SRAM, or a window
+/// conversion's lifted region (see `liftedSram`).
 pub fn liveSram(con: *core.AnyConsole) []u8 {
-    return sramSlice(con);
+    return saveRegion(con);
 }
 
 fn sramSlice(con: *core.AnyConsole) []u8 {
@@ -125,7 +168,7 @@ pub const Sram = struct {
     /// (different revision, corrupted file) warns and boots blank rather
     /// than corrupting: exactly what a real cart with a dead battery does.
     pub fn load(self: *Sram, io: std.Io, con: *core.AnyConsole, err: *std.Io.Writer) void {
-        const sram = sramSlice(con);
+        const sram = liftedSram(con) orelse sramSlice(con);
         const data = std.Io.Dir.cwd().readFile(io, self.path, sram) catch |e| {
             if (e != error.FileNotFound) {
                 err.print("warning: cannot read {s}: {s}\n", .{ self.path, @errorName(e) }) catch {};
@@ -134,11 +177,13 @@ pub const Sram = struct {
             self.debounce.persisted(std.hash.Fnv1a_64.hash(sram));
             return;
         };
-        if (data.len != sram.len) {
+        const lifted = liftedSram(con) != null;
+        if (data.len != sram.len and !(lifted and data.len != 0 and data.len < sram.len)) {
             err.print("warning: {s} is {d} bytes, cart wants {d} — ignoring it\n", .{ self.path, data.len, sram.len }) catch {};
             err.flush() catch {};
             @memset(sram, 0);
         } else {
+            if (lifted and data.len < sram.len) @memset(sram[data.len..], 0);
             err.print("battery save loaded: {s}\n", .{self.path}) catch {};
             err.flush() catch {};
         }
@@ -152,14 +197,14 @@ pub const Sram = struct {
         self.frames += 1;
         if (self.frames < check_interval) return;
         self.frames = 0;
-        const sram = sramSlice(con);
+        const sram = saveRegion(con);
         if (self.debounce.observe(std.hash.Fnv1a_64.hash(sram)))
             self.write(io, sram, err);
     }
 
     /// Unconditional write-if-dirty, for menu open / state load / quit.
     pub fn flush(self: *Sram, io: std.Io, con: *core.AnyConsole, err: *std.Io.Writer) void {
-        const sram = sramSlice(con);
+        const sram = saveRegion(con);
         const h = std.hash.Fnv1a_64.hash(sram);
         if (!self.debounce.dirty(h)) return;
         self.write(io, sram, err);

@@ -355,7 +355,10 @@ pub fn run(
     // session into stale mid-game state.
     var sram: ?saves.Sram = null;
     if (opts.saves_dir) |dir| {
-        if (con.cartridge().hasBattery()) {
+        // A window conversion has no battery in its header; its lifted save
+        // region (saves.liftedSram) is the game's save chip and persists like
+        // one — as its own .srm, 8 KiB for the games lifted so far.
+        if (con.cartridge().hasBattery() or saves.liftedSram(con) != null) {
             // A --record session starts from the machine headless will replay
             // the take on, and headless loads no battery save: blank SRAM in,
             // and the take's in-game saves never reach the real .srm.
@@ -2511,7 +2514,7 @@ fn writeMovie(
     // touches the real .srm, so without this the in-game saves made during
     // the take would be lost with the window. `--record --srm <this file>`
     // continues from it.
-    if (con.cartridge().hasBattery()) {
+    if (con.cartridge().hasBattery() or saves.liftedSram(con) != null) {
         var srm_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&srm_buf, "{s}.srm", .{path[0 .. path.len - util.movie.file_ext.len]})) |srm_path| {
             std.Io.Dir.cwd().writeFile(io, .{ .sub_path = srm_path, .data = saves.liveSram(con) }) catch |e| {
