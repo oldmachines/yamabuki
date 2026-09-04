@@ -942,10 +942,31 @@ pub fn run(
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.drawText(&surf, 4, 4, "<< REWIND", ui.color.accent);
             break :blk compose[0..fb.len];
-        } else if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len)) blk: {
+        } else if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len) or paused) blk: {
+            // Status marks live in the top-right corner: the take indicator
+            // ("* REC" / "> MOVIE") flush right, and the classic two-bar pause
+            // icon just left of it (or in the corner itself when nothing is
+            // being recorded or replayed).
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
-            ui.drawText(&surf, 4, 4, if (rec != null) "* REC" else "> MOVIE", ui.color.accent);
+            const right: i32 = @as(i32, @intCast(width)) - 4;
+            var x_edge: i32 = right;
+            if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len)) {
+                const label: []const u8 = if (rec != null) "* REC" else "> MOVIE";
+                const tx = right - @as(i32, @intCast(ui.textWidth(label)));
+                ui.drawText(&surf, tx, 4, label, ui.color.accent);
+                x_edge = tx - 8;
+            }
+            if (paused) {
+                const bar_w: u32 = 4;
+                const bar_h: u32 = 12;
+                const gap: i32 = 3;
+                const x2 = x_edge - @as(i32, @intCast(bar_w));
+                const x1 = x2 - gap - @as(i32, @intCast(bar_w));
+                ui.fillRect(&surf, x1 - 2, 2, 2 * bar_w + @as(u32, @intCast(gap)) + 4, bar_h + 4, ui.color.panel);
+                ui.fillRect(&surf, x1, 4, bar_w, bar_h, ui.color.accent);
+                ui.fillRect(&surf, x2, 4, bar_w, bar_h, ui.color.accent);
+            }
             break :blk compose[0..fb.len];
         } else fb;
         // The toast rides ON TOP of whatever the ladder picked; when the
