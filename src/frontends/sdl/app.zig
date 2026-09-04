@@ -714,8 +714,7 @@ pub fn run(
                                         toast.set("TAKE END STATE - REC REWOUND TO {d}", .{m.frames.len});
                                     } else toast.set("TAKE END STATE LOADED", .{});
                                 } else toast.set("TAKE END STATE LOADED", .{});
-                                try err.print("movie: take end state loaded (frame {d})
-", .{m.frames.len});
+                                try err.print("movie: take end state loaded (frame {d})\n", .{m.frames.len});
                                 try err.flush();
                             } else toast.set("NO END STATE FOR THIS TAKE", .{});
                         } else toast.set("NO END STATE FOR THIS TAKE", .{});
