@@ -78,6 +78,11 @@ const Args = struct {
     /// `--record`: start an input-movie take at power-on, before the first
     /// frame runs, so the boot frames are in it and no anchor is needed.
     record: bool = false,
+    /// `--continue` (with `--movie`): replay the take at full speed, then keep
+    /// recording from its last frame — the new file carries the old inputs
+    /// plus the new ones, from the same start, so a long playthrough grows as
+    /// one take instead of a chain of saves.
+    continue_take: bool = false,
     /// `--srm <file>` (with `--record`): start the take from this battery save
     /// instead of blank SRAM. The take is then anchored to the powered-on
     /// machine holding that save, so it replays and harvests as a cover pair.
@@ -125,6 +130,8 @@ pub fn main(init: std.process.Init) !void {
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --record    start recording a .ymv at power-on, before the first frame;\n" ++
                 "              F10 stops and saves it (F10 alone cannot promise frame 0)\n" ++
+                "  --continue  with --movie: replay the take at full speed, then keep recording\n" ++
+                "              from its end; the saved file is the whole take, old inputs plus new\n" ++
                 "  --srm f     with --record: start the take from this battery save (.srm)\n" ++
                 "              instead of blank SRAM; the take is anchored to it. Every\n" ++
                 "              --record session writes its own save next to the .ymv as\n" ++
@@ -263,6 +270,7 @@ fn makeOptions(
         .movie = mov,
         .record = args.record,
         .srm = args.srm,
+        .continue_take = args.continue_take,
         .pokes = args.pokes,
         .n_pokes = args.n_pokes,
         .patch_name = booted.patch_name,
@@ -603,6 +611,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 return error.BadPoke;
         } else if (std.mem.eql(u8, a, "--record")) {
             args.record = true;
+        } else if (std.mem.eql(u8, a, "--continue")) {
+            args.continue_take = true;
         } else if (std.mem.eql(u8, a, "--srm")) {
             args.srm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--movie")) {

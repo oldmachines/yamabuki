@@ -92,6 +92,9 @@ pub const Options = struct {
     record: bool = false,
     /// `--srm`: battery save to start a `--record` take from (anchored).
     srm: ?[]const u8 = null,
+    /// `--continue`: when the `--movie` replay ends in sync, keep recording
+    /// from there with the replayed inputs already in the take.
+    continue_take: bool = false,
     /// Cheat pokes held after every executed frame; see cheat.zig.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -352,8 +355,8 @@ pub fn run(
             // A --record session starts from the machine headless will replay
             // the take on, and headless loads no battery save: blank SRAM in,
             // and the take's in-game saves never reach the real .srm.
-            if (opts.record) {
-                if (opts.srm == null) {
+            if (opts.record or opts.continue_take) {
+                if (opts.srm == null and !opts.continue_take) {
                     try err.print("movie: --record starts with blank battery SRAM (the .srm is left untouched)\n", .{});
                     try err.flush();
                 }
@@ -824,7 +827,8 @@ pub fn run(
         // of history it just holds the oldest frame.
         const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
         const halted = paused or mnu != null or rewinding;
-        fast_forward = inp.ffHeld() and !halted;
+        const replaying = play_movie != null and play_idx < play_movie.?.frames.len;
+        fast_forward = (inp.ffHeld() or (opts.continue_take and replaying)) and !halted;
         // During playback the movie owns both pads; live input resumes the
         // frame after it ends.
         const feed: [2]u16 = if (play_movie) |m|
@@ -1069,9 +1073,35 @@ pub fn run(
                         try err.print("movie: DESYNC — end frame hash {x:0>16} (movie {x:0>16}), audio {s}\n", .{
                             fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged",
                         });
+                        if (opts.continue_take) {
+                            try err.print("movie: --continue refused — the replay did not reproduce the take, so inputs appended now would describe a different machine\n", .{});
+                            toast.set("CONTINUE REFUSED - DESYNC", .{});
+                        }
                     }
                 }
                 try err.flush();
+                // --continue: the machine is exactly where the take left it, so
+                // recording resumes with the replayed inputs already in the take
+                // and the same start (anchor or power-on). The file written at
+                // F10 is the whole playthrough, and its hashes describe the end.
+                const in_sync = m.end_frame_hash == 0 or
+                    (core.console.hashFrame(con.framebuffer()) == m.end_frame_hash and (m.end_audio_hash == 0 or audio_hash == m.end_audio_hash));
+                if (opts.continue_take and in_sync and rec == null) {
+                    var r: std.array_list.Managed([2]u16) = .init(gpa);
+                    if (r.appendSlice(m.frames)) {
+                        rec = r;
+                        rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
+                        rec_marks = @splat(null);
+                        if (rw) |*w| w.clear();
+                        try err.print("movie: continuing the take from frame {} (F10 stops and saves the whole take)\n", .{m.frames.len});
+                        try err.flush();
+                        toast.set("CONTINUING TAKE - F10 STOPS", .{});
+                    } else |_| {
+                        r.deinit();
+                        try err.print("movie: cannot allocate the take; input is live, not recorded\n", .{});
+                        try err.flush();
+                    }
+                }
             }
         }
 
