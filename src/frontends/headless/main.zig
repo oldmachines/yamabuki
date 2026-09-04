@@ -3846,6 +3846,18 @@ fn reportSa1(
                 "  {} enemy-header bank(s) de-mirrored ({} headers) — the species' AI,\n  palette and instruction-list bank for enemies no surface met; without\n  it a new enemy paints its palette from the wrong megabyte and runs its\n  AI from it\n",
                 .{ res.stats.rewritten_enemy_banks, res.stats.enemy_headers },
             );
+        if (res.stats.pointer_seed_sites != 0)
+            try out.print(
+                "  {} pointer-seed immediate(s) translated ({} sites) — long pointers the\n  game seeds from constants (the pause map's tilemap bank and its\n  explored-bits address); without it the map draws from the abandoned\n  WRAM homes\n",
+                .{ res.stats.rewritten_pointer_seeds, res.stats.pointer_seed_sites },
+            );
+        if (res.stats.area_map_entries != 0)
+            try out.print(
+                "  {} area-map table bank(s) de-mirrored ({} entries) — the per-area map\n  tilemap pointers the HUD minimap and the pause map read through; without\n  it the minimap paints text glyphs for map cells\n",
+                .{ res.stats.rewritten_area_map_banks, res.stats.area_map_entries },
+            );
+        if (res.stats.area_map_refused_at != 0)
+            try out.print("  area-map table pass REFUSED at $82:{X:0>4} (an entry failed validation)\n", .{res.stats.area_map_refused_at});
         if (res.stats.rewritten_dasb != 0)
             try out.print(
                 "  {} HDMA indirect-bank ($43x7 DASB) write(s) wrapped in a runtime\n  rebank thunk ($7E/$7F->$40/$41 as the write happens — an indirect\n  HDMA whose source is WRAM follows its data into BW-RAM)\n",

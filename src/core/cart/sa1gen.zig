@@ -289,6 +289,16 @@ pub const Stats = struct {
     /// how many records validated as headers.
     rewritten_enemy_banks: u32 = 0,
     enemy_headers: u32 = 0,
+    /// Pointer-seed immediates (see `rebankSmPointerSeeds`): sites whose
+    /// `LDA #imm / STA dp` seeds a long pointer's bank or low-WRAM
+    /// address, and the immediates rewritten (the rest were proven).
+    pointer_seed_sites: u32 = 0,
+    rewritten_pointer_seeds: u32 = 0,
+    /// Area map tilemap table (see `rebankSmAreaMapTable`): entries
+    /// validated, bank bytes de-mirrored, or the $82 address that refused.
+    area_map_entries: u32 = 0,
+    rewritten_area_map_banks: u32 = 0,
+    area_map_refused_at: u32 = 0,
     /// Super Metroid background (library) DMA-list source banks de-mirrored
     /// (the BG2 picture) across the records the room walk reached.
     rewritten_bg_banks: u32 = 0,
@@ -4283,19 +4293,208 @@ fn rebankSmEnemyHeaders(image: []const u8, out: []u8) SmRoomWalk {
     const fa0: usize = 0x20 * 0x8000; // bank $A0 (= $20) file offset
     var walk: SmRoomWalk = .{};
     if (image.len < fa0 + 0x8000) return walk;
+    // The table is not one 64-byte grid: a second run of headers starts
+    // at $F153, 20 bytes off the first grid's phase (the enemy whose raw
+    // bank byte sent the CPU into the wrong megabyte lived at $F693). So
+    // the walk is stride 2 over the whole range, and a record is a header
+    // when it sits on the first grid and passes the original check, or
+    // anywhere and passes a stricter one — the bank's pad byte zero, every
+    // AI pointer (init, main, grapple, hurt, frozen) in ROM, a plausible
+    // part count. Measured on the stock image: 139 on the grid, 26 off it,
+    // no two within 64 bytes of each other.
     var h: u32 = sm_enemy_hdr_lo;
-    while (h + 0x40 <= sm_enemy_hdr_hi) : (h += 0x40) {
+    while (h + 0x40 <= sm_enemy_hdr_hi) : (h += 2) {
         const o = fa0 + (h - 0x8000);
         const bank = image[o + 0x0C];
         const init_ai = std.mem.readInt(u16, image[o + 0x12 ..][0..2], .little);
         const main_ai = std.mem.readInt(u16, image[o + 0x18 ..][0..2], .little);
         if (bank < 0xA0 or bank > 0xBF or init_ai < 0x8000 or main_ai < 0x8000) continue;
+        const on_grid = (h - sm_enemy_hdr_lo) % 0x40 == 0;
+        if (!on_grid) {
+            const grapple = std.mem.readInt(u16, image[o + 0x1A ..][0..2], .little);
+            const hurt = std.mem.readInt(u16, image[o + 0x1C ..][0..2], .little);
+            const frozen = std.mem.readInt(u16, image[o + 0x1E ..][0..2], .little);
+            const parts = std.mem.readInt(u16, image[o + 0x14 ..][0..2], .little);
+            if (image[o + 0x0D] != 0 or grapple < 0x8000 or hurt < 0x8000 or frozen < 0x8000 or parts > 0x10) continue;
+        }
         walk.states += 1;
         if (out[o + 0x0C] != image[o + 0x0C]) continue; // hi_proven got here first
         out[o + 0x0C] = bank - 0x80;
         walk.rebanked += 1;
     }
     return walk;
+}
+
+/// Super Metroid's AREA MAP TABLE: seven 3-byte long pointers at $82:964A,
+/// one per area, naming that area's map tilemap in bank $B5. The HUD
+/// minimap ($90:AA7C) and the pause map ($82:953F) copy an entry into a
+/// direct-page pointer and read the tilemap through it — a bank byte that
+/// lives in a table, never in an operand, so no execution-driven rebanker
+/// sees it, and on the conversion bank $B5 is not the megabyte the map
+/// lives in: the minimap drew text glyphs instead of map cells. The bytes
+/// are de-mirrored in place ($A0-$BF -> -$80), all or nothing, after every
+/// entry validates (bank $B5, address in ROM); a byte a recording already
+/// proved is left as the evidence wrote it. Title-gated like the others.
+const sm_area_map_lo: u16 = 0x964A;
+const sm_area_map_entries: u16 = 7;
+fn rebankSmAreaMapTable(image: []const u8, out: []u8) SmRoomWalk {
+    const f82: usize = 0x02 * 0x8000;
+    var walk: SmRoomWalk = .{};
+    if (image.len < f82 + 0x8000) return walk;
+    var e: u16 = 0;
+    while (e < sm_area_map_entries) : (e += 1) {
+        const o = f82 + (sm_area_map_lo - 0x8000) + @as(usize, e) * 3;
+        const addr = std.mem.readInt(u16, image[o..][0..2], .little);
+        if (image[o + 2] != 0xB5 or addr < 0x8000) {
+            walk.refused_at = sm_area_map_lo + e * 3;
+            return walk;
+        }
+    }
+    walk.states = sm_area_map_entries;
+    e = 0;
+    while (e < sm_area_map_entries) : (e += 1) {
+        const o = f82 + (sm_area_map_lo - 0x8000) + @as(usize, e) * 3 + 2;
+        if (out[o] != image[o]) continue; // proven first
+        out[o] = image[o] - 0x80;
+        walk.rebanked += 1;
+    }
+    return walk;
+}
+
+test "rebankSmAreaMapTable: seven entries de-mirrored, a proven one kept, a bad entry refuses the table" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f82: usize = 0x02 * 0x8000;
+    const t = f82 + (sm_area_map_lo - 0x8000);
+    const table = [_]u8{ 0x00, 0x90, 0xB5, 0x00, 0x80, 0xB5, 0x00, 0xA0, 0xB5, 0x00, 0xB0, 0xB5, 0x00, 0xC0, 0xB5, 0x00, 0xD0, 0xB5, 0x00, 0xE0, 0xB5 };
+    @memcpy(img[t..][0..table.len], &table);
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[t + 5] = 0x35; // entry 1 already proven
+    const w = rebankSmAreaMapTable(img, out);
+    try testing.expectEqual(@as(u32, 7), w.states);
+    try testing.expectEqual(@as(u32, 6), w.rebanked);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    for (0..7) |i| try testing.expectEqual(@as(u8, 0x35), out[t + i * 3 + 2]);
+    // A bad entry refuses the whole table, touching nothing.
+    img[t + 3 * 3 + 2] = 0x7E;
+    @memcpy(out, img);
+    const w2 = rebankSmAreaMapTable(img, out);
+    try testing.expectEqual(@as(u32, sm_area_map_lo + 9), w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqualSlices(u8, img, out);
+}
+
+/// Super Metroid seeds long pointers in the direct page from IMMEDIATES:
+/// the map routine does `LDA #$007E / STA $05` for the tilemap buffer's
+/// bank and `LDA #$0000 / STA $0B`, `LDA #$07F7 / STA $09` for the
+/// explored-map bits it then reads through `LDA [$09]`. Nothing indexes
+/// those constants, no bank register carries them, so neither the
+/// de-mirror map nor the evidence-based rebankers reach them: the map
+/// drew from the abandoned WRAM homes (the garbled pause map). This
+/// pass finds the idiom by signature and translates the seed: a bank
+/// word $007E/$007F becomes $0040/$0041 when a long-indirect access
+/// through that slot's pointer follows within 256 bytes; a low-WRAM
+/// address word (under $2000) gains $6000 — the window's home — when
+/// its bank slot is seeded with $0000 within 64 bytes either way and
+/// the same use follows. Measured on the stock image: 9 bank seeds and
+/// 3 address seeds in banks $80-$B4, every one a pointer the game
+/// dereferences; the 5 that recordings had already proven are left as
+/// the evidence wrote them. Title-gated like the other nets.
+fn rebankSmPointerSeeds(image: []const u8, out: []u8) SmInlineDests {
+    var st: SmInlineDests = .{};
+    var bank: u8 = 0x80;
+    while (bank <= 0xB4) : (bank += 1) {
+        const base: usize = @as(usize, bank & 0x7F) * 0x8000;
+        if (image.len < base + 0x8000) break;
+        const blk = image[base .. base + 0x8000];
+        var i: usize = 0;
+        while (i + 5 <= blk.len) : (i += 1) {
+            if (blk[i] != 0xA9 or blk[i + 3] != 0x85) continue;
+            const imm: u16 = @as(u16, blk[i + 1]) | @as(u16, blk[i + 2]) << 8;
+            const slot = blk[i + 4];
+            if (imm == 0x7E or imm == 0x7F) {
+                if (slot < 2 or !smLongIndirectUse(blk, i + 5, slot - 2)) continue;
+                st.sites += 1;
+                if (out[base + i + 1] != image[base + i + 1]) continue; // proven first
+                out[base + i + 1] = if (imm == 0x7E) 0x40 else 0x41;
+                st.rebanked += 1;
+            } else if (imm != 0 and imm < 0x2000) {
+                if (slot > 0xFD or !smLongIndirectUse(blk, i + 5, slot)) continue;
+                // The bank slot seeded with $0000 nearby: the pointer names
+                // bank 0, whose low 8 KiB is the WRAM mirror.
+                const lo: usize = i -| 64;
+                const hi: usize = @min(blk.len - 5, i + 64);
+                var k: usize = lo;
+                var seeded = false;
+                while (k < hi) : (k += 1) {
+                    if (blk[k] == 0xA9 and blk[k + 1] == 0 and blk[k + 2] == 0 and blk[k + 3] == 0x85 and blk[k + 4] == slot + 2) {
+                        seeded = true;
+                        break;
+                    }
+                }
+                if (!seeded) continue;
+                st.sites += 1;
+                if (out[base + i + 1] != image[base + i + 1] or out[base + i + 2] != image[base + i + 2]) continue;
+                const moved = imm + 0x6000;
+                out[base + i + 1] = @truncate(moved);
+                out[base + i + 2] = @truncate(moved >> 8);
+                st.rebanked += 1;
+            }
+        }
+    }
+    return st;
+}
+
+/// A `[dp]` or `[dp],Y` access (the eight ALU ops' long-indirect forms:
+/// opcode low bits $07/$17) through `slot` within 256 bytes from `from`.
+fn smLongIndirectUse(blk: []const u8, from: usize, slot: u8) bool {
+    var j = from;
+    const end = @min(blk.len - 1, from + 256);
+    while (j < end) : (j += 1) {
+        const lo5 = blk[j] & 0x1F;
+        if ((lo5 == 0x07 or lo5 == 0x17) and blk[j + 1] == slot) return true;
+    }
+    return false;
+}
+
+test "rebankSmPointerSeeds: bank and low-WRAM address seeds of dereferenced pointers, proven ones left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0xEA);
+    const f82: usize = 0x02 * 0x8000;
+    // The map idiom: bank seed for slot $03, address seed for slot $09 with
+    // its bank slot $0B seeded $0000, both dereferenced later.
+    const code = [_]u8{
+        0xA9, 0x00, 0x30, 0x85, 0x03, // LDA #$3000 / STA $03
+        0xA9, 0x7E, 0x00, 0x85, 0x05, // LDA #$007E / STA $05   -> $0040
+        0xA9, 0x00, 0x00, 0x85, 0x0B, // LDA #$0000 / STA $0B
+        0xA9, 0xF7, 0x07, 0x85, 0x09, // LDA #$07F7 / STA $09   -> $67F7
+        0xA7, 0x09, //                   LDA [$09]
+        0x97, 0x03, //                   STA [$03],Y
+        0xA9, 0x7F, 0x00, 0x85, 0x40, // LDA #$007F / STA $40: never dereferenced -> untouched
+        0xA9, 0x10, 0x00, 0x85, 0x20, // LDA #$0010 / STA $20: no bank seed -> untouched
+        0xA7, 0x20, //                   LDA [$20]
+    };
+    @memcpy(img[f82 + 0x1000 ..][0..code.len], &code);
+    // A seed a recording already proved: `out` differs from `image` there.
+    @memcpy(img[f82 + 0x2000 ..][0..7], &[_]u8{ 0xA9, 0x7E, 0x00, 0x85, 0x05, 0xA7, 0x03 });
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[f82 + 0x2000 + 1] = 0x40;
+    const st = rebankSmPointerSeeds(img, out);
+    try testing.expectEqual(@as(u32, 3), st.sites);
+    try testing.expectEqual(@as(u32, 2), st.rebanked);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + 0x1000 + 6]);
+    try testing.expectEqual(@as(u16, 0x67F7), std.mem.readInt(u16, out[f82 + 0x1000 + 16 ..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0x7F), out[f82 + 0x1000 + 25]);
+    try testing.expectEqual(@as(u16, 0x0010), std.mem.readInt(u16, out[f82 + 0x1000 + 30 ..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + 0x2000 + 1]);
 }
 
 test "rebankSmEnemyHeaders: header banks de-mirrored, proven and non-header records left alone" {
@@ -4317,13 +4516,20 @@ test "rebankSmEnemyHeaders: header banks de-mirrored, proven and non-header reco
     hdr(img, 0xEA7F, 0xA8, 0xE7BC, 0xE812); // real -> $28
     hdr(img, 0xF17F, 0xB7, 0x0000, 0x0009); // bank plausible, AI pointers not: skipped
     hdr(img, 0xF13F, 0x02, 0x8000, 0x8000); // bank not a mirror: skipped
+    // Off the first grid (the second run's phase): needs the strict check.
+    hdr(img, 0xF693, 0xB2, 0xFD02, 0xFD32); // -> $32 once its other AI pointers are in ROM
+    for ([_]usize{ 0x1A, 0x1C, 0x1E }) |k| std.mem.writeInt(u16, img[fa0 + (0xF693 - 0x8000) + k ..][0..2], 0x800F, .little);
+    std.mem.writeInt(u16, img[fa0 + (0xF693 - 0x8000) + 0x14 ..][0..2], 1, .little);
+    hdr(img, 0xF6D5, 0xB2, 0xFD02, 0xFD32); // off both grids, grapple AI not in ROM: skipped
     const out = try gpa.alloc(u8, img.len);
     defer gpa.free(out);
     @memcpy(out, img);
     out[fa0 + (0xCEFF - 0x8000) + 0x0C] = 0x22;
     const w = rebankSmEnemyHeaders(img, out);
-    try testing.expectEqual(@as(u32, 3), w.states);
-    try testing.expectEqual(@as(u32, 2), w.rebanked);
+    try testing.expectEqual(@as(u32, 4), w.states);
+    try testing.expectEqual(@as(u32, 3), w.rebanked);
+    try testing.expectEqual(@as(u8, 0x32), out[fa0 + (0xF693 - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0xB2), out[fa0 + (0xF6D5 - 0x8000) + 0x0C]); // skipped
     try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEBF - 0x8000) + 0x0C]);
     try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEFF - 0x8000) + 0x0C]); // untouched
     try testing.expectEqual(@as(u8, 0x28), out[fa0 + (0xEA7F - 0x8000) + 0x0C]);
@@ -7557,6 +7763,13 @@ pub fn convertWholeGame(
             const en = rebankSmEnemyHeaders(image, out);
             res.stats.rewritten_enemy_banks = en.rebanked;
             res.stats.enemy_headers = en.states;
+            const ps = rebankSmPointerSeeds(image, out);
+            res.stats.pointer_seed_sites = ps.sites;
+            res.stats.rewritten_pointer_seeds = ps.rebanked;
+            const am = rebankSmAreaMapTable(image, out);
+            res.stats.area_map_entries = am.states;
+            res.stats.rewritten_area_map_banks = am.rebanked;
+            res.stats.area_map_refused_at = am.refused_at;
         }
     }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
