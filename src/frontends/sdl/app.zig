@@ -442,6 +442,10 @@ pub fn run(
     // a clean replay of the same inputs then reports a desync that is not
     // there. Snapshot it with the mark; restore it with the rewind.
     var rec_audio: [9]u64 = @splat(0);
+    // Identity of the state file each mark describes: a slot can be
+    // overwritten by another session, and a mark must never rewind to a
+    // frame the file on disk no longer matches.
+    var rec_mark_hash: [9]u64 = @splat(0);
     // Whether the console is still exactly as it powered on. A take started
     // here needs no anchor, which keeps "boot and record" writing the small
     // version-1 file it always did.
@@ -508,14 +512,17 @@ pub fn run(
     // Anything off (no sidecar, another build, a different file) falls back
     // to the replay, which decides by the take's own end hashes.
     if (opts.continue_take) if (play_movie) |m| if (opts.movie_path) |mp| {
-        if (loadEndState(io, gpa, con, mp, m, err)) |restored| {
+        var em: EndMarks = .{};
+        if (loadEndState(io, gpa, con, mp, m, &em, err)) |restored| {
             audio_hash = restored;
             play_idx = m.frames.len;
             var r: std.array_list.Managed([2]u16) = .init(gpa);
             if (r.appendSlice(m.frames)) {
                 rec = r;
                 rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
-                rec_marks = @splat(null);
+                rec_marks = em.frames;
+                rec_audio = em.audio;
+                rec_mark_hash = em.hash;
                 if (rw) |*w| w.clear();
                 at_power_on = false;
                 try err.print("movie: continuing the take from its end state, frame {} (no replay; F10 stops and saves the whole take)\n", .{m.frames.len});
@@ -646,8 +653,9 @@ pub fn run(
                                     play_movie = m;
                                     movie_end_check = false;
                                     var from_end = false;
+                                    var em: EndMarks = .{};
                                     if (how == .start_end_state) {
-                                        if (loadEndState(io, gpa, con, p, m, err)) |restored| {
+                                        if (loadEndState(io, gpa, con, p, m, &em, err)) |restored| {
                                             audio_hash = restored;
                                             play_idx = m.frames.len;
                                             from_end = true;
@@ -658,7 +666,9 @@ pub fn run(
                                         if (r.appendSlice(m.frames)) {
                                             rec = r;
                                             rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
-                                            rec_marks = @splat(null);
+                                            rec_marks = em.frames;
+                                            rec_audio = em.audio;
+                                            rec_mark_hash = em.hash;
                                             at_power_on = false;
                                             try err.print("movie: continuing take {s} from its end state, frame {d}\n", .{ p, m.frames.len });
                                             try err.flush();
@@ -744,6 +754,7 @@ pub fn run(
                         if (rec) |r| {
                             rec_marks[slot] = @intCast(r.items.len);
                             rec_audio[slot] = audio_hash;
+                            rec_mark_hash[slot] = std.hash.Fnv1a_64.hash(state_buf);
                         }
                         toast.set("STATE SAVED - SLOT {d}", .{slot});
                         mnu = null;
@@ -756,6 +767,7 @@ pub fn run(
                             // History no longer leads to this present.
                             if (rw) |*r| r.clear();
                             at_power_on = false;
+                            if (rec_marks[slot] != null and rec_mark_hash[slot] != std.hash.Fnv1a_64.hash(state_buf)) rec_marks[slot] = null;
                             if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
                                 toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
                             else
@@ -813,7 +825,8 @@ pub fn run(
                     // a replay it skips straight to the end.
                     if (play_movie) |m| {
                         if (cur_movie_path) |mp| {
-                            if (loadEndState(io, gpa, con, mp, m, err)) |restored| {
+                            var em_old: EndMarks = .{};
+                            if (loadEndState(io, gpa, con, mp, m, &em_old, err)) |restored| {
                                 audio_hash = restored;
                                 play_idx = m.frames.len;
                                 movie_end_check = false;
@@ -871,6 +884,7 @@ pub fn run(
                     if (rec) |r| {
                         rec_marks[slot] = @intCast(r.items.len);
                         rec_audio[slot] = audio_hash;
+                        rec_mark_hash[slot] = std.hash.Fnv1a_64.hash(state_buf);
                     }
                     toast.set("STATE SAVED - SLOT {d}", .{slot});
                 },
@@ -879,6 +893,7 @@ pub fn run(
                         if (sram) |*s| s.flush(io, con, err);
                         if (rw) |*r| r.clear();
                         at_power_on = false;
+                        if (rec_marks[slot] != null and rec_mark_hash[slot] != std.hash.Fnv1a_64.hash(state_buf)) rec_marks[slot] = null;
                         if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
                             toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
                         else
@@ -889,7 +904,7 @@ pub fn run(
                     if (rec != null) {
                         // Stop: the movie's hashes describe the machine as it
                         // stands right now, after the last recorded frame.
-                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, err);
+                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash }, err);
                         rec.?.deinit();
                         rec = null;
                         if (rec_anchor) |a| gpa.free(a);
@@ -1287,7 +1302,10 @@ pub fn run(
                     if (r.appendSlice(m.frames)) {
                         rec = r;
                         rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
-                        rec_marks = @splat(null);
+                        const em: EndMarks = if (cur_movie_path) |mp| readEndMarks(io, gpa, mp, m) else .{};
+                        rec_marks = em.frames;
+                        rec_audio = em.audio;
+                        rec_mark_hash = em.hash;
                         if (rw) |*w| w.clear();
                         try err.print("movie: continuing the take from frame {} (F10 stops and saves the whole take)\n", .{m.frames.len});
                         try err.flush();
@@ -1319,7 +1337,7 @@ pub fn run(
     // miss. Its hashes describe the machine as it stands now, which is
     // exactly what a stop would have recorded.
     if (rec) |*r| {
-        writeMovie(io, gpa, &opts, con, r.items, rec_anchor, audio_hash, err);
+        writeMovie(io, gpa, &opts, con, r.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash }, err);
         r.deinit();
         rec = null;
     }
@@ -2348,23 +2366,83 @@ fn discardMovieModes(
 }
 
 const end_state_magic = "YEND";
-const end_state_version: u32 = 1;
+/// 1: header + state. 2: header + the slot marks + state — so a state saved
+/// in an earlier session of the same playthrough still rewinds the take
+/// instead of discarding it.
+const end_state_version: u32 = 2;
 /// magic, version, movie file hash, audio hash, frame count.
 const end_state_header_len: usize = 4 + 4 + 8 + 8 + 4;
+
+/// The state-slot marks of a take: for each slot, the frame the slot was
+/// saved at (null = not in this take), the running audio hash then, and the
+/// identity of the state file. Carried in the end state so a continued take
+/// keeps them.
+pub const EndMarks = struct {
+    frames: [9]?u32 = @splat(null),
+    audio: [9]u64 = @splat(0),
+    hash: [9]u64 = @splat(0),
+
+    const encoded_len: usize = 9 * (4 + 8 + 8);
+    const none: u32 = 0xFFFF_FFFF;
+
+    fn encode(self: EndMarks, out: []u8) void {
+        var o: usize = 0;
+        for (0..9) |i| {
+            std.mem.writeInt(u32, out[o..][0..4], self.frames[i] orelse none, .little);
+            std.mem.writeInt(u64, out[o + 4 ..][0..8], self.audio[i], .little);
+            std.mem.writeInt(u64, out[o + 12 ..][0..8], self.hash[i], .little);
+            o += 20;
+        }
+    }
+
+    /// Marks past `limit` frames cannot belong to this take's prefix.
+    fn decode(in: []const u8, limit: usize) EndMarks {
+        var m: EndMarks = .{};
+        var o: usize = 0;
+        for (0..9) |i| {
+            const f = std.mem.readInt(u32, in[o..][0..4], .little);
+            if (f != none and f <= limit) {
+                m.frames[i] = f;
+                m.audio[i] = std.mem.readInt(u64, in[o + 4 ..][0..8], .little);
+                m.hash[i] = std.mem.readInt(u64, in[o + 12 ..][0..8], .little);
+            }
+            o += 20;
+        }
+        return m;
+    }
+};
 
 /// Try the take's end-state sidecar for `--continue`. Restores the console
 /// and returns the running audio hash at the take's end, or null (with the
 /// reason printed) when the sidecar is absent, belongs to another file or
 /// frame count, or is a state this build cannot load — every one of which
 /// means "replay instead", never "trust it anyway".
-fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie_path: []const u8, m: util.movie.Movie, err: *std.Io.Writer) ?u64 {
+/// The marks a take's end state carries (version 2), or none. Used by the
+/// replay path, which rebuilds the machine itself but still wants the marks.
+fn readEndMarks(io: std.Io, gpa: std.mem.Allocator, movie_path: []const u8, m: util.movie.Movie) EndMarks {
+    if (movie_path.len <= util.movie.file_ext.len) return .{};
+    var p_buf: [1024]u8 = undefined;
+    const es_path = std.fmt.bufPrint(&p_buf, "{s}.end.state", .{movie_path[0 .. movie_path.len - util.movie.file_ext.len]}) catch return .{};
+    const data = std.Io.Dir.cwd().readFileAlloc(io, es_path, gpa, .limited(64 * 1024 * 1024)) catch return .{};
+    defer gpa.free(data);
+    const head = end_state_header_len;
+    if (data.len < head + EndMarks.encoded_len or !std.mem.eql(u8, data[0..4], end_state_magic) or std.mem.readInt(u32, data[4..8], .little) != 2) return .{};
+    const movie_bytes = std.Io.Dir.cwd().readFileAlloc(io, movie_path, gpa, .limited(64 * 1024 * 1024)) catch return .{};
+    defer gpa.free(movie_bytes);
+    if (std.mem.readInt(u64, data[8..16], .little) != std.hash.Fnv1a_64.hash(movie_bytes)) return .{};
+    return EndMarks.decode(data[head .. head + EndMarks.encoded_len], m.frames.len);
+}
+
+fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie_path: []const u8, m: util.movie.Movie, marks_out: *EndMarks, err: *std.Io.Writer) ?u64 {
+    marks_out.* = .{};
     if (movie_path.len <= util.movie.file_ext.len) return null;
     var p_buf: [1024]u8 = undefined;
     const es_path = std.fmt.bufPrint(&p_buf, "{s}.end.state", .{movie_path[0 .. movie_path.len - util.movie.file_ext.len]}) catch return null;
     const data = std.Io.Dir.cwd().readFileAlloc(io, es_path, gpa, .limited(64 * 1024 * 1024)) catch return null;
     defer gpa.free(data);
-    const head = end_state_header_len;
-    if (data.len < head or !std.mem.eql(u8, data[0..4], end_state_magic) or std.mem.readInt(u32, data[4..8], .little) != end_state_version) {
+    const version: u32 = if (data.len >= 8 and std.mem.eql(u8, data[0..4], end_state_magic)) std.mem.readInt(u32, data[4..8], .little) else 0;
+    const head: usize = if (version == 2) end_state_header_len + EndMarks.encoded_len else end_state_header_len;
+    if (data.len < head or (version != 1 and version != 2)) {
         err.print("movie: {s} is not an end state this build understands; replaying the take instead\n", .{es_path}) catch {};
         err.flush() catch {};
         return null;
@@ -2383,6 +2461,7 @@ fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie
         err.flush() catch {};
         return null;
     };
+    if (version == 2) marks_out.* = EndMarks.decode(data[end_state_header_len..head], m.frames.len);
     return std.mem.readInt(u64, data[16..24], .little);
 }
 
@@ -2397,6 +2476,7 @@ fn writeMovie(
     frames: []const [2]u16,
     anchor: ?[]u8,
     audio_hash: u64,
+    marks: EndMarks,
     err: *std.Io.Writer,
 ) void {
     const dir = opts.movies_dir orelse return;
@@ -2448,7 +2528,7 @@ fn writeMovie(
     // along because the take's end hashes include it.
     var es_buf: [512]u8 = undefined;
     if (std.fmt.bufPrint(&es_buf, "{s}.end.state", .{path[0 .. path.len - util.movie.file_ext.len]})) |es_path| {
-        const head = end_state_header_len;
+        const head = end_state_header_len + EndMarks.encoded_len;
         if (gpa.alloc(u8, head + core.AnyConsole.state_size)) |buf| {
             defer gpa.free(buf);
             @memcpy(buf[0..4], end_state_magic);
@@ -2456,6 +2536,7 @@ fn writeMovie(
             std.mem.writeInt(u64, buf[8..16], std.hash.Fnv1a_64.hash(data), .little);
             std.mem.writeInt(u64, buf[16..24], audio_hash, .little);
             std.mem.writeInt(u32, buf[24..28], @intCast(frames.len), .little);
+            marks.encode(buf[end_state_header_len..head]);
             const written = con.saveState(buf[head..]);
             std.Io.Dir.cwd().writeFile(io, .{ .sub_path = es_path, .data = buf[0 .. head + written] }) catch |e| {
                 err.print("movie: end state of this take not written: {s}\n", .{@errorName(e)}) catch {};
