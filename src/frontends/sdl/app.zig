@@ -693,6 +693,33 @@ pub fn run(
                     if (glv) |g| cycleShader(io, gpa, g, -1, err);
                 } else if (nev.key.scancode == sdl3.scancode.period) {
                     if (glv) |g| cycleShader(io, gpa, g, 1, err);
+                } else if (nev.key.scancode == sdl3.scancode.f11) {
+                    // F11: back to the take's END STATE — the machine the
+                    // --movie file ends on. In a continued session this rewinds
+                    // the recording to the continue point (everything after it
+                    // is dropped, deterministically, like a slot rewind); during
+                    // a replay it skips straight to the end.
+                    if (play_movie) |m| {
+                        if (opts.movie_path) |mp| {
+                            if (loadEndState(io, gpa, con, mp, m, err)) |restored| {
+                                audio_hash = restored;
+                                play_idx = m.frames.len;
+                                movie_end_check = false;
+                                if (rw) |*w| w.clear();
+                                at_power_on = false;
+                                if (rec) |*r| {
+                                    if (r.items.len >= m.frames.len) {
+                                        r.shrinkRetainingCapacity(m.frames.len);
+                                        cutMarks(&rec_marks, @intCast(m.frames.len));
+                                        toast.set("TAKE END STATE - REC REWOUND TO {d}", .{m.frames.len});
+                                    } else toast.set("TAKE END STATE LOADED", .{});
+                                } else toast.set("TAKE END STATE LOADED", .{});
+                                try err.print("movie: take end state loaded (frame {d})
+", .{m.frames.len});
+                                try err.flush();
+                            } else toast.set("NO END STATE FOR THIS TAKE", .{});
+                        } else toast.set("NO END STATE FOR THIS TAKE", .{});
+                    } else toast.set("NO TAKE LOADED", .{});
                 } else if (nev.key.scancode == sdl3.scancode.f) {
                     fullscreen = !fullscreen;
                     if (sdl.SDL_SetWindowFullscreen(window, fullscreen)) {

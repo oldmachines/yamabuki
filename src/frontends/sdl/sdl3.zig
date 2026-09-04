@@ -154,6 +154,7 @@ pub const scancode = struct {
     pub const f1: u32 = 58;
     pub const f5: u32 = 62;
     pub const f9: u32 = 66;
+    pub const f11: u32 = 68;
     pub const right: u32 = 79;
     pub const left: u32 = 80;
     pub const down: u32 = 81;

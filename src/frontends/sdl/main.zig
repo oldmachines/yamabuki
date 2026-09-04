@@ -13,6 +13,7 @@
 //!   Tab or right trigger (hold) fast-forward      Esc quit
 //!   , / .  cycle shaders (fixed keys; only presets baked for this GPU)
 //!   F      toggle fullscreen (fixed key)
+//!   F11    load the --movie take's end state (a continued recording rewinds to it)
 //!
 //! Settings persist in `config.zon` under the OS's per-user data directory
 //! (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki\` on Windows,
