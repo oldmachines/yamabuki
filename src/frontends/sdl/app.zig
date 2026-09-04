@@ -26,6 +26,7 @@ const rewind = @import("rewind.zig");
 const library = @import("library.zig");
 const dirpicker = @import("dirpicker.zig");
 const patchfind = @import("patchfind.zig");
+const takes = @import("takes.zig");
 
 /// `--region ntsc|pal|auto`: override the header-detected region. `auto`
 /// (the default) uses the cart header's region byte.
@@ -384,6 +385,14 @@ pub fn run(
     // Live bindings: a copy, because a remap in the menu re-resolves them.
     var binds = opts.bindings;
     var mnu: ?menu.Menu = null;
+    // The takes screen (F11); see takes.zig.
+    var takes_ui: ?takes.Picker = null;
+    // The take on the machine right now — the `--movie` file, or the one the
+    // takes screen loaded. Its end-state sidecar lives beside it.
+    var cur_movie_path: ?[]const u8 = opts.movie_path;
+    // A replay that hands over to recording when it ends: `--continue`, or
+    // "from the beginning" on the takes screen.
+    var continue_pending: bool = opts.continue_take;
     // The info palette (I): an overlay HUD, not a pause — the game keeps
     // running under it. Slot facts are gathered when it opens and after
     // saves/loads while it is up, never per frame.
@@ -599,6 +608,101 @@ pub fn run(
                 continue;
             }
 
+            if (takes_ui) |*tp| {
+                repeater.feed(nev);
+                const req: takes.Request = if (menu.navFromEvent(nev)) |nav| tp.handleNav(nav) else .none;
+                switch (req) {
+                    .none => {},
+                    .close => {
+                        tp.deinit();
+                        takes_ui = null;
+                        inp.clearTransient();
+                    },
+                    .start_end_state, .start_replay => |how| {
+                        const chosen: ?[]u8 = if (tp.selected()) |sel| (gpa.dupe(u8, sel.path) catch null) else null;
+                        tp.deinit();
+                        takes_ui = null;
+                        inp.clearTransient();
+                        if (chosen) |p| {
+                            // Load and validate the take against this session,
+                            // exactly as --movie does at boot.
+                            const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 * 1024 * 1024)) catch null;
+                            const parsed: ?util.movie.Movie = if (bytes) |b| (util.movie.parse(gpa, b) catch null) else null;
+                            if (parsed) |m| {
+                                const acc: u8 = if (opts.accuracy == .accurate) 1 else 0;
+                                const reg: u8 = if (con.region() == .pal) 1 else 0;
+                                if (m.rom_crc != opts.rom_crc or m.accuracy != acc or m.region != reg) {
+                                    toast.set("TAKE IS FROM ANOTHER IMAGE OR CORE", .{});
+                                } else {
+                                    // The take's machine replaces whatever ran here:
+                                    // drop an open take, stop persisting the real
+                                    // battery save (the take carries its own), and
+                                    // forget the rewind history.
+                                    discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "take picker", err);
+                                    if (sram) |*s| s.flush(io, con, err);
+                                    sram = null;
+                                    if (rw) |*w| w.clear();
+                                    cur_movie_path = p;
+                                    play_movie = m;
+                                    movie_end_check = false;
+                                    var from_end = false;
+                                    if (how == .start_end_state) {
+                                        if (loadEndState(io, gpa, con, p, m, err)) |restored| {
+                                            audio_hash = restored;
+                                            play_idx = m.frames.len;
+                                            from_end = true;
+                                        } else toast.set("NO END STATE - REPLAYING INSTEAD", .{});
+                                    }
+                                    if (from_end) {
+                                        var r: std.array_list.Managed([2]u16) = .init(gpa);
+                                        if (r.appendSlice(m.frames)) {
+                                            rec = r;
+                                            rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
+                                            rec_marks = @splat(null);
+                                            at_power_on = false;
+                                            try err.print("movie: continuing take {s} from its end state, frame {d}\n", .{ p, m.frames.len });
+                                            try err.flush();
+                                            toast.set("CONTINUING TAKE - F10 STOPS", .{});
+                                        } else |_| r.deinit();
+                                    } else {
+                                        // From the beginning: the machine the take
+                                        // started on, then the replay at full speed;
+                                        // the hand-over at its end is the same as
+                                        // --continue's.
+                                        var ok = true;
+                                        if (m.anchor) |a| {
+                                            con.loadState(a) catch {
+                                                toast.set("TAKE START STATE WON'T LOAD HERE", .{});
+                                                play_movie = null;
+                                                ok = false;
+                                            };
+                                        } else {
+                                            con.repower();
+                                            switch (opts.region) {
+                                                .auto => {},
+                                                .ntsc => con.setRegion(.ntsc),
+                                                .pal => con.setRegion(.pal),
+                                            }
+                                            @memset(saves.liveSram(con), 0);
+                                        }
+                                        if (ok) {
+                                            play_idx = 0;
+                                            audio_hash = core.console.audio_hash_init;
+                                            continue_pending = true;
+                                            at_power_on = m.anchor == null;
+                                            try err.print("movie: replaying take {s} ({d} frames) to continue it\n", .{ p, m.frames.len });
+                                            try err.flush();
+                                            toast.set("REPLAYING TAKE - HANDS OFF", .{});
+                                        }
+                                    }
+                                }
+                            } else toast.set("CANNOT READ THAT TAKE", .{});
+                        }
+                    },
+                }
+                continue;
+            }
+
             if (mnu) |*m| {
                 repeater.feed(nev);
                 // Menu path: raw events feed a pending capture; otherwise
@@ -694,13 +798,21 @@ pub fn run(
                 } else if (nev.key.scancode == sdl3.scancode.period) {
                     if (glv) |g| cycleShader(io, gpa, g, 1, err);
                 } else if (nev.key.scancode == sdl3.scancode.f11) {
-                    // F11: back to the take's END STATE — the machine the
+                    if (takes_ui == null) {
+                        if (opts.movies_dir) |md| {
+                            takes_ui = takes.Picker.init(gpa, io, md, opts.game_id);
+                            inp.clearTransient();
+                        } else toast.set("NO TAKES FOLDER", .{});
+                    }
+                } else if (false) {
+                    // (the direct end-state load F11 used to do; the takes screen's
+                    // END STATE option on the current take is the same action) — the machine the
                     // --movie file ends on. In a continued session this rewinds
                     // the recording to the continue point (everything after it
                     // is dropped, deterministically, like a slot rewind); during
                     // a replay it skips straight to the end.
                     if (play_movie) |m| {
-                        if (opts.movie_path) |mp| {
+                        if (cur_movie_path) |mp| {
                             if (loadEndState(io, gpa, con, mp, m, err)) |restored| {
                                 audio_hash = restored;
                                 play_idx = m.frames.len;
@@ -867,6 +979,9 @@ pub fn run(
         // being bound instead. Up/Down only ever move a cursor, so the
         // Request this produces is always .none — .up/.down never adjust a
         // value or toggle anything.
+        if (takes_ui) |*tp| if (repeater.tick()) |nav| {
+            _ = tp.handleNav(nav);
+        };
         if (mnu) |*m| if (!m.capturing()) if (repeater.tick()) |nav| {
             const mctx: menu.Ctx = .{
                 .gpa = gpa,
@@ -880,9 +995,9 @@ pub fn run(
         // capture per displayed frame (~real-time backwards); at the end
         // of history it just holds the oldest frame.
         const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
-        const halted = paused or mnu != null or rewinding;
+        const halted = paused or mnu != null or rewinding or takes_ui != null;
         const replaying = play_movie != null and play_idx < play_movie.?.frames.len;
-        fast_forward = (inp.ffHeld() or (opts.continue_take and replaying)) and !halted;
+        fast_forward = (inp.ffHeld() or (continue_pending and replaying)) and !halted;
         // During playback the movie owns both pads; live input resumes the
         // frame after it ends.
         const feed: [2]u16 = if (play_movie) |m|
@@ -924,7 +1039,13 @@ pub fn run(
         const fb = con.framebuffer();
         const width = con.frameWidth();
         const height: u32 = @intCast(fb.len / width);
-        const src_px: []const u16 = if (mnu) |*m| blk: {
+        const src_px: []const u16 = if (takes_ui) |*tp| blk: {
+            @memcpy(compose[0..fb.len], fb);
+            const surf = ui.Surface.init(compose[0..fb.len], width, height);
+            ui.dimAll(&surf);
+            tp.draw(&surf);
+            break :blk compose[0..fb.len];
+        } else if (mnu) |*m| blk: {
             @memcpy(compose[0..fb.len], fb);
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.dimAll(&surf);
@@ -1148,7 +1269,7 @@ pub fn run(
                         try err.print("movie: DESYNC — end frame hash {x:0>16} (movie {x:0>16}), audio {s}\n", .{
                             fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged",
                         });
-                        if (opts.continue_take) {
+                        if (continue_pending) {
                             try err.print("movie: --continue refused — the replay did not reproduce the take, so inputs appended now would describe a different machine\n", .{});
                             toast.set("CONTINUE REFUSED - DESYNC", .{});
                         }
@@ -1161,7 +1282,7 @@ pub fn run(
                 // F10 is the whole playthrough, and its hashes describe the end.
                 const in_sync = m.end_frame_hash == 0 or
                     (core.console.hashFrame(con.framebuffer()) == m.end_frame_hash and (m.end_audio_hash == 0 or audio_hash == m.end_audio_hash));
-                if (opts.continue_take and in_sync and rec == null) {
+                if (continue_pending and in_sync and rec == null) {
                     var r: std.array_list.Managed([2]u16) = .init(gpa);
                     if (r.appendSlice(m.frames)) {
                         rec = r;
