@@ -1758,6 +1758,23 @@ fn saveHarvestCache(
 /// replay, the stale detector and the cover harvest (all replay a recording
 /// on its own image); it does NOT hold for a stock-side verification surface
 /// in window mode, which is refused at load time instead.
+/// Conversion-side site evidence fills in only where stock evidence is
+/// absent (see the maps' declaration). Returns the stock map, now complete.
+fn foldConvEvidence(site_ev: []u8, conv: []const u8, out: *std.Io.Writer) []u8 {
+    var folded: u32 = 0;
+    var shadowed: u32 = 0;
+    for (site_ev, conv) |*s, c| {
+        if (c == 0) continue;
+        if (s.* == 0) {
+            s.* = c;
+            folded += 1;
+        } else if (s.* != c) shadowed += 1;
+    }
+    out.print("  site evidence: {} site(s) classified by conversion-side replays alone; {} with a differing conversion-side class deferred to stock\n", .{ folded, shadowed }) catch {};
+    out.flush() catch {};
+    return site_ev;
+}
+
 fn anchorMovie(con: anytype, mov: ?util.movie.Movie, what: []const u8, out: *std.Io.Writer) !void {
     const m = mov orelse return;
     const a = m.anchor orelse return;
@@ -2234,6 +2251,15 @@ fn runSa1Gen(
     // baseline accumulate into the same map.
     const site_ev = try gpa.alloc(u8, core.usage_map.cpu_map_len);
     @memset(site_ev, 0);
+    // Site evidence from CONVERSION-side replays is kept apart and folded in
+    // only where stock left nothing: a replay on an older build — a different
+    // memory map — classifies the same instruction through that map, and one
+    // such record turned a clean low-WRAM site (`LDX $0E54`, Brinstar's
+    // elevator) into a split site the rewriter refused to shift. Stock
+    // evidence describes the real machine; conversion evidence is the
+    // fallback for code stock never reached, which is why it was merged.
+    const site_ev_conv = try gpa.alloc(u8, core.usage_map.cpu_map_len);
+    @memset(site_ev_conv, 0);
     // Pointer-bank provenance: which ROM bytes feed $7E/$7F into runtime
     // pointers ([dp] bank bytes, DMA bank registers). Accumulates across
     // every profiled surface like the rest of the evidence.
@@ -2530,6 +2556,7 @@ fn runSa1Gen(
         const tmp_ev = job.tmp_ev;
         const cover_pb = job.pb.?;
         const ci = job.ci;
+        const ci_is_stock = std.mem.eql(u8, ci, image);
         var merged: u32 = 0;
         var merged_ev: u32 = 0;
         var pc: u32 = 0;
@@ -2544,8 +2571,13 @@ fn runSa1Gen(
             if (ub[pc] & core.usage_map.flag_opcode == 0) merged += 1;
             ub[pc] |= tmp[pc];
             if (tmp_ev[pc] != 0) {
-                if (site_ev[pc] == 0) merged_ev += 1;
-                site_ev[pc] |= tmp_ev[pc];
+                if (ci_is_stock) {
+                    if (site_ev[pc] == 0) merged_ev += 1;
+                    site_ev[pc] |= tmp_ev[pc];
+                } else {
+                    if (site_ev_conv[pc] == 0) merged_ev += 1;
+                    site_ev_conv[pc] |= tmp_ev[pc];
+                }
             }
         }
         // Merge proven bank bytes under the same byte-identity guard the
@@ -2858,7 +2890,7 @@ fn runSa1Gen(
             try out.flush();
         }
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
-            core.sa1gen.convertWholeGame(gpa, image, ub, site_ev, ptr_ev, args.wg_static, args.window, if (split_spec != null) &.{} else act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, split_spec, &refusal)
+            core.sa1gen.convertWholeGame(gpa, image, ub, foldConvEvidence(site_ev, site_ev_conv, out), ptr_ev, args.wg_static, args.window, if (split_spec != null) &.{} else act[0..n_act], phase_async, args.wg_expand_to, args.wg_copy_reserve, split_spec, &refusal)
         else
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         if (converted) |cr| {
