@@ -95,6 +95,9 @@ pub const Options = struct {
     /// `--continue`: when the `--movie` replay ends in sync, keep recording
     /// from there with the replayed inputs already in the take.
     continue_take: bool = false,
+    /// The `--movie` file's path: `--continue` looks beside it for the
+    /// take's end state (`<take>.end.state`) to skip the replay.
+    movie_path: ?[]const u8 = null,
     /// Cheat pokes held after every executed frame; see cheat.zig.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -487,6 +490,31 @@ pub fn run(
             }
         }
     }
+
+    // --continue from the take's END STATE: every stop writes the machine at
+    // the take's last frame beside the file. If that state still loads on
+    // this build (same image, same core layout) and belongs to this exact
+    // file, recording resumes from it at once and the replay is skipped —
+    // the replay exists to rebuild that machine, and here it already exists.
+    // Anything off (no sidecar, another build, a different file) falls back
+    // to the replay, which decides by the take's own end hashes.
+    if (opts.continue_take) if (play_movie) |m| if (opts.movie_path) |mp| {
+        if (loadEndState(io, gpa, con, mp, m, err)) |restored| {
+            audio_hash = restored;
+            play_idx = m.frames.len;
+            var r: std.array_list.Managed([2]u16) = .init(gpa);
+            if (r.appendSlice(m.frames)) {
+                rec = r;
+                rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
+                rec_marks = @splat(null);
+                if (rw) |*w| w.clear();
+                at_power_on = false;
+                try err.print("movie: continuing the take from its end state, frame {} (no replay; F10 stops and saves the whole take)\n", .{m.frames.len});
+                try err.flush();
+                toast.set("CONTINUING TAKE - F10 STOPS", .{});
+            } else |_| r.deinit();
+        }
+    };
 
     while (running) {
         if (mnu) |*m| m.tick() else repeater = .{};
@@ -2151,6 +2179,45 @@ fn discardMovieModes(
     }
 }
 
+const end_state_magic = "YEND";
+const end_state_version: u32 = 1;
+/// magic, version, movie file hash, audio hash, frame count.
+const end_state_header_len: usize = 4 + 4 + 8 + 8 + 4;
+
+/// Try the take's end-state sidecar for `--continue`. Restores the console
+/// and returns the running audio hash at the take's end, or null (with the
+/// reason printed) when the sidecar is absent, belongs to another file or
+/// frame count, or is a state this build cannot load — every one of which
+/// means "replay instead", never "trust it anyway".
+fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie_path: []const u8, m: util.movie.Movie, err: *std.Io.Writer) ?u64 {
+    if (movie_path.len <= util.movie.file_ext.len) return null;
+    var p_buf: [1024]u8 = undefined;
+    const es_path = std.fmt.bufPrint(&p_buf, "{s}.end.state", .{movie_path[0 .. movie_path.len - util.movie.file_ext.len]}) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, es_path, gpa, .limited(64 * 1024 * 1024)) catch return null;
+    defer gpa.free(data);
+    const head = end_state_header_len;
+    if (data.len < head or !std.mem.eql(u8, data[0..4], end_state_magic) or std.mem.readInt(u32, data[4..8], .little) != end_state_version) {
+        err.print("movie: {s} is not an end state this build understands; replaying the take instead\n", .{es_path}) catch {};
+        err.flush() catch {};
+        return null;
+    }
+    const movie_bytes = std.Io.Dir.cwd().readFileAlloc(io, movie_path, gpa, .limited(64 * 1024 * 1024)) catch return null;
+    defer gpa.free(movie_bytes);
+    if (std.mem.readInt(u64, data[8..16], .little) != std.hash.Fnv1a_64.hash(movie_bytes) or
+        std.mem.readInt(u32, data[24..28], .little) != m.frames.len)
+    {
+        err.print("movie: {s} belongs to another take; replaying this one instead\n", .{es_path}) catch {};
+        err.flush() catch {};
+        return null;
+    }
+    con.loadState(data[head..]) catch |e| {
+        err.print("movie: the take's end state cannot load on this build ({s}); replaying the take instead\n", .{@errorName(e)}) catch {};
+        err.flush() catch {};
+        return null;
+    };
+    return std.mem.readInt(u64, data[16..24], .little);
+}
+
 /// Write a finished recording as `<movies>/<game_id>-NNNN.ymv`. The end
 /// hashes are taken from the machine as it stands — the frame after the
 /// last recorded input, exactly what a replay reproduces.
@@ -2207,6 +2274,29 @@ fn writeMovie(
             err.flush() catch {};
         } else |_| {}
     }
+    // The machine at the take's last frame, so `--continue` can start here
+    // instead of replaying. Bound to this exact file by the file's hash, and
+    // to this build by the state's own header; the running audio hash rides
+    // along because the take's end hashes include it.
+    var es_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&es_buf, "{s}.end.state", .{path[0 .. path.len - util.movie.file_ext.len]})) |es_path| {
+        const head = end_state_header_len;
+        if (gpa.alloc(u8, head + core.AnyConsole.state_size)) |buf| {
+            defer gpa.free(buf);
+            @memcpy(buf[0..4], end_state_magic);
+            std.mem.writeInt(u32, buf[4..8], end_state_version, .little);
+            std.mem.writeInt(u64, buf[8..16], std.hash.Fnv1a_64.hash(data), .little);
+            std.mem.writeInt(u64, buf[16..24], audio_hash, .little);
+            std.mem.writeInt(u32, buf[24..28], @intCast(frames.len), .little);
+            const written = con.saveState(buf[head..]);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = es_path, .data = buf[0 .. head + written] }) catch |e| {
+                err.print("movie: end state of this take not written: {s}\n", .{@errorName(e)}) catch {};
+                err.flush() catch {};
+            };
+            err.print("movie: end state of this take: {s} (--continue starts here without replaying)\n", .{es_path}) catch {};
+            err.flush() catch {};
+        } else |_| {}
+    } else |_| {}
     err.print("movie: {s} ({} frames{s}, end hashes recorded)\n", .{
         path, frames.len, if (anchor != null) ", anchored to a start state" else ", from power-on",
     }) catch {};

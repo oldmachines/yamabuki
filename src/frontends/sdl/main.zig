@@ -130,8 +130,9 @@ pub fn main(init: std.process.Init) !void {
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
                 "  --record    start recording a .ymv at power-on, before the first frame;\n" ++
                 "              F10 stops and saves it (F10 alone cannot promise frame 0)\n" ++
-                "  --continue  with --movie: replay the take at full speed, then keep recording\n" ++
-                "              from its end; the saved file is the whole take, old inputs plus new\n" ++
+                "  --continue  with --movie: keep recording from the take's end; the saved file is\n" ++
+                "              the whole take, old inputs plus new. Starts from the take's <take>.end.state\n" ++
+                "              when that still loads on this build, else replays the take at full speed\n" ++
                 "  --srm f     with --record: start the take from this battery save (.srm)\n" ++
                 "              instead of blank SRAM; the take is anchored to it. Every\n" ++
                 "              --record session writes its own save next to the .ymv as\n" ++
@@ -268,6 +269,7 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .movie_path = args.movie,
         .record = args.record,
         .srm = args.srm,
         .continue_take = args.continue_take,
