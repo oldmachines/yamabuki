@@ -6,8 +6,8 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v53** (`tests/surfaces/sm-sa1/
-sm-sa1-v53.bps`): five structural nets (room-graph level pointers,
+escape evidence surface. The current build is **v58** (`tests/surfaces/sm-sa1/
+sm-sa1-v58.bps`): five structural nets (room-graph level pointers,
 background records, decompressor inline destinations, the tileset table,
 the enemy headers), the Zebes foreground, the Climb's door/layer code and
 the elevator AI via cover pairs, and the escape palette via an
@@ -1331,6 +1331,56 @@ The working split from here: record on stock for coverage, one long take
 per region; record on the conversion to find the data classes the nets do
 not yet know. The stock take is the one that pays.
 
+## 4m. Brinstar's own elevator, and stock evidence that did not land (v53-v56)
+
+A conversion take on v53 rode the blue elevator into Brinstar (`$9E9F`)
+and arrived to a black playfield with the HUD intact. Not a hang this time:
+the game state was play, brightness full, every tile present in VRAM. The
+state variables said what it was — the elevator status still set and Samus
+locked in the ride pose. The ride never ended, and the black playfield is
+the ride's own display mode (the HUD interrupt's layer set covers the whole
+frame because the per-frame interrupt line is never programmed while an
+elevator is active).
+
+`--stale` listed three sites, all in bank `$A8`: Brinstar's elevator is a
+different species from Crateria's (`$A3`), with its own AI reading the enemy
+RAM through the data-bank mirror. 27 operands hand-relocated across its
+init entry (`$A8:9058`) and main routine (`$A8:C3A2..$C43E`) completed the
+ride: elevator cleared, Samus standing, layers on, zero stale sites over the
+whole take. v56 harvests the take on that image, cached and threaded, and
+verifies.
+
+**The part that matters more than the fix.** The 38-minute stock take rode
+this exact elevator twice, so on stock the species' AI executed and was
+harvested — and the sites stayed raw. Stock evidence for code in the enemy
+banks is not landing. Every enemy-bank fix so far (§4j's elevator, this
+one) came from conversion-side replays, which execute that code at its
+de-mirrored home. A stock profile records it at the `$A0-$BF` mirror, and
+somewhere between that record and the rewriter's key for MB1 code the
+evidence is lost — the same family as §6's harvest bank-mapping note. Until
+that is fixed, a stock take covers everything except the enemy banks, which
+is exactly where Brinstar's new species live.
+
+**Found, with `--site-ev`.** The site's evidence read `wram_low | rom`: the
+same `LDX $0E54` was on record both as a low-WRAM mirror read and as a ROM
+read, and a site with conflicting classes is never shifted — correctly, a
+fixed operand cannot serve both. A build whose only cover pair was the
+stock take showed the site clean (`wram_low` alone), so the ROM record came
+from one of the older conversion-side pairs: a replay on an early build
+with a different memory map classifies the same instruction through that
+map, and its record had been merged into the union as if it described the
+stock machine. It described a machine that no longer exists.
+
+**The fix: stock evidence first.** Conversion-side site evidence now lives
+in its own map and is folded into the union only where stock left nothing
+— the reason it was ever merged (sites only the conversion's timeline
+reaches). Measured on v56's recipe: 2,696 sites classified by conversion
+replays alone, 26 sites whose conversion-side class differed deferred to
+stock, and the elevator's `LDX $0E54` shifted at last. The take rides the
+elevator on a GENERATED image, zero stale sites, in a 14-minute cached
+build. The stock takes' coverage of the enemy banks now lands — the hand
+image pair is still in the recipe for the arrival branch it alone covered.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1453,7 +1503,9 @@ that used to take an hour is one harvest plus one verification.
   harvest bank translation.
 - The cover harvest maps conversion-side coverage with `(pc >> 16) & 0x7F`,
   which is wrong for >2 MiB images where `$A0-$BF` is MB2 (§4f). This
-  silently mis-credits any coverage harvested from those banks.
+  silently mis-credits any coverage harvested from those banks. (Its
+  cousin — conversion-side SITE evidence from early builds polluting stock
+  classes — is closed by the stock-first fold, §4m.)
 - Tiny-base `abs,X` reads under mirror DBRs in the door path
   (`$02:DE06`, `$02:DF44+`) are left stock with pure-ROM evidence; safe on the
   recorded paths, same split class if a path ever lands them in low WRAM.
@@ -1522,6 +1574,14 @@ cover pair: 5,745 instructions, 2,026 sites, 12 bank bytes in one pass;
 verified — the ship (§4l) · v53 a second stock take (56 min, continued from
 the first's battery save with the new `--record --srm`): 2,486 instructions,
 1,038 sites, 9 bank bytes; verified — the ship.
+
+v54-v56 (2026-09-04): v54a/b/c the harvest cache, threads and render-free
+harvests measured byte-identical (§5) · the v53 take rides Brinstar's own
+elevator to a black playfield: the `$A8` species' AI raw despite the stock
+take having ridden it (§4m) · v56 the take on a 27-byte hand-relocated
+image, verified — but the site stays raw: conflicting evidence classes ·
+v57 the stock-first evidence fold: the site shifts, the ride completes on a
+generated image · v58 verified — the ship (§4m).
 
 ## 8. Cross-cutting learnings
 

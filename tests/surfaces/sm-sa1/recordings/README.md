@@ -28,9 +28,11 @@ as a **cover pair** against that image:
 | `v47-poweron-on-plmhand.ymv` | 35,254 | `v47-plm-hand.sfc` | DERIVED: header crc32 rebound to v47 with the 7 PLM-routine operands hand-relocated, so the arrival completes and the take covers the elevator's arrival branch and the PLM code past it |
 | `stock-poweron-brinstar.ymv` | 137,510 | `sm.sfc` (power-on) | STOCK, 38 minutes: power-on through Ceres, the escape, Crateria, the elevator and Brinstar. As a cover pair it covered 5,745 instructions and proved 12 bank bytes in one pass — more than every conversion take combined (§4l). The template for future coverage takes |
 | `stock-from-save-brinstar.ymv` | 203,465 | `sm.sfc` (anchored: `--record --srm`) | STOCK, ~56 minutes, continuing from the battery save the previous take left (`stock-from-save-brinstar.start.srm`, lifted from its end state with `--dump-srm`). The first take made with `--record --srm`: the anchor carries the powered-on machine holding that save, so it replays from the file alone (verified: 203,465 frames, no desync). Cover-pair only, like every anchored take |
+| `v53-poweron.ymv` | 29,137 | `sm-sa1-v53.sfc` (power-on) | power-on down the blue elevator into Brinstar (`$9E9F`): the ride never ended (black playfield, elevator status stuck) — the bank-`$A8` elevator species' AI, raw despite the stock take having ridden it (§4m). In the recipe on v53 and, as `v53-poweron-on-elev8hand.ymv`, on the hand-relocated image |
+| `v53-poweron-on-elev8hand.ymv` | 29,137 | `v53-elev8-hand.sfc` | DERIVED: header crc32 rebound to v53 with the 27 elevator operands hand-relocated, so the ride completes and the take covers the whole routine |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the ones before it feed `sm-sa1-v53.bps.cmd` as cover pairs (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v58.bps.cmd` as cover pairs (add `--harvest-cache <dir>` to any recipe to skip replaying pairs it has seen; the output is byte-identical) (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on. Every `--record` session also writes its
@@ -59,6 +61,8 @@ in the parent directory; two cannot:
 | `sm-sa1-v43.sfc` | yes — `../sm-sa1-v43.bps` from `37cb09e` |
 | `sm-sa1-v47.sfc` | yes — `../sm-sa1-v47.bps` from `c73572c` |
 | `v47-plm-hand.sfc` | **no recipe** — v47 with 7 operand bytes hand-relocated (§4k); keep the image |
+| `sm-sa1-v53.sfc` | yes — `../sm-sa1-v53.bps` from `e4ec19d` |
+| `v53-elev8-hand.sfc` | **no recipe** — v53 with 27 operand bytes hand-relocated (§4m); keep the image |
 | `v44-elev-hand.sfc` | **no recipe** — v44 (v43's recipe + `v43-poweron`, sync-only, at `37cb09e`) with 29 operand bytes hand-relocated in `$A3:9579..$9611` (§4j lists them); keep the image |
 | `cover39.sfc` | **no recipe exists** |
 | `cover40.sfc` | **no recipe exists** |
