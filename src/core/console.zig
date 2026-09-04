@@ -85,7 +85,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -173,6 +173,11 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// or it would shift the save-state layout by a byte and every
         /// anchored recording would load a machine one byte off.
         skip_render: bool,
+        /// The game read the controller since a frontend last took this
+        /// (`takeInputPolled`). Latched here because the profiler clears the
+        /// bus's own flag at frame end; a per-poll input feed advances on it.
+        /// Diagnostic, not machine state: in `serialize_skip`.
+        polled_latch: bool,
         /// CPU instructions/interrupts retired since reset. A deterministic
         /// work proxy for perf-regression baselines (paired with bus.clock).
         steps: u64,
@@ -187,6 +192,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.region = timing.regionFromHeaderByte(self.cart.header.region);
             self.bus.ppu.pal = self.region == .pal;
             self.skip_render = false;
+            self.polled_latch = false;
             self.reset();
         }
 
@@ -255,6 +261,20 @@ pub fn Console(comptime cfg: CoreConfig) type {
             }
             self.scanline = 0;
             self.frame +%= 1;
+            self.polled_latch = self.polled_latch or self.bus.input_polled;
+        }
+
+        /// Whether the game has read the controller since the last `take`.
+        pub fn inputPolled(self: *const Self) bool {
+            return self.polled_latch or self.bus.input_polled;
+        }
+
+        /// Read-and-clear form, for a feed that advances one entry per poll.
+        pub fn takeInputPolled(self: *Self) bool {
+            const p = self.inputPolled();
+            self.polled_latch = false;
+            self.bus.input_polled = false;
+            return p;
         }
 
         fn stepScanline(self: *Self) void {
@@ -280,6 +300,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // scanline 0, so the window matches the NMI-to-NMI period the
                 // game's logic actually runs in.
                 if (cfg.profile) {
+                    self.polled_latch = self.polled_latch or self.bus.input_polled;
                     self.prof.endFrame(self.frame, self.bus.input_polled);
                     self.bus.input_polled = false;
                 }
@@ -1261,6 +1282,18 @@ pub const AnyConsole = union(Accuracy) {
     pub fn runFrame(self: *AnyConsole) void {
         switch (self.*) {
             inline else => |*c| c.runFrame(),
+        }
+    }
+
+    pub fn inputPolled(self: *const AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.inputPolled(),
+        }
+    }
+
+    pub fn takeInputPolled(self: *AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.takeInputPolled(),
         }
     }
 

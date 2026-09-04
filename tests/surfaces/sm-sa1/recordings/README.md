@@ -33,6 +33,7 @@ as a **cover pair** against that image:
 | `stock-bombroom.ymv` | 11,698 | `sm.sfc` (anchored: `--record --srm`) | STOCK, continued from `stock-bombroom.start.srm`: Parlor to the Bomb Torizo room and the Bomb pickup (669 instructions) |
 | `stock-torizo.ymv` | 23,772 | `sm.sfc` (anchored: `--record --srm`) | STOCK, continued from `stock-torizo.start.srm`: the Bomb Torizo fight, won — the first boss the stock takes cover (2,101 instructions, 2 bank bytes; 299 bytes moved in bank `$AA`) — then back to the Parlor save |
 | `stock-green-brinstar.ymv` | 78,836 | `sm.sfc` (anchored: `--record --srm`, then `--continue`) | STOCK, continued from `stock-green-brinstar.start.srm`: down the green Brinstar elevator into the main shaft, the first missiles and energy tanks, the Charge Beam (1,054 instructions; 572 bytes moved, 480 in enemy banks). The first take grown with `--continue`: the player replayed the 44,007-frame session at full speed and kept recording, so one file holds the whole playthrough |
+| `stock-take0001-polls.ymv` | 12,867 polls (13,798 frames on v62) | `sm-sa1-v62.sfc`, migrated to STOCK per poll | STOCK by migration: the player's first take on the v62 conversion from the stock save (`--record --srm`), re-recorded per poll with `--repoll --repoll-poweron --srm` and replayed on the stock image with its `.start.srm` sidecar. Bank $86 projectile routines, a bank $B2 enemy, the room setup ASM writing `$7E:CD22` — the 26 stale sites of the take's garbled map and stalled door. The first **format 3** recording: one entry per controller poll, so it replays on any build (the CRC in its header is v62's; stock replays it as a cross-build take) |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
 The first four fed the v8 generation; the ones before it feed `sm-sa1-v62.bps.cmd` as cover pairs (add `--harvest-cache <dir>` to any recipe to skip replaying pairs it has seen; the output is byte-identical) (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
@@ -113,3 +114,21 @@ because the harvest credits the crash's garbage execution to the wrong file
 bytes on a >2 MiB shim-mapped image. A recording of a run that merely *hung*
 is safe. Until the harvest bank translation is fixed, do not pass a crashed
 recording as a cover surface.
+
+## Per-poll takes and start saves
+
+A **format 3** take (`version_polls` in `src/frontends/movie.zig`) holds one
+entry per controller poll instead of one per frame: the pad holds an entry
+until the game reads it, so a lag frame consumes nothing and the same take
+replays on any build whose logic is behaviorally the same — which is what
+the verifier certifies. Every take the player records now is format 3;
+`yamabuki-headless <image> --movie <v1 or v2 take> --repoll <out.ymv>`
+migrates an old one (add `--repoll-poweron --srm <save>` for a take whose
+anchor was a powered-on machine with that save loaded).
+
+`<take>.start.srm` beside a take is the battery save it began from; every
+replay path (the headless, the player's `--movie`, the takes screen, the
+harvest) loads it before the first frame. A power-on take with a start
+save carries no machine state, so unlike an anchored take it crosses
+builds. The `.start.srm` files of the anchored stock takes above are
+documentation copies; those takes replay by their anchors.

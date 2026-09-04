@@ -17,6 +17,10 @@ pub const Take = struct {
     number: []u8,
     frames: u32,
     anchored: bool,
+    /// Format 3: one entry per controller poll — replays on any build.
+    per_poll: bool,
+    /// Recorded on another build of this game (same title, other image).
+    other_build: bool,
     /// `<take>.end.state` exists beside it (whether it loads is decided later).
     has_end: bool,
 };
@@ -48,9 +52,19 @@ pub const Picker = struct {
             const n = entry.name;
             if (!std.mem.endsWith(u8, n, util.movie.file_ext)) continue;
             const stem = n[0 .. n.len - util.movie.file_ext.len];
-            // `<game_id>-NNNN`
-            if (stem.len < game_id.len + 2 or !std.mem.startsWith(u8, stem, game_id) or stem[game_id.len] != '-') continue;
-            const number = stem[game_id.len + 1 ..];
+            // `<game_id>-NNNN`, where game_id is `<image hash>-<title>`: a
+            // take of the same title from another image is listed too —
+            // a per-poll one replays here (the SA-1 conversion of a game
+            // continues the stock game's takes), the rest are shown greyed.
+            if (stem.len < 6 or stem[stem.len - 5] != '-') continue;
+            const number = stem[stem.len - 4 ..];
+            const id = stem[0 .. stem.len - 5];
+            const other_build = !std.mem.eql(u8, id, game_id);
+            if (other_build) {
+                const dash = std.mem.indexOfScalar(u8, game_id, '-') orelse continue;
+                const title = game_id[dash..];
+                if (id.len <= title.len or !std.mem.endsWith(u8, id, title)) continue;
+            }
             const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ movies_dir, n }) catch continue;
             const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
                 gpa.free(path);
@@ -63,7 +77,8 @@ pub const Picker = struct {
             }
             const version = std.mem.readInt(u16, bytes[4..6], .little);
             const frames = std.mem.readInt(u32, bytes[12..16], .little);
-            const anchored = version == util.movie.version and bytes.len >= util.movie.header_len_v2 and
+            const per_poll = version == util.movie.version_polls;
+            const anchored = (version == util.movie.version or per_poll) and bytes.len >= util.movie.header_len_v2 and
                 std.mem.readInt(u32, bytes[32..36], .little) != 0;
             var es_buf: [512]u8 = undefined;
             const es_name = std.fmt.bufPrint(&es_buf, "{s}.end.state", .{stem}) catch "";
@@ -72,7 +87,7 @@ pub const Picker = struct {
                 gpa.free(path);
                 continue;
             };
-            self.takes.append(gpa, .{ .path = path, .number = num, .frames = frames, .anchored = anchored, .has_end = has_end }) catch {
+            self.takes.append(gpa, .{ .path = path, .number = num, .frames = frames, .anchored = anchored, .per_poll = per_poll, .other_build = other_build, .has_end = has_end }) catch {
                 gpa.free(path);
                 gpa.free(num);
                 continue;
@@ -82,6 +97,7 @@ pub const Picker = struct {
         // the numeric order.
         std.mem.sort(Take, self.takes.items, {}, struct {
             fn lt(_: void, a: Take, b: Take) bool {
+                if (a.other_build != b.other_build) return !a.other_build;
                 return std.mem.order(u8, a.number, b.number) == .gt;
             }
         }.lt);
@@ -95,6 +111,12 @@ pub const Picker = struct {
             self.gpa.free(t.number);
         }
         self.takes.deinit(self.gpa);
+    }
+
+    /// Whether the take can be continued here at all: this build's takes
+    /// always; another build's only per poll and from power-on.
+    pub fn usable(t: Take) bool {
+        return !t.other_build or (t.per_poll and !t.anchored);
     }
 
     pub fn selected(self: *const Picker) ?*const Take {
@@ -112,16 +134,16 @@ pub const Picker = struct {
                 .down => if (n != 0 and self.cursor + 1 < n) {
                     self.cursor += 1;
                 },
-                .confirm => if (self.selected()) |t| {
+                .confirm => if (self.selected()) |t| if (usable(t.*)) {
                     self.stage = .how;
-                    self.how = if (t.has_end) 0 else 1;
+                    self.how = if (t.has_end and !t.other_build) 0 else 1;
                 },
                 .back, .close => return .close,
                 .left, .right => {},
             },
             .how => switch (nav) {
                 .up, .down, .left, .right => if (self.selected()) |t| {
-                    if (t.has_end) self.how ^= 1;
+                    if (t.has_end and !t.other_build) self.how ^= 1;
                 },
                 .confirm => return if (self.how == 0) .start_end_state else .start_replay,
                 .back => self.stage = .list,
@@ -137,7 +159,7 @@ pub const Picker = struct {
         const w: i32 = @intCast(s.w);
         ui.fillRect(s, 0, 0, s.w, s.h, ui.color.panel);
         ui.drawText(s, 8, 6, "TAKES", ui.color.accent);
-        ui.drawText(s, 8, 18, "CONTINUE A RECORDING OF THIS GAME", ui.color.text_dim);
+        ui.drawText(s, 8, 18, "CONTINUE A RECORDING OF THIS GAME (ANY BUILD)", ui.color.text_dim);
         if (self.err_msg) |msg| {
             ui.drawText(s, 8, 40, msg, ui.color.text);
             ui.drawText(s, 8, 200, "ESC  BACK", ui.color.text_dim);
@@ -150,12 +172,12 @@ pub const Picker = struct {
             const y: i32 = @intCast(32 + row * ui.line_h);
             const sel = i == self.cursor;
             if (sel and self.stage == .list) ui.drawText(s, 2, y, ">", ui.color.accent);
-            const fg = if (sel) ui.color.text else ui.color.text_dim;
+            const fg = if (sel and usable(t)) ui.color.text else ui.color.text_dim;
             var buf: [64]u8 = undefined;
             const secs = t.frames / 60;
             const label = std.fmt.bufPrint(&buf, "{s}  {d}:{d:0>2}:{d:0>2}", .{ t.number, secs / 3600, (secs / 60) % 60, secs % 60 }) catch "?";
             ui.drawText(s, 10, y, label, fg);
-            const tag: []const u8 = if (t.has_end) "END STATE" else if (t.anchored) "ANCHORED" else "POWER-ON";
+            const tag: []const u8 = if (t.other_build) (if (usable(t)) "OTHER BUILD" else "OTHER BUILD -") else if (t.has_end) "END STATE" else if (t.anchored) "ANCHORED" else "POWER-ON";
             ui.drawText(s, w - 8 - @as(i32, @intCast(ui.textWidth(tag))), y, tag, fg);
         }
         if (self.stage == .how) {
@@ -168,11 +190,11 @@ pub const Picker = struct {
             ui.drawText(s, 14, top + 4, title, ui.color.accent);
             const y0: i32 = top + 4 + @as(i32, @intCast(ui.line_h));
             const y1: i32 = y0 + @as(i32, @intCast(ui.line_h));
-            if (t.has_end) {
+            if (t.has_end and !t.other_build) {
                 if (self.how == 0) ui.drawText(s, 14, y0, ">", ui.color.accent);
                 ui.drawText(s, 22, y0, "ITS END STATE  (INSTANT)", if (self.how == 0) ui.color.text else ui.color.text_dim);
             } else {
-                ui.drawText(s, 22, y0, "ITS END STATE  (NONE SAVED)", ui.color.text_dim);
+                ui.drawText(s, 22, y0, if (t.other_build) "ITS END STATE  (ANOTHER BUILD)" else "ITS END STATE  (NONE SAVED)", ui.color.text_dim);
             }
             if (self.how == 1) ui.drawText(s, 14, y1, ">", ui.color.accent);
             ui.drawText(s, 22, y1, "THE BEGINNING  (REPLAY, THEN CONTINUE)", if (self.how == 1) ui.color.text else ui.color.text_dim);

@@ -459,7 +459,21 @@ pub fn run(
     var toast: Toast = .{};
     var play_movie: ?util.movie.Movie = opts.movie;
     var play_idx: usize = 0;
+    // Per-poll replay: frames still to run after the last entry was
+    // consumed before the take's end (and its hashes) is reached.
+    var play_tail: ?u32 = null;
     var movie_end_check = false;
+    // The open take records one entry per controller poll (format 3) —
+    // every new take does; a per-frame take continued from its end state
+    // keeps its own form so the prefix stays consistent.
+    var rec_per_poll: bool = false;
+    // Frames run since the last recorded poll (format 3's tail).
+    var rec_tail: u32 = 0;
+    // Per slot: `rec_tail` when the state was saved, restored on rewind.
+    var rec_mark_tail: [9]u32 = @splat(0);
+    // The battery save the open take began from (written beside it as
+    // `.start.srm`), when it began from one.
+    var rec_start_srm: ?[]u8 = null;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
 
     // --record: open the take here, before any frame has run, so the movie
@@ -476,21 +490,25 @@ pub fn run(
             try err.flush();
         } else {
             rec = .init(gpa);
+            rec_per_poll = true;
+            rec_tail = 0;
             if (opts.srm) |srm_path| {
                 // Continue from a battery save. The machine has not run a
                 // frame, but its SRAM is no longer blank, so the take must
                 // carry the powered-on machine as its anchor — captured here,
                 // before the first recorded frame, exactly like the F10 path.
                 if (saves.loadSramFile(io, con, srm_path, err)) {
-                    if (gpa.alloc(u8, core.AnyConsole.state_size)) |anchor| {
-                        _ = con.saveState(anchor);
-                        rec_anchor = anchor;
-                        at_power_on = false;
-                        try err.print("movie: recording from battery save {s} (anchored; F10 stops and saves)\n", .{srm_path});
+                    // A power-on take plus the save it began from (written
+                    // beside it as `.start.srm`): no machine state to seed,
+                    // so it replays on any build of the game — which an
+                    // anchored take, tied to one build's layout, cannot.
+                    if (gpa.dupe(u8, saves.liveSram(con))) |copy| {
+                        rec_start_srm = copy;
+                        try err.print("movie: recording from battery save {s} (power-on take with a start save; F10 stops and saves)\n", .{srm_path});
                         try err.flush();
                         toast.set("RECORDING FROM SAVE - F10 STOPS", .{});
                     } else |_| {
-                        try err.print("movie: cannot allocate the anchor; recording from blank SRAM instead\n", .{});
+                        try err.print("movie: cannot keep a copy of the save; recording from blank SRAM instead\n", .{});
                         try err.flush();
                         @memset(saves.liveSram(con), 0);
                     }
@@ -499,7 +517,7 @@ pub fn run(
                     try err.flush();
                 }
             }
-            if (rec_anchor == null) {
+            if (rec_start_srm == null) {
                 try err.print("movie: recording from power-on (--record; F10 stops and saves)\n", .{});
                 try err.flush();
                 toast.set("RECORDING FROM POWER-ON - F10 STOPS", .{});
@@ -522,10 +540,14 @@ pub fn run(
             var r: std.array_list.Managed([2]u16) = .init(gpa);
             if (r.appendSlice(m.frames)) {
                 rec = r;
+                rec_per_poll = m.per_poll;
+                rec_tail = m.tail_frames;
+                rec_start_srm = if (m.start_srm) |sb| (gpa.dupe(u8, sb) catch null) else null;
                 rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
                 rec_marks = em.frames;
                 rec_audio = em.audio;
                 rec_mark_hash = em.hash;
+                rec_mark_tail = em.tail;
                 if (rw) |*w| w.clear();
                 at_power_on = false;
                 try err.print("movie: continuing the take from its end state, frame {} (no replay; F10 stops and saves the whole take)\n", .{m.frames.len});
@@ -533,6 +555,17 @@ pub fn run(
                 toast.set("CONTINUING TAKE - F10 STOPS", .{});
             } else |_| r.deinit();
         }
+    };
+    // --continue by replay (no usable end state): the take is re-recorded
+    // per poll AS IT REPLAYS, so the file saved at F10 is the whole
+    // playthrough in the cross-build form whatever form the source had.
+    if (continue_pending and rec == null) if (play_movie) |m| {
+        rec = .init(gpa);
+        rec_per_poll = true;
+        rec_tail = 0;
+        rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
+        rec_start_srm = if (m.start_srm) |sb| (gpa.dupe(u8, sb) catch null) else null;
+        rec_marks = @splat(null);
     };
 
     while (running) {
@@ -637,12 +670,19 @@ pub fn run(
                             // Load and validate the take against this session,
                             // exactly as --movie does at boot.
                             const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 * 1024 * 1024)) catch null;
-                            const parsed: ?util.movie.Movie = if (bytes) |b| (util.movie.parse(gpa, b) catch null) else null;
+                            var parsed: ?util.movie.Movie = if (bytes) |b| (util.movie.parse(gpa, b) catch null) else null;
+                            if (parsed) |*pm| pm.start_srm = util.movie.loadStartSrm(io, gpa, p);
                             if (parsed) |m| {
                                 const acc: u8 = if (opts.accuracy == .accurate) 1 else 0;
                                 const reg: u8 = if (con.region() == .pal) 1 else 0;
-                                if (m.rom_crc != opts.rom_crc or m.accuracy != acc or m.region != reg) {
+                                // Another build of the game is fine for a per-poll
+                                // take that starts at power-on: nothing but inputs
+                                // indexed by the game's own pad reads.
+                                const cross_build = m.rom_crc != opts.rom_crc;
+                                if ((cross_build and !(m.per_poll and m.anchor == null)) or m.accuracy != acc or m.region != reg) {
                                     toast.set("TAKE IS FROM ANOTHER IMAGE OR CORE", .{});
+                                } else if (cross_build and how == .start_end_state) {
+                                    toast.set("ANOTHER BUILD - REPLAY FROM THE BEGINNING", .{});
                                 } else {
                                     // The take's machine replaces whatever ran here:
                                     // drop an open take, stop persisting the real
@@ -655,6 +695,7 @@ pub fn run(
                                     cur_movie_path = p;
                                     play_movie = m;
                                     movie_end_check = false;
+                                    play_tail = null;
                                     var from_end = false;
                                     var em: EndMarks = .{};
                                     if (how == .start_end_state) {
@@ -668,10 +709,14 @@ pub fn run(
                                         var r: std.array_list.Managed([2]u16) = .init(gpa);
                                         if (r.appendSlice(m.frames)) {
                                             rec = r;
+                                            rec_per_poll = m.per_poll;
+                                            rec_tail = m.tail_frames;
+                                            rec_start_srm = if (m.start_srm) |sb| (gpa.dupe(u8, sb) catch null) else null;
                                             rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
                                             rec_marks = em.frames;
                                             rec_audio = em.audio;
                                             rec_mark_hash = em.hash;
+                rec_mark_tail = em.tail;
                                             at_power_on = false;
                                             try err.print("movie: continuing take {s} from its end state, frame {d}\n", .{ p, m.frames.len });
                                             try err.flush();
@@ -696,12 +741,30 @@ pub fn run(
                                                 .ntsc => con.setRegion(.ntsc),
                                                 .pal => con.setRegion(.pal),
                                             }
-                                            @memset(saves.liveSram(con), 0);
+                                            if (m.start_srm) |sb| {
+                                                if (!saves.loadSramBytes(con, sb)) {
+                                                    toast.set("TAKE START SAVE WON'T FIT HERE", .{});
+                                                    play_movie = null;
+                                                    ok = false;
+                                                }
+                                            } else @memset(saves.liveSram(con), 0);
                                         }
                                         if (ok) {
                                             play_idx = 0;
                                             audio_hash = core.console.audio_hash_init;
                                             continue_pending = true;
+                                            // Re-recorded per poll as it replays (see
+                                            // the --continue path above the loop).
+                                            rec = .init(gpa);
+                                            rec_per_poll = true;
+                                            rec_tail = 0;
+                                            rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
+                                            rec_start_srm = if (m.start_srm) |sb| (gpa.dupe(u8, sb) catch null) else null;
+                                            rec_marks = @splat(null);
+                                            if (cross_build) {
+                                                try err.print("movie: take {s} is from another build; its per-poll inputs replay here, the picture may differ\n", .{p});
+                                                try err.flush();
+                                            }
                                             at_power_on = m.anchor == null;
                                             try err.print("movie: replaying take {s} ({d} frames) to continue it\n", .{ p, m.frames.len });
                                             try err.flush();
@@ -758,6 +821,7 @@ pub fn run(
                             rec_marks[slot] = @intCast(r.items.len);
                             rec_audio[slot] = audio_hash;
                             rec_mark_hash[slot] = std.hash.Fnv1a_64.hash(state_buf);
+                            rec_mark_tail[slot] = rec_tail;
                         }
                         toast.set("STATE SAVED - SLOT {d}", .{slot});
                         mnu = null;
@@ -771,7 +835,7 @@ pub fn run(
                             if (rw) |*r| r.clear();
                             at_power_on = false;
                             if (rec_marks[slot] != null and rec_mark_hash[slot] != std.hash.Fnv1a_64.hash(state_buf)) rec_marks[slot] = null;
-                            if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                            if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, &rec_tail, &rec_mark_tail, slot, err)) |f|
                                 toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
                             else
                                 toast.set("STATE LOADED - SLOT {d}", .{slot});
@@ -888,6 +952,7 @@ pub fn run(
                         rec_marks[slot] = @intCast(r.items.len);
                         rec_audio[slot] = audio_hash;
                         rec_mark_hash[slot] = std.hash.Fnv1a_64.hash(state_buf);
+                        rec_mark_tail[slot] = rec_tail;
                     }
                     toast.set("STATE SAVED - SLOT {d}", .{slot});
                 },
@@ -897,27 +962,29 @@ pub fn run(
                         if (rw) |*r| r.clear();
                         at_power_on = false;
                         if (rec_marks[slot] != null and rec_mark_hash[slot] != std.hash.Fnv1a_64.hash(state_buf)) rec_marks[slot] = null;
-                        if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, slot, err)) |f|
+                        if (rewindRecToSlot(gpa, &rec, &rec_anchor, &play_movie, &rec_marks, &rec_audio, &audio_hash, &rec_tail, &rec_mark_tail, slot, err)) |f|
                             toast.set("STATE LOADED - REC REWOUND TO {d}", .{f})
                         else
                             toast.set("STATE LOADED - SLOT {d}", .{slot});
                     } else toast.set("NO STATE IN SLOT {d}", .{slot});
                 },
                 .record_movie => {
-                    if (rec != null) {
+                    if (replayActive(play_movie, play_idx, play_tail)) {
+                        try err.print("movie: cannot record during playback\n", .{});
+                        try err.flush();
+                        toast.set("CANNOT RECORD DURING PLAYBACK", .{});
+                    } else if (rec != null) {
                         // Stop: the movie's hashes describe the machine as it
                         // stands right now, after the last recorded frame.
-                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash }, err);
+                        writeMovie(io, gpa, &opts, con, rec.?.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash, .tail = rec_mark_tail }, .{ .per_poll = rec_per_poll, .tail_frames = rec_tail, .start_srm = rec_start_srm }, err);
                         rec.?.deinit();
                         rec = null;
                         if (rec_anchor) |a| gpa.free(a);
                         rec_anchor = null;
+                        if (rec_start_srm) |sb| gpa.free(sb);
+                        rec_start_srm = null;
                         rec_marks = @splat(null);
                         toast.set("RECORDING SAVED", .{});
-                    } else if (play_movie != null and play_idx < play_movie.?.frames.len) {
-                        try err.print("movie: cannot record during playback\n", .{});
-                        try err.flush();
-                        toast.set("CANNOT RECORD DURING PLAYBACK", .{});
                     } else if (opts.movies_dir == null) {
                         try err.print("movie: recording unavailable — no per-user data directory\n", .{});
                         try err.flush();
@@ -927,6 +994,8 @@ pub fn run(
                         if (rw) |*r| r.clear();
                         audio_hash = core.console.audio_hash_init;
                         rec = .init(gpa);
+                        rec_per_poll = true;
+                        rec_tail = 0;
                         rec_marks = @splat(null);
                         try err.print("movie: recording from power-on (press again to stop and save)\n", .{});
                         try err.flush();
@@ -943,6 +1012,8 @@ pub fn run(
                             if (rw) |*r| r.clear();
                             audio_hash = core.console.audio_hash_init;
                             rec = .init(gpa);
+                            rec_per_poll = true;
+                            rec_tail = 0;
                             rec_marks = @splat(null);
                             try err.print("movie: recording from here ({d} KiB start state carried; press again to stop and save)\n", .{anchor.len / 1024});
                             try err.flush();
@@ -1014,16 +1085,20 @@ pub fn run(
         // of history it just holds the oldest frame.
         const rewinding = mnu == null and inp.rewindHeld() and rw != null and opts.cfg.rewind.enabled;
         const halted = paused or mnu != null or rewinding or takes_ui != null;
-        const replaying = play_movie != null and play_idx < play_movie.?.frames.len;
+        const replaying = replayActive(play_movie, play_idx, play_tail);
         fast_forward = (inp.ffHeld() or (continue_pending and replaying)) and !halted;
         // During playback the movie owns both pads; live input resumes the
-        // frame after it ends.
+        // frame after it ends. A per-poll take holds its current entry
+        // until the game reads the pad (the cursor moves below, after the
+        // frame), and reads idle through its tail.
         const feed: [2]u16 = if (play_movie) |m|
-            (if (play_idx < m.frames.len) m.frames[play_idx] else .{ inp.masks[0], inp.masks[1] })
+            (if (play_idx < m.frames.len) m.frames[play_idx] else if (play_tail != null) .{ 0, 0 } else .{ inp.masks[0], inp.masks[1] })
         else
             .{ inp.masks[0], inp.masks[1] };
         con.setButtons(0, feed[0]);
         con.setButtons(1, feed[1]);
+        // The poll latch answers for THIS frame only.
+        _ = con.takeInputPolled();
         if (rewinding) {
             _ = rw.?.rewindStep(con);
             discardMovieModes(gpa, &rec, &rec_anchor, &play_movie, "rewind", err);
@@ -1034,13 +1109,36 @@ pub fn run(
             // AFTER the frame: the value the next frame reads must be the
             // cheat's, not whatever the game just stored over it.
             if (cheats_on and opts.n_pokes != 0) _ = util.cheat.apply(con, opts.pokes[0..opts.n_pokes]);
-            if (rec) |*r| r.append(feed) catch {};
+            const polled = con.inputPolled();
+            if (rec) |*r| {
+                if (!rec_per_poll) {
+                    r.append(feed) catch {};
+                } else if (polled) {
+                    r.append(feed) catch {};
+                    rec_tail = 0;
+                } else rec_tail += 1;
+            }
             if (play_movie) |m| {
-                if (play_idx < m.frames.len) {
-                    play_idx += 1;
-                    // The frame the movie ends on is the one its hashes
-                    // describe — checked below, after its audio drains.
-                    if (play_idx == m.frames.len) movie_end_check = true;
+                if (!m.per_poll) {
+                    if (play_idx < m.frames.len) {
+                        play_idx += 1;
+                        // The frame the movie ends on is the one its hashes
+                        // describe — checked below, after its audio drains.
+                        if (play_idx == m.frames.len) movie_end_check = true;
+                    }
+                } else {
+                    // The entry is consumed by the poll; the take ends its
+                    // tail after the frame that consumed the last one.
+                    if (play_idx < m.frames.len and polled) {
+                        play_idx += 1;
+                        if (play_idx == m.frames.len) play_tail = m.tail_frames;
+                    }
+                    if (play_idx == m.frames.len) if (play_tail) |t| {
+                        if (t == 0) {
+                            movie_end_check = true;
+                            play_tail = null;
+                        } else play_tail = t - 1;
+                    };
                 }
             }
             if (sram) |*s| s.tick(io, con, err);
@@ -1107,7 +1205,7 @@ pub fn run(
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             ui.drawText(&surf, 4, 4, "<< REWIND", ui.color.accent);
             break :blk compose[0..fb.len];
-        } else if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len) or paused) blk: {
+        } else if (rec != null or replayActive(play_movie, play_idx, play_tail) or paused) blk: {
             // Status marks live in the top-right corner: the take indicator
             // ("* REC" / "> MOVIE") flush right, and the classic two-bar pause
             // icon just left of it (or in the corner itself when nothing is
@@ -1116,8 +1214,8 @@ pub fn run(
             const surf = ui.Surface.init(compose[0..fb.len], width, height);
             const right: i32 = @as(i32, @intCast(width)) - 4;
             var x_edge: i32 = right;
-            if (rec != null or (play_movie != null and play_idx < play_movie.?.frames.len)) {
-                const label: []const u8 = if (rec != null) "* REC" else "> MOVIE";
+            if (rec != null or replayActive(play_movie, play_idx, play_tail)) {
+                const label: []const u8 = if (rec != null and !replayActive(play_movie, play_idx, play_tail)) "* REC" else "> MOVIE";
                 const tx = right - @as(i32, @intCast(ui.textWidth(label)));
                 ui.drawText(&surf, tx, 4, label, ui.color.accent);
                 x_edge = tx - 8;
@@ -1276,6 +1374,10 @@ pub fn run(
         if (movie_end_check) {
             movie_end_check = false;
             if (play_movie) |m| {
+                // A per-poll take from another build lands its inputs on the
+                // same polls but draws a different picture: its end hashes
+                // cannot match and do not judge it.
+                const cross_build = m.rom_crc != opts.rom_crc;
                 if (m.end_frame_hash == 0) {
                     try err.print("movie: {} frames replayed (no end hashes recorded — sync unverified); input is live\n", .{m.frames.len});
                 } else {
@@ -1287,7 +1389,9 @@ pub fn run(
                         try err.print("movie: DESYNC — end frame hash {x:0>16} (movie {x:0>16}), audio {s}\n", .{
                             fh, m.end_frame_hash, if (audio_ok) "ok" else "diverged",
                         });
-                        if (continue_pending) {
+                        if (cross_build) {
+                            try err.print("movie: (another build — the differing picture is expected; the inputs landed on the same polls)\n", .{});
+                        } else if (continue_pending) {
                             try err.print("movie: --continue refused — the replay did not reproduce the take, so inputs appended now would describe a different machine\n", .{});
                             toast.set("CONTINUE REFUSED - DESYNC", .{});
                         }
@@ -1298,26 +1402,27 @@ pub fn run(
                 // recording resumes with the replayed inputs already in the take
                 // and the same start (anchor or power-on). The file written at
                 // F10 is the whole playthrough, and its hashes describe the end.
-                const in_sync = m.end_frame_hash == 0 or
+                const in_sync = cross_build or m.end_frame_hash == 0 or
                     (core.console.hashFrame(con.framebuffer()) == m.end_frame_hash and (m.end_audio_hash == 0 or audio_hash == m.end_audio_hash));
-                if (continue_pending and in_sync and rec == null) {
-                    var r: std.array_list.Managed([2]u16) = .init(gpa);
-                    if (r.appendSlice(m.frames)) {
-                        rec = r;
-                        rec_anchor = if (m.anchor) |a| (gpa.dupe(u8, a) catch null) else null;
-                        const em: EndMarks = if (cur_movie_path) |mp| readEndMarks(io, gpa, mp, m) else .{};
-                        rec_marks = em.frames;
-                        rec_audio = em.audio;
-                        rec_mark_hash = em.hash;
+                // The continuation's take has been open since the replay's
+                // first frame, re-recording the inputs per poll; it simply
+                // keeps going — or is dropped when the replay did not
+                // reproduce the take.
+                if (continue_pending and rec != null) {
+                    if (in_sync) {
                         if (rw) |*w| w.clear();
-                        try err.print("movie: continuing the take from frame {} (F10 stops and saves the whole take)\n", .{m.frames.len});
+                        try err.print("movie: continuing the take — re-recorded per poll, {} entries so far (F10 stops and saves the whole take)\n", .{rec.?.items.len});
                         try err.flush();
                         toast.set("CONTINUING TAKE - F10 STOPS", .{});
-                    } else |_| {
-                        r.deinit();
-                        try err.print("movie: cannot allocate the take; input is live, not recorded\n", .{});
-                        try err.flush();
+                    } else {
+                        rec.?.deinit();
+                        rec = null;
+                        if (rec_anchor) |a| gpa.free(a);
+                        rec_anchor = null;
+                        if (rec_start_srm) |sb| gpa.free(sb);
+                        rec_start_srm = null;
                     }
+                    continue_pending = false;
                 }
             }
         }
@@ -1340,7 +1445,7 @@ pub fn run(
     // miss. Its hashes describe the machine as it stands now, which is
     // exactly what a stop would have recorded.
     if (rec) |*r| {
-        writeMovie(io, gpa, &opts, con, r.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash }, err);
+        writeMovie(io, gpa, &opts, con, r.items, rec_anchor, audio_hash, .{ .frames = rec_marks, .audio = rec_audio, .hash = rec_mark_hash, .tail = rec_mark_tail }, .{ .per_poll = rec_per_poll, .tail_frames = rec_tail, .start_srm = rec_start_srm }, err);
         r.deinit();
         rec = null;
     }
@@ -2320,6 +2425,19 @@ fn cutMarks(marks: *[9]?u32, at: u32) void {
     }
 }
 
+/// The movie still owns the pads: entries left, or a per-poll tail running.
+fn replayActive(pm: ?util.movie.Movie, idx: usize, tail: ?u32) bool {
+    const m = pm orelse return false;
+    return idx < m.frames.len or tail != null;
+}
+
+/// How a take is written: its entry form and what it began from.
+const TakeForm = struct {
+    per_poll: bool,
+    tail_frames: u32,
+    start_srm: ?[]const u8,
+};
+
 fn rewindRecToSlot(
     gpa: std.mem.Allocator,
     rec: *?std.array_list.Managed([2]u16),
@@ -2328,6 +2446,8 @@ fn rewindRecToSlot(
     marks: *[9]?u32,
     audio_marks: *const [9]u64,
     audio_hash: *u64,
+    rec_tail: *u32,
+    tails: *const [9]u32,
     slot: u32,
     err: *std.Io.Writer,
 ) ?u32 {
@@ -2339,6 +2459,7 @@ fn rewindRecToSlot(
     };
     rec.*.?.shrinkRetainingCapacity(at);
     audio_hash.* = audio_marks[slot];
+    rec_tail.* = tails[slot];
     cutMarks(marks, at);
     err.print("recording rewound to frame {d} (slot {d})\n", .{ at, slot }) catch {};
     err.flush() catch {};
@@ -2372,7 +2493,7 @@ const end_state_magic = "YEND";
 /// 1: header + state. 2: header + the slot marks + state — so a state saved
 /// in an earlier session of the same playthrough still rewinds the take
 /// instead of discarding it.
-const end_state_version: u32 = 2;
+const end_state_version: u32 = 3;
 /// magic, version, movie file hash, audio hash, frame count.
 const end_state_header_len: usize = 4 + 4 + 8 + 8 + 4;
 
@@ -2384,8 +2505,14 @@ pub const EndMarks = struct {
     frames: [9]?u32 = @splat(null),
     audio: [9]u64 = @splat(0),
     hash: [9]u64 = @splat(0),
+    /// Frames since the last recorded poll when the state was saved (a
+    /// per-poll take's tail at that point); version 3 of the sidecar.
+    tail: [9]u32 = @splat(0),
 
-    const encoded_len: usize = 9 * (4 + 8 + 8);
+    const record_len_v2: usize = 4 + 8 + 8;
+    const record_len: usize = 4 + 8 + 8 + 4;
+    const encoded_len_v2: usize = 9 * record_len_v2;
+    const encoded_len: usize = 9 * record_len;
     const none: u32 = 0xFFFF_FFFF;
 
     fn encode(self: EndMarks, out: []u8) void {
@@ -2394,12 +2521,14 @@ pub const EndMarks = struct {
             std.mem.writeInt(u32, out[o..][0..4], self.frames[i] orelse none, .little);
             std.mem.writeInt(u64, out[o + 4 ..][0..8], self.audio[i], .little);
             std.mem.writeInt(u64, out[o + 12 ..][0..8], self.hash[i], .little);
-            o += 20;
+            std.mem.writeInt(u32, out[o + 20 ..][0..4], self.tail[i], .little);
+            o += record_len;
         }
     }
 
-    /// Marks past `limit` frames cannot belong to this take's prefix.
-    fn decode(in: []const u8, limit: usize) EndMarks {
+    /// Marks past `limit` entries cannot belong to this take's prefix.
+    /// `rlen` is the record length of the sidecar's version.
+    fn decode(in: []const u8, limit: usize, rlen: usize) EndMarks {
         var m: EndMarks = .{};
         var o: usize = 0;
         for (0..9) |i| {
@@ -2408,8 +2537,9 @@ pub const EndMarks = struct {
                 m.frames[i] = f;
                 m.audio[i] = std.mem.readInt(u64, in[o + 4 ..][0..8], .little);
                 m.hash[i] = std.mem.readInt(u64, in[o + 12 ..][0..8], .little);
+                if (rlen == record_len) m.tail[i] = std.mem.readInt(u32, in[o + 20 ..][0..4], .little);
             }
-            o += 20;
+            o += rlen;
         }
         return m;
     }
@@ -2429,11 +2559,14 @@ fn readEndMarks(io: std.Io, gpa: std.mem.Allocator, movie_path: []const u8, m: u
     const data = std.Io.Dir.cwd().readFileAlloc(io, es_path, gpa, .limited(64 * 1024 * 1024)) catch return .{};
     defer gpa.free(data);
     const head = end_state_header_len;
-    if (data.len < head + EndMarks.encoded_len or !std.mem.eql(u8, data[0..4], end_state_magic) or std.mem.readInt(u32, data[4..8], .little) != 2) return .{};
+    if (data.len < head + 8 or !std.mem.eql(u8, data[0..4], end_state_magic)) return .{};
+    const ver = std.mem.readInt(u32, data[4..8], .little);
+    const mlen: usize = if (ver == 2) EndMarks.encoded_len_v2 else if (ver == 3) EndMarks.encoded_len else return .{};
+    if (data.len < head + mlen) return .{};
     const movie_bytes = std.Io.Dir.cwd().readFileAlloc(io, movie_path, gpa, .limited(64 * 1024 * 1024)) catch return .{};
     defer gpa.free(movie_bytes);
     if (std.mem.readInt(u64, data[8..16], .little) != std.hash.Fnv1a_64.hash(movie_bytes)) return .{};
-    return EndMarks.decode(data[head .. head + EndMarks.encoded_len], m.frames.len);
+    return EndMarks.decode(data[head .. head + mlen], m.frames.len, mlen / 9);
 }
 
 fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie_path: []const u8, m: util.movie.Movie, marks_out: *EndMarks, err: *std.Io.Writer) ?u64 {
@@ -2444,8 +2577,9 @@ fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie
     const data = std.Io.Dir.cwd().readFileAlloc(io, es_path, gpa, .limited(64 * 1024 * 1024)) catch return null;
     defer gpa.free(data);
     const version: u32 = if (data.len >= 8 and std.mem.eql(u8, data[0..4], end_state_magic)) std.mem.readInt(u32, data[4..8], .little) else 0;
-    const head: usize = if (version == 2) end_state_header_len + EndMarks.encoded_len else end_state_header_len;
-    if (data.len < head or (version != 1 and version != 2)) {
+    const mlen: usize = if (version == 2) EndMarks.encoded_len_v2 else if (version == 3) EndMarks.encoded_len else 0;
+    const head: usize = end_state_header_len + mlen;
+    if (data.len < head or (version != 1 and version != 2 and version != 3)) {
         err.print("movie: {s} is not an end state this build understands; replaying the take instead\n", .{es_path}) catch {};
         err.flush() catch {};
         return null;
@@ -2464,7 +2598,7 @@ fn loadEndState(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, movie
         err.flush() catch {};
         return null;
     };
-    if (version == 2) marks_out.* = EndMarks.decode(data[end_state_header_len..head], m.frames.len);
+    if (mlen != 0) marks_out.* = EndMarks.decode(data[end_state_header_len..head], m.frames.len, mlen / 9);
     return std.mem.readInt(u64, data[16..24], .little);
 }
 
@@ -2480,6 +2614,7 @@ fn writeMovie(
     anchor: ?[]u8,
     audio_hash: u64,
     marks: EndMarks,
+    form: TakeForm,
     err: *std.Io.Writer,
 ) void {
     const dir = opts.movies_dir orelse return;
@@ -2498,6 +2633,8 @@ fn writeMovie(
         .end_audio_hash = audio_hash,
         .frames = @constCast(frames),
         .anchor = anchor,
+        .per_poll = form.per_poll,
+        .tail_frames = form.tail_frames,
     };
     const data = util.movie.encode(gpa, m) catch |e| {
         err.print("movie: save failed: {s}\n", .{@errorName(e)}) catch {};
@@ -2525,6 +2662,18 @@ fn writeMovie(
             err.flush() catch {};
         } else |_| {}
     }
+    // The save the take began from, beside it: with it, a power-on take
+    // replays from the same save on any build (the takes screen and
+    // --movie load it; so does the headless).
+    if (form.start_srm) |sb| {
+        var sp_buf: [1024]u8 = undefined;
+        if (util.movie.startSrmPath(&sp_buf, path)) |sp| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = sb }) catch |e| {
+                err.print("movie: start save of this take not written: {s}\n", .{@errorName(e)}) catch {};
+                err.flush() catch {};
+            };
+        }
+    }
     // The machine at the take's last frame, so `--continue` can start here
     // instead of replaying. Bound to this exact file by the file's hash, and
     // to this build by the state's own header; the running audio hash rides
@@ -2549,8 +2698,12 @@ fn writeMovie(
             err.flush() catch {};
         } else |_| {}
     } else |_| {}
-    err.print("movie: {s} ({} frames{s}, end hashes recorded)\n", .{
-        path, frames.len, if (anchor != null) ", anchored to a start state" else ", from power-on",
+    err.print("movie: {s} ({} {s}{s}{s}, end hashes recorded)\n", .{
+        path,
+        frames.len,
+        if (form.per_poll) "polls" else "frames",
+        if (anchor != null) ", anchored to a start state" else ", from power-on",
+        if (form.start_srm != null) " with a start save" else "",
     }) catch {};
     err.flush() catch {};
 }

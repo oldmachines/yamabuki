@@ -139,6 +139,22 @@ pub fn loadSramFile(io: std.Io, con: *core.AnyConsole, path: []const u8, err: *s
     return true;
 }
 
+/// A take's start save (its `.start.srm` sidecar) into the live save
+/// region: the exact size for a real chip, up to the region for a lifted
+/// one. False when it does not fit — the caller decides what to do.
+pub fn loadSramBytes(con: *core.AnyConsole, data: []const u8) bool {
+    if (liftedSram(con)) |region| {
+        if (data.len == 0 or data.len > region.len) return false;
+        @memset(region, 0);
+        @memcpy(region[0..data.len], data);
+        return true;
+    }
+    const sram = sramSlice(con);
+    if (data.len != sram.len) return false;
+    @memcpy(sram, data);
+    return true;
+}
+
 /// The console's live battery save: the cart's mapped SRAM, or a window
 /// conversion's lifted region (see `liftedSram`).
 pub fn liveSram(con: *core.AnyConsole) []u8 {

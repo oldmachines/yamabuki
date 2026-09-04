@@ -1493,6 +1493,23 @@ output byte-identical:
 And `--wg-sync` on ship builds skips the async trial. Together: a candidate
 that used to take an hour is one harvest plus one verification.
 
+**Per-poll takes (movie format 3).** A take that indexes its inputs by
+frame dies on the conversion the moment a lag frame shifts: the stock
+power-on take to Brinstar ended in Ceres on every build. Indexed by the
+game's own controller poll — the verifier's tick — the same inputs land
+on the same reads whatever the frame timing: the migrated stock take
+reaches Brinstar on v62, and the first take played on v62 replays on
+stock as a stock cover pair. `util.movie.Feed` is the one feed every
+replay loop uses (13 in the headless, the player's frame); it advances
+on the console's poll latch (`takeInputPolled`, latched at frame end so
+the profiler's own clear cannot eat it). `--repoll out.ymv` re-records a
+replay per poll; `--repoll-poweron` drops a power-on-plus-save anchor;
+`--srm file` and the `<take>.start.srm` sidecar (written by the player's
+`--record --srm`, loaded by every replay path) carry the save a take
+began from without a machine state. The cost of the lag-invariance: the
+end hashes describe a picture, and a cross-build replay's picture differs
+— they are advisory there, and the behavioral tier is still the judge.
+
 ## 6. Known latent issues (not blocking the current surfaces)
 
 - The `$94:98E9` twin cutscene handler and the `$00:840F` `$7F`-fill loop are

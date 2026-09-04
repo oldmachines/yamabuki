@@ -137,6 +137,21 @@ const Args = struct {
     /// mode preserves the S-CPU's code and frame timing, so controller
     /// input usually stays in sync). The end-hash check becomes advisory.
     movie_ignore_crc: bool = false,
+    /// `--repoll out.ymv`: while replaying `--movie`, record the take again
+    /// as a PER-POLL movie (format 3): one entry per controller read the
+    /// game made, so the result replays on any build of the game whose
+    /// logic is behaviorally equivalent — a stock take migrated to the
+    /// conversion, lag frames and all. Same anchor, same end hashes.
+    repoll: ?[]const u8 = null,
+    /// `--repoll-poweron`: write the re-recorded take without the source
+    /// take's anchor. For a take whose anchor is a powered-on machine with
+    /// a battery save loaded and nothing run (`--record --srm`): the
+    /// result replays from power-on with the same save (`--srm`, or the
+    /// `.start.srm` sidecar this writes beside it) — on ANY build.
+    repoll_poweron: bool = false,
+    /// `--srm <file>`: load a battery save into the cart's save chip (or a
+    /// window conversion's lifted save region) before the first frame.
+    srm: ?[]const u8 = null,
     /// `--dump-vram`: raw VRAM (64 KiB) then OAM (544 B) after the run.
     dump_vram: ?[]const u8 = null,
     /// --save-state-at: frame to stop at and the file to write the machine to.
@@ -533,6 +548,7 @@ fn run(init: std.process.Init) !void {
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
     // After --state on purpose: a movie's own anchor is the machine ITS
     // inputs were recorded against, so it wins over a session-wide one.
+    try applyStartSave(io, gpa, con, args, mov, out);
     try anchorMovie(con, mov, "movie", out);
 
     // Window debugging: dump what the machine settled on, after the run.
@@ -561,14 +577,31 @@ fn run(init: std.process.Init) !void {
         .init(gpa)
     else
         null;
-    const frames = args.frames orelse if (mov) |m| @as(u32, @intCast(m.frames.len)) else 1;
+    const frames = args.frames orelse if (mov != null) @as(u32, @intCast(util.movie.Feed.budget(mov))) else 1;
+    var feed: util.movie.Feed = .init(mov);
+    // A per-poll take ends `tail_frames` after the frame that consumed its
+    // last entry — known only once that frame has run.
+    var movie_end: ?usize = if (mov) |m| (if (m.per_poll) null else m.frames.len - 1) else null;
+    // --repoll: the entries a per-poll take of this replay holds, and the
+    // frames run after the last poll (the tail its end hashes describe).
+    var repoll: std.array_list.Managed([2]u16) = .init(gpa);
+    defer repoll.deinit();
+    var repoll_tail: u32 = 0;
     for (0..frames) |i| {
-        if (mov) |m| {
-            const f: [2]u16 = if (i < m.frames.len) m.frames[i] else .{ 0, 0 };
-            con.setButtons(0, f[0]);
-            con.setButtons(1, f[1]);
-        }
+        feed.step(con, i);
+        // Recording per poll needs the latch cleared every frame; the feed
+        // only does so for a per-poll source (and has already taken it).
+        if (args.repoll != null) _ = con.takeInputPolled();
         con.runFrame();
+        if (mov) |m| if (m.per_poll and movie_end == null and feed.cursor + 1 >= m.frames.len and con.inputPolled()) {
+            movie_end = i + m.tail_frames;
+        };
+        if (args.repoll != null) {
+            if (con.inputPolled()) {
+                try repoll.append(feed.last);
+                repoll_tail = 0;
+            } else repoll_tail += 1;
+        }
         // AFTER the frame, so the value the next frame reads is the cheat's
         // and not whatever the game just stored over it. Applied before the
         // frame instead, the game wins every tie and the poke does nothing.
@@ -603,14 +636,14 @@ fn run(init: std.process.Init) !void {
             .wav = if (args.wav != null) &audio_all else null,
         }, AudioSink.collect);
         // The frame the movie ends on is the one its hashes describe.
-        if (mov) |m| if (i + 1 == m.frames.len) {
+        if (mov) |m| if (movie_end != null and i == movie_end.?) {
             if (m.end_frame_hash == 0) {
-                try out.print("movie: {} frames replayed (no end hashes recorded — sync unverified)\n", .{m.frames.len});
+                try out.print("movie: {} frames replayed (no end hashes recorded — sync unverified)\n", .{i + 1});
             } else {
                 const fh = core.console.hashFrame(con.framebuffer());
                 const audio_ok = m.end_audio_hash == 0 or audio_hash == m.end_audio_hash;
                 if (fh == m.end_frame_hash and audio_ok) {
-                    try out.print("movie: sync verified — {} frames replayed, end hashes match\n", .{m.frames.len});
+                    try out.print("movie: sync verified — {} frames replayed, end hashes match\n", .{i + 1});
                 } else {
                     try out.print(
                         "movie: DESYNC at end of replay — frame hash {x:0>16} (movie {x:0>16}), audio {s}\n",
@@ -623,8 +656,40 @@ fn run(init: std.process.Init) !void {
                     if (!args.movie_ignore_crc) std.process.exit(1);
                 }
             }
+            // A per-poll take's frame budget is a ceiling, not a length:
+            // stop here unless a frame count was asked for.
+            if (m.per_poll and args.frames == null) break;
+        };
+        if (mov) |m| if (m.per_poll and args.frames == null and i + 1 == frames) {
+            try out.print("movie: {} of {} per-poll entries consumed in {} frames — the game stopped reading the pad\n", .{ feed.cursor, m.frames.len, frames });
         };
     }
+
+    if (args.repoll) |path| if (mov) |m| {
+        const pm: util.movie.Movie = .{
+            .accuracy = m.accuracy,
+            .region = m.region,
+            .rom_crc = m.rom_crc,
+            .end_frame_hash = core.console.hashFrame(con.framebuffer()),
+            .end_audio_hash = audio_hash,
+            .frames = repoll.items,
+            .anchor = if (args.repoll_poweron) null else m.anchor,
+            .per_poll = true,
+            .tail_frames = repoll_tail,
+        };
+        const bytes = try util.movie.encode(gpa, pm);
+        defer gpa.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+        // The save the take began from rides beside it: --srm's file, or
+        // the source take's own sidecar.
+        var sp_buf: [1024]u8 = undefined;
+        const start_save: ?[]const u8 = if (args.srm) |p| (std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1024 * 1024)) catch null) else m.start_srm;
+        if (start_save) |sb| if (util.movie.startSrmPath(&sp_buf, path)) |sp| {
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = sb });
+            try out.print("repoll: start save written beside it: {s}\n", .{sp});
+        };
+        try out.print("repoll: wrote {s} — {} poll(s) from {} frame(s), {} tail frame(s), anchor {s}\n", .{ path, repoll.items.len, frames, repoll_tail, if (pm.anchor != null) "kept" else if (m.anchor != null) "dropped (--repoll-poweron)" else "none" });
+    };
 
     const fb = con.framebuffer();
     const width = con.frameWidth();
@@ -760,11 +825,61 @@ fn dumpPpu(io: std.Io, out: *std.Io.Writer, con: *core.AnyConsole, path: []const
 /// `--dump-ram`: WRAM (128K), BW-RAM's first 64K, VRAM and I-RAM after the
 /// run, plus the CPU's resting place. The tool that found every window-mode
 /// blocker so far.
-/// `--dump-srm`: the cart's battery SRAM as a plain .srm (its mapped span).
+/// The bytes that stand for the game's battery save: the cart's mapped
+/// SRAM, or — on a window conversion, whose header declares no battery —
+/// the lifted save region at the front of the upper BW-RAM half (the
+/// generator moves the game's save chip there; see the SDL's saves.zig).
+fn saveRegion(cart: anytype) ?[]u8 {
+    if (cart.chip == .sa1 and !cart.hasBattery() and cart.sram_hi_mask >= 0x7FFF) return cart.sram_hi[0..0x8000];
+    if (cart.sram_mask == 0) return null;
+    return cart.sram[0 .. cart.sram_mask + 1];
+}
+
+/// Drop a battery save into the save region: zero it, then the file's
+/// bytes at the front (a smaller chip's save in a larger region reads back
+/// through the game's own mirroring). False when nothing takes it.
+fn loadSaveBytes(cart: anytype, data: []const u8) bool {
+    const region = saveRegion(cart) orelse return false;
+    if (data.len == 0 or data.len > region.len) return false;
+    @memset(region, 0);
+    @memcpy(region[0..data.len], data);
+    return true;
+}
+
+/// `--srm`, then the movie's start-save sidecar: the save chip as the take
+/// began. Runs before the anchor, which (when there is one) overrides it.
+fn applyStartSave(io: std.Io, gpa: std.mem.Allocator, con: anytype, args: Args, mov: ?util.movie.Movie, out: *std.Io.Writer) !void {
+    if (args.srm) |p| {
+        const data = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1024 * 1024)) catch {
+            try out.print("error: cannot read --srm '{s}'\n", .{p});
+            try out.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(data);
+        const cart = if (@TypeOf(con) == *core.AnyConsole) con.cartridge() else con.bus.cart;
+        if (!loadSaveBytes(cart, data)) {
+            try out.print("error: --srm '{s}' ({d} bytes) does not fit this cart's save region\n", .{ p, data.len });
+            try out.flush();
+            std.process.exit(1);
+        }
+        try out.print("srm: {s} loaded ({d} bytes)\n", .{ p, data.len });
+        return;
+    }
+    const m = mov orelse return;
+    const data = m.start_srm orelse return;
+    const cart = if (@TypeOf(con) == *core.AnyConsole) con.cartridge() else con.bus.cart;
+    if (!loadSaveBytes(cart, data)) {
+        try out.print("error: the movie's .start.srm sidecar ({d} bytes) does not fit this cart's save region\n", .{data.len});
+        try out.flush();
+        std.process.exit(1);
+    }
+    try out.print("movie: start save loaded from the .start.srm sidecar ({d} bytes)\n", .{data.len});
+}
+
+/// `--dump-srm`: the game's battery save as a plain .srm (see saveRegion).
 fn dumpSrm(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
     const cart = con.cartridge();
-    if (cart.sram_mask == 0) return;
-    const sram = cart.sram[0 .. cart.sram_mask + 1];
+    const sram = saveRegion(cart) orelse return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sram }) catch return;
     std.debug.print("wrote {s} ({d} bytes of battery SRAM)\n", .{ path, sram.len });
 }
@@ -805,10 +920,11 @@ fn loadMovie(
         out.print("error: cannot read movie '{s}'\n", .{path}) catch {};
         fail(out);
     };
-    const m = util.movie.parse(gpa, bytes) catch |e| {
+    var m = util.movie.parse(gpa, bytes) catch |e| {
         out.print("error: '{s}' is not a valid movie: {s}\n", .{ path, @errorName(e) }) catch {};
         fail(out);
     };
+    m.start_srm = util.movie.loadStartSrm(io, gpa, path);
     const crc = util.movie.imageCrc(image);
     if (m.rom_crc != crc) {
         if (args.movie_ignore_crc) {
@@ -897,10 +1013,12 @@ pub var dbg_ev_only: bool = false;
 /// before verification — minutes instead of the whole ladder.
 pub var dbg_audit: bool = false;
 
-fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, mov: ?util.movie.Movie, frame: u32) bool {
+fn stepBehavioralFrame(con: *core.FastConsole, snap: *core.bus.Bus.TickSnap, feed: *util.movie.Feed, frame: u32) bool {
+    // The feed consumes the poll latch first: the harness's own clear below
+    // is for the tick snapshot, and must not eat the feed's signal.
+    feed.step(con, frame);
     con.bus.input_polled = false;
     snap.captured = false;
-    feedMovie(con, mov, frame);
     con.runFrame();
     var drain: [4096]i16 = undefined;
     while (con.readAudio(&drain) != 0) {}
@@ -945,8 +1063,9 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
 
     var ticks: u32 = 0;
     var lag_run: u32 = 0;
+    var feed: util.movie.Feed = .init(mov);
     for (0..total) |i| {
-        if (stepBehavioralFrame(con, snap, mov, @intCast(i))) {
+        if (stepBehavioralFrame(con, snap, &feed, @intCast(i))) {
             if (lag_run > 0 and lag_run <= lag_run_max and ticks > 0) {
                 for (0..lag_run) |r| {
                     const before = if (r == 0) prev else lagbuf[(r - 1) * wram_len ..];
@@ -1115,6 +1234,8 @@ fn verifyBehavioral(
         con: *core.FastConsole,
         snap: *core.bus.Bus.TickSnap,
         prev: *core.bus.Bus.TickSnap,
+        /// The take's input feed; a per-poll take advances per tick.
+        feed: util.movie.Feed = .{ .mov = null },
         frame: u32 = 0,
         /// Wall frame of the current (last returned) tick.
         tick_wall: u32 = 0,
@@ -1143,9 +1264,10 @@ fn verifyBehavioral(
         }
 
         fn advance(self: *@This(), m: ?util.movie.Movie, budget: u32) bool {
+            if (self.feed.mov == null) self.feed = .init(m);
             const from = self.frame;
             while (self.frame < budget) {
-                const ticked = stepBehavioralFrame(self.con, self.snap, m, self.frame -| self.pad);
+                const ticked = stepBehavioralFrame(self.con, self.snap, &self.feed, self.frame -| self.pad);
                 self.frame += 1;
                 if (ticked) {
                     self.tick_wall = self.frame - 1;
@@ -1486,6 +1608,7 @@ fn runTickDump(
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try applyStartSave(io, gpa, con, args, mov, out);
     try anchorMovie(con, mov, "movie", out);
 
     const snap = try gpa.create(core.bus.Bus.TickSnap);
@@ -1523,10 +1646,11 @@ fn runTickDump(
     var ticks: u32 = 0;
     var lag_run: u32 = 0;
     var drain: [4096]i16 = undefined;
+    var feed: util.movie.Feed = .init(mov);
     for (0..frames) |i| {
+        feed.step(con, i);
         con.bus.input_polled = false;
         snap.captured = false;
-        feedMovie(con, mov, i);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {}
         if (snap.captured) {
@@ -2324,9 +2448,10 @@ fn runSa1Gen(
         std.process.exit(1);
     };
     var base_audio = core.console.audio_hash_init;
+    var feed0: util.movie.Feed = .init(movAt(movs, 0));
     for (0..total) |i| {
         if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
-        feedMovie(con, movAt(movs, 0), i);
+        feed0.step(con, i);
         con.runFrame();
         try util.drainAudio(con, &base_audio, EnergySink{ .cell = &env_base[i] }, EnergySink.add);
         hashes[i] = core.console.hashFrame(con.framebuffer());
@@ -2351,8 +2476,9 @@ fn runSa1Gen(
         var audio_s = core.console.audio_hash_init;
         var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
         try samples_s.ensureTotalCapacity(totals[s]);
+        var feed_s: util.movie.Feed = .init(movAt(movs, s));
         for (0..totals[s]) |i| {
-            feedMovie(con_s, movAt(movs, s), i);
+            feed_s.step(con_s, i);
             con_s.runFrame();
             try util.drainAudio(con_s, &audio_s, EnergySink{ .cell = &env_base_s[s][i] }, EnergySink.add);
             hashes_s[s][i] = core.console.hashFrame(con_s.framebuffer());
@@ -2385,8 +2511,9 @@ fn runSa1Gen(
             con_p.init(cart_p);
             con_p.usage = &umap;
             if (surfaceAnchor(movs, s, verify_state)) |sb| try con_p.loadState(sb);
+            var feed_p: util.movie.Feed = .init(movAt(movs, s));
             for (0..totals[s] + cov_pad) |i| {
-                feedMovie(con_p, movAt(movs, s), i);
+                feed_p.step(con_p, i);
                 con_p.runFrame();
             }
             con_p.cart.deinit(gpa);
@@ -2434,13 +2561,20 @@ fn runSa1Gen(
         fn replay(job: *@This()) void {
             const c = job.con.?;
             const m = job.movie.?;
+            if (m.start_srm) |sb| _ = loadSaveBytes(c.bus.cart, sb);
             if (m.anchor) |anc| c.loadState(anc) catch {
                 job.anchor_failed = true;
                 return;
             };
-            for (0..m.frames.len + 600) |i| {
-                feedMovie(c, m, i);
+            // The take plus a 600-frame tail; per poll, until every entry
+            // is consumed plus the tail (see Feed.budget for the ceiling).
+            var feed: util.movie.Feed = .init(m);
+            var i: usize = 0;
+            var tail: usize = 0;
+            while (tail < 600 and i < util.movie.Feed.budget(m) + 600) : (i += 1) {
+                feed.step(c, i);
                 c.runFrame();
+                if (feed.done()) tail += 1;
             }
         }
     };
@@ -2467,6 +2601,7 @@ fn runSa1Gen(
             try out.flush();
             std.process.exit(1);
         };
+        job.movie.?.start_srm = util.movie.loadStartSrm(io, gpa, args.cover_movie[ci_i].?);
         job.ci_crc = util.movie.imageCrc(job.ci);
         job.mov_hash = std.hash.Fnv1a_64.hash(job.mb);
         if (args.harvest_cache) |dir| {
@@ -3028,8 +3163,9 @@ fn runSa1Gen(
                 const con2 = try gpa.create(core.ProfilingConsole);
                 con2.init(cart2);
                 if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
+                var feed2: util.movie.Feed = .init(movAt(movs, s));
                 for (0..s_total) |i| {
-                    feedMovie(con2, movAt(movs, s), i);
+                    feed2.step(con2, i);
                     con2.runFrame();
                     try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &s_env_conv[i] }, EnergySink.add);
                     s_conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
@@ -3560,8 +3696,9 @@ fn replayTrace(
     }
     con.init(cart);
     con.bus.sa1.trace = trace;
+    var feed: util.movie.Feed = .init(mov);
     for (0..n) |i| {
-        feedMovie(con, mov, i);
+        feed.step(con, i);
         con.runFrame();
     }
     return trace;
@@ -3576,8 +3713,9 @@ fn replayWram(gpa: std.mem.Allocator, image: []const u8, n: u32, mov: ?util.movi
         gpa.destroy(con);
     }
     con.init(cart);
+    var feed: util.movie.Feed = .init(mov);
     for (0..n) |i| {
-        feedMovie(con, mov, i);
+        feed.step(con, i);
         con.runFrame();
     }
     return gpa.dupe(u8, &con.bus.wram.data);
@@ -4015,8 +4153,8 @@ fn runReport(
     cart: core.Cartridge,
     mov: ?util.movie.Movie,
 ) !void {
-    const want = args.frames orelse if (mov) |m|
-        @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
+    const want = args.frames orelse if (mov != null)
+        @max(1, @as(u32, @intCast(util.movie.Feed.budget(mov))) -| args.skip)
     else
         report_frames_default;
 
@@ -4024,6 +4162,7 @@ fn runReport(
     con.init(cart);
     if (args.auto_fastrom) con.bus.enableAutoFastrom();
     if (args.state) |spath| try loadStateInto(io, gpa, out, con, spath);
+    try applyStartSave(io, gpa, con, args, mov, out);
     try anchorMovie(con, mov, "movie", out);
 
     // Coverage wants the boot code too, so the map is attached before the
@@ -4040,8 +4179,9 @@ fn runReport(
     try samples.ensureTotalCapacity(want);
 
     var drain: [4096]i16 = undefined;
+    var feed: util.movie.Feed = .init(mov);
     for (0..args.skip + want) |i| {
-        feedMovie(con, mov, i);
+        feed.step(con, i);
         con.runFrame();
         while (con.readAudio(&drain) != 0) {} // keep the ring from backing up
         const s = con.takeProfile() orelse continue;
@@ -5023,6 +5163,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_vram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ppu")) {
             out.dump_ppu = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--repoll")) {
+            out.repoll = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--repoll-poweron")) {
+            out.repoll_poweron = true;
+        } else if (std.mem.eql(u8, a, "--srm")) {
+            out.srm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--movie-ignore-crc")) {
             out.movie_ignore_crc = true;
             core.console.dbg_ignore_state_rom_crc = true; // also let an anchored state cross builds
