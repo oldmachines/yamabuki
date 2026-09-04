@@ -32,9 +32,10 @@ as a **cover pair** against that image:
 | `v53-poweron-on-elev8hand.ymv` | 29,137 | `v53-elev8-hand.sfc` | DERIVED: header crc32 rebound to v53 with the 27 elevator operands hand-relocated, so the ride completes and the take covers the whole routine |
 | `stock-bombroom.ymv` | 11,698 | `sm.sfc` (anchored: `--record --srm`) | STOCK, continued from `stock-bombroom.start.srm`: Parlor to the Bomb Torizo room and the Bomb pickup (669 instructions) |
 | `stock-torizo.ymv` | 23,772 | `sm.sfc` (anchored: `--record --srm`) | STOCK, continued from `stock-torizo.start.srm`: the Bomb Torizo fight, won — the first boss the stock takes cover (2,101 instructions, 2 bank bytes; 299 bytes moved in bank `$AA`) — then back to the Parlor save |
+| `stock-green-brinstar.ymv` | 78,836 | `sm.sfc` (anchored: `--record --srm`, then `--continue`) | STOCK, continued from `stock-green-brinstar.start.srm`: down the green Brinstar elevator into the main shaft, the first missiles and energy tanks, the Charge Beam (1,054 instructions; 572 bytes moved, 480 in enemy banks). The first take grown with `--continue`: the player replayed the 44,007-frame session at full speed and kept recording, so one file holds the whole playthrough |
 | `sm-escape-poweron.ymv` | 20,807 | `sm.sfc` (power-on) | STOCK from power-on: intro, Ceres, Ridley, the whole escape to the elevator. An `--evidence-movie` in v34, not a `--movie`: it profiles the escape (proving the level pointers the walk misses AND the palette-DMA banks that otherwise render the escape black) without being verified — the escape is an RNG-forked scene the tier cannot tick-lock (§4g) |
 
-The first four fed the v8 generation; the ones before it feed `sm-sa1-v60.bps.cmd` as cover pairs (add `--harvest-cache <dir>` to any recipe to skip replaying pairs it has seen; the output is byte-identical) (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
+The first four fed the v8 generation; the ones before it feed `sm-sa1-v62.bps.cmd` as cover pairs (add `--harvest-cache <dir>` to any recipe to skip replaying pairs it has seen; the output is byte-identical) (`v38-poweron` is kept as the take that found §4h's class; it is not in the recipe).
 Recorded with `--record` where noted as power-on: the player opens the take
 before the first frame and starts with blank battery SRAM, which is the
 machine headless replays it on. Every `--record` session also writes its
@@ -42,7 +43,10 @@ battery save next to the take as `<take>.srm`; `--record --srm <that file>`
 continues from it as an anchored take (the anchor carries the save), which
 is how a long game is played across sessions without starting over. The
 `.start.srm` files here are those starting saves, kept for the record; the
-take itself does not need them.
+take itself does not need them. Better still, `--movie <take> --continue`
+replays a take at full speed and keeps recording from its end, so one
+growing file holds the whole playthrough; the continued file replaces its
+predecessor in the recipe.
 
 ## The images they need
 
