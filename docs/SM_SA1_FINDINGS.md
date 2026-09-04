@@ -6,8 +6,8 @@ measured on the real game; commits are on `claude/sa1-async-offload`.
 
 Status: the conversion boots, plays, and verifies BEHAVIORALLY EQUIVALENT on
 its scripted surfaces (attract, title-skip, play-death) plus a power-on Ceres
-escape evidence surface. The current build is **v58** (`tests/surfaces/sm-sa1/
-sm-sa1-v58.bps`): five structural nets (room-graph level pointers,
+escape evidence surface. The current build is **v60** (`tests/surfaces/sm-sa1/
+sm-sa1-v60.bps`): five structural nets (room-graph level pointers,
 background records, decompressor inline destinations, the tileset table,
 the enemy headers), the Zebes foreground, the Climb's door/layer code and
 the elevator AI via cover pairs, and the escape palette via an
@@ -1581,7 +1581,11 @@ elevator to a black playfield: the `$A8` species' AI raw despite the stock
 take having ridden it (§4m) · v56 the take on a 27-byte hand-relocated
 image, verified — but the site stays raw: conflicting evidence classes ·
 v57 the stock-first evidence fold: the site shifts, the ride completes on a
-generated image · v58 verified — the ship (§4m).
+generated image · v58 verified — the ship (§4m) · v60 two more stock takes
+(the Bomb pickup room; the Bomb Torizo fight, the first boss the stock
+takes cover — 2,101 instructions, 299 bytes moved in the boss's bank $AA);
+verified — the ship. A third take, 17 minutes of attract demos at the title
+screen, added nothing and is not in the recipe.
 
 ## 8. Cross-cutting learnings
 
