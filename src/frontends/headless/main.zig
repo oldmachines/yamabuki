@@ -197,8 +197,8 @@ const Args = struct {
     /// `--cover-movie` after it fills the same slot. One recording covers
     /// one scenario, and the defects live in the scenarios nobody
     /// profiled — so the harvest has to take as many as there are.
-    cover_image: [24]?[]const u8 = @splat(null),
-    cover_movie: [24]?[]const u8 = @splat(null),
+    cover_image: [max_cover_pairs]?[]const u8 = @splat(null),
+    cover_movie: [max_cover_pairs]?[]const u8 = @splat(null),
     n_cover: usize = 0,
     /// --harvest-cache <dir>: keep each cover pair's harvest — the replay's
     /// usage map, site evidence, proven bank bytes and armed HDMA tables —
@@ -294,6 +294,9 @@ const report_frames_default: u32 = 3600;
 
 /// Input surfaces one generator run accepts (each `--movie` is one).
 const max_movies: usize = 6;
+/// Cover pairs a recipe may carry. The Super Metroid campaign reached 24 —
+/// the old cap, hit with a usage error — on its fourth stock take.
+const max_cover_pairs: usize = 64;
 
 /// Default frames for `--gen-fastrom-patch` verification: 30 seconds, the
 /// same standard patches/fastrom-compat.zon entries are verified to.
@@ -2441,7 +2444,7 @@ fn runSa1Gen(
             }
         }
     };
-    var jobs: [24]HarvestJob = @splat(.{});
+    var jobs: [max_cover_pairs]HarvestJob = @splat(.{});
     const jobs_max: usize = if (args.harvest_jobs != 0) args.harvest_jobs else @min(12, std.Thread.getCpuCount() catch 4);
     // Phase 1: load every pair, decide cache hit or replay, and prepare the
     // replay's console on this thread (allocation stays off the workers).
