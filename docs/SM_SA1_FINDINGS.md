@@ -199,7 +199,24 @@ mechanical:
   from the wrong megabyte and ran its AI from it (§4j). Per-record
   validated (bank `$A0-$BF`, init and main AI pointers in ROM), because
   the run of true headers is followed by same-aligned records of another
-  shape.
+  shape. The table is TWO grids: a second run starts at `$F153`, 20 bytes
+  off the first grid's phase, so the walk is stride 2 with a stricter
+  check off-grid (pad byte zero, five AI pointers in ROM, part count);
+  the header at `$F693` was raw through v65 and sent the CPU into the
+  wrong megabyte (§4n). Stock: 139 on the grid, 26 off it.
+- **Area map table** (`$82:964A`, seven 3-byte pointers, one per area):
+  the map tilemaps in bank `$B5`, read through a direct-page pointer by
+  the HUD minimap (`$90:AA7C`) and the pause map (`$82:953F`). All or
+  nothing after every entry validates. Raw, the minimap painted text
+  glyphs for map cells (§4n).
+- **Pointer seeds** (signature, banks `$80-$B4`): `LDA #$007E / STA dp`
+  followed within 256 bytes by a long-indirect use of that slot's pointer
+  — the bank word becomes `$0040` (`$7F` -> `$0041`); a low-WRAM address
+  immediate (`LDA #$07F7 / STA $09`) whose bank slot is seeded `$0000`
+  within 64 bytes gains `$6000`, the window's home. Not a table — the
+  constants sit in code, indexed by nothing — so the only structure to
+  read is the idiom itself. Stock: 12 sites, 5 already proven by
+  recordings and left as written, 7 rewritten.
 
 **The gate on every SM-specific net:** the ROM title starts with
 `Super Metroid` and the image is a > 2 MiB window conversion. Reads STOCK
@@ -279,6 +296,15 @@ A conversion is a function of three inputs — the stock ROM, the generator, and
   a recording for any structural class.
 
 ### 0.10 The process lessons
+
+- **Index a recording by the game's own controller poll, not by frame.**
+  A frame-indexed take dies on the conversion at the first lag frame it
+  does not share with stock; a poll-indexed one (movie format 3, §5)
+  replays on either build, so a bug found by playing the conversion
+  becomes a STOCK cover pair by migration (`--repoll`) — the harvest's
+  provenance then proves the bank bytes the conversion-side replay could
+  only classify. v64-v66 were built from the first take ever played on
+  the conversion, re-recorded onto stock.
 
 - **Measure the generation before optimizing the game.** An hour per build
   was 785k frames of replays on one core, most of them unchanged since the
@@ -1381,6 +1407,64 @@ elevator on a GENERATED image, zero stale sites, in a 14-minute cached
 build. The stock takes' coverage of the enemy banks now lands — the hand
 image pair is still in the recipe for the arrival branch it alone covered.
 
+## 4n. The first take played on the conversion: a stalled door, a garbled map (v63-v66)
+
+The player started v62 from the stock battery save (a window
+conversion's lifted save region is its battery save, §5) and recorded
+13,798 frames: through Brinstar, a garbled HUD minimap along the way,
+and at the end a door transition that never finished — the black screen
+with the door capsule. `--stale` on the take listed 26 sites: bank `$86`
+projectile routines (`$86:858E..8669`, `$86:D130..D1B5`, plain absolute
+WRAM operands, uncovered), one site in the `$B2` enemy bank, and
+`$8F:BE36 STA $7E:CD22` in a room's setup ASM. All code, all coverage —
+but the take was recorded on v62, anchored to a v62 state, so it could
+not harvest on stock.
+
+**The per-poll bridge (v64).** With movie format 3 (§5) the take was
+re-recorded per poll on v62 (`--repoll --repoll-poweron --srm`: 12,867
+polls, the anchor replaced by the start save as a `.start.srm` sidecar)
+and replayed on STOCK, where it reproduces the play through the same
+rooms and, unlike v62, walks through the door. As a stock cover pair it
+covered 261 instructions and evidenced 91 sites; v64 verified. The `$86`
+and `$8F` sites shifted. The door still stalled, and the end picture was
+byte-identical to v62's.
+
+**The off-grid enemy header (v65).** `--trace-clk` around the last stale
+read showed the S-CPU executing mid-instruction at `$B2:FD07..FD15` —
+the enemy dispatcher (`$A0:8B7C`: `LDX $0F78,Y / LDA $000C,X`) had
+pushed bank `$B2` and `$FD02` for an enemy whose header lives at
+`$A0:F693`, and jumped into a megabyte that holds other code on the
+conversion. `$F693 - $CEBF` is not a multiple of 64: the enemy-header
+net's grid walk had never seen the record. The table is two grids (the
+second from `$F153`, 26 headers); the net now walks at stride 2 with a
+stricter off-grid check (§0.6). v65 verified; the take reaches the room
+past the door. The map was still wrong.
+
+**The area-map table and the pointer seeds (v66).** The game state
+never entered a pause in the take (`--watch 0998`), so the garbled map
+was the HUD minimap: on v65 it painted text glyphs where stock paints
+map cells. The minimap (`$90:AA7C`) and the pause map (`$82:953F`) copy
+a 3-byte pointer from `$82:964A` — seven area tilemaps in bank `$B5` —
+into the direct page and read through it: a table bank byte, DATA,
+untouched on every build so far. The same routines seed their other
+pointers from immediates (`LDA #$007E / STA $05`, `LDA #$0000 / STA
+$0B`, `LDA #$07F7 / STA $09`, then `LDA [$09]`): 12 such sites in the
+code banks, 5 of them already proven by recordings. Two nets (§0.6);
+v66 verified, 129/165 enemy banks, 7/12 seeds, 7/7 area-map banks. On
+v66 the take draws the minimap's cells and walks through the door;
+`--stale` lists two sites left, `$86:8030 LDA $0F96,X` — a projectile
+spawn the stock replay of the same inputs never reached (a lag-shifted
+enemy decision), the next take's job.
+
+Three lessons. The trace by clock (`--trace-clk from-to`) is the
+instrument when `--stale` names a site whose registers make no sense
+for its instruction: a PC that is not on an instruction boundary means
+the CPU is running data, and the cause is the jump before it. A 64-byte
+grid is a guess about a table until every record on it validates AND
+the records off it are shown not to. And the minimap is drawn from the
+same table as the pause map: one net fixed both, but only the `--watch`
+on the game state said which screen the player had actually seen.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1607,6 +1691,13 @@ with the player's new `--continue` (replay a take at full speed, then keep
 recording: one file, 78,836 frames, replays in sync): down the green
 Brinstar elevator, the main shaft, the Charge Beam — 1,054 instructions,
 572 bytes across 13 banks, 480 of them in enemy banks; verified — the ship.
+
+v63-v66 (2026-09-04/05): v63 = v62 (no new code) · v64 the first take
+played on the conversion, migrated to stock per poll (movie format 3,
+`--repoll`): 261 instructions, 91 sites; verified, door still stalled ·
+v65 the enemy-header net walks both grids (165 headers, 129 banks); the
+door opens · v66 the area-map table (7 banks) and the pointer-seed net
+(7 of 12 immediates); the minimap draws; verified — the ship (§4n).
 
 ## 8. Cross-cutting learnings
 
