@@ -5676,7 +5676,15 @@ fn emitSplit(
                 const file = bank * 0x8000 + (aa - 0x8000);
                 const op = out[file];
                 var hazard = op == 0xCB or op == 0xDB;
-                if (!hazard and (op == 0xAD or op == 0xAC or op == 0xAE or op == 0x2C or op == 0xCD)) {
+                // every absolute read/compare/RMW form, plus the indexed reads
+                // whose base sits in the register file (X unknown: unshadowed)
+                const abs_read = switch (op) {
+                    0xAD, 0xAC, 0xAE, 0x2C, 0xCD, 0x6D, 0xED, 0x2D, 0x0D, 0x4D, 0xEC, 0xCC => true, // loads, compares, ALU
+                    0xEE, 0xCE, 0x0E, 0x4E, 0x2E, 0x6E, 0x0C, 0x1C => true, // RMW
+                    0xBD, 0xBC, 0xBE, 0xB9, 0x7D, 0x79, 0xFD, 0xF9, 0xDD, 0xD9, 0x3D, 0x39, 0x1D, 0x19, 0x5D, 0x59, 0x3C => true, // indexed
+                    else => false,
+                };
+                if (!hazard and abs_read) {
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                     hazard = (v >= 0x2100 and v <= 0x21FF) or (v >= 0x4200 and v <= 0x43FF);
                 }
@@ -6658,7 +6666,13 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
     // bank, no neighbouring instruction copied — the previous shapes
     // (a JSL over a span, a bank-local JSR) each failed on Super
     // Metroid: a `PHA` in a span, a bank with 63 free bytes.
-    const Desc = struct { addr: u24, off: u8, kind: u8 };
+    const Desc = struct { addr: u24, off: u8, kind: u8, opi: u8 };
+    // kind 7, "operate": the site's own opcode re-run against the fetched
+    // value (ADC $4216 was 70 of Super Metroid's 250 product reads — the
+    // scroll code's `ADC $4216` read open bus on the SA-1 and the camera
+    // walked off on the first gameplay lap). Index = position here.
+    const operate_ops = [_]u8{ 0x6D, 0xED, 0xCD, 0x2D, 0x0D, 0x4D, 0x2C, 0xEC, 0xCC }; // ADC SBC CMP AND ORA EOR BIT CPX CPY
+    const operate_dp = [_]u8{ 0x65, 0xE5, 0xC5, 0x25, 0x05, 0x45, 0x24, 0xE4, 0xC4 }; // their direct-page forms
     var descs: [1024]Desc = undefined;
     var n_sites: u32 = 0;
     var per_bank: [0x40]u16 = @splat(0);
@@ -6672,6 +6686,7 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                 if (u & usage_map.flag_opcode == 0) continue;
                 const file = splitFile(ac);
                 const op = out[file];
+                var opi: u8 = 0;
                 const kind: u8 = switch (op) {
                     0x8D => 0,
                     0x8E => 1,
@@ -6680,17 +6695,21 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                     0xAD => 4,
                     0xAE => 5,
                     0xAC => 6,
-                    else => continue,
+                    else => blk: {
+                        const i = std.mem.indexOfScalar(u8, &operate_ops, op) orelse continue;
+                        opi = @intCast(i);
+                        break :blk 7;
+                    },
                 };
                 const reg = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                 const math_in = reg >= 0x4202 and reg <= 0x4206;
                 const math_out = reg >= 0x4214 and reg <= 0x4217;
                 if (!(kind <= 3 and math_in) and !(kind >= 4 and math_out)) continue;
-                const idx_reg = kind == 1 or kind == 2 or kind == 5 or kind == 6;
+                const idx_reg = kind == 1 or kind == 2 or kind == 5 or kind == 6 or (kind == 7 and opi >= 7);
                 const wide = if (idx_reg) u & usage_map.flag_x == 0 else u & usage_map.flag_m == 0;
                 if (n_sites == descs.len or per_bank[bank] == 256)
                     return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
-                descs[n_sites] = .{ .addr = ac, .off = @intCast(reg - 0x4202), .kind = kind | (if (wide) @as(u8, 0x80) else 0) };
+                descs[n_sites] = .{ .addr = ac, .off = @intCast(reg - 0x4202), .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi };
                 n_sites += 1;
                 per_bank[bank] += 1;
             }
@@ -6710,8 +6729,9 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         put(&hb, &hc, &.{ 0xC2, 0x20, 0xA5, 0x02, 0x29, 0x3F, 0x00, 0x0A, 0xAA }); // REP / LDA $02 / AND #$3F (the mirror bit off: the table is 64 banks) / ASL / TAX
         const bank_tbl_ref = hc;
         put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x85, 0x04 }); // LDA banktbl,X (patched) / STA $04
-        put(&hb, &hc, &.{ 0xA5, 0x03, 0x29, 0xFF, 0x00, 0x0A, 0x18, 0x65, 0x04, 0xAA }); // nn*2 + base -> X
+        put(&hb, &hc, &.{ 0xA5, 0x03, 0x29, 0xFF, 0x00, 0x85, 0x0E, 0x0A, 0x18, 0x65, 0x0E, 0x18, 0x65, 0x04, 0xAA }); // nn*3 + base -> X
         put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x85, 0x06 }); // LDA $0000,X / STA $06: $06 = off, $07 = kind|wide
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xBD, 0x02, 0x00, 0x85, 0x10, 0xC2, 0x20 }); // $10 = the operate opcode index
         // the target: the register (S-CPU) or the cell (SA-1), into [$08]
         put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x0D });
         put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00, 0x18, 0x69, 0x02, 0x42, 0x85, 0x08, 0x80, 0x14 }); // reg = $4202 + off
@@ -6755,6 +6775,9 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         // loads: A = kind (4/5/6); three copies, one per saved slot
         const loads_at = hc;
         hb[bcs_loads_at + 1] = @intCast(loads_at - (bcs_loads_at + 2));
+        put(&hb, &hc, &.{ 0xC9, 0x07, 0x00 }); // kind 7: operate
+        const beq_operate_at = hc;
+        put(&hb, &hc, &.{ 0xF0, 0x00 }); // BEQ operate (patched)
         put(&hb, &hc, &.{ 0xC9, 0x05, 0x00, 0xF0, 0x20, 0xB0, 0x40 }); // 5 -> X copy, 6 -> Y copy, else A
         const slots = [_]u8{ 0x09, 0x07, 0x05 }; // A, X, Y saved slots, +1 for the PHP
         var exit_patches: [3]usize = undefined;
@@ -6766,24 +6789,61 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
             exit_patches[k] = hc;
             put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
         }
-        std.debug.assert(hc - loads_at - 7 == 96); // three 32-byte copies
+        std.debug.assert(hc - loads_at - 12 == 96); // three 32-byte copies
         const exit_at = hc;
         put(&hb, &hc, &.{ 0xC2, 0x30, 0xAB, 0x2B, 0x7A, 0xFA, 0x68, 0x40 }); // REP #$30 / PLB PLD PLY PLX PLA / RTI
+        // operate: the value into $0E, then the caller's A/X/Y/P back and
+        // the site's opcode run against $0E in its direct-page form — the
+        // caller's widths and carry govern, the result P lands in the
+        // saved P, A in the saved A (M-width: an 8-bit op leaves B alone).
+        // Dispatch by RTS through a pushed stub address: X is free for the
+        // lookup while the caller's X is still on the frame.
+        const operate_at = hc;
+        hb[beq_operate_at + 1] = @intCast(operate_at - (beq_operate_at + 2));
+        put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x06, 0xA7, 0x08, 0x85, 0x0E, 0x80, 0x08 }); // wide: LDA [$08] / STA $0E
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA7, 0x08, 0x85, 0x0E, 0xC2, 0x20 }); // narrow: SEP / LDA [$08] / STA $0E / REP
+        put(&hb, &hc, &.{ 0xA5, 0x10, 0x29, 0xFF, 0x00, 0x0A, 0xAA }); // LDA $10 / AND #$FF / ASL / TAX
+        const optbl_ref = hc;
+        put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x3A, 0x48 }); // LDA optbl,X (patched) / DEC / PHA: the stub, for the RTS
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x0C, 0x48 }); // SEP #$20 / LDA $0C,S (caller P) / PHA
+        // the caller's X, Y, A from the frame (S-relative offsets after the
+        // two pushes above: A at $0B, X at $09, Y at $07)
+        put(&hb, &hc, &.{ 0xC2, 0x30, 0xA3, 0x09, 0xAA, 0xA3, 0x07, 0xA8, 0xA3, 0x0B }); // REP #$30 / LDA $09,S / TAX / LDA $07,S / TAY / LDA $0B,S
+        put(&hb, &hc, &.{ 0x28, 0x60 }); // PLP / RTS -> the stub
+        var stub_at: [operate_ops.len]usize = undefined;
+        var join_patches: [operate_ops.len]usize = undefined;
+        for (operate_dp, 0..) |dp, k| {
+            stub_at[k] = hc;
+            put(&hb, &hc, &.{ dp, 0x0E }); // op $0E
+            join_patches[k] = hc;
+            put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA join (patched)
+        }
+        const join_at = hc;
+        for (join_patches) |at| hb[at + 1] = @intCast(join_at - (at + 2));
+        put(&hb, &hc, &.{ 0x08, 0x83, 0x09 }); // PHP / STA $09,S -- A back (M-width)
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x01, 0x83, 0x0B, 0x68 }); // SEP / LDA $01,S (result P) / STA $0B,S (saved P) / PLA
+        const bra_exit5_at = hc;
+        put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        const optbl_at = hc;
+        hc += operate_ops.len * 2;
         std.mem.writeInt(u16, hb[bne_exit1_at + 1 ..][0..2], @intCast(exit_at - (bne_exit1_at + 3)), .little);
         hb[bra_exit2_at + 1] = @intCast(exit_at - (bra_exit2_at + 2));
         hb[bra_exit3_at + 1] = @intCast(exit_at - (bra_exit3_at + 2));
         hb[bra_exit4_at + 1] = @intCast(exit_at - (bra_exit4_at + 2));
         for (exit_patches) |at| hb[at + 1] = @intCast(exit_at - (at + 2));
+        hb[bra_exit5_at + 1] = @bitCast(@as(i8, @intCast(@as(isize, @intCast(exit_at)) - @as(isize, @intCast(bra_exit5_at + 2)))));
         std.debug.assert(mul_call_at == bne_exit1_at + 3 + 5 + 5 + 5 + 4 + 5 + 5 + 2 + 2); // the trigger branches land on the calls
         std.debug.assert(div_call_at == mul_call_at + 6);
         // the block
         const bank_tbl_at = hc;
         const desc_at = hc + 0x80;
-        const total: u32 = @intCast(desc_at + @as(usize, n_sites) * 2);
+        const total: u32 = @intCast(desc_at + @as(usize, n_sites) * 3);
         const at = far.nextIn(0, total, carve, carve_len) orelse
             return refuse(refusal, .{ .reason = .no_free_space, .detail = total });
         const base: u16 = @intCast(0x8000 + at);
         std.mem.writeInt(u16, hb[bank_tbl_ref + 1 ..][0..2], base + @as(u16, @intCast(bank_tbl_at)), .little);
+        std.mem.writeInt(u16, hb[optbl_ref + 1 ..][0..2], base + @as(u16, @intCast(optbl_at)), .little);
+        for (stub_at, 0..) |sa, k| std.mem.writeInt(u16, hb[optbl_at + k * 2 ..][0..2], base + @as(u16, @intCast(sa)), .little);
         @memcpy(out[at .. at + hc], hb[0..hc]);
         // per-bank descriptor tables, sites numbered in address order
         var next: [0x40]u16 = undefined;
@@ -6792,15 +6852,16 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
             next[bk] = 0;
             const t: u16 = base + @as(u16, @intCast(cursor));
             std.mem.writeInt(u16, out[at + bank_tbl_at + bk * 2 ..][0..2], t, .little);
-            cursor += @as(usize, per_bank[bk]) * 2;
+            cursor += @as(usize, per_bank[bk]) * 3;
         }
         for (descs[0..n_sites]) |dsc| {
             const bk: usize = (dsc.addr >> 16) & 0x3F;
             const t = std.mem.readInt(u16, out[at + bank_tbl_at + bk * 2 ..][0..2], .little) - 0x8000;
             const nn = next[bk];
             next[bk] += 1;
-            out[t + nn * 2] = dsc.off;
-            out[t + nn * 2 + 1] = dsc.kind;
+            out[t + nn * 3] = dsc.off;
+            out[t + nn * 3 + 1] = dsc.kind;
+            out[t + nn * 3 + 2] = dsc.opi;
             const file = splitFile(dsc.addr);
             sites[n_out.*] = .{ .addr = dsc.addr, .bytes = out[file..][0..3].* };
             n_out.* += 1;
@@ -11295,8 +11356,8 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
         0xC2, 0x20, // 803B REP #$20
         0xAD, 0x14, 0x42, // 803D LDA $4214 — the quotient
         0x18, 0x6D, 0x06, 0x01, 0x8D, 0x06, 0x01, // 8040 += into $0106
-        0xAD, 0x16, 0x42, // 8047 LDA $4216 — the remainder
-        0x18, 0x65, 0x08, 0xEA, 0x85, 0x08, 0xEA, // 804A += into $0108, direct-page ($6108: D=$6100)
+        0xA5, 0x08, 0xEA, // 8047 LDA $08 — the remainder total, direct-page ($6108: D=$6100)
+        0x18, 0x6D, 0x16, 0x42, 0x85, 0x08, 0xEA, // 804A CLC / ADC $4216 — the remainder, through an ALU read of the register / STA $08
         0xE2, 0x20, // 8051 SEP #$20
         0x20, 0x80, 0x80, // 8053 JSR $8080 — the RTS-shaped IO routine (bank $01)
         0x22, 0x60, 0x80, 0x00, // 8056 JSL $00:8060 — the deferred RTL one
@@ -11322,7 +11383,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     for ([_]u32{ 0x8000, 0x8002, 0x8003, 0x8004, 0x8005, 0x8007, 0x800A, 0x800C, 0x800E, 0x8011, 0x8013, 0x8016, 0x8017, 0x8018, 0x8019, 0x801A }) |a| mark(bytes, 0x01_0000 | a, true);
     for ([_]u32{ 0x801C, 0x801F, 0x8020, 0x8023, 0x8026, 0x8029, 0x802C }) |a| mark(bytes, 0x01_0000 | a, false);
     for ([_]u32{ 0x802E, 0x8030, 0x8033, 0x8034, 0x8035, 0x8036, 0x8037, 0x8038, 0x8039, 0x803A, 0x803B }) |a| mark(bytes, 0x01_0000 | a, true);
-    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x804A, 0x804B, 0x804D, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x8049, 0x804A, 0x804B, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
     for ([_]u32{ 0x8053, 0x8056, 0x805A, 0x805C, 0x805F, 0x8061, 0x8064, 0x8066, 0x8069, 0x8080, 0x8083, 0x8086 }) |a| mark(bytes, 0x01_0000 | a, true);
 
     const io = [_]SplitIo{ .{ .entry = 0x01_8080 }, .{ .entry = 0x00_8060, .deferred = true, .rtl = true } };
@@ -11353,6 +11414,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u8, 0x02), res.image[0x800E]); // COP at STA $4202
     try testing.expectEqual(@as(u8, 0xEA), res.image[0x8010]);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x804B]); // COP at ADC $4216: the operate kind
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
