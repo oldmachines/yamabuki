@@ -2084,7 +2084,13 @@ SA-1 lacks, emulated per site through the **COP handler**: each access
 becomes `COP nn`, a software interrupt whose handler performs the
 instruction on the interrupted registers — the real register on the
 S-CPU, an I-RAM cell on the SA-1 with the SA-1's arithmetic unit for the
-product and a software divide. **Dual image.** With an 8 MiB image, two
+product and a software divide. **Site kinds.** What the handler does per
+site: *stores* (STA/STX/STY/STZ into an input register), *loads*
+(LDA/LDX/LDY of a result, landing in the saved register with N/Z), and
+*operate* (ADC/SBC/CMP/AND/ORA/EOR/BIT/CPX/CPY of a result: the value is
+fetched into scratch and the site's own opcode re-run against it with
+the caller's registers and flags, so carry and width behave as the
+original did). **Dual image.** With an 8 MiB image, two
 copies of the game: the S-CPU's with stock bytes at every math site, the
 SA-1's with the COPs, the mapper switched between them at each handoff so
 the S-CPU's own eras run at stock speed. **Tail flavor.** The split's
