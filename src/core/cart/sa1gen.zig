@@ -384,6 +384,8 @@ pub const Stats = struct {
     split_mul: u8 = 0,
     /// Mainloop flavor: math sites shadowed (uncapped).
     split_math_sites: u32 = 0,
+    /// Mainloop flavor: the dual image is in effect (see emitSplit).
+    split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
     n_split_hazards: u8 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
@@ -5597,8 +5599,18 @@ fn emitSplit(
     // only — anything looser is a named refusal, not a guess.
     var mul_sites: [4]u32 = undefined;
     var n_mul: usize = 0;
+    var math_sites: [1024]MathSite = undefined;
+    var n_math_sites: u32 = 0;
+    // The DUAL IMAGE (mainloop flavor, 8 MiB images): the lower 4 MiB is
+    // the S-CPU's game, stock bytes at every math site; the upper 4 MiB a
+    // copy that carries the COP sites, and the mapper registers switch the
+    // whole cartridge between them at each ownership handoff. Measured on
+    // Super Metroid: with COPs in the one image, the S-CPU's own eras ran
+    // ~150 cycles slower per math access, the Ceres intro gained lag
+    // frames, and the frame-counter-fed state forked for good.
+    const dual = spec.tail == 0 and out.len >= 8 * 1024 * 1024;
     if (spec.tail == 0) {
-        try emitSplitMath(out, usage, far, carve, carve_len, refusal, res);
+        try emitSplitMath(out, usage, far, carve, carve_len, &math_sites, &n_math_sites, refusal, res);
     } else {
         var bank: u32 = 0;
         while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
@@ -6152,6 +6164,11 @@ fn emitSplit(
     // takeover (S-CPU): the SA-1 handed the loop back — its context is
     // in the cells; the game stack is where the S-CPU left it.
     d[beq_take_at + 1] = @intCast(cur - (beq_take_at + 2));
+    if (dual) {
+        // The S-CPU's copy back: megabytes 0/1/0/2 (SEP #$30 is live).
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x20, 0x22, 0xA9, 0x81, 0x8D, 0x21, 0x22 });
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x22, 0x22, 0xA9, 0x82, 0x8D, 0x23, 0x22 });
+    }
     put(d, &cur, &.{ 0xC2, 0x30, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // S
     put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // D
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // DBR
@@ -6196,6 +6213,13 @@ fn emitSplit(
     put(d, &cur, &.{ 0xA9, 0x01, 0x8F, @truncate(split_engaged), 0x37, 0x00 }); // engaged := 1
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // release the SA-1
     d[eng_released_at + 1] = @intCast(cur - (eng_released_at + 2));
+    if (dual) {
+        // The SA-1's copy: regions C/D/E/F onto megabytes 4/5/4/6 (the
+        // shim's own E/F choice, one copy up). Both CPUs sit in bank $00
+        // code identical in both copies while this takes effect.
+        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x85, 0x8F, 0x21, 0x22, 0x00 });
+        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x86, 0x8F, 0x23, 0x22, 0x00 });
+    }
     put(d, &cur, &.{ 0xA9, 0x01, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := SA-1
     put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_ml_pump_stack), @truncate(split_ml_pump_stack >> 8), 0x1B }); // the pump stack
     put(d, &cur, &.{ 0x4B, 0xAB, 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) }); // DBR := $00, into the pump
@@ -6271,6 +6295,18 @@ fn emitSplit(
     out[mf + 3] = 0x00;
     if (mlspan > 4) @memset(out[mf + 4 ..][0 .. mlspan - 4], 0xEA);
     res.stats.split_engage_addr = engage16;
+
+    if (dual) {
+        // The SA-1's copy, COP sites and all; then the S-CPU's copy gets
+        // its stock bytes back at every math site.
+        const half: usize = 4 * 1024 * 1024;
+        @memcpy(out[half .. 2 * half], out[0..half]);
+        for (math_sites[0..n_math_sites]) |ms| {
+            const f = splitFile(ms.addr);
+            out[f..][0..3].* = ms.bytes;
+        }
+        res.stats.split_dual = true;
+    }
 }
 
 /// The mainloop flavor's IO machinery, bank-general: for each routine a
@@ -6469,7 +6505,11 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 /// dividend). Each site is displaced by a bank-local JSR (the same 3
 /// bytes) to a helper in its own bank; no neighbouring instruction is
 /// copied.
-fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, refusal: *?Refusal, res: *Result) Error!void {
+/// A math site the shadow displaced, with the bytes it replaced — so the
+/// S-CPU's copy of the game can have them back (see the dual image).
+const MathSite = struct { addr: u24, bytes: [3]u8 };
+
+fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
     var calc: [160]u8 = undefined;
     var cc: usize = 0;
@@ -6674,6 +6714,8 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
             out[t + nn * 2] = dsc.off;
             out[t + nn * 2 + 1] = dsc.kind;
             const file = splitFile(dsc.addr);
+            sites[n_out.*] = .{ .addr = dsc.addr, .bytes = out[file..][0..3].* };
+            n_out.* += 1;
             out[file] = 0x02; // COP
             out[file + 1] = @intCast(nn);
             out[file + 2] = 0xEA;
