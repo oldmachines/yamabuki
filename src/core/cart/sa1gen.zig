@@ -152,6 +152,11 @@ pub const SplitSpec = struct {
     /// ownership changing hands at the anchor, once per lap at most.
     mode_cell: u16 = 0,
     mode_value: u8 = 0,
+    /// Mainloop flavor: the gate accepts the whole range `mode_value ..=
+    /// mode_hi` when `mode_hi` is nonzero — gameplay plus the door
+    /// transitions ($08-$0C on Super Metroid), where the visible slowdown
+    /// lives. Zero = the single value.
+    mode_hi: u8 = 0,
     mode_gate: bool = false,
 };
 
@@ -6253,12 +6258,23 @@ fn emitSplit(
     // S-CPU: the gate (I-RAM was opened by the shim at reset).
     put(d, &cur, &.{ 0xE2, 0x20 });
     var eng_native_at: usize = 0;
+    var eng_native2_at: usize = 0;
     if (spec.mode_gate) {
         put(d, &cur, &.{ 0xC2, 0x20, 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // LDA $00:home (16-bit)
-        put(d, &cur, &.{ 0x29, 0xFF, 0x00, 0xC9, spec.mode_value, 0x00 }); // AND #$00FF / CMP #value
-        put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ hand over
-        eng_native_at = cur;
-        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+        put(d, &cur, &.{ 0x29, 0xFF, 0x00, 0xC9, spec.mode_value, 0x00 }); // AND #$00FF / CMP #lo
+        if (spec.mode_hi == 0) {
+            put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ hand over
+            eng_native_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+        } else {
+            // lo <= mode <= hi: below lo or above hi is native
+            put(d, &cur, &.{ 0xB0, 0x03 }); // BCS on
+            eng_native_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+            put(d, &cur, &.{ 0xC9, spec.mode_hi +% 1, 0x00, 0x90, 0x03 }); // CMP #hi+1 / BCC hand over
+            eng_native2_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+        }
     }
     // hand over: publish the context, first-engage the SA-1 once, own := SA-1
     put(d, &cur, &.{ 0xC2, 0x30, 0x68, 0x8F, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x00 }); // A
@@ -6291,17 +6307,27 @@ fn emitSplit(
     put(d, &cur, &.{ 0x4B, 0xAB, 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) }); // DBR := $00, into the pump
     // native (S-CPU, mode gate says not gameplay): this CPU runs the lap.
     if (spec.mode_gate) std.mem.writeInt(u16, d[eng_native_at + 1 ..][0..2], @intCast(cur - (eng_native_at + 3)), .little);
+    if (spec.mode_gate and spec.mode_hi != 0) std.mem.writeInt(u16, d[eng_native2_at + 1 ..][0..2], @intCast(cur - (eng_native2_at + 3)), .little);
     put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x28 }); // PLA / PLP
     const nat_jml_at = cur;
     put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML tramp (patched)
     // the SA-1's arrival: gameplay -> the lap; else hand back and wait.
     std.mem.writeInt(u16, d[eng_sa1_at + 1 ..][0..2], @intCast(cur - (eng_sa1_at + 3)), .little);
     var sa1_back_at: usize = 0;
+    var sa1_back2_at: usize = 0;
     if (spec.mode_gate) {
         put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // 16-bit (REP #$20 is live)
         put(d, &cur, &.{ 0x29, 0xFF, 0x00, 0xC9, spec.mode_value, 0x00 });
-        sa1_back_at = cur;
-        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE hand back (patched)
+        if (spec.mode_hi == 0) {
+            sa1_back_at = cur;
+            put(d, &cur, &.{ 0xD0, 0x00 }); // BNE hand back (patched)
+        } else {
+            sa1_back_at = cur;
+            put(d, &cur, &.{ 0x90, 0x00 }); // BCC hand back (patched): below lo
+            put(d, &cur, &.{ 0xC9, spec.mode_hi +% 1, 0x00 }); // CMP #hi+1
+            sa1_back2_at = cur;
+            put(d, &cur, &.{ 0xB0, 0x00 }); // BCS hand back (patched): above hi
+        }
     }
     put(d, &cur, &.{ 0x68, 0x28 }); // PLA / PLP
     const sa1_lap_jml_at = cur;
@@ -6309,6 +6335,7 @@ fn emitSplit(
     var sa1_wait_jmp_at: usize = 0;
     if (spec.mode_gate) {
         d[sa1_back_at + 1] = @intCast(cur - (sa1_back_at + 2));
+        if (spec.mode_hi != 0) d[sa1_back2_at + 1] = @intCast(cur - (sa1_back2_at + 2));
         put(d, &cur, &.{ 0xC2, 0x30, 0x68, 0x8F, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x00 });
         put(d, &cur, &.{ 0x8A, 0x8F, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0x00 });
         put(d, &cur, &.{ 0x98, 0x8F, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8), 0x00 });

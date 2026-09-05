@@ -289,6 +289,7 @@ const Args = struct {
     wg_split_dbr: u8 = 0,
     wg_split_mode_cell: u16 = 0,
     wg_split_mode_value: u8 = 0,
+    wg_split_mode_hi: u8 = 0,
     wg_split_mode: bool = false,
     wg_split_io: [26]core.sa1gen.SplitIo = undefined,
     n_wg_split_io: usize = 0,
@@ -3066,6 +3067,7 @@ fn runSa1Gen(
             .tail_dbr = args.wg_split_dbr,
             .mode_cell = args.wg_split_mode_cell,
             .mode_value = args.wg_split_mode_value,
+            .mode_hi = args.wg_split_mode_hi,
             .mode_gate = args.wg_split_mode,
             .shared_sites = args.wg_split_shared,
         } else null;
@@ -5529,7 +5531,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, ':');
             out.wg_split_mode_cell = try std.fmt.parseInt(u16, pit.next().?, 16);
-            out.wg_split_mode_value = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+            // "<cell>:<lo>[-<hi>]": a range takes the SA-1 through every mode in it
+            const vals = pit.next() orelse return error.MissingValue;
+            var rit = std.mem.splitScalar(u8, vals, '-');
+            out.wg_split_mode_value = try std.fmt.parseInt(u8, rit.next().?, 16);
+            if (rit.next()) |hi| out.wg_split_mode_hi = try std.fmt.parseInt(u8, hi, 16);
             out.wg_split_mode = true;
         } else if (std.mem.eql(u8, a, "--wg-split-io")) {
             // "<hex4>[:d][:l]" — d = deferred (handshake body, pump-only
