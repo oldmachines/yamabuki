@@ -5563,8 +5563,10 @@ fn emitSplit(
     // $3794+, inside the declared ranges only. The pump feeds the cells
     // continuously post-engage; boot-path readers outside the ranges
     // keep the real registers.
+    var displaced: [512]Displaced = undefined;
+    var n_displaced: u32 = 0;
     if (spec.tail == 0) {
-        try emitSplitReaders(out, usage, spec, far, carve, carve_len, refusal);
+        try emitSplitReaders(out, usage, spec, far, carve, carve_len, &displaced, &n_displaced, refusal);
     } else for (spec.vbl_ranges) |r| {
         var pc: u32 = r[0];
         while (pc < r[1]) {
@@ -6185,8 +6187,8 @@ fn emitSplit(
     put(d, &cur, &.{ 0xD0, 0x03 }); // BNE the S-CPU path
     const eng_sa1_at = cur;
     put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the SA-1 arrival (patched)
-    // S-CPU: I-RAM open (every cell store below needs it), then the gate.
-    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, 0xFF, 0x8F, 0x29, 0x22, 0x00 }); // SIWP
+    // S-CPU: the gate (I-RAM was opened by the shim at reset).
+    put(d, &cur, &.{ 0xE2, 0x20 });
     var eng_native_at: usize = 0;
     if (spec.mode_gate) {
         put(d, &cur, &.{ 0xC2, 0x20, 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // LDA $00:home (16-bit)
@@ -6283,7 +6285,7 @@ fn emitSplit(
     const onward: u24 = @intCast(@as(u32, ml24) + mlspan);
     put(d, &cur, &.{ 0x5C, @truncate(onward), @truncate(onward >> 8), @truncate(onward >> 16) });
 
-    try emitSplitIoBanked(out, usage, spec, d, &cur, base16, tbl_lo_at, tbl_bank_at, far, carve, carve_len, refusal, res);
+    try emitSplitIoBanked(out, usage, spec, d, &cur, base16, tbl_lo_at, tbl_bank_at, far, carve, carve_len, &displaced, &n_displaced, refusal, res);
 
     if (cur > wg_window_shim_max + split_disp_max)
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
@@ -6304,6 +6306,14 @@ fn emitSplit(
         for (math_sites[0..n_math_sites]) |ms| {
             const f = splitFile(ms.addr);
             out[f..][0..3].* = ms.bytes;
+        }
+        // ... and its IO entries and readers too: the S-CPU's own eras run
+        // stock bytes everywhere but the anchor. (When the SA-1 owns the
+        // loop the mapper shows the S-CPU the upper copy, whose stubs and
+        // readers still serve its NMI handler and the pump's replays.)
+        for (displaced[0..n_displaced]) |ds| {
+            const f = splitFile(ds.addr);
+            @memcpy(out[f..][0..ds.len], ds.bytes[0..ds.len]);
         }
         res.stats.split_dual = true;
     }
@@ -6330,6 +6340,8 @@ fn emitSplitIoBanked(
     far: *FarPad,
     carve: u32,
     carve_len: u32,
+    disp: *[512]Displaced,
+    n_disp: *u32,
     refusal: *?Refusal,
     res: *Result,
 ) Error!void {
@@ -6365,21 +6377,26 @@ fn emitSplitIoBanked(
         @memcpy(out[tat .. tat + tc], tb[0..tc]);
         tramp24[i] = (@as(u24, bank_byte) << 16) | t16;
 
-        // The enqueue stub, in the same bank.
+        // The enqueue stub, in the same bank. The CPU test comes FIRST and
+        // the S-CPU's path is an early exit (~35 cycles: measured, the full
+        // capture on every native-era call cost a razor-edge transition lap
+        // its vblank, one lag frame, and a permanent fork); only the SA-1
+        // captures and enqueues.
         var fb: [200]u8 = undefined;
         var fc: usize = 0;
-        // A comes back from the STACK, not from the cell: a cell store the
-        // S-CPU makes with SIWP closed bounces, and reading it back handed
-        // every boot-time IO body a garbage A.
+        put(&fb, &fc, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP / REP #$20 / PHA / TSC & $F000 == $3000?
+        const scpu_at = fc;
+        put(&fb, &fc, &.{ 0xD0, 0x00 }); // BNE the S-CPU exit (patched)
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP — the caller's A and P back
+        // A comes back from the STACK, not from the cell: a cell store made
+        // with SIWP closed bounces, and reading it back handed every
+        // boot-time IO body a garbage A.
         put(&fb, &fc, &.{ 0x08, 0xC2, 0x30, 0x48 }); // PHP / REP #$30 / PHA
         put(&fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
         put(&fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
         put(&fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
         put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP — caller state fully intact
         put(&fb, &fc, &.{ 0x48, 0xDA, 0x5A, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHY/PHP/SEP #$30
-        put(&fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
-        const not_sa1_at = fc;
-        put(&fb, &fc, &.{ 0xD0, 0x00 }); // BNE the common tail (patched)
         // Caller D/DBR/P to the replay; enqueue; wait if deferred.
         put(&fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00, 0xE2, 0x20 });
         put(&fb, &fc, &.{ 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
@@ -6394,9 +6411,15 @@ fn emitSplitIoBanked(
             put(&fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
             put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
             put(&fb, &fc, &[_]u8{if (io.rtl) 0x6B else 0x60}); // pop the GAME frame, in the body's own bank
+        } else {
+            put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+            @memcpy(fb[fc .. fc + span], out[splitFile(io.entry)..][0..span]);
+            fc += span;
+            put(&fb, &fc, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) }); // back into the body
         }
-        fb[not_sa1_at + 1] = @intCast(fc - (not_sa1_at + 2));
-        put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+        // the S-CPU: A and P back, the prefix, the body
+        fb[scpu_at + 1] = @intCast(fc - (scpu_at + 2));
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP
         @memcpy(fb[fc .. fc + span], out[splitFile(io.entry)..][0..span]);
         fc += span;
         put(&fb, &fc, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) }); // back into the body
@@ -6417,6 +6440,10 @@ fn emitSplitIoBanked(
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
         const f = splitFile(io.entry);
+        if (n_disp.* == disp.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        disp[n_disp.*] = .{ .addr = io.entry, .len = @intCast(span), .bytes = undefined };
+        @memcpy(disp[n_disp.*].bytes[0..span], out[f..][0..span]);
+        n_disp.* += 1;
         out[f] = 0x4C; // JMP stub — bank-local, frameless
         std.mem.writeInt(u16, out[f + 1 ..][0..2], stub16[i], .little);
         if (span > 3) @memset(out[f + 3 ..][0 .. span - 3], 0xEA);
@@ -6437,7 +6464,7 @@ fn emitSplitIoBanked(
 /// long form when the opcode has one — the SA-1's DBR is whatever the
 /// game left) after restoring the caller's P, so the flags the branch
 /// after the read looks at are the load's own.
-fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad, carve: u32, carve_len: u32, refusal: *?Refusal) Error!void {
+fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad, carve: u32, carve_len: u32, disp: *[512]Displaced, n_disp: *u32, refusal: *?Refusal) Error!void {
     for (spec.vbl_ranges) |r| {
         // Keyed on the coverage map's instruction starts, not decoded from
         // the range's first byte: a range given by hand starts wherever it
@@ -6484,6 +6511,10 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
                         return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(hc) });
                     @memcpy(out[at .. at + hc], hb[0..hc]);
                     const h16: u16 = @intCast(0x8000 + (at % 0x8000));
+                    if (n_disp.* == disp.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(pc) });
+                    disp[n_disp.*] = .{ .addr = @intCast(pc), .len = 3, .bytes = undefined };
+                    @memcpy(disp[n_disp.*].bytes[0..3], out[f..][0..3]);
+                    n_disp.* += 1;
                     out[f] = 0x20; // JSR helper — bank-local, the same 3 bytes
                     std.mem.writeInt(u16, out[f + 1 ..][0..2], h16, .little);
                 }
@@ -6505,9 +6536,10 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 /// dividend). Each site is displaced by a bank-local JSR (the same 3
 /// bytes) to a helper in its own bank; no neighbouring instruction is
 /// copied.
-/// A math site the shadow displaced, with the bytes it replaced — so the
+/// A site the split displaced, with the bytes it replaced — so the
 /// S-CPU's copy of the game can have them back (see the dual image).
 const MathSite = struct { addr: u24, bytes: [3]u8 };
+const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
 
 fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
