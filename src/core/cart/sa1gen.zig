@@ -6332,12 +6332,14 @@ fn emitSplitIoBanked(
         // The enqueue stub, in the same bank.
         var fb: [200]u8 = undefined;
         var fc: usize = 0;
-        put(&fb, &fc, &.{ 0x08, 0xC2, 0x30 }); // PHP / REP #$30
+        // A comes back from the STACK, not from the cell: a cell store the
+        // S-CPU makes with SIWP closed bounces, and reading it back handed
+        // every boot-time IO body a garbage A.
+        put(&fb, &fc, &.{ 0x08, 0xC2, 0x30, 0x48 }); // PHP / REP #$30 / PHA
         put(&fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
         put(&fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
         put(&fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
-        put(&fb, &fc, &.{ 0xAF, @truncate(split_cell_a), 0x37, 0x00 }); // A back
-        put(&fb, &fc, &.{0x28}); // PLP — caller state fully intact
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP — caller state fully intact
         put(&fb, &fc, &.{ 0x48, 0xDA, 0x5A, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHY/PHP/SEP #$30
         put(&fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
         const not_sa1_at = fc;
@@ -8868,6 +8870,10 @@ pub fn convertWholeGame(
         }
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
+        // The mainloop split's stubs and COP handler store into I-RAM from
+        // the S-CPU from the first frame on (boot-time IO calls, boot-time
+        // math), long before the engage stub's own SIWP open: open it here.
+        if (ml_split != null) wn = emitStore(d, wn, 0x2229, 0xFF);
         if (boot) |b| {
             // Boot the SA-1 into the window dispatcher; the async busy
             // flag starts idle (I-RAM is garbage at power-on, and SIWP
