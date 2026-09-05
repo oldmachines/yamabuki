@@ -1560,6 +1560,9 @@ output byte-identical:
   once and read back after. Cold 62 min, warm 16.7 min on the same recipe,
   same image to the byte, same "newly covered" numbers line for line; 50 MB
   for 19 pairs. Bump `harvest_cache_version` when the profiler changes.
+- `--sa1-report` prints the **offload census** (§10): the frame split into
+  main-loop work, handler work and idle, and the main loop's hardware
+  register touches per frame by class, register and site.
 - `--harvest-jobs N` (default: cores, at most 12): pairs that still need a
   replay run on worker threads, spawned ahead in recipe order, merged on the
   main thread in recipe order — the union and the log are the same at any
@@ -1743,7 +1746,116 @@ Method traps that cost real time and are worth internalizing:
   NVIDIA card once pointed at `<repo>/shaders` (`crt-easymode-halation`,
   `essl300`); `,`/`.` cycle the ten baked presets in the player.
 
-## 10. Commit index
+## 10. Preparing the game-loop offload — the census (2026-09-05)
+
+The window conversion carries the SA-1 for its RAM and leaves the game on
+the S-CPU; the speedup, if there is one, is the **S5 mainline split**
+(`SA1_CONVERSION_LEARNINGS.md` §25-§29): the S-CPU keeps the interrupt
+handlers and a pump that replays the loop's hardware IO, the SA-1 runs the
+main loop in place. Before drawing that boundary on Super Metroid, three
+numbers had to exist: how much of the frame the main loop's own work is
+(the share an offload can take), what the handlers keep, and every
+hardware register the loop touches (each one a marshalled request, since
+the SA-1 cannot reach the PPU, DMA, APU ports or the joypad). The
+`--sa1-report` now prints them (§5, "offload census"), and the per-poll
+takes (§4n) let real play be the input.
+
+**The loop.** `$82:8948..$897F`: three per-frame JSLs, the game-state
+dispatcher `JSR ($8981,X)` on `$0998`, three more, then `JSL $80:8338` —
+the NMI wait, a WRAM spin on `$05B4` set by the handler. The pad is read in
+the handler (`$80:945C`: `$4212` auto-joy wait, `LDA $4218`), which is the
+poll-lockstep tick, and it stays native on the S-CPU — no displacement.
+
+**Time split, three stock takes** (profiled after 300 boot frames):
+
+| take | frames | main-loop work | NMI/IRQ work | idle | lag frames | main > 90% alone |
+|---|---|---|---|---|---|---|
+| the v62 take migrated (Crateria/Brinstar) | 13,400 | 43% (max 100%) | 7% (max 100%) | 50% | 518 (509 main-led) | 1,021 |
+| Bomb Torizo | 23,472 | 45% (max 100%) | 7% (max 75%) | 48% | 1,512 (1,486) | 2,709 |
+| green Brinstar (`--continue` take) | 78,500 | 48% (max 100%) | 7% (max 100%) | 45% | 4,526 (4,437) | 6,573 |
+| power-on to Brinstar (Ceres, intro, Crateria) | 137,200 | 39% (max 100%) | 7% (max 100%) | 54% | 4,491 (4,477) | 49,542 |
+
+Read: the handlers cost a flat 7% of the frame; the main loop is 39-48%
+on average and the whole frame at its peaks, and in 98% of the lag frames
+it is the main loop, not the handler, that overran. The share an offload
+can take off the S-CPU is real. The routines behind the dropped frames are
+the same five on every take — `$82:DAA6`/`$82:DA4A` (level-data block
+lookup), `$80:B0FF`/`$80:B271` (the decompressor), `$80:8059` (the APU
+upload handshake) — load and transition work rather than the fight, which
+is where the SA-1's speed would show first.
+
+**The main loop's hardware traffic** (register touches per frame; the
+handler's own ~100/frame are PPU/DMA uploads that stay where they are):
+
+| class | migrated take | Torizo | green Brinstar | power-on | what it is |
+|---|---|---|---|---|---|
+| mul/div `$4202-$4206`, `$4214-$4217` | 52.5 | 70.5 | 60.8 | 46.5 | the S-CPU's multiplier and divider, from `$80:8116`, `$81:A0xx`, `$8B:9175`, `$82:DEDC`, enemy AI |
+| `$4212` polls | 5.5 | 52.8 | 49.2 | 14.7 | vblank/hblank waits `$80:843C`, `$80:8525`, `$80:82C9` — idle time, but MMIO reads |
+| joypad `$4218/$4219` | 0.0 | 99.0 | 96.1 | 16.8 | direct pad reads in main-loop context: `$85:84AA` (message box), `$80:9465` (the handler's reader, called from the loop) |
+| APU `$2140-$2143` | 45.5 | 46.7 | 8.1 | 15.8 | the sound engine's port handshake from the loop: `$80:8040..80DC`, `$80:8F27`, `$82:8A0E..8A80`; `$80:8059` spins on the SPC echo |
+| PPU `$2117-$2119`, `$213A` | 5.2 | 5.3 | 2.2 | 14.2 | VRAM writes outside the handler: `$80:B352..B404` (decompressor to VRAM), `$8B:9C1C` |
+| DMA `$420B`, `$43xx` | 0.1 | 0.1 | 0.0 | 0.1 | room-transition setups `$8B:9190`, `$80:8782` |
+
+**Mapping onto the split's disciplines.**
+
+- Mul/div: 50-70 touches per frame, the largest class — and the cheapest.
+  The split already rewrites multiply sites to an engaged-discriminated
+  helper (`SplitSpec.split_mul`); the SA-1 has its own multiplier and
+  divider (`$2250-$225D`, results at `$2306-$230A`), so this class costs no
+  marshalling at all once the divide sites (`$4204-$4206`, `$4214-$4215`)
+  join the helper.
+- `$4212` and joypad reads: the `vbl_ranges` mirror — the pump feeds I-RAM
+  mirror cells, the loop's readers swap to them. The message box's
+  `$85:84AA` and the loop-called `$80:9465` are the ranges. The vblank
+  waits are the frame fence, which is what the split wants them to be.
+- APU: the real blocker to price. 8-47 touches per frame, and `$80:8059`
+  is a handshake body (read-waits on the echo) — `deferred` IO in split
+  terms, pump-only post-engage; the port pumps (`$80:8040` family) are
+  candidates for ring 2 (fire-and-forget) only if the queue-interleave law
+  allows (§26 of the learnings: a "sound call" that appends to a queue the
+  loop flushes stays RPC). The census gives the per-site list to decide
+  each one from what its body touches.
+- PPU and DMA from the loop: 2-5 per frame, all in the decompressor's VRAM
+  path and the transition setups — ordered RPC (ring 1), or the whole
+  decompressor left native (it is a leaf the loop calls; the pump can run
+  it on the S-CPU while the SA-1 waits, which is the sync flavor that won
+  on Gradius III).
+
+**What the generator lacks for this shape** — the concrete work before a
+first attempt:
+
+1. The split's addresses are 16-bit, bank-`$00` file offsets
+   (`out[spec.mainloop - 0x8000]`, `JML ... $00`): Gradius III lives in
+   bank `$00`. Super Metroid's loop is at `$82:8949`, its IO routines in
+   `$80`, `$85`, `$8B`, `$82`: the anchor, the IO entries and the vbl
+   ranges need 24-bit addresses and per-bank carves for the trampolines.
+2. The engage anchor must be 4 whole instructions with no branch:
+   `$82:8949 REP #$30 / JSL $88:84B9` qualifies (5 bytes, two
+   instructions), with the mode gate on `$0998` (`--wg-split-mode` on
+   the game state, gameplay `$08` only — door transitions `$09-$0B`
+   and loads run nested-native, exactly the frames the census shows the
+   decompressor owning).
+3. The divide sites (`$4204-$4206`, `$4214-$4215`) added to the mul
+   helper, with the SA-1's 16/8 semantics matched (the S-CPU's divider
+   is 16/8 with remainder; the SA-1's is 16/16).
+4. The APU discipline per site, from the census's PC list.
+
+Then the first attempt is the existing loop: generate, `--stale`, the
+behavioral tier on the per-poll takes (a split removes lag, so the pixel
+gate diverges by design and the tick-locked comparison is the judge, §29
+of the learnings), and the token as proof of life.
+
+**Instrument notes.** `FrameSample.int_work`/`main_work` split `work` by
+interrupt depth at credit time (staged loop cycles settle a few
+instructions late; totals stay exact). `profile.Census` counts every
+`$21xx`/`$42xx`/`$43xx`/`$4016-17` touch by context, register and up to 6
+sites. One bug found on the way: a per-poll feed takes the poll latch
+between frames, and the profiler's frame boundary sits at vblank start
+with the game's poll after it — so every frame read as dropped until the
+console started remembering a consumed poll for the boundary
+(`polled_consumed`).
+
+## 11. Commit index
 
 - `4577111`,`9f7e475`,`10442ad`,`213bb3a`,`f9fcb7e`,`15f77a3`,`22fd4a2` —
   the generator/provenance fixes (§2).
