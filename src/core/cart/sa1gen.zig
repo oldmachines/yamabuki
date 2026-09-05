@@ -6121,12 +6121,12 @@ fn emitSplit(
     const pump16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
     put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), @truncate(split_vbl_mirror >> 8) });
-    put(d, &cur, &.{ 0xC2, 0x20 }); // REP #$20 -- pads as words
-    var pi: u16 = 0;
-    while (pi < 8) : (pi += 2) {
-        put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pi), 0x42, 0x8D, @truncate(split_pad_mirror + pi), @truncate((split_pad_mirror + pi) >> 8) });
-    }
-    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
+    // The PAD mirrors are NOT fed here: a read of $4218-$421F is a poll,
+    // and the verifier pairs the two runs poll-for-poll — a pump reading
+    // the pads thousands of times a frame generated ticks on frames stock
+    // never polled (measured: a 4-frame tick skew and a fork from it).
+    // The game's own poll feeds them: the reader helper the NMI handler's
+    // pad read wears stores what it read (see emitSplitReaders).
     put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
     const bne_drain_at = cur;
     put(d, &cur, &.{ 0xD0, 0x00 }); // BNE drain (patched)
@@ -6496,11 +6496,29 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
                         0xAD, 0xCD, 0x0D, 0x2D, 0x4D, 0x6D, 0xED => op | 0x02,
                         else => null,
                     };
-                    var hb: [32]u8 = undefined;
+                    var hb: [40]u8 = undefined;
                     var hc: usize = 0;
                     put(&hb, &hc, &.{ 0x08, 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP / REP #$20 / TSC / AND / CMP
-                    put(&hb, &hc, &.{ 0xF0, 0x05 }); // BEQ the SA-1 read
-                    put(&hb, &hc, &.{ 0x28, op, @truncate(v), @truncate(v >> 8), 0x60 }); // PLP / the read, real / RTS
+                    // A pad LOAD on the S-CPU also feeds the mirror (STA/STX/STY
+                    // leave the flags alone, so the branch after the read still
+                    // sees the load's own): the game's poll is the feed.
+                    const feed_op: ?u8 = if (v >= 0x4218) switch (op) {
+                        0xAD => @as(u8, 0x8F), // STA long
+                        0xAE => @as(u8, 0x8E), // STX abs (I-RAM aliases in every code bank)
+                        0xAC => @as(u8, 0x8C), // STY abs
+                        else => null,
+                    } else null;
+                    const scpu_len: u8 = if (feed_op) |fo| (if (fo == 0x8F) 9 else 8) else 5;
+                    put(&hb, &hc, &.{ 0xF0, scpu_len }); // BEQ the SA-1 read
+                    put(&hb, &hc, &.{ 0x28, op, @truncate(v), @truncate(v >> 8) }); // PLP / the read, real
+                    if (feed_op) |fo| {
+                        if (fo == 0x8F) {
+                            put(&hb, &hc, &.{ 0x8F, @truncate(mirror), @truncate(mirror >> 8), 0x00 });
+                        } else {
+                            put(&hb, &hc, &.{ fo, @truncate(mirror), @truncate(mirror >> 8) });
+                        }
+                    }
+                    put(&hb, &hc, &.{0x60}); // RTS
                     if (long_op) |lo| {
                         put(&hb, &hc, &.{ 0x28, lo, @truncate(mirror), @truncate(mirror >> 8), 0x00, 0x60 });
                     } else {
