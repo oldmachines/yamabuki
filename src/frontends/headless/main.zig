@@ -2189,7 +2189,7 @@ fn runGenerate(
         error.GenFailed => {
             switch (failure.?) {
                 .refused => |r| {
-                    try out.print("refused: {s}\n", .{r.reason.describe()});
+                    try out.print("refused: {s} (detail ${x:0>6})\n", .{ r.reason.describe(), r.detail });
                     switch (r.reason) {
                         .memsel_store_unpatchable => if (r.detail != 0) try out.print(
                             "  the store at ${x:0>2}:{x:0>4} is not a plain STZ/STA $420D\n",
@@ -3059,7 +3059,7 @@ fn runSa1Gen(
         var res = converted catch |e| switch (e) {
             error.Refused => {
                 const r = refusal.?;
-                try out.print("refused: {s}\n", .{r.reason.describe()});
+                try out.print("refused: {s} (detail ${x:0>6})\n", .{ r.reason.describe(), r.detail });
                 // Most whole-game refusals name the instruction that caused
                 // them; without the address the message is a dead end.
                 switch (r.reason) {

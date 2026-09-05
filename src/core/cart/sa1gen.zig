@@ -5553,7 +5553,9 @@ fn emitSplit(
     // $3794+, inside the declared ranges only. The pump feeds the cells
     // continuously post-engage; boot-path readers outside the ranges
     // keep the real registers.
-    for (spec.vbl_ranges) |r| {
+    if (spec.tail == 0) {
+        try emitSplitReaders(out, usage, spec, far, carve, carve_len, refusal);
+    } else for (spec.vbl_ranges) |r| {
         var pc: u32 = r[0];
         while (pc < r[1]) {
             const f = splitFile(@intCast(pc));
@@ -6375,6 +6377,71 @@ fn emitSplitIoBanked(
     }
     res.stats.split_io = @intCast(spec.io_entries.len);
     curp.* = cur;
+}
+
+/// The mainloop flavor's `$4212` / joypad readers. A reader the game shares
+/// between boot and gameplay (Super Metroid's four-vblank wait at
+/// `$80:8436`, measured: the boot hung in it once the operand was swapped
+/// to a mirror nobody fed yet) cannot simply read the mirror: on the
+/// S-CPU the real register is right, always; only the SA-1 needs the
+/// pump-fed cell. Each 3-byte absolute read of `$4212`/`$4218-$421F` in
+/// the declared ranges becomes a bank-local JSR to a helper in the
+/// site's bank that discriminates by stack page and performs the SAME
+/// opcode against the register (S-CPU) or the mirror (SA-1, through a
+/// long form when the opcode has one — the SA-1's DBR is whatever the
+/// game left) after restoring the caller's P, so the flags the branch
+/// after the read looks at are the load's own.
+fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad, carve: u32, carve_len: u32, refusal: *?Refusal) Error!void {
+    for (spec.vbl_ranges) |r| {
+        var pc: u32 = r[0];
+        while (pc < r[1]) {
+            const f = splitFile(@intCast(pc));
+            const op = out[f];
+            const u = splitUsage(usage, @intCast(pc));
+            const m8 = u & usage_map.flag_m != 0;
+            const x8 = u & usage_map.flag_x != 0;
+            const len = usage_map.instrLen(op, m8, x8);
+            const is_read = switch (op) {
+                0xAD, 0xAE, 0xAC, 0x2C, 0xCD, 0xEC, 0xCC, 0x0D, 0x2D, 0x4D, 0x6D, 0xED => true,
+                else => false,
+            };
+            if (len == 3 and is_read and u & usage_map.flag_opcode != 0) {
+                const v = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
+                const mirror: u16 = if (v == 0x4212)
+                    split_vbl_mirror
+                else if (v >= 0x4218 and v <= 0x421F)
+                    split_pad_mirror + (v - 0x4218)
+                else
+                    0;
+                if (mirror != 0) {
+                    // A-register ops have a long form (op | $02); the rest
+                    // read the mirror through the DBR.
+                    const long_op: ?u8 = switch (op) {
+                        0xAD, 0xCD, 0x0D, 0x2D, 0x4D, 0x6D, 0xED => op | 0x02,
+                        else => null,
+                    };
+                    var hb: [32]u8 = undefined;
+                    var hc: usize = 0;
+                    put(&hb, &hc, &.{ 0x08, 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP / REP #$20 / TSC / AND / CMP
+                    put(&hb, &hc, &.{ 0xF0, 0x05 }); // BEQ the SA-1 read
+                    put(&hb, &hc, &.{ 0x28, op, @truncate(v), @truncate(v >> 8), 0x60 }); // PLP / the read, real / RTS
+                    if (long_op) |lo| {
+                        put(&hb, &hc, &.{ 0x28, lo, @truncate(mirror), @truncate(mirror >> 8), 0x00, 0x60 });
+                    } else {
+                        put(&hb, &hc, &.{ 0x28, op, @truncate(mirror), @truncate(mirror >> 8), 0x60 });
+                    }
+                    const bank: u32 = (pc >> 16) & 0x7F;
+                    const at = far.nextIn(bank, @intCast(hc), if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
+                        return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(hc) });
+                    @memcpy(out[at .. at + hc], hb[0..hc]);
+                    const h16: u16 = @intCast(0x8000 + (at % 0x8000));
+                    out[f] = 0x20; // JSR helper — bank-local, the same 3 bytes
+                    std.mem.writeInt(u16, out[f + 1 ..][0..2], h16, .little);
+                }
+            }
+            pc += len;
+        }
+    }
 }
 
 /// The math shadow (mainloop flavor). The S-CPU's multiplier and divider
@@ -10882,8 +10949,8 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     // The anchors wear their displacements.
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x0040]); // JMP enq
-    // The mainloop's $4212 reads look at the mirror now.
-    try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x0019..0x001B], .little));
+    // The mainloop's $4212 read goes through a reader helper now.
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0018]);
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
@@ -11035,7 +11102,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expect(std.mem.readInt(u16, res.image[0x8081..0x8083], .little) >= 0x8000); // a bank-$01 stub
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x0060]); // JMP stub at $00:8060
     try testing.expectEqual(@as(u8, 0x22), res.image[0x800E]); // JSL math helper at STA $4202
-    try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x8008..0x800A], .little));
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
@@ -11059,9 +11126,21 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     // the shadow's product, quotient and remainder equal the S-CPU's.
     try testing.expect(trace.total > 0);
     try testing.expect(laps >= 6);
-    try testing.expectEqual(@as(u16, laps *% 156), acc_mul);
-    try testing.expectEqual(@as(u16, laps *% 142), acc_q);
-    try testing.expectEqual(@as(u16, laps *% 6), acc_r);
+    // The run stops mid-lap: the lap in flight may have done its sums and
+    // not yet counted itself, so the totals stand for `laps` or `laps + 1`
+    // laps — the same number for all three.
+    // (the lap in flight may also have stopped BETWEEN its three sums, so
+    // each total is exact for its own count, the counts descending)
+    const k_mul: u16 = acc_mul / 156;
+    const k_q: u16 = acc_q / 142;
+    const k_r: u16 = acc_r / 6;
+    try testing.expect(k_mul == laps or k_mul == laps + 1);
+    try testing.expect(k_q == laps or k_q == laps + 1);
+    try testing.expect(k_r == laps or k_r == laps + 1);
+    try testing.expect(k_mul >= k_q and k_q >= k_r);
+    try testing.expectEqual(@as(u16, k_mul *% 156), acc_mul);
+    try testing.expectEqual(@as(u16, k_q *% 142), acc_q);
+    try testing.expectEqual(@as(u16, k_r *% 6), acc_r);
     // The IO routine's WMDATA writes landed in real WRAM — natively on the
     // S-CPU's laps, through the pump on the SA-1's.
     var wm_writes: usize = 0;
