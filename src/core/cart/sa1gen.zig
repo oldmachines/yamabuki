@@ -6515,7 +6515,12 @@ fn emitSplitIoBanked(
             put(&ab, &ac, &.{ 0xE2, 0x20, 0xA9, 0x6B, 0x8F, @truncate(split_args + args), @truncate((split_args + args) >> 8), 0x00, 0xC2, 0x20 }); // the RTL after them
             // the JSL frame (at $04,S past PHP and PHD) becomes the fake one
             put(&ab, &ac, &.{ 0xA9, @truncate(split_args - 1), @truncate((split_args - 1) >> 8), 0x83, 0x04 });
-            put(&ab, &ac, &.{ 0xE2, 0x20, 0xA9, 0x00, 0x83, 0x06, 0xC2, 0x30, 0x2B }); // bank $00 / PLD
+            // the frame's bank is the CALLER'S: a callee may record it as a data
+            // bank (Super Metroid's HDMA-object spawner stores it beside the list
+            // pointer it took from the arguments — measured: bank $00 there sent
+            // the object's interpreter into ROM); I-RAM aliases in every code
+            // bank, so the argument bytes and the RTL after them read the same.
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xAF, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00, 0x83, 0x06, 0xC2, 0x30, 0x2B }); // bank / PLD
             put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_x), @truncate(split_asc_x >> 8), 0x00, 0xAA });
             put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_y), @truncate(split_asc_y >> 8), 0x00, 0xA8 });
             put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_a), @truncate(split_asc_a >> 8), 0x00, 0x28 }); // A, then PLP
