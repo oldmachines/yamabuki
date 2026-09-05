@@ -466,6 +466,10 @@ pub const Routine = struct {
     /// Of the calls, those made with a 3-byte frame (JSL): the routine's
     /// return shape, which a split's replay stub has to match.
     rtl_calls: u64,
+    /// It wrote WRAM while on top of the stack. A split IO routine that
+    /// does cannot be replayed on top of an SA-1 run of the same body (the
+    /// state would advance twice); it must be deferred.
+    writes_wram: bool,
     /// Entries made while an interrupt frame was on the stack (the handler's
     /// own dispatch included). `int_entries * 2 > calls` reads as "this
     /// routine lives in interrupt context" — the offload machinery's single
@@ -755,6 +759,7 @@ pub const Profiler = struct {
             .kind = .code,
             .calls = 0,
         .rtl_calls = 0,
+        .writes_wram = false,
             .int_entries = 0,
             .self_cycles = 0,
             .incl_cycles = 0,
@@ -887,8 +892,8 @@ pub const Profiler = struct {
         // moved routine would still have to reach, idle or not — so this runs
         // for every access, not just ones the wait classifier calls work.
         if (self.depth != 0) {
-            if (read) |addr| self.noteAccess(addr);
-            if (write) |addr| self.noteAccess(addr);
+            if (read) |addr| self.noteAccess(addr, false);
+            if (write) |addr| self.noteAccess(addr, true);
         }
         if (self.census_on) {
             const top: u24 = if (self.depth != 0) @intCast(self.routines[self.topSlot()].entry & 0xFF_FFFF) else 0;
@@ -952,10 +957,13 @@ pub const Profiler = struct {
     }
 
     /// Sort one data access into the routine on top of the stack's footprint.
-    fn noteAccess(self: *Profiler, addr: u24) void {
+    fn noteAccess(self: *Profiler, addr: u24, is_write: bool) void {
         const r = &self.routines[self.topSlot()];
         switch (classify(addr)) {
-            .wram => if (wramOffset(addr)) |off| r.noteWram(off),
+            .wram => if (wramOffset(addr)) |off| {
+                r.noteWram(off);
+                if (is_write) r.writes_wram = true;
+            },
             .mmio => r.noteMmio(@truncate(addr)),
             .sram => r.touches_sram = true,
             .rom => {},

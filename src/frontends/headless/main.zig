@@ -4276,7 +4276,10 @@ fn printOffloadCensus(out: *std.Io.Writer, samples: []const profile.FrameSample,
         try out.print("    split IO routines (main-loop routines touching hardware; :d = has reads, :l = JSL-called):\n", .{});
         for (ents[0..n_ents], 0..) |e, k| {
             const rtl = if (prof.routineInfo(e)) |r| r.rtl_calls * 2 > r.calls else false;
-            try out.print("      --wg-split-io {X:0>6}{s}{s}", .{ e, if (ent_read[k]) ":d" else "", if (rtl) ":l" else "" });
+            // Deferred when the routine READS hardware (a handshake) or WRITES
+            // WRAM (a body run on both CPUs would advance that state twice).
+            const wram_w = if (prof.routineInfo(e)) |r| r.writes_wram else false;
+            try out.print("      --wg-split-io {X:0>6}{s}{s}", .{ e, if (ent_read[k] or wram_w) ":d" else "", if (rtl) ":l" else "" });
             if (prof.routineInfo(e)) |r| {
                 try out.print("   ({} calls, regs", .{r.calls});
                 for (r.mmio_regs[0..r.n_mmio_regs]) |reg| try out.print(" ${X:0>4}", .{reg});
