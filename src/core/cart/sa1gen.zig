@@ -2975,7 +2975,7 @@ const WinBoot = struct { crv: u16, civ: u16 };
 /// The split flavor's carve budget: tok + mini-tok + sloop + the mul
 /// helper + up to 26 stub/trampoline pairs. Bank $00's whole padding
 /// run must cover shim + this.
-const split_disp_max: u32 = 1200;
+const split_disp_max: u32 = 1400;
 const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
@@ -6127,19 +6127,31 @@ fn emitSplit(
     // never polled (measured: a 4-frame tick skew and a fork from it).
     // The game's own poll feeds them: the reader helper the NMI handler's
     // pad read wears stores what it read (see emitSplitReaders).
-    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
-    const bne_drain_at = cur;
-    put(d, &cur, &.{ 0xD0, 0x00 }); // BNE drain (patched)
-    // Ring empty: does the loop still belong to the SA-1?
+    // The check-and-consume is a critical section: the NMI hook drains too,
+    // and one interrupting between the pump's check and its consume would
+    // take the entry and leave the pump replaying a stale slot. The
+    // in-replay cell marks the section; the hook stands down while set.
+    put(d, &cur, &.{ 0xEE, @truncate(split_in_replay), 0x37 }); // in_replay := 1
+    const drain_call_at = cur;
+    put(d, &cur, &.{ 0x20, 0x00, 0x00 }); // JSR drain_one (patched; returns at once when empty)
+    put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 }); // in_replay := 0
+    // Does the loop still belong to the SA-1?
     put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) });
     const beq_take_at = cur;
     put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ takeover (patched)
     put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
-    // drain: one entry — the caller's D/DBR/registers/widths come back
-    // from the stub's capture (RPC serializes, so one cell set holds),
-    // the dispatch goes through a 24-bit pointer with an RTL-shaped
-    // frame pushed by hand, and the release is the ack bump after.
-    d[bne_drain_at + 1] = @intCast(cur - (bne_drain_at + 2));
+    // drain_one (SEP #$30, DBR $00 on entry; RTS): one ring entry — the
+    // caller's D/DBR/registers/widths come back from the stub's capture
+    // (RPC serializes, so one cell set holds), the dispatch goes through a
+    // 24-bit pointer with an RTL-shaped frame pushed by hand, and the
+    // release is the ack bump after. Called by the pump, and by the NMI
+    // hook: a deferred call made just before the S-CPU's NMI would else
+    // wait the whole handler out, milliseconds per call.
+    const drain16: u16 = base16 + @as(u16, @intCast(cur));
+    std.mem.writeInt(u16, d[drain_call_at + 1 ..][0..2], drain16, .little);
+    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
+    const drain_empty_at = cur;
+    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the RTS (patched): nothing pending
     put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 }); // TAX / LDA ring,X / PHA
     put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 }); // rd consumes early
     put(d, &cur, &.{ 0x68, 0x0A, 0x0A, 0xAA }); // PLA / ASL / ASL / TAX -- id*4
@@ -6160,9 +6172,23 @@ fn emitSplit(
     put(d, &cur, &.{ 0x4B, 0xF4, @truncate(ret1 - 1), @truncate((ret1 - 1) >> 8) }); // PHK / PEA return-1
     put(d, &cur, &.{ 0xDC, @truncate(split_cell_t), 0x37 }); // JML [cell_t]
     std.debug.assert(base16 + @as(u16, @intCast(cur)) == ret1);
-    put(d, &cur, &.{ 0xE2, 0x30, 0x4B, 0xAB }); // widths, pump DBR back
+    put(d, &cur, &.{ 0xE2, 0x30, 0x4B, 0xAB }); // widths, DBR back
     put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
-    put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
+    d[drain_empty_at + 1] = @intCast(cur - (drain_empty_at + 2));
+    put(d, &cur, &.{0x60}); // RTS
+    // --- the NMI hook: drain a pending entry before the game's handler ---
+    // Everything the interrupted code had is put back before the JML, so
+    // the handler's own RTI pops the original frame. Widths are unknown at
+    // entry: PHP first, then REP #$30, so every push and pull is 16-bit.
+    const nmi_vec = std.mem.readInt(u16, out[0x7FEA..0x7FEC], .little);
+    const hook16: u16 = base16 + @as(u16, @intCast(cur));
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB, 0xE2, 0x30 }); // PHP / REP / PHA PHX PHY PHD PHB / PHK PLB / SEP #$30
+    put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 }); // the pump mid-drain? stand down
+    put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the call
+    put(d, &cur, &.{ 0x20, @truncate(drain16), @truncate(drain16 >> 8) });
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAB, 0x2B, 0x7A, 0xFA, 0x68, 0x28 }); // REP / PLB PLD PLY PLX PLA / PLP
+    put(d, &cur, &.{ 0x5C, @truncate(nmi_vec), @truncate(nmi_vec >> 8), 0x00 }); // JML the game's handler
+    std.mem.writeInt(u16, out[0x7FEA..0x7FEC], hook16, .little);
     // takeover (S-CPU): the SA-1 handed the loop back — its context is
     // in the cells; the game stack is where the S-CPU left it.
     d[beq_take_at + 1] = @intCast(cur - (beq_take_at + 2));
@@ -6209,6 +6235,7 @@ fn emitSplit(
     const eng_released_at = cur;
     put(d, &cur, &.{ 0xD0, 0x00 }); // BNE released (patched)
     put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 }); // ring reset (DBR is the game's: I-RAM aliases in every bank < $40 / $80-$BF)
+    put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 }); // no drain in flight
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := S-CPU until the SA-1 waits
     const eng_crv_at = cur;
     put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x03, 0x22, 0x00, 0xA9, 0x00, 0x8F, 0x04, 0x22, 0x00 }); // CRV (patched)
