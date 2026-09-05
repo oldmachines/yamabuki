@@ -1845,6 +1845,100 @@ behavioral tier on the per-poll takes (a split removes lag, so the pixel
 gate diverges by design and the tick-locked comparison is the judge, §29
 of the learnings), and the token as proof of life.
 
+**The generator work for the four gaps (2026-09-05, commit `03bac7e`).**
+
+1. *Bank-general split.* `SplitSpec`/`SplitIo` take 24-bit addresses.
+   The anchor's displaced span may run 4-8 bytes of whole flow-free
+   instructions (a JSL may ride — it returns into the copy; the site
+   keeps a JML and NOP fill), which is what `$82:8948`'s `PHP / REP #$30
+   / JSL $88:84B9` needs. Each IO routine's enqueue stub and drain
+   trampoline are emitted into the routine's OWN bank (`FarPad.nextIn`,
+   the bank-$00 carve reserved), so its RTS-shaped return and bank-local
+   jumps stay sound; the dispatch table is 24-bit and the pump calls
+   through it with a hand-pushed RTL frame (`PHK / PEA ret-1 / JML
+   [cell]`), restoring the caller's D, DBR, registers and widths from the
+   stub's capture. The pump's stack moved to real WRAM (`$1EFF`): the
+   stack page is the CPU discriminator, and a pump on an I-RAM page would
+   have made a replayed body's nested IO calls enqueue to the drain that
+   was busy running them.
+2. *Divide sites.* Rather than another strict idiom, the **math shadow**:
+   every covered absolute store or load of `$4202-$4206` / `$4214-$4217`
+   is displaced to a helper that runs the original on the S-CPU and, on
+   the SA-1, the same access against I-RAM cells — a write of `$4203`
+   (or a 16-bit write of `$4202`) computing the 8x8 product through the
+   SA-1's arithmetic unit, a write of `$4206` the unsigned 16/8 quotient
+   and remainder in software, exactly (divide by zero: quotient `$FFFF`,
+   remainder the dividend, as the hardware). A site whose span cannot be
+   formed is a listed hazard.
+3. *APU discipline.* The census now carries each site's routine and
+   reads vs writes, and the profiler counts JSL-shaped calls; the report
+   prints the split's IO routines as `--wg-split-io` lines (`:d` when the
+   routine has hardware READS — a handshake spins forever on the SA-1's
+   open bus — and `:l` when JSL-called) and the mirror ranges for the
+   main loop's `$4212`/joypad readers. `ff` has no frame-exit phase in
+   this flavor and is treated as deferred.
+4. *Mode gate.* A 16-bit low-WRAM cell read at its window home through
+   bank `$00`, both CPUs seeing the same BW-RAM byte. Ownership of the
+   loop changes hands at the anchor, once per lap at most: the SA-1 runs
+   laps while the cell holds the gameplay value, the S-CPU runs them
+   natively otherwise; context (A/X/Y/P/D/DBR, S on the S-CPU side)
+   crosses through I-RAM cells and an owner cell, the pump taking the
+   loop back only once its ring is drained.
+
+Tested end to end (`split mainloop: a second bank, the mode-gate handoff
+and the math shadow`): a bank-`$01` loop that flips the mode cell every
+lap, multiplies 12x13 and divides 1000/7 through the math registers and
+accumulates the results — the totals match the lap count exactly across
+both CPUs' laps; a bank-`$01` RTS-shaped IO routine's WMDATA writes land
+through the pump, a bank-`$00` deferred RTL one runs once per lap.
+
+The Super Metroid recipe the report suggests (the migrated take; the
+boot-only routines dropped, the NMI handler's pad reader `$80:945C`
+deliberately NOT mirrored — the poll-lockstep law):
+
+    --wg-split 828948 --wg-split-mode 0998:08
+    --wg-split-io 808F0C:d:l 8289EF:d:l 828A2C:d 828A55:d 828A6C:d 828A7C:d
+                  808028:d 808059:d 808CD8 88851C 8091A9:l 88829E:l 8882C1:l
+                  888435:l 80A23F:l 80A29C:l 80B271:d:l 8085F6:d 8B9B87:l
+                  818DDB 81A5F6 81AAAC 81A5B3 81A61C
+    --wg-split-vbl 808436-80844A 808520-808530 8082C6-8082D6 85849A-8584C0
+
+**The laps (2026-09-05).** Goal, confirmed with the player: the WHOLE
+game loop on the SA-1 — every lap of `$82:8948..$897F` and everything it
+calls — with the S-CPU keeping only the NMI handler and the pump. Land
+gameplay first (the mode gate on `$0998 == $08`), then widen to every
+era. Nine generations so far, each a measured failure and a fix:
+
+| lap | outcome | cause | fix (commit) |
+|---|---|---|---|
+| s1 | refused: prefix shape | `$81:AAAC` (a menu routine) opens with a JSR, which cannot be copied | dropped from the list; refusals now print their address |
+| s2 | boot hangs in the four-vblank wait `$80:843C` | a reader shared by boot and gameplay had its operand swapped to a mirror that only the pump feeds after engage | **reader helpers**: a bank-local JSR to a helper that reads the register on the S-CPU, the mirror on the SA-1 (460ead5) |
+| s3 | boot reaches frame 237, then the game's BRK trap | a math site displaced as a 4-byte span carried the `PHA` after `LDA $4216`; inside the helper's JSL frame the push corrupted the return | per-site helpers, no spans (0bebe23); the reader-range walk keyed on instruction starts |
+| s4 | refused: no free space | a math site in bank `$A6`, which has 63 free bytes | **the COP handler**: `COP nn / NOP` at each site, one bank-$00 handler, descriptors by bank and signature (aacdac3) |
+| s5 | diverges at frame 239 (the intro) | the stubs' capture read A back from an I-RAM cell the S-CPU's closed SIWP had bounced | the shim opens SIWP at reset; A comes back from the stack (a2624b5) |
+| s6 | RNG constant from its first call | the handler indexed its bank table by the raw bank byte (`$80`), past 64 entries | mask to six bits (7ed4a31) |
+| s7 | attract surface: wall-time echoes only; play-death forks at frame 239 | the S-CPU's own eras ran ~150 cycles slower per math access; the Ceres intro gained lag and the frame-counter-fed state forked for good | **the dual image**: an 8 MiB image whose lower copy keeps stock math bytes and whose upper copy carries the COPs, the mapper switched at each handoff (9db7871) |
+| s8 | attract: equivalent modulo one RNG-fork episode (v66's own verdict); play-death forks from tick ~8000 | thirteen IO routines declared "plain" (run on the SA-1 AND replayed) also write WRAM state — the VRAM DMA queue processor clears its queue, the HDMA table writer bumps its cursors — so that state advanced twice | every IO routine deferred; the report suggests `:d` for WRAM writers (e2041fb) |
+| s9 | in progress | | |
+
+Instruments this arc added: `--trace-clk from-to` around a stale site
+whose registers make no sense (a PC off an instruction boundary means the
+CPU is running data), `--watch` on the game state and the frame counter to
+pin a lag frame, the hash stream to find the first frame two images'
+pictures part, and the refusal detail address.
+
+**Where it stands.** The SA-1 runs the attract demo's gameplay laps and
+the behavioral tier returns for that surface exactly v66's verdict. The
+play-death surface reaches its gameplay with the loop on the SA-1 and
+forks later; s8's fork was the plain-discipline bug above, s9 tests the
+fix. Lag itself is the next question: a split removes lag by design, and
+a lag differential during a transition is expected — the tier's rule for
+Gradius III (§29 of the learnings) is that a fork healed by a scene reset
+is excused and a permanent one is not; Super Metroid's RNG has no scene
+reset, so a lag-fork signature (first bad cells = the wall-coupled
+counters and the RNG, at a tick where the lag differential changed) may
+need its own acceptance rule with liveness checks past it.
+
 **Instrument notes.** `FrameSample.int_work`/`main_work` split `work` by
 interrupt depth at credit time (staged loop cycles settle a few
 instructions late; totals stay exact). `profile.Census` counts every
@@ -1855,7 +1949,142 @@ with the game's poll after it — so every frame read as dropped until the
 console started remembering a consumed poll for the boundary
 (`polled_consumed`).
 
-## 11. Commit index
+## 11. Glossary
+
+Terms as this document uses them, in the order a reader meets them.
+
+**S-CPU.** The SNES's own 65816 at 3.58 MHz. **SA-1.** The cartridge's
+second 65816 at 10.74 MHz, with 2 KiB of **I-RAM** (fast, its own) and
+up to 256 KiB of **BW-RAM** (battery-backed, shared with the S-CPU through
+a movable 8 KiB **window** at `$6000-$7FFF` and linearly at banks
+`$40-$43`). The SA-1 cannot reach the PPU, the DMA unit, the APU ports or
+the joypad: those registers do not exist on its bus and read as
+**open bus**.
+
+**Window relocation (v17).** The conversion architecture that works for
+this game: the game keeps running on the S-CPU, its low 8 KiB of WRAM is
+moved into the BW-RAM window and its `$7E/$7F` references re-banked to
+`$40/$41`, so the whole working set lives where both CPUs can address it.
+The SA-1 is parked. **Abandoned home.** A WRAM address the relocation
+moved away from; an access that still lands there is a **stale read** (or
+write) — the `--stale` detector lists them with the PC that made them.
+
+**De-mirror map.** The bank translation the conversion applies because
+the SA-1's mapper (the **Super MMC**, registers `$2220-$2223`, mapping 1
+MiB **chunks** into the four bank regions C/D/E/F) does not reproduce the
+LoROM mirrors the game assumed: `$C0-$DF` references go to `$A0-$BF`
+(-`$20`), `$A0-$BF` ones to `$20-$3F` (-`$80`).
+
+**Coverage.** The set of instructions a recording actually executed,
+kept in the **usage map** (per CPU address: executed, opcode start,
+M/X widths, read/write). **Site.** One executed instruction that names
+memory. **Site evidence.** Per site, which classes of memory its
+accesses reached (low WRAM, the WRAM banks, ROM, MMIO) — what decides an
+ambiguous operand. **Provenance / proven byte.** A ROM byte a recording
+proved to feed an address (a pointer's bank byte, a DMA register), so the
+generator may rewrite it as data. **Harvest.** Replaying a **cover pair**
+— a recording plus the image it was recorded on — to collect coverage and
+evidence into the generator's union; cached per pair (`--harvest-cache`).
+**Stock take.** A recording made on the unmodified game, whose harvest
+proves bank bytes by provenance (a conversion-side replay can only
+classify them).
+
+**Code vs data (the dividing line).** An uncovered CODE site is fixed by
+coverage: record play that reaches it. A bank byte inside a DATA structure
+(a level pointer, an enemy header, a pointer table) is never executed, so
+no recording can prove it; it is fixed by a **net**: a structural,
+title-gated pass that reads the game's own structure (the room graph,
+the header table, the pointer idiom), validates every record, and
+translates the bank bytes it finds, leaving proven bytes alone. Eight
+nets exist for Super Metroid (§0.6).
+
+**Thunk.** A small generated routine a site is displaced to when one
+operand cannot serve every caller: the site becomes a JSR/JSL to the
+thunk, which performs the original operation with the operand chosen at
+run time (by the data bank, by the index's magnitude, by which CPU is
+running). **Far stub / far pool.** Generated code placed in the padding
+of some other bank (the far pool, walked from the top identity bank
+down), reached by a JML hop; `FarPad.nextIn` allocates in one named bank
+for shapes that must stay bank-local. **Carve.** The bank-`$00` region
+the conversion reserves for its scaffold: the boot **shim** (the reset
+code that installs the mapper, moves the stack and direct page into the
+window, opens the BW-RAM writes) and, in split mode, the pump and engage
+stubs. **Dispatch toll.** The cycles a displaced site pays to reach its
+thunk and back — window mode's only overhead.
+
+**Surface.** A movie the generator profiles AND verifies on both images
+(`--movie`); an **evidence movie** (`--evidence-movie`) only profiles.
+**Verification surface.** The same, seen from the verifier: the sequence
+it compares stock against the conversion on. **Cover pair.** A
+recording used only for coverage, bound to the image it was made on.
+**Anchor / anchored take.** A recording that starts from a save state
+(the machine at its first frame) rather than power-on; it replays only on
+the build whose state layout it carries. **Start save (`.start.srm`).**
+The battery save a power-on take began from, riding beside it; a
+power-on take with a start save carries no machine state and crosses
+builds.
+
+**Tick.** The game's own controller poll (a `$4218`/`$4016` read) — the
+one instant two differently-lagged runs share. **Behavioral tier.** The
+verifier that runs stock and the conversion **tick-locked** and compares
+the game's logic state at every tick, masking wall-coupled cells; it
+judges what the **pixel gate** (frame hash equality) cannot once timing
+differs. **Lag frame / dropped frame.** A frame in which the main loop did
+not complete a lap (the game never polled). **Lag differential.** The
+difference in lag frames between the two runs at the same tick.
+**Wall-time echoes.** Divergences that are only the lag differential
+showing through wall-coupled cells. **RNG fork.** A divergence of the
+random-number state; excused when healed by a scene reset.
+**Poll-lockstep law.** No generated or suppressed poll anywhere, or the
+tick pairing breaks. **Per-poll take (movie format 3).** A recording
+whose entries are indexed by tick, not frame: it replays on any build
+whose logic is behaviorally the same; `--repoll` migrates a frame-indexed
+one.
+
+**Hazard.** A covered instruction the split leaves unhandled that would
+misbehave on the SA-1 (an absolute MMIO read, a WAI/STP), listed by the
+audit. **Census.** The per-frame split of work by context (main loop,
+handlers, idle) and the main loop's hardware register touches by
+register and site, printed by `--sa1-report` (§10).
+
+**The mainloop split (S5).** The offload architecture: the S-CPU runs
+the game up to the loop's top (the **anchor**), where a displaced JML
+reaches the **engage stub**; from then on the **SA-1 runs the loop in
+place** — the same bytes — while the S-CPU sits in the **pump**: a loop
+that feeds the **mirror cells** (I-RAM copies of `$4212` and the joypad
+registers the SA-1 cannot read) and drains the **ring** of enqueued IO.
+**IO routine.** A routine the loop calls that writes hardware; its entry
+wears an **enqueue stub** that, on the SA-1, records the call (id and the
+caller's A/X/Y/P/D/DBR) in the ring; the pump replays it on the S-CPU
+through a **drain trampoline** that restores that context and runs the
+body for real. **Disciplines.** *Plain*: the SA-1 runs the body too (its
+hardware writes vanish) and the pump replays it — sound only for bodies
+that write nothing but registers. *Deferred (RPC, `:d`)*: the SA-1 skips
+the body and waits for the pump's **ack** — required for handshakes (a
+read-wait on a register spins forever on open bus) and for any body that
+writes WRAM. *Fire-and-forget (`:f`)*: enqueued without waiting, replayed
+at a frame-exit phase — the tail flavor's only. `:l` marks a JSL-called
+(RTL-shaped) body. **CPU discriminator.** How generated code tells which
+CPU runs it: the stack page — the SA-1's stack lives in I-RAM (`$3xxx`),
+the S-CPU's never does. **Mode gate.** A game-state cell read at its
+window home that decides who owns the loop: the SA-1 while it holds the
+gameplay value, the S-CPU natively otherwise; **ownership** changes hands
+at the anchor through context cells and an **owner** cell. **Reader
+helper.** The bank-local JSR a `$4212`/joypad read becomes, reading the
+register on the S-CPU and the mirror on the SA-1. **Math shadow.** The
+S-CPU's multiplier and divider (`$4202-$4206`, `$4214-$4217`), which the
+SA-1 lacks, emulated per site through the **COP handler**: each access
+becomes `COP nn`, a software interrupt whose handler performs the
+instruction on the interrupted registers — the real register on the
+S-CPU, an I-RAM cell on the SA-1 with the SA-1's arithmetic unit for the
+product and a software divide. **Dual image.** With an 8 MiB image, two
+copies of the game: the S-CPU's with stock bytes at every math site, the
+SA-1's with the COPs, the mapper switched between them at each handoff so
+the S-CPU's own eras run at stock speed. **Tail flavor.** The split's
+other shape, Gradius III's, where the engine lives inside the NMI handler
+and the boundary is drawn there (`SA1_CONVERSION_LEARNINGS.md` §25).
+
+## 12. Commit index
 
 - `4577111`,`9f7e475`,`10442ad`,`213bb3a`,`f9fcb7e`,`15f77a3`,`22fd4a2` —
   the generator/provenance fixes (§2).
