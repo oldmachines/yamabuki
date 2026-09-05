@@ -213,6 +213,16 @@ const split_math_a: u16 = 0x36F0;
 const split_math_div: u16 = 0x36F2;
 const split_math_q: u16 = 0x36F6;
 const split_math_r: u16 = 0x36F8;
+// The PPU's mode-7 multiplier ($211B x $211C -> $2134-$2136), which games
+// use as a signed 16x8 multiplier (Super Metroid's trig helper at
+// $A9:C460: Ridley's tail collapsed onto one point without it). Cells in
+// register order so the handler's offset arithmetic stays linear: off =
+// reg - $20DB ($211B -> $40, $211C -> $41, $2134-6 -> $59-$5B).
+const split_m7_last: u16 = 0x36FA; // the byte last written to $211B
+const split_m7b: u16 = 0x36FB; // $211C, signed 8-bit
+const split_m7_prod: u16 = 0x36FC; // $2134-$2136: the 24-bit signed product
+const split_m7a: u16 = 0x36EA; // the composed 16-bit M7A (hi = last byte, lo = the latch before it)
+const split_m7_latch: u16 = 0x36EC; // the write-twice latch
 
 pub const Reason = enum {
     coprocessor,
@@ -5682,9 +5692,11 @@ fn emitSplit(
                     0xAD, 0xAC, 0xAE, 0x2C, 0xCD, 0x6D, 0xED, 0x2D, 0x0D, 0x4D, 0xEC, 0xCC => true, // loads, compares, ALU
                     0xEE, 0xCE, 0x0E, 0x4E, 0x2E, 0x6E, 0x0C, 0x1C => true, // RMW
                     0xBD, 0xBC, 0xBE, 0xB9, 0x7D, 0x79, 0xFD, 0xF9, 0xDD, 0xD9, 0x3D, 0x39, 0x1D, 0x19, 0x5D, 0x59, 0x3C => true, // indexed
+                    0xAF, 0xBF, 0x6F, 0x7F, 0xEF, 0xFF, 0xCF, 0xDF, 0x2F, 0x3F, 0x0F, 0x1F, 0x4F, 0x5F => true, // long forms (a $00-bank long read of the register file)
                     else => false,
                 };
-                if (!hazard and abs_read) {
+                const long_form = op & 0x0F == 0x0F;
+                if (!hazard and abs_read and (!long_form or (out[file + 3] & 0x7F) < 0x40)) {
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                     hazard = (v >= 0x2100 and v <= 0x21FF) or (v >= 0x4200 and v <= 0x43FF);
                 }
@@ -6346,7 +6358,7 @@ fn emitSplit(
         @memcpy(out[half .. 2 * half], out[0..half]);
         for (math_sites[0..n_math_sites]) |ms| {
             const f = splitFile(ms.addr);
-            out[f..][0..3].* = ms.bytes;
+            @memcpy(out[f..][0..ms.len], ms.bytes[0..ms.len]);
         }
         // ... and its IO entries and readers too: the S-CPU's own eras run
         // stock bytes everywhere but the anchor. (When the SA-1 owns the
@@ -6602,7 +6614,7 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 /// copied.
 /// A site the split displaced, with the bytes it replaced — so the
 /// S-CPU's copy of the game can have them back (see the dual image).
-const MathSite = struct { addr: u24, bytes: [3]u8 };
+const MathSite = struct { addr: u24, len: u8, bytes: [4]u8 };
 const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
 
 fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
@@ -6666,7 +6678,7 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
     // bank, no neighbouring instruction copied — the previous shapes
     // (a JSL over a span, a bank-local JSR) each failed on Super
     // Metroid: a `PHA` in a span, a bank with 63 free bytes.
-    const Desc = struct { addr: u24, off: u8, kind: u8, opi: u8 };
+    const Desc = struct { addr: u24, off: u8, kind: u8, opi: u8, len: u8 };
     // kind 7, "operate": the site's own opcode re-run against the fetched
     // value (ADC $4216 was 70 of Super Metroid's 250 product reads — the
     // scroll code's `ADC $4216` read open bus on the SA-1 and the camera
@@ -6688,11 +6700,11 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                 const op = out[file];
                 var opi: u8 = 0;
                 const kind: u8 = switch (op) {
-                    0x8D => 0,
+                    0x8D, 0x8F => 0, // STA abs / long
                     0x8E => 1,
                     0x8C => 2,
                     0x9C => 3,
-                    0xAD => 4,
+                    0xAD, 0xAF => 4, // LDA abs / long
                     0xAE => 5,
                     0xAC => 6,
                     else => blk: {
@@ -6701,15 +6713,21 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                         break :blk 7;
                     },
                 };
+                const long = op == 0x8F or op == 0xAF;
+                if (long and (out[file + 3] & 0x7F) >= 0x40) continue; // a long form names a bank without the register file
                 const reg = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                 const math_in = reg >= 0x4202 and reg <= 0x4206;
                 const math_out = reg >= 0x4214 and reg <= 0x4217;
-                if (!(kind <= 3 and math_in) and !(kind >= 4 and math_out)) continue;
+                const m7_in = reg == 0x211B or reg == 0x211C;
+                const m7_out = reg >= 0x2134 and reg <= 0x2136;
+                if (!(kind <= 3 and (math_in or m7_in)) and !(kind >= 4 and (math_out or m7_out))) continue;
                 const idx_reg = kind == 1 or kind == 2 or kind == 5 or kind == 6 or (kind == 7 and opi >= 7);
                 const wide = if (idx_reg) u & usage_map.flag_x == 0 else u & usage_map.flag_m == 0;
+                if (m7_in and wide) continue; // a 16-bit store straddles M7A and M7B: not a shape the shadow models (the audit does not list stores; none seen)
                 if (n_sites == descs.len or per_bank[bank] == 256)
                     return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
-                descs[n_sites] = .{ .addr = ac, .off = @intCast(reg - 0x4202), .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi };
+                const off: u8 = if (m7_in or m7_out) @intCast(reg - 0x20DB) else @intCast(reg - 0x4202);
+                descs[n_sites] = .{ .addr = ac, .off = off, .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi, .len = if (long) 4 else 3 };
                 n_sites += 1;
                 per_bank[bank] += 1;
             }
@@ -6717,7 +6735,7 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
     }
     if (n_sites != 0) {
         // Block: [handler][bank table: 64 words][per-bank descriptors].
-        var hb: [512]u8 = undefined;
+        var hb: [1024]u8 = undefined;
         var hc: usize = 0;
         put(&hb, &hc, &.{ 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB }); // REP #$30 / PHA PHX PHY PHD PHB / PHK PLB
         put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x09 }); // the SA-1 skips the SIWP open
@@ -6733,16 +6751,26 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x85, 0x06 }); // LDA $0000,X / STA $06: $06 = off, $07 = kind|wide
         put(&hb, &hc, &.{ 0xE2, 0x20, 0xBD, 0x02, 0x00, 0x85, 0x10, 0xC2, 0x20 }); // $10 = the operate opcode index
         // the target: the register (S-CPU) or the cell (SA-1), into [$08]
-        put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x0D });
-        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00, 0x18, 0x69, 0x02, 0x42, 0x85, 0x08, 0x80, 0x14 }); // reg = $4202 + off
-        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00, 0xC9, 0x08, 0x00, 0xB0, 0x06 }); // off < 8 ?
+        put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x16 }); // BEQ the SA-1's cell (22 bytes on)
+        // S-CPU: the register — $4202 + off, or $20DB + off for the mode-7 set
+        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00, 0xC9, 0x40, 0x00, 0xB0, 0x06 }); // off >= $40 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, 0x02, 0x42, 0x80, 0x30 }); // reg = $4202 + off; BRA store (6 + 42 bytes on)
+        put(&hb, &hc, &.{ 0x18, 0x69, 0xDB, 0x20, 0x80, 0x2A }); // reg = $20DB + off; BRA store (42 bytes of SA-1 path)
+        // SA-1: the cell — three ranges, the mode-7 product's and inputs' apart
+        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00 });
+        put(&hb, &hc, &.{ 0xC9, 0x59, 0x00, 0x90, 0x06 }); // off < $59 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_m7_prod - 0x59), @truncate((split_m7_prod - 0x59) >> 8), 0x80, 0x1A }); // cell = $36FC + (off - $59)
+        put(&hb, &hc, &.{ 0xC9, 0x40, 0x00, 0x90, 0x06 }); // off < $40 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_m7_last - 0x40), @truncate((split_m7_last - 0x40) >> 8), 0x80, 0x0F }); // cell = $36FA + (off - $40)
+        put(&hb, &hc, &.{ 0xC9, 0x08, 0x00, 0xB0, 0x06 }); // off < 8 ?
         put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_math_a), @truncate(split_math_a >> 8), 0x80, 0x04 }); // cell = $36F0 + off
         put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_math_q - 0x12), @truncate((split_math_q - 0x12) >> 8) }); // cell = $36E4 + off
         put(&hb, &hc, &.{ 0x85, 0x08, 0x64, 0x0A }); // STA $08 / STZ $0A (pointer bank 0)
         // kind
         put(&hb, &hc, &.{ 0xA5, 0x07, 0x29, 0x07, 0x00, 0xC9, 0x04, 0x00 }); // LDA $07 / AND #7 / CMP #4
-        const bcs_loads_at = hc;
-        put(&hb, &hc, &.{ 0xB0, 0x00 }); // BCS loads (patched)
+        put(&hb, &hc, &.{ 0x90, 0x03 }); // BCC stores, over the BRL
+        const brl_loads_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL loads (patched; past a short branch's reach)
         // stores: the value from the saved register
         put(&hb, &hc, &.{ 0xC9, 0x00, 0x00, 0xD0, 0x04, 0xA3, 0x08, 0x80, 0x15 }); // A
         put(&hb, &hc, &.{ 0xC9, 0x01, 0x00, 0xD0, 0x04, 0xA3, 0x06, 0x80, 0x0C }); // X
@@ -6756,6 +6784,12 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         const bne_exit1_at = hc;
         put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL exit (patched; the exit is past a short branch's reach)
         put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00 }); // off
+        put(&hb, &hc, &.{ 0xC9, 0x40, 0x00, 0xD0, 0x03 }); // $211B -> the M7A compose + product (BNE over the BRL: the block sits past the exit)
+        const brl_m7a_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // (patched)
+        put(&hb, &hc, &.{ 0xC9, 0x41, 0x00, 0xD0, 0x03 }); // $211C -> the product
+        const brl_m7b_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // (patched)
         put(&hb, &hc, &.{ 0xC9, 0x01, 0x00, 0xF0, 0x17 }); // $4203 -> mul
         put(&hb, &hc, &.{ 0xC9, 0x04, 0x00, 0xF0, 0x18 }); // $4206 -> div
         put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x0A }); // narrow: exit
@@ -6774,7 +6808,7 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
         // loads: A = kind (4/5/6); three copies, one per saved slot
         const loads_at = hc;
-        hb[bcs_loads_at + 1] = @intCast(loads_at - (bcs_loads_at + 2));
+        std.mem.writeInt(u16, hb[brl_loads_at + 1 ..][0..2], @intCast(loads_at - (brl_loads_at + 3)), .little);
         put(&hb, &hc, &.{ 0xC9, 0x07, 0x00 }); // kind 7: operate
         const beq_operate_at = hc;
         put(&hb, &hc, &.{ 0xF0, 0x00 }); // BEQ operate (patched)
@@ -6824,15 +6858,33 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x01, 0x83, 0x0B, 0x68 }); // SEP / LDA $01,S (result P) / STA $0B,S (saved P) / PLA
         const bra_exit5_at = hc;
         put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        // the mode-7 multiplier (SA-1 only; REP #$20 is live, DBR 0, D scratch):
+        // a $211B write composes M7A = value<<8 | latch and latches the value
+        // (the register's own write-twice shape); either input recomputes
+        // the signed 16x8 product through MA/MB with M7B sign-extended.
+        std.mem.writeInt(u16, hb[brl_m7a_at + 1 ..][0..2], @intCast(hc - (brl_m7a_at + 3)), .little);
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x8D, @truncate(split_m7a + 1), @truncate((split_m7a + 1) >> 8) }); // SEP / hi := last
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x8D, @truncate(split_m7a), @truncate(split_m7a >> 8) }); // lo := latch
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x8D, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0xC2, 0x20 }); // latch := last / REP
+        std.mem.writeInt(u16, hb[brl_m7b_at + 1 ..][0..2], @intCast(hc - (brl_m7b_at + 3)), .little);
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x8D, 0x51, 0x22 }); // MA := M7A (16-bit)
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x8D, 0x53, 0x22 }); // MB lo
+        put(&hb, &hc, &.{ 0xA9, 0x00, 0x2C, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x10, 0x02, 0xA9, 0xFF }); // sign-extend
+        put(&hb, &hc, &.{ 0x8D, 0x54, 0x22, 0xEA, 0xEA, 0xEA }); // MB hi (triggers) / the unit's 5 cycles
+        put(&hb, &hc, &.{ 0xC2, 0x20, 0xAD, 0x06, 0x23, 0x8D, @truncate(split_m7_prod), @truncate(split_m7_prod >> 8) }); // product low word
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, 0x08, 0x23, 0x8D, @truncate(split_m7_prod + 2), @truncate((split_m7_prod + 2) >> 8), 0xC2, 0x20 }); // byte 2
+        const brl_exit6_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL exit (patched)
         const optbl_at = hc;
         hc += operate_ops.len * 2;
         std.mem.writeInt(u16, hb[bne_exit1_at + 1 ..][0..2], @intCast(exit_at - (bne_exit1_at + 3)), .little);
+        std.mem.writeInt(i16, hb[brl_exit6_at + 1 ..][0..2], @intCast(@as(isize, @intCast(exit_at)) - @as(isize, @intCast(brl_exit6_at + 3))), .little); // backward: the block sits past the exit
         hb[bra_exit2_at + 1] = @intCast(exit_at - (bra_exit2_at + 2));
         hb[bra_exit3_at + 1] = @intCast(exit_at - (bra_exit3_at + 2));
         hb[bra_exit4_at + 1] = @intCast(exit_at - (bra_exit4_at + 2));
         for (exit_patches) |at| hb[at + 1] = @intCast(exit_at - (at + 2));
         hb[bra_exit5_at + 1] = @bitCast(@as(i8, @intCast(@as(isize, @intCast(exit_at)) - @as(isize, @intCast(bra_exit5_at + 2)))));
-        std.debug.assert(mul_call_at == bne_exit1_at + 3 + 5 + 5 + 5 + 4 + 5 + 5 + 2 + 2); // the trigger branches land on the calls
+        std.debug.assert(mul_call_at == bne_exit1_at + 3 + 5 + 16 + 5 + 5 + 4 + 5 + 5 + 2 + 2); // the trigger branches land on the calls
         std.debug.assert(div_call_at == mul_call_at + 6);
         // the block
         const bank_tbl_at = hc;
@@ -6863,11 +6915,12 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
             out[t + nn * 3 + 1] = dsc.kind;
             out[t + nn * 3 + 2] = dsc.opi;
             const file = splitFile(dsc.addr);
-            sites[n_out.*] = .{ .addr = dsc.addr, .bytes = out[file..][0..3].* };
+            sites[n_out.*] = .{ .addr = dsc.addr, .len = dsc.len, .bytes = undefined };
+            @memcpy(sites[n_out.*].bytes[0..dsc.len], out[file..][0..dsc.len]);
             n_out.* += 1;
             out[file] = 0x02; // COP
             out[file + 1] = @intCast(nn);
-            out[file + 2] = 0xEA;
+            @memset(out[file + 2 ..][0 .. dsc.len - 2], 0xEA);
         }
         // the native COP vector, both CPUs' (the SA-1 does not intercept it)
         std.mem.writeInt(u16, out[0x7FE4..0x7FE6], base, .little);
@@ -11363,10 +11416,21 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
         0x22, 0x60, 0x80, 0x00, // 8056 JSL $00:8060 — the deferred RTL one
         0xC2, 0x20, 0xEE, 0x00, 0x01, 0xE2, 0x20, // 805A the lap counter (16-bit), at the lap's END
         0xAD, 0x00, 0x01, 0x29, 0x01, 0x8D, 0x10, 0x01, // 8061 LDA $0100 / AND #1 / STA $0110 — the mode cell
-        0x4C, 0x00, 0x80, // 8069 JMP $8000
+        0x4C, 0x90, 0x80, // 8069 JMP $8090 — the mode-7 multiply, then around
     };
     @memcpy(rom[0x8000 .. 0x8000 + loop.len], &loop);
     @memcpy(rom[0x8080..0x8087], &[_]u8{ 0xAD, 0x00, 0x01, 0x8D, 0x80, 0x21, 0x60 }); // LDA $0100 / STA $2180 / RTS
+    // the PPU's mode-7 multiplier as a signed 16x8 unit: -2 x 3 = -6 into $010A
+    @memcpy(rom[0x8090..0x80B2], &[_]u8{
+        0xE2, 0x20, // 8090 SEP #$20
+        0xA9, 0xFE, 0x8D, 0x1B, 0x21, // 8092 LDA #$FE / STA $211B (low)
+        0xA9, 0xFF, 0x8F, 0x1B, 0x21, 0x00, // 8097 LDA #$FF / STA $00:211B (high, long form)
+        0xA9, 0x03, 0x8D, 0x1C, 0x21, // 809D LDA #3 / STA $211C
+        0xC2, 0x20, // 80A2 REP #$20
+        0xAF, 0x34, 0x21, 0x00, // 80A4 LDA $00:2134 (long form) — the product's low word: $FFFA
+        0x18, 0x6D, 0x0A, 0x01, 0x8D, 0x0A, 0x01, // 80A8 CLC / ADC $010A / STA $010A
+        0x4C, 0x00, 0x80, // 80AF JMP $8000
+    });
 
     const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
     defer gpa.free(bytes);
@@ -11385,6 +11449,8 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     for ([_]u32{ 0x802E, 0x8030, 0x8033, 0x8034, 0x8035, 0x8036, 0x8037, 0x8038, 0x8039, 0x803A, 0x803B }) |a| mark(bytes, 0x01_0000 | a, true);
     for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x8049, 0x804A, 0x804B, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
     for ([_]u32{ 0x8053, 0x8056, 0x805A, 0x805C, 0x805F, 0x8061, 0x8064, 0x8066, 0x8069, 0x8080, 0x8083, 0x8086 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x8090, 0x8092, 0x8094, 0x8097, 0x8099, 0x809D, 0x809F, 0x80A2 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x80A4, 0x80A8, 0x80A9, 0x80AC, 0x80AF }) |a| mark(bytes, 0x01_0000 | a, false);
 
     const io = [_]SplitIo{ .{ .entry = 0x01_8080 }, .{ .entry = 0x00_8060, .deferred = true, .rtl = true } };
     const vr = [_][2]u24{.{ 0x01_8005, 0x01_8069 }};
@@ -11400,9 +11466,10 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     defer gpa.free(res.image);
     try testing.expectEqual(@as(u8, 2), res.stats.split_io);
     try testing.expect(res.stats.split_engage_addr != 0);
-    // Seven math sites shadowed; the one hazard the audit lists is the NMI
-    // handler's $4210 ack read, which only the S-CPU ever runs.
-    try testing.expectEqual(@as(u8, 7), res.stats.split_mul);
+    // Eleven math sites shadowed (seven on the S-CPU's unit, four on the
+    // mode-7 one); the one hazard the audit lists is the NMI handler's $4210
+    // ack read, which only the S-CPU ever runs.
+    try testing.expectEqual(@as(u8, 11), res.stats.split_mul);
     try testing.expectEqual(@as(u8, 1), res.stats.n_split_hazards);
     try testing.expectEqual(@as(u24, 0x00_8051), res.stats.split_hazards[0]);
     // The anchors wear their displacements, in their own banks.
@@ -11415,6 +11482,9 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u8, 0xEA), res.image[0x8010]);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
     try testing.expectEqual(@as(u8, 0x02), res.image[0x804B]); // COP at ADC $4216: the operate kind
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x8099]); // COP at STA $00:211B (4-byte site)
+    try testing.expectEqual(@as(u8, 0xEA), res.image[0x809C]);
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x80A4]); // COP at LDA $00:2134
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
@@ -11433,6 +11503,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     const acc_mul = std.mem.readInt(u16, con.bus.sa1.bwram[0x0104..0x0106], .little);
     const acc_q = std.mem.readInt(u16, con.bus.sa1.bwram[0x0106..0x0108], .little);
     const acc_r = std.mem.readInt(u16, con.bus.sa1.bwram[0x0108..0x010A], .little);
+    const acc_m7 = std.mem.readInt(u16, con.bus.sa1.bwram[0x010A..0x010C], .little);
     // Laps ran on BOTH CPUs (the SA-1's trace saw the loop; the gate
     // alternates), and the math totals match the lap count exactly:
     // the shadow's product, quotient and remainder equal the S-CPU's.
@@ -11453,6 +11524,10 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u16, k_mul *% 156), acc_mul);
     try testing.expectEqual(@as(u16, k_q *% 142), acc_q);
     try testing.expectEqual(@as(u16, k_r *% 6), acc_r);
+    // the mode-7 product: -6 per lap, on both units (it follows the lap
+    // counter, so the total stands for `laps` or `laps - 1`)
+    const neg6: u16 = 0xFFFA;
+    try testing.expect(acc_m7 == laps *% neg6 or acc_m7 == (laps -% 1) *% neg6);
     // The IO routine's WMDATA writes landed in real WRAM — natively on the
     // S-CPU's laps, through the pump on the SA-1's.
     var wm_writes: usize = 0;
