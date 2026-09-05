@@ -110,6 +110,16 @@ pub const SplitSpec = struct {
     /// jump is not); the site keeps a JML and NOP fill. Ignored when
     /// `tail` is set.
     mainloop: u24 = 0,
+    /// Mainloop flavor, dual image: the S-CPU instruction addresses the
+    /// split's census saw run while the upper copy was mapped (the NMI and
+    /// IRQ handlers, the IO bodies the pump replays, their callees), sorted.
+    /// A math site outside this set is the SA-1's alone in that copy and
+    /// becomes a direct I-RAM cell access — the same opcode, the cell for
+    /// the register — instead of a COP (measured: the COP handler was 65%
+    /// of a gameplay lap, the game itself 25%). Trigger stores (the
+    /// multiplier's B, the divisor, the mode-7 inputs) keep the COP: the
+    /// shadow has to compute. Empty = every site is a COP.
+    shared_sites: []const u24 = &.{},
     /// NMI-TAIL flavor (the shape Gradius III actually has: the whole
     /// engine runs inside the NMI handler). `tail` is the boundary in
     /// the handler — the vblank-timed upload cluster before it stays on
@@ -394,6 +404,7 @@ pub const Stats = struct {
     split_mul: u8 = 0,
     /// Mainloop flavor: math sites shadowed (uncapped).
     split_math_sites: u32 = 0,
+    split_math_direct: u32 = 0,
     /// Mainloop flavor: the dual image is in effect (see emitSplit).
     split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
@@ -5622,7 +5633,7 @@ fn emitSplit(
     // frames, and the frame-counter-fed state forked for good.
     const dual = spec.tail == 0 and out.len >= 8 * 1024 * 1024;
     if (spec.tail == 0) {
-        try emitSplitMath(out, usage, far, carve, carve_len, &math_sites, &n_math_sites, refusal, res);
+        try emitSplitMath(out, usage, far, carve, carve_len, spec.shared_sites, &math_sites, &n_math_sites, refusal, res);
     } else {
         var bank: u32 = 0;
         while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
@@ -6617,7 +6628,7 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 const MathSite = struct { addr: u24, len: u8, bytes: [4]u8 };
 const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
 
-fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
+fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, shared: []const u24, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
     var calc: [160]u8 = undefined;
     var cc: usize = 0;
@@ -6727,7 +6738,26 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                 if (n_sites == descs.len or per_bank[bank] == 256)
                     return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
                 const off: u8 = if (m7_in or m7_out) @intCast(reg - 0x20DB) else @intCast(reg - 0x4202);
-                descs[n_sites] = .{ .addr = ac, .off = off, .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi, .len = if (long) 4 else 3 };
+                const len: u8 = if (long) 4 else 3;
+                // Direct cell access for the SA-1's own sites: no trigger to
+                // run, no S-CPU ever here in this copy.
+                const trigger = kind <= 3 and (off == 1 or (off == 0 and wide) or off == 4 or (off == 3 and wide) or off == 0x40 or off == 0x41);
+                const is_shared = std.sort.binarySearch(u24, shared, ac, struct {
+                    fn f(k: u24, v: u24) std.math.Order {
+                        return std.math.order(k, v);
+                    }
+                }.f) != null;
+                if (!trigger and !is_shared and shared.len != 0) {
+                    const cell: u16 = if (off < 8) split_math_a + off else if (off < 0x40) split_math_q - 0x12 + off else if (off < 0x59) split_m7_last + (off - 0x40) else split_m7_prod + (off - 0x59);
+                    if (n_out.* == sites.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                    sites[n_out.*] = .{ .addr = ac, .len = len, .bytes = undefined };
+                    @memcpy(sites[n_out.*].bytes[0..len], out[file..][0..len]);
+                    n_out.* += 1;
+                    std.mem.writeInt(u16, out[file + 1 ..][0..2], cell, .little); // the opcode and (for a long form) the bank stay
+                    res.stats.split_math_direct += 1;
+                    continue;
+                }
+                descs[n_sites] = .{ .addr = ac, .off = off, .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi, .len = len };
                 n_sites += 1;
                 per_bank[bank] += 1;
             }
@@ -6926,7 +6956,7 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
         std.mem.writeInt(u16, out[0x7FE4..0x7FE6], base, .little);
     }
     res.stats.split_mul = @intCast(@min(n_sites, 255));
-    res.stats.split_math_sites = n_sites;
+    res.stats.split_math_sites = n_sites + res.stats.split_math_direct;
 }
 
 /// The shared IO machinery: per-routine drain trampolines, enqueue

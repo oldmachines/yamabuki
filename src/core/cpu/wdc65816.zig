@@ -82,6 +82,13 @@ pub var dbg_trace_to: u64 = 0;
 /// TEMP diagnostics: trace up to N SA-1 instructions once the watch arms.
 pub var dbg_trace_sa1: usize = 0;
 var dbg_trace_sa1_n: usize = 0;
+/// The split's S-CPU census: while the SA-1 owns the loop (the dual
+/// image's upper copy is mapped — the SA-1 MMC write keeps the flag),
+/// every S-CPU instruction address in the ROM window is marked, one byte
+/// per 32 KiB-bank offset. A math site the S-CPU never runs there can be
+/// a direct I-RAM cell access in that copy instead of a COP.
+pub var dbg_upper_mapped: bool = false;
+pub var dbg_scpu_set: ?[]u8 = null;
 /// TEMP diagnostics, BW-RAM window conversions: report data accesses to the
 /// ABANDONED WRAM homes. Once the low 8 KiB moves to $6000-$7FFF and banks
 /// $7E/$7F move to $40/$41, nothing the game runs should ever touch real
@@ -207,6 +214,9 @@ pub fn Cpu(comptime BusT: type) type {
                 if (clk >= dbg_trace_from and clk < dbg_trace_to)
                     std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} s={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.s, self.regs.d, self.regs.dbr, self.regs.p, clk });
             }
+            if (dbg_scpu_set) |m| if (@hasField(BusT, "clock") and dbg_upper_mapped and self.regs.pc >= 0x8000 and (self.regs.pbr & 0x7F) < 0x40) {
+                m[(@as(usize, self.regs.pbr & 0x3F) << 15) | (self.regs.pc & 0x7FFF)] = 1;
+            };
             if (dbg_stale_ring and !@hasField(BusT, "clock")) {
                 dbg_ring[dbg_ring_n % dbg_ring.len] = .{ .pbr = self.regs.pbr, .pc = self.regs.pc, .c = self.regs.c, .x = self.regs.x, .y = self.regs.y, .d = self.regs.d, .dbr = self.regs.dbr, .p = self.regs.p };
                 dbg_ring_n += 1;
@@ -214,7 +224,10 @@ pub fn Cpu(comptime BusT: type) type {
             // SA-1-side trace: fires once the S-CPU-side watch has armed.
             if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {
                 dbg_trace_sa1_n += 1;
-                std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p });
+                // The SA-1's own clock, in master cycles: what the catch-up has
+                // handed it minus what it has not yet spent.
+                const sclk: u64 = if (@hasField(BusT, "last_sync") and @hasField(BusT, "budget")) self.bus.last_sync -% @as(u64, @intCast(@max(self.bus.budget, 0))) else 0;
+                std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p, sclk });
             }
             const m8 = self.regs.e or (self.regs.p & Flags.m) != 0;
             const x8 = self.regs.e or (self.regs.p & Flags.x) != 0;

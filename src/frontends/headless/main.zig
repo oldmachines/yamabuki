@@ -122,6 +122,11 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
+    /// instruction address run while a split's upper copy was mapped.
+    split_scpu_set: ?[]const u8 = null,
+    /// --wg-split-shared <file>: that set, for the generator.
+    wg_split_shared: []const u24 = &.{},
     /// `--dump-srm <file>`: write the cart's battery SRAM at the end of the
     /// run — the way to lift a save out of a state (`--state x --frames 1
     /// --dump-srm x.srm`) for `yamabuki-sdl --record --srm`.
@@ -563,6 +568,12 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_vram) |vpath| dumpVram(io, con, vpath);
     defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
+    if (args.split_scpu_set != null) {
+        const m = try gpa.alloc(u8, 0x40 * 0x8000);
+        @memset(m, 0);
+        core.wdc65816.dbg_scpu_set = m;
+    }
+    defer if (args.split_scpu_set) |sp| writeScpuSet(io, gpa, sp);
     defer if (args.dump_srm) |spath| dumpSrm(io, con, spath);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
@@ -885,6 +896,37 @@ fn dumpSrm(io: std.Io, con: *core.AnyConsole, path: []const u8) void {
     const sram = saveRegion(cart) orelse return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sram }) catch return;
     std.debug.print("wrote {s} ({d} bytes of battery SRAM)\n", .{ path, sram.len });
+}
+
+/// The split's S-CPU set file: little-endian u24 CPU addresses, sorted.
+fn readScpuSet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]const u24 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    const n = bytes.len / 3;
+    const list = try gpa.alloc(u24, n);
+    for (0..n) |k| list[k] = @as(u24, bytes[k * 3]) | (@as(u24, bytes[k * 3 + 1]) << 8) | (@as(u24, bytes[k * 3 + 2]) << 16);
+    std.mem.sort(u24, list, {}, std.sort.asc(u24));
+    return list;
+}
+
+/// Merge the run's marks into the set file (a union across runs: one
+/// file gathers every surface's census).
+fn writeScpuSet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
+    const m = core.wdc65816.dbg_scpu_set orelse return;
+    if (readScpuSet(io, gpa, path)) |old| {
+        for (old) |ac| {
+            if ((ac & 0xFFFF) >= 0x8000 and ((ac >> 16) & 0x7F) < 0x40) m[(@as(usize, (ac >> 16) & 0x3F) << 15) | (ac & 0x7FFF)] = 1;
+        }
+    } else |_| {}
+    var list: std.array_list.Managed(u8) = .init(gpa);
+    var n: usize = 0;
+    for (m, 0..) |b, off| {
+        if (b == 0) continue;
+        const ac: u24 = (@as(u24, @intCast(off >> 15)) << 16) | 0x8000 | @as(u24, @intCast(off & 0x7FFF));
+        list.appendSlice(&.{ @truncate(ac), @truncate(ac >> 8), @truncate(ac >> 16) }) catch return;
+        n += 1;
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = list.items }) catch {};
+    std.debug.print("[scpu-set] {} instruction address(es) in the SA-1's copy -> {s}\n", .{ n, path });
 }
 
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
@@ -3025,6 +3067,7 @@ fn runSa1Gen(
             .mode_cell = args.wg_split_mode_cell,
             .mode_value = args.wg_split_mode_value,
             .mode_gate = args.wg_split_mode,
+            .shared_sites = args.wg_split_shared,
         } else null;
         if (split_spec != null) {
             try out.print("  --wg-split: engaging the split (anchor ${x:0>6}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) @as(u24, args.wg_split_tail) else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
@@ -3036,7 +3079,7 @@ fn runSa1Gen(
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         if (converted) |cr| {
             if (cr.stats.split_engage_addr != 0) {
-                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} math site(s) shadowed ({} in the tail flavor's multiply helper){s}\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_math_sites, cr.stats.split_mul, if (cr.stats.split_dual) @as([]const u8, "; dual image: the S-CPU's copy keeps stock math bytes") else "" });
+                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} math site(s) shadowed ({} direct cell accesses, the rest COPs){s}\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_math_sites, cr.stats.split_math_direct, if (cr.stats.split_dual) @as([]const u8, "; dual image: the S-CPU's copy keeps stock math bytes") else "" });
                 var hi: usize = 0;
                 while (hi < cr.stats.n_split_hazards) : (hi += 1)
                     try out.print("  split HAZARD (open bus or dead wait on the SA-1): ${x:0>2}:{x:0>4}\n", .{ cr.stats.split_hazards[hi] >> 16, cr.stats.split_hazards[hi] & 0xFFFF });
@@ -5474,6 +5517,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.wg_split_tail = try std.fmt.parseInt(u16, pit.next().?, 16);
             out.wg_split_epi = try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16);
             out.wg_split_dbr = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
+        } else if (std.mem.eql(u8, a, "--split-scpu-set")) {
+            out.split_scpu_set = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--wg-split-shared")) {
+            const path = it.next() orelse return error.MissingValue;
+            out.wg_split_shared = readScpuSet(init.io, gpa, path) catch return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--wg-split-mode")) {
             // "<cell>:<value>" (hex) — gameplay-mode gate: the tail goes
             // to the SA-1 only while dp <cell> holds <value>; menus and

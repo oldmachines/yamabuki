@@ -647,6 +647,7 @@ pub const Sa1 = struct {
             0x2208 => self.civ = (self.civ & 0x00FF) | (@as(u16, value) << 8),
             0x2220 => {
                 self.cb = @truncate(value);
+                wdc65816.dbg_upper_mapped = (value & 0x07) == 4; // the split's dual image: megabyte 4 = the SA-1's copy
                 self.cbmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
                 self.refreshMmc();

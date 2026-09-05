@@ -1464,7 +1464,7 @@ pub const Summary = struct {
     /// Where the slowdown was: the first few short lag runs (frame of the
     /// first dropped frame, run length), so a 0.1% verdict can be placed
     /// in the take — a boss burst and a transition are different findings.
-    slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8,
+    slow_runs: [768]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 768,
     n_slow_runs: u8 = 0,
     /// Lag in short runs: genuine frame-rate slowdown. This is the number the
     /// verdict is based on. See `stall_run_max`.
@@ -2033,7 +2033,7 @@ pub fn summarise(samples: []const FrameSample, util_scratch: []f64) Summary {
     const p95 = percentile(utils, 95);
 
     // Second pass: place the short runs.
-    var slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8;
+    var slow_runs: [768]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 768;
     var n_slow_runs: u8 = 0;
     {
         var r: u32 = 0;
