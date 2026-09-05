@@ -6348,6 +6348,11 @@ fn emitSplit(
             const f = splitFile(ds.addr);
             @memcpy(out[f..][0..ds.len], ds.bytes[0..ds.len]);
         }
+        // The NMI hook too: only the SA-1's copy vectors NMI through it (the
+        // vector lives in each copy's bank $00). The S-CPU's own eras run
+        // the game's handler untouched — measured: the hook's ~70 cycles on
+        // every intro NMI were enough to fork the intro.
+        std.mem.writeInt(u16, out[0x7FEA..0x7FEC], nmi_vec, .little);
         res.stats.split_dual = true;
     }
 }
