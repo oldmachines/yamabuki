@@ -116,6 +116,21 @@ regenerates, kept solely so the chain can run.
 The chain bottoms out at `cover39.sfc`/`cover40.sfc`, which have no recipe —
 see `recordings/README.md`. Everything else rebuilds from this directory.
 
+### The split ship (v67)
+
+`sm-sa1-v67.bps.cmd` is v66's recipe plus the mainloop split (`--wg-split`,
+the 23 `--wg-split-io` routines, the `--wg-split-vbl` reader ranges, the
+`--wg-split-mode 0998:08` gameplay gate, `--wg-expand 8m` for the dual
+image) and one more input: `sm-sa1-v67.scpu.set`, the S-CPU's instruction
+addresses seen while the SA-1 owned the loop. That set is recorded, not
+written by hand: run the previous split image over every surface with
+`--split-scpu-set <file>` (the file accumulates across runs) and hand the
+result to `--wg-split-shared`. A math site outside the set is the SA-1's
+alone and becomes a direct I-RAM cell access; one inside keeps its COP.
+The patch applies to the stock ROM and produces an 8 MiB image: the lower
+4 MiB is v66's conversion with the split's anchor, the upper the same with
+the SA-1's shadows (`docs/SM_SA1_FINDINGS.md` §10).
+
 ### What v25 does not include
 
 `sm-sa1-v25.bps.cmd` passes the three scripted surfaces and nothing else: no
