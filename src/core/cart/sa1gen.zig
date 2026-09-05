@@ -376,6 +376,8 @@ pub const Stats = struct {
     /// and covered hazards the audit found (WAI/STP, or an MMIO read the
     /// split leaves unhandled) — each a 24-bit CPU address, capped.
     split_mul: u8 = 0,
+    /// Mainloop flavor: math sites shadowed (uncapped).
+    split_math_sites: u32 = 0,
     split_hazards: [8]u24 = @splat(0),
     n_split_hazards: u8 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
@@ -5590,7 +5592,7 @@ fn emitSplit(
     var mul_sites: [4]u32 = undefined;
     var n_mul: usize = 0;
     if (spec.tail == 0) {
-        try emitSplitMath(out, usage, far, refusal, res);
+        try emitSplitMath(out, usage, far, carve, carve_len, refusal, res);
     } else {
         var bank: u32 = 0;
         while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
@@ -6393,8 +6395,11 @@ fn emitSplitIoBanked(
 /// after the read looks at are the load's own.
 fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad, carve: u32, carve_len: u32, refusal: *?Refusal) Error!void {
     for (spec.vbl_ranges) |r| {
+        // Keyed on the coverage map's instruction starts, not decoded from
+        // the range's first byte: a range given by hand starts wherever it
+        // starts (measured: a walk from mid-instruction missed $80:8525).
         var pc: u32 = r[0];
-        while (pc < r[1]) {
+        while (pc < r[1]) : (pc += 1) {
             const f = splitFile(@intCast(pc));
             const op = out[f];
             const u = splitUsage(usage, @intCast(pc));
@@ -6439,7 +6444,6 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
                     std.mem.writeInt(u16, out[f + 1 ..][0..2], h16, .little);
                 }
             }
-            pc += len;
         }
     }
 }
@@ -6454,10 +6458,10 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 /// $4203 computing the 8x8 product through the SA-1's arithmetic unit,
 /// a write of $4206 the unsigned 16/8 quotient and remainder in software
 /// (exact, divide-by-zero included: quotient $FFFF, remainder the
-/// dividend). The displaced span is whole flow-free instructions of at
-/// least 4 bytes, copied verbatim on both paths; a site whose span cannot
-/// be formed is listed as a hazard instead.
-fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, refusal: *?Refusal, res: *Result) Error!void {
+/// dividend). Each site is displaced by a bank-local JSR (the same 3
+/// bytes) to a helper in its own bank; no neighbouring instruction is
+/// copied.
+fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
     var calc: [160]u8 = undefined;
     var cc: usize = 0;
@@ -6508,14 +6512,21 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, refusal: *?Refusal,
     const mul24: u24 = @intCast(((cat / 0x8000) << 16) | (0x8000 + (cat % 0x8000)));
     const div24: u24 = mul24 + @as(u24, @intCast(mul_len));
 
-    // The sites.
+    // The sites: each a 3-byte absolute access, displaced by a 3-byte
+    // bank-local JSR to a helper in the site's own bank that performs JUST
+    // that instruction — nothing after it rides along, so no stack op or
+    // branch target can be caught in a copy (measured: a `LDA $4216 / PHA`
+    // pair displaced as a span pushed A over the helper's return address
+    // and the game came back through its BRK trap). Flags after the
+    // access survive the RTS; A is preserved through the discriminator.
     var n_sites: u32 = 0;
     var bank: u32 = 0;
     while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
         var aa: u32 = 0x8000;
-        while (aa < 0xFFF8) : (aa += 1) {
+        while (aa < 0xFFFD) : (aa += 1) {
             const ac: u24 = @intCast((bank << 16) | aa);
-            if (splitUsage(usage, ac) & usage_map.flag_opcode == 0) continue;
+            const u = splitUsage(usage, ac);
+            if (u & usage_map.flag_opcode == 0) continue;
             const file = splitFile(ac);
             const op = out[file];
             const is_store = op == 0x8D or op == 0x8E or op == 0x8C or op == 0x9C;
@@ -6525,27 +6536,16 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, refusal: *?Refusal,
             const math_in = reg >= 0x4202 and reg <= 0x4206;
             const math_out = reg >= 0x4214 and reg <= 0x4217;
             if (!(is_store and math_in) and !(is_load and math_out)) continue;
-            const span = splitPrefixSpan(out, usage, ac, 4);
-            if (span < 4) {
-                if (res.stats.n_split_hazards < res.stats.split_hazards.len) {
-                    res.stats.split_hazards[res.stats.n_split_hazards] = ac;
-                    res.stats.n_split_hazards += 1;
-                }
-                continue;
-            }
-            const u = splitUsage(usage, ac);
             const m8 = u & usage_map.flag_m != 0;
             const x8 = u & usage_map.flag_x != 0;
             const wide = if (op == 0x8E or op == 0x8C or op == 0xAE or op == 0xAC) !x8 else !m8;
-            // cell for the register
             const cell: u16 = if (reg <= 0x4206) split_math_a + (reg - 0x4202) else split_math_q + (reg - 0x4214);
-            var hb: [64]u8 = undefined;
+            var hb: [48]u8 = undefined;
             var hc: usize = 0;
-            put(&hb, &hc, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP/REP/PHA/TSC/AND/CMP
+            put(&hb, &hc, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP/REP #$20/PHA/TSC/AND/CMP
             const bne_at = hc;
             put(&hb, &hc, &.{ 0xD0, 0x00 }); // BNE the S-CPU path (patched)
             put(&hb, &hc, &.{ 0x68, 0x28 }); // PLA / PLP
-            // the shadow of the register access (same width)
             switch (op) {
                 0x8D => put(&hb, &hc, &.{ 0x8F, @truncate(cell), @truncate(cell >> 8), 0x00 }), // STA long
                 0x8E => put(&hb, &hc, &.{ 0x8E, @truncate(cell), @truncate(cell >> 8) }), // STX abs (I-RAM aliases in every code bank)
@@ -6555,32 +6555,27 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, refusal: *?Refusal,
                 0xAE => put(&hb, &hc, &.{ 0xAE, @truncate(cell), @truncate(cell >> 8) }), // LDX abs
                 else => put(&hb, &hc, &.{ 0xAC, @truncate(cell), @truncate(cell >> 8) }), // LDY abs
             }
-            // triggers: the high multiplicand, the divisor
             if (is_store and (reg == 0x4203 or (reg == 0x4202 and wide)))
                 put(&hb, &hc, &.{ 0x22, @truncate(mul24), @truncate(mul24 >> 8), @truncate(mul24 >> 16) });
             if (is_store and (reg == 0x4206 or (reg == 0x4205 and wide)))
                 put(&hb, &hc, &.{ 0x22, @truncate(div24), @truncate(div24 >> 8), @truncate(div24 >> 16) });
-            // the rest of the span, verbatim
-            @memcpy(hb[hc .. hc + span - 3], out[file + 3 ..][0 .. span - 3]);
-            hc += span - 3;
-            put(&hb, &hc, &.{0x6B});
+            put(&hb, &hc, &.{0x60});
             hb[bne_at + 1] = @intCast(hc - (bne_at + 2));
             put(&hb, &hc, &.{ 0x68, 0x28 }); // PLA / PLP
-            @memcpy(hb[hc .. hc + span], out[file..][0..span]);
-            hc += span;
-            put(&hb, &hc, &.{0x6B});
-            const hat = far.next(@intCast(hc)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(hc) });
+            @memcpy(hb[hc .. hc + 3], out[file..][0..3]);
+            hc += 3;
+            put(&hb, &hc, &.{0x60});
+            const hat = far.nextIn(bank, @intCast(hc), if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
+                return refuse(refusal, .{ .reason = .no_free_space, .detail = ac });
             @memcpy(out[hat .. hat + hc], hb[0..hc]);
-            const h24: u24 = @intCast(((hat / 0x8000) << 16) | (0x8000 + (hat % 0x8000)));
-            out[file] = 0x22;
-            out[file + 1] = @truncate(h24);
-            out[file + 2] = @truncate(h24 >> 8);
-            out[file + 3] = @truncate(h24 >> 16);
-            if (span > 4) @memset(out[file + 4 ..][0 .. span - 4], 0xEA);
+            const h16: u16 = @intCast(0x8000 + (hat % 0x8000));
+            out[file] = 0x20; // JSR helper
+            std.mem.writeInt(u16, out[file + 1 ..][0..2], h16, .little);
             n_sites += 1;
         }
     }
     res.stats.split_mul = @intCast(@min(n_sites, 255));
+    res.stats.split_math_sites = n_sites;
 }
 
 /// The shared IO machinery: per-routine drain trampolines, enqueue
@@ -11101,7 +11096,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x8080]); // JMP stub at $01:8080
     try testing.expect(std.mem.readInt(u16, res.image[0x8081..0x8083], .little) >= 0x8000); // a bank-$01 stub
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x0060]); // JMP stub at $00:8060
-    try testing.expectEqual(@as(u8, 0x22), res.image[0x800E]); // JSL math helper at STA $4202
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x800E]); // JSR math helper at STA $4202
     try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
