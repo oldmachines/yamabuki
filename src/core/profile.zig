@@ -463,6 +463,9 @@ pub const Routine = struct {
     kind: RoutineKind,
     /// Times it was entered (calls + interrupt dispatches).
     calls: u64,
+    /// Of the calls, those made with a 3-byte frame (JSL): the routine's
+    /// return shape, which a split's replay stub has to match.
+    rtl_calls: u64,
     /// Entries made while an interrupt frame was on the stack (the handler's
     /// own dispatch included). `int_entries * 2 > calls` reads as "this
     /// routine lives in interrupt context" — the offload machinery's single
@@ -751,6 +754,7 @@ pub const Profiler = struct {
             .entry = Routine.empty,
             .kind = .code,
             .calls = 0,
+        .rtl_calls = 0,
             .int_entries = 0,
             .self_cycles = 0,
             .incl_cycles = 0,
@@ -887,8 +891,9 @@ pub const Profiler = struct {
             if (write) |addr| self.noteAccess(addr);
         }
         if (self.census_on) {
-            if (read) |addr| self.census.note(addr, pc, self.int_depth > 0);
-            if (write) |addr| self.census.note(addr, pc, self.int_depth > 0);
+            const top: u24 = if (self.depth != 0) @intCast(self.routines[self.topSlot()].entry & 0xFF_FFFF) else 0;
+            if (read) |addr| self.census.note(addr, pc, self.int_depth > 0, top, false);
+            if (write) |addr| self.census.note(addr, pc, self.int_depth > 0, top, true);
         }
 
         self.applyEvent(ev);
@@ -1013,9 +1018,9 @@ pub const Profiler = struct {
     fn applyEvent(self: *Profiler, ev: Event) void {
         switch (ev.kind) {
             .none => {},
-            .call => self.pushFrame(ev.target, ev.sp_before, ev.d, false),
+            .call => self.pushFrame(ev.target, ev.sp_before, ev.d, false, ev.sp_after),
             .nmi, .irq => {
-                self.pushFrame(ev.target, ev.sp_before, ev.d, true);
+                self.pushFrame(ev.target, ev.sp_before, ev.d, true, ev.sp_after);
                 // Tag the handler. First insert wins; a routine both called
                 // and interrupted into keeps whichever it was seen as first.
                 if (self.depth > 0) {
@@ -1037,7 +1042,7 @@ pub const Profiler = struct {
         }
     }
 
-    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16, is_int: bool) void {
+    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16, is_int: bool, sp_after: u16) void {
         if (self.depth == call_stack_max) {
             // Deeper than the model follows — recursion, or a game using the
             // stack in ways no model survives. Start over and count it rather
@@ -1058,6 +1063,7 @@ pub const Profiler = struct {
         if (is_int) self.int_depth += 1;
         const r = &self.routines[slot];
         r.calls += 1;
+        if (!is_int and sp_pre -% sp_after == 3) r.rtl_calls += 1;
         if (self.int_depth > 0) r.int_entries += 1;
         r.on_stack += 1;
         self.stack[self.depth] = .{ .slot = slot, .sp_pre = sp_pre, .observed_at = self.observed, .is_int = is_int };
@@ -1325,7 +1331,11 @@ pub const Census = struct {
     pub const pcs_cap: usize = 6;
     /// [context][bucket]: 0 = main loop, 1 = interrupt.
     count: [2][buckets]u64 = @splat(@splat(0)),
+    /// Of `count`, the writes.
+    writes: [2][buckets]u64 = @splat(@splat(0)),
     pcs: [2][buckets][pcs_cap]u24 = @splat(@splat(@splat(0))),
+    /// The routine (entry) each site ran under, parallel to `pcs`.
+    entries: [2][buckets][pcs_cap]u24 = @splat(@splat(@splat(0))),
     n_pcs: [2][buckets]u8 = @splat(@splat(0)),
 
     pub fn bucketOf(addr: u24) ?u16 {
@@ -1356,26 +1366,30 @@ pub const Census = struct {
         return .cpu;
     }
 
-    pub fn note(self: *Census, addr: u24, pc: u24, in_int: bool) void {
+    pub fn note(self: *Census, addr: u24, pc: u24, in_int: bool, entry: u24, is_write: bool) void {
         const b = bucketOf(addr) orelse return;
         const c: usize = if (in_int) 1 else 0;
         self.count[c][b] += 1;
+        if (is_write) self.writes[c][b] += 1;
         const n = self.n_pcs[c][b];
         for (self.pcs[c][b][0..n]) |q| if (q == pc) return;
         if (n == pcs_cap) return;
         self.pcs[c][b][n] = pc;
+        self.entries[c][b][n] = entry;
         self.n_pcs[c][b] = n + 1;
     }
 };
 
 test "census: registers bucket by context with their sites, and classify for the offload" {
     var c: Census = .{};
-    c.note(0x002118, 0x808000, false);
-    c.note(0x802118, 0x808010, false);
-    c.note(0x002118, 0x808000, false);
-    c.note(0x00420B, 0x809000, true);
-    c.note(0x004016, 0x80A000, false);
-    c.note(0x7E2118, 0x80B000, false); // WRAM, not a register
+    c.note(0x002118, 0x808000, false, 0x807000, true);
+    c.note(0x802118, 0x808010, false, 0x807000, true);
+    c.note(0x002118, 0x808000, false, 0x807000, true);
+    c.note(0x00420B, 0x809000, true, 0x808F00, true);
+    c.note(0x004016, 0x80A000, false, 0, false);
+    c.note(0x7E2118, 0x80B000, false, 0, false); // WRAM, not a register
+    try std.testing.expectEqual(@as(u64, 3), c.writes[0][0x18]);
+    try std.testing.expectEqual(@as(u24, 0x807000), c.entries[0][0x18][0]);
     try std.testing.expectEqual(@as(u64, 3), c.count[0][0x18]);
     try std.testing.expectEqual(@as(u8, 2), c.n_pcs[0][0x18]);
     try std.testing.expectEqual(@as(u64, 1), c.count[1][0x10B]);

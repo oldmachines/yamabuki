@@ -274,17 +274,20 @@ const Args = struct {
     /// --wg-copy-reserve: bytes held at the tail of the biggest padding run
     /// for offload tree copies. The default matches the generator's own.
     wg_copy_reserve: u32 = core.sa1gen.copy_reserve,
-    /// S5 mainline split: the engage anchor; zero = split off.
-    wg_split_mainloop: u16 = 0,
+    /// S5 mainline split: the engage anchor (24-bit, any code bank); zero
+    /// = split off. `--wg-split-io <hex24>[:d][:l]`, `--wg-split-vbl
+    /// <hex24>-<hex24>` and `--wg-split-mode <cell16>:<value>` (a low-WRAM
+    /// address in the mainloop flavor, read at its window home) follow.
+    wg_split_mainloop: u24 = 0,
     wg_split_tail: u16 = 0,
     wg_split_epi: u16 = 0,
     wg_split_dbr: u8 = 0,
-    wg_split_mode_cell: u8 = 0,
+    wg_split_mode_cell: u16 = 0,
     wg_split_mode_value: u8 = 0,
     wg_split_mode: bool = false,
     wg_split_io: [26]core.sa1gen.SplitIo = undefined,
     n_wg_split_io: usize = 0,
-    wg_split_vbl: [8][2]u16 = undefined,
+    wg_split_vbl: [8][2]u24 = undefined,
     n_wg_split_vbl: usize = 0,
     /// --wg-expand: grow the converted image to this many bytes (0 = keep the
     /// original size), handing the conversion room it does not otherwise have.
@@ -3024,7 +3027,7 @@ fn runSa1Gen(
             .mode_gate = args.wg_split_mode,
         } else null;
         if (split_spec != null) {
-            try out.print("  --wg-split: engaging the split (anchor $00:{x:0>4}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) args.wg_split_tail else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
+            try out.print("  --wg-split: engaging the split (anchor ${x:0>6}) ({} IO routine(s), {} reader range(s))\n", .{ if (args.wg_split_tail != 0) @as(u24, args.wg_split_tail) else args.wg_split_mainloop, args.n_wg_split_io, args.n_wg_split_vbl });
             try out.flush();
         }
         const converted: core.sa1gen.Error!core.sa1gen.Result = if (args.whole_game)
@@ -4162,7 +4165,7 @@ const coverage_unsettled_pct: f64 = 1.0;
 /// the S-CPU — against the interrupt handlers' share, and every hardware
 /// register the main loop touches, which is what the S-CPU would have to
 /// keep doing on the SA-1's behalf.
-fn printOffloadCensus(out: *std.Io.Writer, samples: []const profile.FrameSample, census: *const profile.Census) !void {
+fn printOffloadCensus(out: *std.Io.Writer, samples: []const profile.FrameSample, census: *const profile.Census, prof: *const profile.Profiler) !void {
     if (samples.len == 0) return;
     var int_sum: f64 = 0;
     var main_sum: f64 = 0;
@@ -4239,6 +4242,66 @@ fn printOffloadCensus(out: *std.Io.Writer, samples: []const profile.FrameSample,
             for (census.pcs[c][b][0..census.n_pcs[c][b]]) |q| try out.print(" ${X:0>2}:{X:0>4}", .{ q >> 16, q & 0xFFFF });
             if (census.n_pcs[c][b] == profile.Census.pcs_cap) try out.print(" ...", .{});
             try out.print("\n", .{});
+        }
+    }
+
+    // --- what the mainloop split would need, from the census -----------
+    // IO routines: every main-loop routine that touches the APU, the
+    // PPU, the WRAM port or the DMA unit. Deferred (`:d`) when any of
+    // its touches are READS — a handshake spins forever on the SA-1's
+    // open bus; RTL-shaped (`:l`) when it was JSL-called. Mirror ranges:
+    // the main-loop sites reading $4212 or the joypad, a window each.
+    var ents: [64]u24 = undefined;
+    var ent_read: [64]bool = undefined;
+    var n_ents: usize = 0;
+    for (census.count[0], 0..) |cnt, b| {
+        if (cnt == 0) continue;
+        const cls = profile.Census.classOf(profile.Census.regOf(b));
+        if (cls == .math or cls == .cpu or cls == .joypad) continue;
+        const is_read = census.writes[0][b] < cnt;
+        for (census.entries[0][b][0..census.n_pcs[0][b]]) |e| {
+            if (e == 0) continue;
+            var k: usize = 0;
+            while (k < n_ents and ents[k] != e) : (k += 1) {}
+            if (k == n_ents) {
+                if (n_ents == ents.len) break;
+                ents[n_ents] = e;
+                ent_read[n_ents] = false;
+                n_ents += 1;
+            }
+            if (is_read) ent_read[k] = true;
+        }
+    }
+    if (n_ents != 0) {
+        try out.print("    split IO routines (main-loop routines touching hardware; :d = has reads, :l = JSL-called):\n", .{});
+        for (ents[0..n_ents], 0..) |e, k| {
+            const rtl = if (prof.routineInfo(e)) |r| r.rtl_calls * 2 > r.calls else false;
+            try out.print("      --wg-split-io {X:0>6}{s}{s}", .{ e, if (ent_read[k]) ":d" else "", if (rtl) ":l" else "" });
+            if (prof.routineInfo(e)) |r| {
+                try out.print("   ({} calls, regs", .{r.calls});
+                for (r.mmio_regs[0..r.n_mmio_regs]) |reg| try out.print(" ${X:0>4}", .{reg});
+                try out.print(")", .{});
+            }
+            try out.print("\n", .{});
+        }
+    }
+    var n_vbl: usize = 0;
+    var vbl_seen: [32]u24 = undefined;
+    for (census.count[0], 0..) |cnt, b| {
+        if (cnt == 0) continue;
+        const reg = profile.Census.regOf(b);
+        if (reg != 0x4212 and !(reg >= 0x4218 and reg <= 0x421F)) continue;
+        for (census.pcs[0][b][0..census.n_pcs[0][b]]) |pc| {
+            const win: u24 = pc & 0xFFFFC0;
+            var dup = false;
+            for (vbl_seen[0..n_vbl]) |v| if (v == win) {
+                dup = true;
+            };
+            if (dup or n_vbl == vbl_seen.len) continue;
+            vbl_seen[n_vbl] = win;
+            n_vbl += 1;
+            if (n_vbl == 1) try out.print("    split mirror ranges (main-loop $4212 / joypad readers, a 64-byte window each — widen to the routine):\n", .{});
+            try out.print("      --wg-split-vbl {X:0>6}-{X:0>6}\n", .{ win, win + 0x40 });
         }
     }
 }
@@ -4516,7 +4579,7 @@ fn runReport(
         });
     }
 
-    try printOffloadCensus(out, samples.items, &con.prof.census);
+    try printOffloadCensus(out, samples.items, &con.prof.census, &con.prof);
 
     try out.print("\n  verdict: {s}\n", .{sum.verdict.describe()});
     switch (sum.verdict) {
@@ -5400,7 +5463,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.n_wg_add += 1;
         } else if (std.mem.eql(u8, a, "--wg-split")) {
             const v = it.next() orelse return error.MissingValue;
-            out.wg_split_mainloop = try std.fmt.parseInt(u16, v, 16);
+            out.wg_split_mainloop = try std.fmt.parseInt(u24, v, 16);
         } else if (std.mem.eql(u8, a, "--wg-split-tail")) {
             // "<tail>:<epilogue>:<dbr>" — the NMI-tail flavor.
             const v = it.next() orelse return error.MissingValue;
@@ -5414,7 +5477,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             // transitions run nested-native (the stock shape).
             const v = it.next() orelse return error.MissingValue;
             var pit = std.mem.splitScalar(u8, v, ':');
-            out.wg_split_mode_cell = try std.fmt.parseInt(u8, pit.next().?, 16);
+            out.wg_split_mode_cell = try std.fmt.parseInt(u16, pit.next().?, 16);
             out.wg_split_mode_value = try std.fmt.parseInt(u8, pit.next() orelse return error.MissingValue, 16);
             out.wg_split_mode = true;
         } else if (std.mem.eql(u8, a, "--wg-split-io")) {
@@ -5423,7 +5486,7 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             if (out.n_wg_split_io == out.wg_split_io.len) return error.TooManyAdds;
             var pit = std.mem.splitScalar(u8, v, ':');
-            var io: core.sa1gen.SplitIo = .{ .entry = try std.fmt.parseInt(u16, pit.next().?, 16) };
+            var io: core.sa1gen.SplitIo = .{ .entry = try std.fmt.parseInt(u24, pit.next().?, 16) };
             while (pit.next()) |f| {
                 if (std.mem.eql(u8, f, "d")) io.deferred = true;
                 if (std.mem.eql(u8, f, "l")) io.rtl = true;
@@ -5436,8 +5499,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             if (out.n_wg_split_vbl == out.wg_split_vbl.len) return error.TooManyAdds;
             var pit = std.mem.splitScalar(u8, v, '-');
             out.wg_split_vbl[out.n_wg_split_vbl] = .{
-                try std.fmt.parseInt(u16, pit.next().?, 16),
-                try std.fmt.parseInt(u16, pit.next() orelse return error.MissingValue, 16),
+                try std.fmt.parseInt(u24, pit.next().?, 16),
+                try std.fmt.parseInt(u24, pit.next() orelse return error.MissingValue, 16),
             };
             out.n_wg_split_vbl += 1;
         } else if (std.mem.eql(u8, a, "--wg-expand")) {
