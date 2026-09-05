@@ -4157,6 +4157,92 @@ const coverage_unsettled_pct: f64 = 1.0;
 /// because a title screen idling at 8% utilisation is not evidence of anything.
 /// A recorded playthrough is the way out: it replays real input from power-on
 /// and verifies it stayed in sync, so the profile describes gameplay.
+/// The SA-1 game-loop offload census (profile.Census): how much of the
+/// frame the main loop's own work is — the share an offload can take off
+/// the S-CPU — against the interrupt handlers' share, and every hardware
+/// register the main loop touches, which is what the S-CPU would have to
+/// keep doing on the SA-1's behalf.
+fn printOffloadCensus(out: *std.Io.Writer, samples: []const profile.FrameSample, census: *const profile.Census) !void {
+    if (samples.len == 0) return;
+    var int_sum: f64 = 0;
+    var main_sum: f64 = 0;
+    var idle_sum: f64 = 0;
+    var main_max: f64 = 0;
+    var int_max: f64 = 0;
+    var over_alone: usize = 0; // frames the main loop's work alone would overrun
+    var over_lag: usize = 0; // lag frames where the main loop, not the handler, is the bulk
+    var lag_frames: usize = 0;
+    var budget: f64 = 0;
+    for (samples) |smp| {
+        const tot: f64 = @floatFromInt(smp.work + smp.idle);
+        if (tot == 0) continue;
+        if (budget == 0 or tot < budget) budget = tot; // one frame's cycles (a lag frame spans more)
+        const iw: f64 = @floatFromInt(smp.int_work);
+        const mw: f64 = @floatFromInt(smp.main_work);
+        int_sum += iw / tot;
+        main_sum += mw / tot;
+        idle_sum += @as(f64, @floatFromInt(smp.idle)) / tot;
+        if (mw / tot > main_max) main_max = mw / tot;
+        if (iw / tot > int_max) int_max = iw / tot;
+        if (smp.lag) {
+            lag_frames += 1;
+            if (mw > iw) over_lag += 1;
+        }
+    }
+    for (samples) |smp| if (budget != 0 and @as(f64, @floatFromInt(smp.main_work)) > budget * 0.9) {
+        over_alone += 1;
+    };
+    const n: f64 = @floatFromInt(samples.len);
+    try out.print("\n  SA-1 offload census (main loop vs interrupt handlers)\n", .{});
+    try out.print("    frame time        main-loop work {d:.0}% (max {d:.0}%)   NMI/IRQ work {d:.0}% (max {d:.0}%)   idle {d:.0}%\n", .{
+        main_sum / n * 100, main_max * 100, int_sum / n * 100, int_max * 100, idle_sum / n * 100,
+    });
+    try out.print("    lag frames        {} — in {} of them the main loop, not the handler, is the larger share\n", .{ lag_frames, over_lag });
+    try out.print("    main loop > 90% of a frame by itself: {} frame(s)\n", .{over_alone});
+    // Register census, per context.
+    const names = [_][]const u8{ "main loop", "interrupt handlers" };
+    for (0..2) |c| {
+        var total: u64 = 0;
+        var by_class: [7]u64 = @splat(0);
+        var distinct: usize = 0;
+        for (census.count[c], 0..) |cnt, b| {
+            if (cnt == 0) continue;
+            total += cnt;
+            distinct += 1;
+            by_class[@intFromEnum(profile.Census.classOf(profile.Census.regOf(b)))] += cnt;
+        }
+        try out.print("    {s}: {d:.1} register touches per frame over {} distinct register(s) — ppu {d:.1}  apu {d:.1}  wram-port {d:.1}  dma {d:.1}  cpu {d:.1}  joypad {d:.1}  mul/div {d:.1}\n", .{
+            names[c],
+            @as(f64, @floatFromInt(total)) / n,
+            distinct,
+            @as(f64, @floatFromInt(by_class[0])) / n,
+            @as(f64, @floatFromInt(by_class[1])) / n,
+            @as(f64, @floatFromInt(by_class[2])) / n,
+            @as(f64, @floatFromInt(by_class[3])) / n,
+            @as(f64, @floatFromInt(by_class[4])) / n,
+            @as(f64, @floatFromInt(by_class[5])) / n,
+            @as(f64, @floatFromInt(by_class[6])) / n,
+        });
+        // The heaviest registers, with the sites that touch them.
+        var shown: usize = 0;
+        var used: [profile.Census.buckets]bool = @splat(false);
+        while (shown < 20) : (shown += 1) {
+            var best: ?usize = null;
+            for (census.count[c], 0..) |cnt, b| {
+                if (cnt == 0 or used[b]) continue;
+                if (best == null or cnt > census.count[c][best.?]) best = b;
+            }
+            const b = best orelse break;
+            used[b] = true;
+            const reg = profile.Census.regOf(b);
+            try out.print("      ${X:0>4} {s:<9} {d:>9.2}/frame  from", .{ reg, @tagName(profile.Census.classOf(reg)), @as(f64, @floatFromInt(census.count[c][b])) / n });
+            for (census.pcs[c][b][0..census.n_pcs[c][b]]) |q| try out.print(" ${X:0>2}:{X:0>4}", .{ q >> 16, q & 0xFFFF });
+            if (census.n_pcs[c][b] == profile.Census.pcs_cap) try out.print(" ...", .{});
+            try out.print("\n", .{});
+        }
+    }
+}
+
 fn runReport(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -4189,6 +4275,7 @@ fn runReport(
 
     var samples: std.array_list.Managed(profile.FrameSample) = .init(gpa);
     try samples.ensureTotalCapacity(want);
+    con.prof.census_on = true;
 
     var drain: [4096]i16 = undefined;
     var feed: util.movie.Feed = .init(mov);
@@ -4428,6 +4515,8 @@ fn runReport(
             sum.longest_stall, sum.longest_stall_at,
         });
     }
+
+    try printOffloadCensus(out, samples.items, &con.prof.census);
 
     try out.print("\n  verdict: {s}\n", .{sum.verdict.describe()});
     switch (sum.verdict) {

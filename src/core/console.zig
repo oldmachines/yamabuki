@@ -85,7 +85,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "polled_consumed", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -178,6 +178,12 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// bus's own flag at frame end; a per-poll input feed advances on it.
         /// Diagnostic, not machine state: in `serialize_skip`.
         polled_latch: bool,
+        /// A poll the frontend already took (`takeInputPolled`) since the
+        /// profiler's last frame boundary — the boundary sits at vblank start,
+        /// the game's own poll comes after it, and a per-poll feed takes the
+        /// flag between frames; without this the profiler saw every frame as
+        /// dropped. Diagnostic, in `serialize_skip`.
+        polled_consumed: bool,
         /// CPU instructions/interrupts retired since reset. A deterministic
         /// work proxy for perf-regression baselines (paired with bus.clock).
         steps: u64,
@@ -193,6 +199,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.ppu.pal = self.region == .pal;
             self.skip_render = false;
             self.polled_latch = false;
+            self.polled_consumed = false;
             self.reset();
         }
 
@@ -272,6 +279,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// Read-and-clear form, for a feed that advances one entry per poll.
         pub fn takeInputPolled(self: *Self) bool {
             const p = self.inputPolled();
+            if (p) self.polled_consumed = true;
             self.polled_latch = false;
             self.bus.input_polled = false;
             return p;
@@ -301,7 +309,8 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // game's logic actually runs in.
                 if (cfg.profile) {
                     self.polled_latch = self.polled_latch or self.bus.input_polled;
-                    self.prof.endFrame(self.frame, self.bus.input_polled);
+                    self.prof.endFrame(self.frame, self.bus.input_polled or self.polled_consumed);
+                    self.polled_consumed = false;
                     self.bus.input_polled = false;
                 }
                 // Entering vblank: latch the NMI flag and deliver if enabled.

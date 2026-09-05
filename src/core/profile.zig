@@ -379,6 +379,12 @@ pub const FrameSample = struct {
     /// complete an iteration: a dropped frame, which the player sees as
     /// slowdown.
     lag: bool,
+    /// `work` split by context: cycles credited while an interrupt frame was
+    /// on the call stack (the NMI/IRQ handlers and everything they call),
+    /// and the rest — the main loop's own work, the share an SA-1 offload
+    /// of the game loop could take off the S-CPU. Sums to `work`.
+    int_work: u64 = 0,
+    main_work: u64 = 0,
 
     /// Fraction of the frame spent working, 0..1. The headline number: a game
     /// that never approaches 1.0 is not a candidate for a faster CPU.
@@ -654,6 +660,13 @@ pub const Profiler = struct {
     depth: u16,
     /// Interrupt frames currently on the stack (nonzero = interrupt context).
     int_depth: u16,
+    /// Per-frame `work` by context (see FrameSample.int_work).
+    int_work_frame: u64,
+    main_work_frame: u64,
+    /// The offload census: MMIO touches by context, register and site.
+    /// Off by default (the report turns it on); see `Census`.
+    census_on: bool,
+    census: Census,
     stack_resets: u64,
     /// Every cycle the profiler has seen, work or idle — the wall clock that
     /// inclusive time is measured on.
@@ -763,6 +776,10 @@ pub const Profiler = struct {
         .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0, .is_int = false }),
         .depth = 0,
         .int_depth = 0,
+        .int_work_frame = 0,
+        .main_work_frame = 0,
+        .census_on = false,
+        .census = .{},
         .stack_resets = 0,
         .observed = 0,
         .ledger = @splat(.{ .slot = 0, .pure = 0, .iter = 0 }),
@@ -869,6 +886,10 @@ pub const Profiler = struct {
             if (read) |addr| self.noteAccess(addr);
             if (write) |addr| self.noteAccess(addr);
         }
+        if (self.census_on) {
+            if (read) |addr| self.census.note(addr, pc, self.int_depth > 0);
+            if (write) |addr| self.census.note(addr, pc, self.int_depth > 0);
+        }
 
         self.applyEvent(ev);
     }
@@ -947,6 +968,10 @@ pub const Profiler = struct {
 
     fn creditSelf(self: *Profiler, slot: u16, cycles: u64) void {
         if (cycles == 0) return;
+        // Context at settlement: staged loop cycles settle a few
+        // instructions after they ran, so a loop that straddles an
+        // interrupt boundary smears a little; the totals stay exact.
+        if (self.int_depth > 0) self.int_work_frame += cycles else self.main_work_frame += cycles;
         if (slot == slot_main) {
             self.main_self += cycles;
             self.main_frame += cycles;
@@ -1258,7 +1283,11 @@ pub const Profiler = struct {
             .work = self.work,
             .idle = self.idle,
             .lag = !polled,
+            .int_work = self.int_work_frame,
+            .main_work = self.main_work_frame,
         };
+        self.int_work_frame = 0;
+        self.main_work_frame = 0;
         self.total_work += self.work;
         self.total_idle += self.idle;
         self.work = 0;
@@ -1283,6 +1312,81 @@ pub const Profiler = struct {
         return self.pending;
     }
 };
+/// The offload census. Moving the game loop to the SA-1 leaves the S-CPU
+/// with the interrupt handlers and with every hardware register the loop
+/// touches — the SA-1 cannot reach the PPU, the DMA unit, the APU ports or
+/// the joypad, so each of those touches becomes a marshalled request. This
+/// counts them: by context (main loop vs interrupt), by register, with the
+/// first few sites that make them. Registers are bucketed: $2100-$21FF ->
+/// 0..$FF, $4200-$43FF -> $100..$2FF, $4016/$4017 (the manual joypad
+/// ports, outside `isMmio`) -> $300/$301.
+pub const Census = struct {
+    pub const buckets: usize = 0x302;
+    pub const pcs_cap: usize = 6;
+    /// [context][bucket]: 0 = main loop, 1 = interrupt.
+    count: [2][buckets]u64 = @splat(@splat(0)),
+    pcs: [2][buckets][pcs_cap]u24 = @splat(@splat(@splat(0))),
+    n_pcs: [2][buckets]u8 = @splat(@splat(0)),
+
+    pub fn bucketOf(addr: u24) ?u16 {
+        const bank: u8 = @intCast((addr >> 16) & 0x7F);
+        const a16: u16 = @truncate(addr);
+        if (bank > 0x3F) return null;
+        if (a16 >= 0x2100 and a16 <= 0x21FF) return a16 - 0x2100;
+        if (a16 >= 0x4200 and a16 <= 0x43FF) return 0x100 + (a16 - 0x4200);
+        if (a16 == 0x4016 or a16 == 0x4017) return 0x300 + (a16 - 0x4016);
+        return null;
+    }
+
+    pub fn regOf(bucket: usize) u16 {
+        if (bucket < 0x100) return 0x2100 + @as(u16, @intCast(bucket));
+        if (bucket < 0x300) return 0x4200 + @as(u16, @intCast(bucket - 0x100));
+        return 0x4016 + @as(u16, @intCast(bucket - 0x300));
+    }
+
+    /// What a register is to an offload: the class decides the cost.
+    pub const Class = enum { ppu, apu, wram_port, dma, cpu, joypad, math };
+    pub fn classOf(reg: u16) Class {
+        if (reg >= 0x2140 and reg <= 0x2143) return .apu;
+        if (reg >= 0x2180 and reg <= 0x2183) return .wram_port;
+        if (reg < 0x2200) return .ppu;
+        if (reg == 0x4016 or reg == 0x4017 or (reg >= 0x4218 and reg <= 0x421F)) return .joypad;
+        if (reg == 0x420B or reg == 0x420C or reg >= 0x4300) return .dma;
+        if ((reg >= 0x4202 and reg <= 0x4206) or (reg >= 0x4214 and reg <= 0x4217)) return .math;
+        return .cpu;
+    }
+
+    pub fn note(self: *Census, addr: u24, pc: u24, in_int: bool) void {
+        const b = bucketOf(addr) orelse return;
+        const c: usize = if (in_int) 1 else 0;
+        self.count[c][b] += 1;
+        const n = self.n_pcs[c][b];
+        for (self.pcs[c][b][0..n]) |q| if (q == pc) return;
+        if (n == pcs_cap) return;
+        self.pcs[c][b][n] = pc;
+        self.n_pcs[c][b] = n + 1;
+    }
+};
+
+test "census: registers bucket by context with their sites, and classify for the offload" {
+    var c: Census = .{};
+    c.note(0x002118, 0x808000, false);
+    c.note(0x802118, 0x808010, false);
+    c.note(0x002118, 0x808000, false);
+    c.note(0x00420B, 0x809000, true);
+    c.note(0x004016, 0x80A000, false);
+    c.note(0x7E2118, 0x80B000, false); // WRAM, not a register
+    try std.testing.expectEqual(@as(u64, 3), c.count[0][0x18]);
+    try std.testing.expectEqual(@as(u8, 2), c.n_pcs[0][0x18]);
+    try std.testing.expectEqual(@as(u64, 1), c.count[1][0x10B]);
+    try std.testing.expectEqual(@as(u64, 1), c.count[0][0x300]);
+    try std.testing.expectEqual(@as(u16, 0x420B), Census.regOf(0x10B));
+    try std.testing.expectEqual(Census.Class.dma, Census.classOf(0x420B));
+    try std.testing.expectEqual(Census.Class.math, Census.classOf(0x4216));
+    try std.testing.expectEqual(Census.Class.apu, Census.classOf(0x2140));
+    try std.testing.expectEqual(Census.Class.ppu, Census.classOf(0x2118));
+}
+
 /// The answer to "is this game CPU-bound?", which is the only question step one
 /// of the analyser is entitled to answer.
 pub const Verdict = enum {
