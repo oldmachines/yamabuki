@@ -210,6 +210,18 @@ const split_ml_pump_stack: u16 = 0x1EFF;
 const split_ml_sa1_stack: u16 = 0x35FF;
 /// The COP handler's direct page (16 bytes of I-RAM scratch).
 const split_cop_dp: u16 = 0x3640;
+// Inline-argument calls (a JSL followed by n data bytes the callee reads
+// through its return address and skips on return — Super Metroid's
+// $88:8435 and $80:91A9): the SA-1's stub captures the caller's return
+// frame, the S-CPU's replay copies the n bytes into I-RAM behind a fake
+// frame, and an RTL after them pops the drain's own frame.
+const split_cell_ret: u16 = 0x3720; // the caller's pushed PC (2) and bank (1, +1 junk)
+const split_args: u16 = 0x3724; // up to 8 argument bytes, then the RTL
+const split_asc_a: u16 = 0x3730; // the replay helper's register parking
+const split_asc_x: u16 = 0x3732;
+const split_asc_y: u16 = 0x3734;
+const split_cell_pret: u16 = 0x3736; // the P a replayed body returned with
+const split_scr_pw: u16 = 0x3737; // scratch: the caller's widths
 /// Mainloop flavor: the loop's context at the anchor when ownership
 /// changes hands (A/X/Y here; D, DBR, P, S in the engage cells), and
 /// the owner cell: 1 = the SA-1 runs the laps, 0 = the S-CPU does.
@@ -410,6 +422,7 @@ pub const Stats = struct {
     /// Mainloop flavor: math sites shadowed (uncapped).
     split_math_sites: u32 = 0,
     split_math_direct: u32 = 0,
+    split_inline_args: u8 = 0,
     /// Mainloop flavor: the dual image is in effect (see emitSplit).
     split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
@@ -6212,6 +6225,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0x4B, 0xF4, @truncate(ret1 - 1), @truncate((ret1 - 1) >> 8) }); // PHK / PEA return-1
     put(d, &cur, &.{ 0xDC, @truncate(split_cell_t), 0x37 }); // JML [cell_t]
     std.debug.assert(base16 + @as(u16, @intCast(cur)) == ret1);
+    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x68, 0x8F, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00 }); // the body's P, for the caller
     put(d, &cur, &.{ 0xE2, 0x30, 0x4B, 0xAB }); // widths, DBR back
     put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
     d[drain_empty_at + 1] = @intCast(cur - (drain_empty_at + 2));
@@ -6424,6 +6438,23 @@ fn emitSplit(
 /// waits for the replay: a handshake, or shared state that must land in
 /// order). `ff` has no frame-exit phase to ride here and is treated as
 /// deferred.
+/// An inline-argument callee: `LDA $03,S` (its return address) ...
+/// `ADC #n` ... `STA $03,S` (skipping the n bytes after the JSL). Returns n.
+fn inlineArgs(out: []const u8, entry: u24) u8 {
+    const f = splitFile(entry);
+    if (f + 64 > out.len) return 0;
+    const b = out[f..][0..64];
+    var seen_lda = false;
+    var n: u8 = 0;
+    var i: usize = 0;
+    while (i + 2 < b.len) : (i += 1) {
+        if (b[i] == 0xA3 and b[i + 1] == 0x03) seen_lda = true;
+        if (seen_lda and b[i] == 0x69 and b[i + 2] == 0x00 and b[i + 1] != 0 and b[i + 1] <= 8) n = b[i + 1];
+        if (seen_lda and n != 0 and b[i] == 0x83 and b[i + 1] == 0x03) return n;
+    }
+    return 0;
+}
+
 fn emitSplitIoBanked(
     out: []u8,
     usage: []const u8,
@@ -6451,15 +6482,49 @@ fn emitSplitIoBanked(
         const e16: u16 = @truncate(io.entry);
         const bank_byte: u8 = @intCast(io.entry >> 16);
         const deferred = io.deferred or io.ff;
+        const args = inlineArgs(out, io.entry);
+        if (args != 0 and !(io.rtl and deferred)) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        if (args != 0) res.stats.split_inline_args += 1;
 
         // The trampoline: [JSR/JSL helper][RTL][helper: prefix; JMP body+span]
+        // — or, for an inline-argument callee, [JSL far helper][helper...]:
+        // the far helper copies the argument bytes behind a fake frame and
+        // jumps into the helper (see split_args).
         var tb: [40]u8 = undefined;
         var tc: usize = 0;
-        const t_need: u32 = if (io.rtl) 5 + span + 3 else 4 + span + 3;
+        const t_need: u32 = if (args != 0) 4 + span + 3 else if (io.rtl) 5 + span + 3 else 4 + span + 3;
         const tat = far.nextIn(bank, t_need, if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
             return refuse(refusal, .{ .reason = .no_free_space, .detail = t_need });
         const t16: u16 = @intCast(0x8000 + (tat % 0x8000));
-        if (io.rtl) {
+        if (args != 0) {
+            const helper: u24 = (@as(u24, bank_byte) << 16) | (t16 + 4);
+            var ab: [160]u8 = undefined;
+            var ac: usize = 0;
+            put(&ab, &ac, &.{ 0x08, 0xC2, 0x30 }); // PHP / REP #$30
+            put(&ab, &ac, &.{ 0x8F, @truncate(split_asc_a), @truncate(split_asc_a >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x8A, 0x8F, @truncate(split_asc_x), @truncate(split_asc_x >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x98, 0x8F, @truncate(split_asc_y), @truncate(split_asc_y >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x0B, 0xF4, @truncate(split_cop_dp), @truncate(split_cop_dp >> 8), 0x2B }); // PHD / D := scratch
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_cell_ret), @truncate(split_cell_ret >> 8), 0x00, 0x1A, 0x85, 0x00 }); // ptr := ret + 1
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xAF, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00, 0x85, 0x02, 0xC2, 0x20 }); // bank
+            put(&ab, &ac, &.{ 0xA0, 0x00, 0x00, 0xA2, 0x00, 0x00 });
+            var k: u8 = 0;
+            while (k < args) : (k += 2) {
+                put(&ab, &ac, &.{ 0xB7, 0x00, 0x9F, @truncate(split_args), @truncate(split_args >> 8), 0x00, 0xC8, 0xC8, 0xE8, 0xE8 }); // LDA [$00],Y / STA args,X
+            }
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xA9, 0x6B, 0x8F, @truncate(split_args + args), @truncate((split_args + args) >> 8), 0x00, 0xC2, 0x20 }); // the RTL after them
+            // the JSL frame (at $04,S past PHP and PHD) becomes the fake one
+            put(&ab, &ac, &.{ 0xA9, @truncate(split_args - 1), @truncate((split_args - 1) >> 8), 0x83, 0x04 });
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xA9, 0x00, 0x83, 0x06, 0xC2, 0x30, 0x2B }); // bank $00 / PLD
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_x), @truncate(split_asc_x >> 8), 0x00, 0xAA });
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_y), @truncate(split_asc_y >> 8), 0x00, 0xA8 });
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_a), @truncate(split_asc_a >> 8), 0x00, 0x28 }); // A, then PLP
+            put(&ab, &ac, &.{ 0x5C, @truncate(helper), @truncate(helper >> 8), @truncate(helper >> 16) }); // JML helper
+            const fat = far.next(@intCast(ac)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(ac) });
+            @memcpy(out[fat .. fat + ac], ab[0..ac]);
+            const far24: u24 = @intCast(((fat / 0x8000) << 16) | (0x8000 + (fat % 0x8000)));
+            put(&tb, &tc, &.{ 0x22, @truncate(far24), @truncate(far24 >> 8), @truncate(far24 >> 16) }); // JSL far helper
+        } else if (io.rtl) {
             const helper = t16 + 5;
             put(&tb, &tc, &.{ 0x22, @truncate(helper), @truncate(helper >> 8), bank_byte, 0x6B });
         } else {
@@ -6488,6 +6553,11 @@ fn emitSplitIoBanked(
         // with SIWP closed bounces, and reading it back handed every
         // boot-time IO body a garbage A.
         put(&fb, &fc, &.{ 0x08, 0xC2, 0x30, 0x48 }); // PHP / REP #$30 / PHA
+        if (args != 0) {
+            // the game's JSL frame sits at $04,S: PC, then the bank
+            put(&fb, &fc, &.{ 0xA3, 0x04, 0x8F, @truncate(split_cell_ret), @truncate(split_cell_ret >> 8), 0x00 });
+            put(&fb, &fc, &.{ 0xA3, 0x06, 0x8F, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00 });
+        }
         put(&fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
         put(&fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
         put(&fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
@@ -6505,7 +6575,17 @@ fn emitSplitIoBanked(
             put(&fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00 }); // spin: ack
             put(&fb, &fc, &.{ 0xCF, @truncate(split_scr_a), 0x37, 0x00 }); // still the old one?
             put(&fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
+            // The flags the body returned with (a `CLC; RTL` is a return
+            // value), under the caller's own widths — the pushes below
+            // were made in those.
+            put(&fb, &fc, &.{ 0xA3, 0x01, 0x29, 0x30, 0x8F, @truncate(split_scr_pw), @truncate(split_scr_pw >> 8), 0x00 });
+            put(&fb, &fc, &.{ 0xAF, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00, 0x29, 0xCF });
+            put(&fb, &fc, &.{ 0x0F, @truncate(split_scr_pw), @truncate(split_scr_pw >> 8), 0x00, 0x83, 0x01 });
             put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+            if (args != 0) {
+                // skip the inline bytes, as the body would have
+                put(&fb, &fc, &.{ 0x08, 0xC2, 0x20, 0x48, 0xA3, 0x04, 0x18, 0x69, args, 0x00, 0x83, 0x04, 0x68, 0x28 });
+            }
             put(&fb, &fc, &[_]u8{if (io.rtl) 0x6B else 0x60}); // pop the GAME frame, in the body's own bank
         } else {
             put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
