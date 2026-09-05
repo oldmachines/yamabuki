@@ -2965,7 +2965,7 @@ const wg_prologue_len = 21;
 /// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
 /// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
-const wg_window_shim_max = 33 + 48;
+const wg_window_shim_max = 33 + 72;
 /// What the shim must program before releasing the SA-1 from reset:
 /// its reset vector and — S-CPU-side registers both — its IRQ vector,
 /// aimed at the watchdog's abort handler.
@@ -6135,10 +6135,14 @@ fn emitSplit(
     const drain_call_at = cur;
     put(d, &cur, &.{ 0x20, 0x00, 0x00 }); // JSR drain_one (patched; returns at once when empty)
     put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 }); // in_replay := 0
-    // Does the loop still belong to the SA-1?
+    // Does the loop still belong to the SA-1? BNE-over-BRL: the takeover
+    // sits past the drain routine and the NMI hook, out of a short branch's
+    // reach (measured: the truncated offset branched backward into the
+    // boot, and the game re-ran its reset path every frame).
     put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) });
-    const beq_take_at = cur;
-    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ takeover (patched)
+    put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the BRL
+    const brl_take_at = cur;
+    put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL takeover (patched)
     put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
     // drain_one (SEP #$30, DBR $00 on entry; RTS): one ring entry — the
     // caller's D/DBR/registers/widths come back from the stub's capture
@@ -6183,6 +6187,8 @@ fn emitSplit(
     const nmi_vec = std.mem.readInt(u16, out[0x7FEA..0x7FEC], .little);
     const hook16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB, 0xE2, 0x30 }); // PHP / REP / PHA PHX PHY PHD PHB / PHK PLB / SEP #$30
+    put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) }); // the SA-1 owns the loop?
+    put(d, &cur, &.{ 0xF0, 0x08 }); // BEQ over the call: nothing to drain in the S-CPU's own eras
     put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 }); // the pump mid-drain? stand down
     put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the call
     put(d, &cur, &.{ 0x20, @truncate(drain16), @truncate(drain16 >> 8) });
@@ -6191,7 +6197,7 @@ fn emitSplit(
     std.mem.writeInt(u16, out[0x7FEA..0x7FEC], hook16, .little);
     // takeover (S-CPU): the SA-1 handed the loop back — its context is
     // in the cells; the game stack is where the S-CPU left it.
-    d[beq_take_at + 1] = @intCast(cur - (beq_take_at + 2));
+    std.mem.writeInt(u16, d[brl_take_at + 1 ..][0..2], @intCast(cur - (brl_take_at + 3)), .little);
     if (dual) {
         // The S-CPU's copy back: megabytes 0/1/0/2 (SEP #$30 is live).
         put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x20, 0x22, 0xA9, 0x81, 0x8D, 0x21, 0x22 });
@@ -8992,7 +8998,17 @@ pub fn convertWholeGame(
         // The mainloop split's stubs and COP handler store into I-RAM from
         // the S-CPU from the first frame on (boot-time IO calls, boot-time
         // math), long before the engage stub's own SIWP open: open it here.
-        if (ml_split != null) wn = emitStore(d, wn, 0x2229, 0xFF);
+        if (ml_split != null) {
+            wn = emitStore(d, wn, 0x2229, 0xFF);
+            // The split's cells are power-on garbage until the first engage
+            // resets them — and the NMI hook drains the ring from the first
+            // frame (measured: boot-era NMIs replayed nonsense ids and the
+            // intro gained four lag frames). Zero them here.
+            wn = emitStore(d, wn, split_ring_wr, 0x00);
+            wn = emitStore(d, wn, split_ring_rd, 0x00);
+            wn = emitStore(d, wn, split_in_replay, 0x00);
+            wn = emitStore(d, wn, split_owner, 0x00);
+        }
         if (boot) |b| {
             // Boot the SA-1 into the window dispatcher; the async busy
             // flag starts idle (I-RAM is garbage at power-on, and SIWP
