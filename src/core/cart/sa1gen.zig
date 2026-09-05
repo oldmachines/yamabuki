@@ -162,7 +162,7 @@ const split_ring_rd: u16 = 0x3791; // S-CPU drains
 const split_vbl_mirror: u16 = 0x3792; // live $4212 image
 const split_pad_mirror: u16 = 0x3794; // $4218-$421F, 8 bytes
 const split_cell_d: u16 = 0x379C; // game D at engage
-const split_cell_p: u16 = 0x379D; // game P at engage
+const split_cell_p: u16 = 0x36E8; // game P at engage -- NOT $379D: that is cell_d's high byte, and the engage stub's P store turned the game's D=$6000 into P<<8 (measured: D=$8100 at the first gameplay hand-over, the IRQ handler's LDX $AB read ROM, and the S-CPU jumped into $80:0000)
 const split_cell_s: u16 = 0x379E; // game S at engage (16-bit)
 const split_ring: u16 = 0x37A0; // 16 ids
 const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
@@ -5883,7 +5883,7 @@ fn emitSplit(
         // chain, and $9231's 16-bit fill count in Y truncated to 8 bits
         // (measured: the option screen cleared 256 of each map's 1024
         // words and the menu logo stayed behind the text).
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // LDA cell_p / PHA / PLP
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48, 0x28 }); // LDA cell_p / PHA / PLP
         put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the head's context
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8) });
         // The SA-1 island: unwind the pins (the head's own D/B come
@@ -6206,7 +6206,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0xC2, 0x30, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // S
     put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // D
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // DBR
-    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48 }); // P, pushed for the PLP
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48 }); // P, pushed for the PLP
     put(d, &cur, &.{ 0xC2, 0x30, 0xAE, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0xAC, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8) });
     put(d, &cur, &.{ 0xAD, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x28 }); // A / PLP
     const take_jml_at = cur;
@@ -6235,7 +6235,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0x98, 0x8F, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8), 0x00 }); // Y
     put(d, &cur, &.{ 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00 }); // D
     put(d, &cur, &.{ 0xE2, 0x20, 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 }); // DBR
-    put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), 0x37, 0x00 }); // P (pushed at entry)
+    put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x00 }); // P (pushed at entry)
     put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x8F, @truncate(split_cell_s), 0x37, 0x00, 0xE2, 0x20 }); // S
     put(d, &cur, &.{ 0xAF, @truncate(split_engaged), 0x37, 0x00 });
     const eng_released_at = cur;
@@ -6283,7 +6283,7 @@ fn emitSplit(
         put(d, &cur, &.{ 0x98, 0x8F, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8), 0x00 });
         put(d, &cur, &.{ 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00 });
         put(d, &cur, &.{ 0xE2, 0x20, 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
-        put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), 0x37, 0x00 });
+        put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x00 });
         put(d, &cur, &.{ 0xA9, 0x00, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := S-CPU, last
         sa1_wait_jmp_at = cur;
         put(d, &cur, &.{ 0x4C, 0x00, 0x00 }); // JMP the SA-1 wait (patched)
@@ -6305,7 +6305,7 @@ fn emitSplit(
     put(d, &cur, &.{ 0xF0, 0xF8 }); // BEQ the wait (-8)
     put(d, &cur, &.{ 0xC2, 0x30, 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // D
     put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // DBR
-    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48 }); // P for the PLP
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48 }); // P for the PLP
     put(d, &cur, &.{ 0xC2, 0x30, 0xAE, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0xAC, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8) });
     put(d, &cur, &.{ 0xAD, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x28 }); // A / PLP
     const tramp16: u16 = base16 + @as(u16, @intCast(cur)) + 4;
@@ -11263,12 +11263,15 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     @memset(rom[0x1000..0x7FC0], 0xFF); // bank $00 carve space
     @memset(rom[0x8000..0x10000], 0xFF); // bank $01: the loop, then padding
     // bank $00: boot, the deferred RTL routine, the NMI handler
-    @memcpy(rom[0x0000..0x0018], &[_]u8{
+    @memcpy(rom[0x0000..0x001C], &[_]u8{
         0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
         0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
         0xA9, 0x10, 0x8D, 0x82, 0x21, // LDA #$10 / STA $2182
         0x9C, 0x83, 0x21, // STZ $2183
         0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
+        0xF4, 0x00, 0x01, 0x2B, // PEA $0100 / PLD (the shift moves it to $6100) — a nonzero D the lap USES (below): a
+        // handoff that hands the SA-1 a wrong D breaks the remainder total
+        // (the cells once overlapped: P's store clobbered D's high byte)
         0x5C, 0x00, 0x80, 0x01, // JML $01:8000
     });
     @memcpy(rom[0x0060..0x0064], &[_]u8{ 0xEE, 0x02, 0x01, 0x6B }); // INC $0102 / RTL
@@ -11293,7 +11296,7 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
         0xAD, 0x14, 0x42, // 803D LDA $4214 — the quotient
         0x18, 0x6D, 0x06, 0x01, 0x8D, 0x06, 0x01, // 8040 += into $0106
         0xAD, 0x16, 0x42, // 8047 LDA $4216 — the remainder
-        0x18, 0x6D, 0x08, 0x01, 0x8D, 0x08, 0x01, // 804A += into $0108
+        0x18, 0x65, 0x08, 0xEA, 0x85, 0x08, 0xEA, // 804A += into $0108, direct-page ($6108: D=$6100)
         0xE2, 0x20, // 8051 SEP #$20
         0x20, 0x80, 0x80, // 8053 JSR $8080 — the RTS-shaped IO routine (bank $01)
         0x22, 0x60, 0x80, 0x00, // 8056 JSL $00:8060 — the deferred RTL one
@@ -11313,13 +11316,13 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
             if (m8) u[a] |= usage_map.flag_m;
         }
     }.f;
-    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014 }) |a| mark(bytes, a, true);
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8017, 0x8018 }) |a| mark(bytes, a, true);
     for ([_]u32{ 0x8060, 0x8063, 0x8050, 0x8051, 0x8054, 0x8055 }) |a| mark(bytes, a, true);
     // the loop: 8-bit until 801A, 16-bit to 802C, 8-bit to 803B, 16-bit to 8051, 8-bit after
     for ([_]u32{ 0x8000, 0x8002, 0x8003, 0x8004, 0x8005, 0x8007, 0x800A, 0x800C, 0x800E, 0x8011, 0x8013, 0x8016, 0x8017, 0x8018, 0x8019, 0x801A }) |a| mark(bytes, 0x01_0000 | a, true);
     for ([_]u32{ 0x801C, 0x801F, 0x8020, 0x8023, 0x8026, 0x8029, 0x802C }) |a| mark(bytes, 0x01_0000 | a, false);
     for ([_]u32{ 0x802E, 0x8030, 0x8033, 0x8034, 0x8035, 0x8036, 0x8037, 0x8038, 0x8039, 0x803A, 0x803B }) |a| mark(bytes, 0x01_0000 | a, true);
-    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x804A, 0x804B, 0x804E, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x804A, 0x804B, 0x804D, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
     for ([_]u32{ 0x8053, 0x8056, 0x805A, 0x805C, 0x805F, 0x8061, 0x8064, 0x8066, 0x8069, 0x8080, 0x8083, 0x8086 }) |a| mark(bytes, 0x01_0000 | a, true);
 
     const io = [_]SplitIo{ .{ .entry = 0x01_8080 }, .{ .entry = 0x00_8060, .deferred = true, .rtl = true } };
