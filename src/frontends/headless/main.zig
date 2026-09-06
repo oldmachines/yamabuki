@@ -129,6 +129,13 @@ const Args = struct {
     /// --ref-overclock <n>: the behavioral tier's BASELINE runs its S-CPU n
     /// times faster (a lag-free stock reference; see Bus.overclock).
     ref_overclock: u8 = 1,
+    /// --conv-overclock <n>: the CONVERSION side too — both its S-CPU and
+    /// its SA-1 run n times faster in the gate's eras. With
+    /// --ref-overclock the tier compares two lag-free machines: logic
+    /// equivalence with the lag differential taken out of the picture.
+    /// On a plain run of a conversion image, `--ref-overclock` alone
+    /// overclocks that image's CPUs the same way (a measurement).
+    conv_overclock: u8 = 1,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -519,6 +526,7 @@ fn run(init: std.process.Init) !void {
     }
     if (args.behavioral_probe) |cpath| {
         dbg_ref_overclock = args.ref_overclock;
+        dbg_conv_overclock = args.conv_overclock;
         dbg_ref_oc_cell = args.wg_split_mode_cell;
         dbg_ref_oc_lo = args.wg_split_mode_value;
         dbg_ref_oc_hi = if (args.wg_split_mode_hi != 0) args.wg_split_mode_hi else args.wg_split_mode_value;
@@ -584,6 +592,7 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
     if (args.lap_cell != 0) core.wdc65816.lap_cell = args.lap_cell;
     dbg_ref_overclock = args.ref_overclock;
+    dbg_conv_overclock = args.conv_overclock;
     dbg_ref_oc_cell = args.wg_split_mode_cell;
     dbg_ref_oc_lo = args.wg_split_mode_value;
     dbg_ref_oc_hi = if (args.wg_split_mode_hi != 0) args.wg_split_mode_hi else args.wg_split_mode_value;
@@ -627,6 +636,13 @@ fn run(init: std.process.Init) !void {
         if (args.repoll != null) {
             _ = con.takeInputPolled();
             _ = con.takeLapPassed();
+        }
+        // --ref-overclock on a plain run: this image's CPUs, in the gate's
+        // eras (a lag-free measurement of either side).
+        if (dbg_ref_overclock > 1 and i >= 300 and con.* == .fast) {
+            const v = modeCell(&con.fast, dbg_ref_oc_cell);
+            con.fast.bus.overclock = if (dbg_ref_oc_cell != 0 and v >= dbg_ref_oc_lo and v <= dbg_ref_oc_hi) dbg_ref_overclock else 1;
+            con.fast.bus.sa1.overclock = con.fast.bus.overclock;
         }
         con.runFrame();
         if (mov) |m| if (m.per_poll and movie_end == null and feed.cursor + 1 >= m.frames.len and (if (m.lap_cell != 0) con.lapPassed() else con.inputPolled())) {
@@ -1079,8 +1095,17 @@ fn loadMovie(
 /// must follow it or every press lands early in game-time and forks the
 /// run). Set by the undocumented --conv-pad flag.
 pub var dbg_conv_pad: u32 = 0;
+/// The split's mode cell as this machine holds it: WRAM on stock, the
+/// BW-RAM window (the relocated home) on a conversion with an SA-1.
+fn modeCell(con: *core.FastConsole, cell: u16) u8 {
+    if (con.bus.sa1.bwram_mask != 0) return con.bus.sa1.bwram[cell & con.bus.sa1.bwram_mask];
+    return con.bus.wram.data[cell];
+}
+
 /// --ref-overclock: the verifier's baseline S-CPU divisor.
 pub var dbg_ref_overclock: u8 = 1;
+/// --conv-overclock: the verifier's conversion-side divisor (S-CPU and SA-1).
+pub var dbg_conv_overclock: u8 = 1;
 pub var dbg_ref_oc_cell: u16 = 0;
 pub var dbg_ref_oc_lo: u8 = 0;
 pub var dbg_ref_oc_hi: u8 = 0;
@@ -1148,8 +1173,9 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
     var feed: util.movie.Feed = .init(mov);
     for (0..total) |i| {
         if (dbg_ref_overclock > 1 and i >= 300) {
-            const v = con.bus.wram.data[dbg_ref_oc_cell];
+            const v = modeCell(con, dbg_ref_oc_cell);
             con.bus.overclock = if (dbg_ref_oc_cell != 0 and v >= dbg_ref_oc_lo and v <= dbg_ref_oc_hi) dbg_ref_overclock else 1;
+            con.bus.sa1.overclock = con.bus.overclock;
         }
         if (stepBehavioralFrame(con, snap, &feed, @intCast(i))) {
             if (lag_run > 0 and lag_run <= lag_run_max and ticks > 0) {
@@ -1363,8 +1389,9 @@ fn verifyBehavioral(
             const from = self.frame;
             while (self.frame < budget) {
                 if (self.oc > 1 and self.frame >= 300) {
-                    const v = self.con.bus.wram.data[self.oc_cell];
+                    const v = modeCell(self.con, self.oc_cell);
                     self.con.bus.overclock = if (self.oc_cell != 0 and v >= self.oc_lo and v <= self.oc_hi) self.oc else 1;
+                    self.con.bus.sa1.overclock = self.con.bus.overclock;
                 }
                 const ticked = stepBehavioralFrame(self.con, self.snap, &self.feed, self.frame -| self.pad);
                 self.frame += 1;
@@ -1394,6 +1421,10 @@ fn verifyBehavioral(
     base.oc_cell = dbg_ref_oc_cell;
     base.oc_lo = dbg_ref_oc_lo;
     base.oc_hi = dbg_ref_oc_hi;
+    conv.oc = dbg_conv_overclock;
+    conv.oc_cell = dbg_ref_oc_cell;
+    conv.oc_lo = dbg_ref_oc_lo;
+    conv.oc_hi = dbg_ref_oc_hi;
     if (state) |sb| {
         try base.con.loadState(sb);
         try seedConverted(conv.con, sb, plan, res);
@@ -5434,6 +5465,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_ppu = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--ref-overclock")) {
             out.ref_overclock = try std.fmt.parseInt(u8, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--conv-overclock")) {
+            out.conv_overclock = try std.fmt.parseInt(u8, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--lap-cell")) {
             out.lap_cell = try std.fmt.parseInt(u16, it.next() orelse return error.MissingValue, 16);
         } else if (std.mem.eql(u8, a, "--repoll")) {

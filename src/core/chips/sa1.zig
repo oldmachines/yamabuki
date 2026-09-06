@@ -32,7 +32,7 @@ const sa1_trace = @import("../sa1_trace.zig");
 const usage_map = @import("../usage_map.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "bwram_hi", "bwram_hi_mask", "mmc_base", "mmc_flat", "trace", "usage" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "bwram_hi", "bwram_hi_mask", "mmc_base", "mmc_flat", "trace", "usage", "overclock" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -65,6 +65,12 @@ pub const Sa1 = struct {
     // Catch-up scheduling (master cycles banked, 2 per SA-1 cycle).
     last_sync: u64,
     budget: i64,
+    /// SA-1 overclock multiplier (1 = real): the master cycles banked per
+    /// sync are multiplied, so the SA-1 runs n times faster. A
+    /// verification REFERENCE, paired with Bus.overclock on the S-CPU: a
+    /// conversion whose CPUs are both lag-free pairs per poll with a
+    /// lag-free stock, where real timing forks on every lag difference.
+    overclock: u8,
 
     // $2200 CCNT (SNES → SA-1 control)
     sa1_irq: bool,
@@ -180,6 +186,7 @@ pub const Sa1 = struct {
         // Zero everything bytewise (the struct holds pointers, which
         // std.mem.zeroes refuses); attach() wires the pointers before use.
         @memset(std.mem.asBytes(self), 0);
+        self.overclock = 1;
         self.cpu = CpuT.init(self);
         self.sa1_resb = true; // held in reset until the SNES releases it
         self.db = 1;
@@ -227,7 +234,7 @@ pub const Sa1 = struct {
             self.last_sync = master_clock;
             return;
         }
-        self.budget += @intCast(master_clock - self.last_sync);
+        self.budget += @as(i64, @intCast(master_clock - self.last_sync)) * @as(i64, self.overclock);
         self.last_sync = master_clock;
         if (!self.running()) {
             self.budget = 0;
