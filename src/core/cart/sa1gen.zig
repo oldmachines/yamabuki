@@ -423,6 +423,7 @@ pub const Stats = struct {
     split_math_sites: u32 = 0,
     split_math_direct: u32 = 0,
     split_inline_args: u8 = 0,
+    split_trigger_jsl: u32 = 0,
     /// Mainloop flavor: the dual image is in effect (see emitSplit).
     split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
@@ -6737,8 +6738,43 @@ fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad,
 /// copied.
 /// A site the split displaced, with the bytes it replaced — so the
 /// S-CPU's copy of the game can have them back (see the dual image).
-const MathSite = struct { addr: u24, len: u8, bytes: [4]u8 };
+const MathSite = struct { addr: u24, len: u8, bytes: [8]u8 };
 const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
+
+/// Whether any covered branch, jump or call in `addr`'s bank lands on
+/// `addr` — a displaced instruction there would be skipped by that path.
+fn splitTargeted(out: []const u8, usage: []const u8, addr: u24) bool {
+    const bank: u32 = (addr >> 16) & 0x7F;
+    const a16: u16 = @truncate(addr);
+    var pc: u32 = 0x8000;
+    while (pc < 0x10000) : (pc += 1) {
+        const ac: u24 = @intCast((bank << 16) | pc);
+        const u = splitUsage(usage, ac);
+        if (u & usage_map.flag_opcode == 0) continue;
+        const f = splitFile(ac);
+        const op = out[f];
+        switch (op) {
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80 => {
+                const rel: i8 = @bitCast(out[f + 1]);
+                const t: i32 = @as(i32, @intCast(pc)) + 2 + rel;
+                if (t == a16) return true;
+            },
+            0x82, 0x62 => {
+                const rel: i16 = @bitCast(std.mem.readInt(u16, out[f + 1 ..][0..2], .little));
+                const t: i32 = @as(i32, @intCast(pc)) + 3 + rel;
+                if (t == a16) return true;
+            },
+            0x4C, 0x20 => {
+                if (std.mem.readInt(u16, out[f + 1 ..][0..2], .little) == a16) return true;
+            },
+            0x5C, 0x22 => {
+                if (std.mem.readInt(u16, out[f + 1 ..][0..2], .little) == a16 and (out[f + 3] & 0x7F) == bank) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
 
 fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, shared: []const u24, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
@@ -6806,6 +6842,30 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
     @memcpy(out[cat .. cat + cc], calc[0..cc]);
     const mul24: u24 = @intCast(((cat / 0x8000) << 16) | (0x8000 + (cat % 0x8000)));
     const div24: u24 = mul24 + @as(u24, @intCast(mul_len));
+    // The mode-7 calculators as far routines (for the JSL-shaped trigger
+    // sites; the COP handler keeps its inline copy): m7a composes M7A from
+    // the last-written byte and the latch, both recompute the product.
+    // Long addressing throughout — the caller's DBR is anything.
+    var m7c: [96]u8 = undefined;
+    var mc: usize = 0;
+    put(&m7c, &mc, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP / SEP #$20 / PHA
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x00, 0x8F, @truncate(split_m7a + 1), @truncate((split_m7a + 1) >> 8), 0x00 }); // hi := last
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x00, 0x8F, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x00 }); // lo := latch
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x00, 0x8F, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x00 }); // latch := last
+    put(&m7c, &mc, &.{ 0x68, 0x28 }); // PLA / PLP -- falls into the product
+    const m7b_off = mc;
+    put(&m7c, &mc, &.{ 0x08, 0xC2, 0x20, 0x48 }); // PHP / REP #$20 / PHA
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x00, 0x8F, 0x51, 0x22, 0x00 }); // MA := M7A
+    put(&m7c, &mc, &.{ 0xE2, 0x20, 0xAF, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x00, 0x8F, 0x53, 0x22, 0x00 }); // MB lo
+    put(&m7c, &mc, &.{ 0xA9, 0x00, 0x2C, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x10, 0x02, 0xA9, 0xFF }); // sign-extend (BIT abs: DBR is a code bank, I-RAM aliases there)
+    put(&m7c, &mc, &.{ 0x8F, 0x54, 0x22, 0x00, 0xEA, 0xEA, 0xEA }); // MB hi (triggers) / 5 cycles
+    put(&m7c, &mc, &.{ 0xC2, 0x20, 0xAF, 0x06, 0x23, 0x00, 0x8F, @truncate(split_m7_prod), @truncate(split_m7_prod >> 8), 0x00 }); // product low word
+    put(&m7c, &mc, &.{ 0xE2, 0x20, 0xAF, 0x08, 0x23, 0x00, 0x8F, @truncate(split_m7_prod + 2), @truncate((split_m7_prod + 2) >> 8), 0x00 }); // byte 2
+    put(&m7c, &mc, &.{ 0xC2, 0x20, 0x68, 0x28, 0x6B }); // REP / PLA / PLP / RTL
+    const m7at = far.next(@intCast(mc)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(mc) });
+    @memcpy(out[m7at .. m7at + mc], m7c[0..mc]);
+    const m7a24: u24 = @intCast(((m7at / 0x8000) << 16) | (0x8000 + (m7at % 0x8000)));
+    const m7b24: u24 = m7a24 + @as(u24, @intCast(m7b_off));
 
     // The sites. Each 3-byte absolute access becomes `COP nn / NOP`: a
     // software interrupt whose handler (bank $00, the native COP vector —
@@ -6870,6 +6930,90 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
                 // Direct cell access for the SA-1's own sites: no trigger to
                 // run, no S-CPU ever here in this copy.
                 const trigger = kind <= 3 and (off == 1 or (off == 0 and wide) or off == 4 or (off == 3 and wide) or off == 0x40 or off == 0x41);
+                // A trigger store as a JSL to its own far routine (measured: the
+                // COP dispatch was ~95 instructions per site, 0.18 frame of a
+                // gameplay lap and a quarter of a door transition's SA-1 time).
+                // The 3-byte site needs the instruction after it to ride along:
+                // a whole, covered, relocatable one — no flow, no push/pull, no
+                // stack move, no register-file access, and nothing branches to it.
+                if (trigger and (long or blk: {
+                    const nf = file + 3;
+                    const nu = splitUsage(usage, ac + 3);
+                    if (nu & usage_map.flag_opcode == 0) break :blk false;
+                    const nop = out[nf];
+                    switch (nop) {
+                        0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x62, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x02, 0xCB, 0xDB => break :blk false, // flow
+                        0x48, 0xDA, 0x5A, 0x08, 0x8B, 0x0B, 0x4B, 0xF4, 0xD4, 0x68, 0xFA, 0x7A, 0x28, 0xAB, 0x2B, 0x3B, 0x1B, 0x9A, 0xBA, 0x22 => break :blk false, // push/pull/stack/JSL
+                        else => if (nop & 0x0F == 0x03) break :blk false, // stack-relative: the frame is three deeper inside the routine
+                    }
+                    const nlen = usage_map.instrLen(nop, nu & usage_map.flag_m != 0, nu & usage_map.flag_x != 0);
+                    if (nlen < 1 or 3 + @as(u32, nlen) > 8) break :blk false;
+                    if (nlen >= 3) {
+                        const nreg = std.mem.readInt(u16, out[nf + 1 ..][0..2], .little);
+                        if ((nreg >= 0x2100 and nreg <= 0x21FF) or (nreg >= 0x4200 and nreg <= 0x43FF)) break :blk false;
+                    }
+                    if (splitTargeted(out, usage, ac + 3)) break :blk false;
+                    break :blk true;
+                })) {
+                    const site_len: u32 = if (long) 4 else 3;
+                    const span: u32 = if (long) 4 else 3 + @as(u32, usage_map.instrLen(out[file + 3], splitUsage(usage, ac + 3) & usage_map.flag_m != 0, splitUsage(usage, ac + 3) & usage_map.flag_x != 0));
+                    var tb: [96]u8 = undefined;
+                    var tcn: usize = 0;
+                    // PHP / REP #$20 / PHA / TSC / AND / CMP / BEQ sa1 / PLA / PLP / the real store / displaced / RTL
+                    put(&tb, &tcn, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 });
+                    const beq_at = tcn;
+                    put(&tb, &tcn, &.{ 0xF0, 0x00 }); // (patched)
+                    put(&tb, &tcn, &.{ 0x68, 0x28 }); // PLA / PLP
+                    @memcpy(tb[tcn .. tcn + site_len], out[file..][0..site_len]); // the original store, real register
+                    tcn += if (long) 4 else 3;
+                    if (span > site_len) {
+                        @memcpy(tb[tcn .. tcn + (span - site_len)], out[file + site_len ..][0 .. span - site_len]);
+                        tcn += span - site_len;
+                    }
+                    put(&tb, &tcn, &.{0x6B}); // RTL
+                    // SA-1: PLA / PLP, then registers and flags kept around the cell store + calc
+                    tb[beq_at + 1] = @intCast(tcn - (beq_at + 2));
+                    put(&tb, &tcn, &.{ 0x68, 0x28, 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // PLA PLP / PHP REP #$30 PHA PHX PHY
+                    const reg_kind = kind & 3; // 0 A, 1 X, 2 Y, 3 zero
+                    switch (reg_kind) {
+                        1 => put(&tb, &tcn, &.{0x8A}), // TXA
+                        2 => put(&tb, &tcn, &.{0x98}), // TYA
+                        3 => put(&tb, &tcn, &.{ 0xA9, 0x00, 0x00 }), // LDA #0
+                        else => {},
+                    }
+                    const cell: u16 = if (off < 8) split_math_a + off else split_m7_last + (off - 0x40);
+                    if (wide) {
+                        put(&tb, &tcn, &.{ 0x8F, @truncate(cell), @truncate(cell >> 8), 0x00 }); // 16-bit store
+                    } else {
+                        put(&tb, &tcn, &.{ 0xE2, 0x20, 0x8F, @truncate(cell), @truncate(cell >> 8), 0x00, 0xC2, 0x20 });
+                    }
+                    const calc24: u24 = switch (off) {
+                        0, 1 => mul24,
+                        3, 4 => div24,
+                        0x40 => m7a24,
+                        else => m7b24,
+                    };
+                    put(&tb, &tcn, &.{ 0x22, @truncate(calc24), @truncate(calc24 >> 8), @truncate(calc24 >> 16) });
+                    put(&tb, &tcn, &.{ 0x7A, 0xFA, 0x68, 0x28 }); // PLY PLX PLA PLP
+                    if (span > site_len) {
+                        @memcpy(tb[tcn .. tcn + (span - site_len)], out[file + site_len ..][0 .. span - site_len]);
+                        tcn += span - site_len;
+                    }
+                    put(&tb, &tcn, &.{0x6B}); // RTL
+                    const tat = far.next(@intCast(tcn)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(tcn) });
+                    @memcpy(out[tat .. tat + tcn], tb[0..tcn]);
+                    const t24: u24 = @intCast(((tat / 0x8000) << 16) | (0x8000 + (tat % 0x8000)));
+                    if (n_out.* == sites.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                    sites[n_out.*] = .{ .addr = ac, .len = @intCast(span), .bytes = undefined };
+                    @memcpy(sites[n_out.*].bytes[0..span], out[file..][0..span]);
+                    n_out.* += 1;
+                    out[file] = 0x22;
+                    std.mem.writeInt(u16, out[file + 1 ..][0..2], @truncate(t24), .little);
+                    out[file + 3] = @truncate(t24 >> 16);
+                    if (span > 4) @memset(out[file + 4 ..][0 .. span - 4], 0xEA);
+                    res.stats.split_trigger_jsl += 1;
+                    continue;
+                }
                 const is_shared = std.sort.binarySearch(u24, shared, ac, struct {
                     fn f(k: u24, v: u24) std.math.Order {
                         return std.math.order(k, v);
@@ -11625,9 +11769,11 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u8, 2), res.stats.split_io);
     try testing.expect(res.stats.split_engage_addr != 0);
     // Eleven math sites shadowed (seven on the S-CPU's unit, four on the
-    // mode-7 one); the one hazard the audit lists is the NMI handler's $4210
-    // ack read, which only the S-CPU ever runs.
-    try testing.expectEqual(@as(u8, 11), res.stats.split_mul);
+    // mode-7 one): the five trigger stores as JSLs to their own far
+    // routines, the six others as COPs; the one hazard the audit lists is
+    // the NMI handler's $4210 ack read, which only the S-CPU ever runs.
+    try testing.expectEqual(@as(u8, 6), res.stats.split_mul);
+    try testing.expectEqual(@as(u32, 5), res.stats.split_trigger_jsl);
     try testing.expectEqual(@as(u8, 1), res.stats.n_split_hazards);
     try testing.expectEqual(@as(u24, 0x00_8051), res.stats.split_hazards[0]);
     // The anchors wear their displacements, in their own banks.
@@ -11640,8 +11786,8 @@ test "split mainloop: a second bank, the mode-gate handoff and the math shadow" 
     try testing.expectEqual(@as(u8, 0xEA), res.image[0x8010]);
     try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
     try testing.expectEqual(@as(u8, 0x02), res.image[0x804B]); // COP at ADC $4216: the operate kind
-    try testing.expectEqual(@as(u8, 0x02), res.image[0x8099]); // COP at STA $00:211B (4-byte site)
-    try testing.expectEqual(@as(u8, 0xEA), res.image[0x809C]);
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8099]); // JSL at STA $00:211B (a 4-byte site: no rider)
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8013]); // JSL at STA $4203, carrying the NOP after it
     try testing.expectEqual(@as(u8, 0x02), res.image[0x80A4]); // COP at LDA $00:2134
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);

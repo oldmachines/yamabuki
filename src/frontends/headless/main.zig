@@ -3128,7 +3128,7 @@ fn runSa1Gen(
             core.sa1gen.convert(gpa, image, &plan, ub, act[0..n_act], neighbours, dma_pages, &refusal);
         if (converted) |cr| {
             if (cr.stats.split_engage_addr != 0) {
-                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} math site(s) shadowed ({} direct cell accesses, the rest COPs); {} inline-argument callee(s){s}\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_math_sites, cr.stats.split_math_direct, cr.stats.split_inline_args, if (cr.stats.split_dual) @as([]const u8, "; dual image: the S-CPU's copy keeps stock math bytes") else "" });
+                try out.print("  split: engaged at $00:{x:0>4}; {} IO routine(s), {} math site(s) shadowed ({} direct cell accesses, {} JSL triggers, the rest COPs); {} inline-argument callee(s){s}\n", .{ cr.stats.split_engage_addr, cr.stats.split_io, cr.stats.split_math_sites, cr.stats.split_math_direct, cr.stats.split_trigger_jsl, cr.stats.split_inline_args, if (cr.stats.split_dual) @as([]const u8, "; dual image: the S-CPU's copy keeps stock math bytes") else "" });
                 var hi: usize = 0;
                 while (hi < cr.stats.n_split_hazards) : (hi += 1)
                     try out.print("  split HAZARD (open bus or dead wait on the SA-1): ${x:0>2}:{x:0>4}\n", .{ cr.stats.split_hazards[hi] >> 16, cr.stats.split_hazards[hi] & 0xFFFF });
