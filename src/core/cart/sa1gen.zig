@@ -6248,10 +6248,10 @@ fn emitSplit(
         if (spec.mode_gate) {
             put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // LDA $00:home (8-bit)
             put(d, &cur, &.{ 0xC9, spec.mode_value, 0x90, 0x04 }); // below lo: switch (BCC over the range check)
-            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0x90, 0x14 }); // in range: out (BCC over the 20-byte switch)
+            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0x90, 0x18 }); // in range: out (BCC over the 24-byte switch)
         }
         put(d, &cur, &.{ 0xA9, 0x80, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x81, 0x8F, 0x21, 0x22, 0x00 });
-        put(d, &cur, &.{ 0xA9, 0x80, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x82, 0x8F, 0x23, 0x22, 0x00 }); // 20 bytes: megabytes 0/1/0/2
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x82, 0x8F, 0x23, 0x22, 0x00 }); // 24 bytes: megabytes 0/1/0/2
     }
     const bra_hook_out_at = cur;
     put(d, &cur, &.{ 0x80, 0x00 }); // BRA out (patched)
@@ -6276,11 +6276,11 @@ fn emitSplit(
         put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP / SEP #$20 / PHA
         if (spec.mode_gate) {
             put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 });
-            put(d, &cur, &.{ 0xC9, spec.mode_value, 0x90, 0x18 }); // below lo: out (BCC over 4 + 20)
-            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0xB0, 0x14 }); // above hi: out (BCS over 20)
+            put(d, &cur, &.{ 0xC9, spec.mode_value, 0x90, 0x1C }); // below lo: out (BCC over 4 + 24)
+            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0xB0, 0x18 }); // above hi: out (BCS over 24)
         }
         put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x85, 0x8F, 0x21, 0x22, 0x00 });
-        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x86, 0x8F, 0x23, 0x22, 0x00 }); // 20 bytes: megabytes 4/5/4/6
+        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x86, 0x8F, 0x23, 0x22, 0x00 }); // 24 bytes: megabytes 4/5/4/6 (measured: a 20-byte hop landed on the last store and wrote the mode into FXB)
         put(d, &cur, &.{ 0x68, 0x28 }); // PLA / PLP
         put(d, &cur, &.{ 0x5C, @truncate(nmi_vec), @truncate(nmi_vec >> 8), 0x00 }); // JML the game's handler
     }
