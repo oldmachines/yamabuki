@@ -6742,7 +6742,7 @@ const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
 
 fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, shared: []const u24, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
     // The shared calculators, once.
-    var calc: [160]u8 = undefined;
+    var calc: [224]u8 = undefined;
     var cc: usize = 0;
     // mulcalc: product := A-cell * B-cell (8x8 unsigned fits the signed 16x16 unit)
     put(&calc, &cc, &.{ 0x08, 0xC2, 0x20, 0x48, 0xE2, 0x20 }); // PHP / REP #$20 / PHA / SEP #$20
@@ -6760,6 +6760,22 @@ fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_l
     put(&calc, &cc, &.{ 0x80, 0x24 }); // BRA store-r (patched below by construction)
     // ok:
     put(&calc, &cc, &.{ 0xC2, 0x20, 0xAF, @truncate(split_math_div), @truncate(split_math_div >> 8), 0x00 }); // dividend
+    // The SA-1's own divider for a dividend below $8000 (its dividend is
+    // signed): 5 cycles where the shift-subtract loop below cost ~400 —
+    // measured: that loop was 45% of a door transition's SA-1 time, and the
+    // transitions ran slower than stock's. Divisor's high byte is zero (the
+    // cell past it). Divide mode on ($2250 bit 1), multiply mode back after.
+    put(&calc, &cc, &.{ 0x30, 0x33 }); // BMI the software path
+    put(&calc, &cc, &.{ 0xE2, 0x20, 0xA9, 0x01, 0x8D, 0x50, 0x22, 0xC2, 0x20 }); // MCNT := divide (bit 0; bit 1 is the accumulate mode)
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div), @truncate((split_math_div) >> 8), 0x00, 0x8D, 0x51, 0x22 }); // MA := dividend (reloaded: the mode write went through A)
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div + 2), @truncate((split_math_div + 2) >> 8), 0x00 }); // divisor (16-bit, high byte zero)
+    put(&calc, &cc, &.{ 0x8D, 0x53, 0x22 }); // MB (the $2254 write triggers)
+    put(&calc, &cc, &.{ 0xEA, 0xEA, 0xEA }); // the unit's 5 cycles
+    put(&calc, &cc, &.{ 0xAD, 0x06, 0x23, 0x8F, @truncate(split_math_q), @truncate(split_math_q >> 8), 0x00 }); // quotient
+    put(&calc, &cc, &.{ 0xAD, 0x08, 0x23, 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00 }); // remainder
+    put(&calc, &cc, &.{ 0xE2, 0x20, 0x9C, 0x50, 0x22, 0xC2, 0x20 }); // ACM := multiply
+    put(&calc, &cc, &.{ 0xFA, 0x68, 0x28, 0x6B }); // PLX / PLA / PLP / RTL
+    // software path (dividend >= $8000): restoring shift-subtract, 16 rounds
     put(&calc, &cc, &.{ 0x8F, @truncate(split_math_q), @truncate(split_math_q >> 8), 0x00 }); // q := dividend (shift register)
     put(&calc, &cc, &.{ 0xA9, 0x00, 0x00, 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00 }); // r := 0
     put(&calc, &cc, &.{ 0xA2, 0x10, 0x00 }); // LDX #16

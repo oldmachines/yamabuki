@@ -51,6 +51,9 @@
 //!  --- version 3 only (per-poll take; see `version_polls`) ---
 //!    36     4  tail frames: frames run after the last poll before the stop
 //!    40     -  anchor (length at 32, may be 0)
+//!  --- version 4 only (per-LAP take; see `version_laps`) ---
+//!    40     2  lap cell: the low-WRAM address the game's lap counter lives at
+//!    42     -  anchor (length at 32, may be 0)
 //!  --- all ---
 //!     -     -  entry count x { u16 port0 mask, u16 port1 mask }
 //!              (one per frame in versions 1 and 2, one per controller poll in 3)
@@ -86,6 +89,12 @@ pub const anchor_max = 8 * 1024 * 1024;
 /// anchor (length may be 0), then the entries.
 pub const version_polls: u16 = 3;
 pub const header_len_v3 = 40;
+/// A per-lap take: one entry per write of the game's lap counter, held
+/// across the lag frames in between. The tick a slowdown-removing
+/// conversion can be paired on (a per-poll take forks wherever stock
+/// lagged: the game polled every frame, and ran fewer laps).
+pub const version_laps: u16 = 4;
+pub const header_len_v4 = 42;
 
 /// Frame-count ceiling: ~9 hours at 60 fps. A header past it is corrupt,
 /// not ambitious.
@@ -117,6 +126,8 @@ pub const Movie = struct {
     per_poll: bool = false,
     /// Format 3: frames run after the last poll before the stop.
     tail_frames: u32 = 0,
+    /// Version 4: the lap counter's address (0 = a per-poll take).
+    lap_cell: u16 = 0,
     /// Not in the file: the battery save the take started from, read from
     /// the `<take>.start.srm` sidecar beside it (see `loadStartSrm`). A
     /// power-on take with a start save is the cross-build form of a take
@@ -134,11 +145,11 @@ pub const Movie = struct {
 /// Serialize to caller-owned bytes. An anchored movie is written as version 2;
 /// a power-on one stays version 1 so older builds keep reading it.
 pub fn encode(gpa: std.mem.Allocator, m: Movie) ![]u8 {
-    const head: usize = if (m.per_poll) header_len_v3 else if (m.anchor != null) header_len_v2 else header_len;
+    const head: usize = if (m.per_poll and m.lap_cell != 0) header_len_v4 else if (m.per_poll) header_len_v3 else if (m.anchor != null) header_len_v2 else header_len;
     const alen: usize = if (m.anchor) |a| a.len else 0;
     const out = try gpa.alloc(u8, head + alen + m.frames.len * 4);
     @memcpy(out[0..4], magic);
-    std.mem.writeInt(u16, out[4..6], if (m.per_poll) version_polls else if (m.anchor != null) version else version_plain, .little);
+    std.mem.writeInt(u16, out[4..6], if (m.per_poll and m.lap_cell != 0) version_laps else if (m.per_poll) version_polls else if (m.anchor != null) version else version_plain, .little);
     out[6] = m.accuracy;
     out[7] = m.region;
     std.mem.writeInt(u32, out[8..12], m.rom_crc, .little);
@@ -148,7 +159,8 @@ pub fn encode(gpa: std.mem.Allocator, m: Movie) ![]u8 {
     if (m.per_poll) {
         std.mem.writeInt(u32, out[32..36], @intCast(alen), .little);
         std.mem.writeInt(u32, out[36..40], m.tail_frames, .little);
-        if (m.anchor) |a| @memcpy(out[header_len_v3..][0..a.len], a);
+        if (m.lap_cell != 0) std.mem.writeInt(u16, out[40..42], m.lap_cell, .little);
+        if (m.anchor) |a| @memcpy(out[head..][0..a.len], a);
     } else if (m.anchor) |a| {
         std.mem.writeInt(u32, out[32..36], @intCast(a.len), .little);
         @memcpy(out[header_len_v2..][0..a.len], a);
@@ -166,7 +178,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
     const ver = std.mem.readInt(u16, bytes[4..6], .little);
-    if (ver != version and ver != version_plain and ver != version_polls) return error.BadVersion;
+    if (ver != version and ver != version_plain and ver != version_polls and ver != version_laps) return error.BadVersion;
     const count = std.mem.readInt(u32, bytes[12..16], .little);
     if (count > frames_max) return error.TooLong;
 
@@ -175,15 +187,21 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
     var head: usize = header_len;
     var alen: usize = 0;
     var tail: u32 = 0;
-    if (ver == version or ver == version_polls) {
+    var lap_cell: u16 = 0;
+    if (ver == version or ver == version_polls or ver == version_laps) {
         if (bytes.len < header_len_v2) return error.Truncated;
         alen = std.mem.readInt(u32, bytes[32..36], .little);
         if (alen > anchor_max) return error.TooLong;
         head = header_len_v2;
-        if (ver == version_polls) {
+        if (ver == version_polls or ver == version_laps) {
             if (bytes.len < header_len_v3) return error.Truncated;
             tail = std.mem.readInt(u32, bytes[36..40], .little);
             head = header_len_v3;
+        }
+        if (ver == version_laps) {
+            if (bytes.len < header_len_v4) return error.Truncated;
+            lap_cell = std.mem.readInt(u16, bytes[40..42], .little);
+            head = header_len_v4;
         }
     }
     if (bytes.len < head + alen + @as(usize, count) * 4) return error.Truncated;
@@ -205,7 +223,8 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
         .end_audio_hash = std.mem.readInt(u64, bytes[24..32], .little),
         .frames = frames,
         .anchor = anchor,
-        .per_poll = ver == version_polls,
+        .per_poll = ver == version_polls or ver == version_laps,
+        .lap_cell = lap_cell,
         .tail_frames = tail,
     };
 }
@@ -242,7 +261,7 @@ pub const Feed = struct {
     pub fn step(self: *Feed, con: anytype, frame: usize) void {
         const m = self.mov orelse return;
         if (m.per_poll) {
-            if (con.takeInputPolled()) self.cursor += 1;
+            if (if (m.lap_cell != 0) con.takeLapPassed() else con.takeInputPolled()) self.cursor += 1;
         } else self.cursor = frame;
         const f: [2]u16 = if (self.cursor < m.frames.len) m.frames[self.cursor] else .{ 0, 0 };
         self.last = f;
@@ -425,6 +444,9 @@ test "movie: a per-poll take round-trips with its tail and anchor, and feeds per
             const p = self.polled;
             self.polled = false;
             return p;
+        }
+        fn takeLapPassed(_: *@This()) bool {
+            return false;
         }
     };
     var pad: Pad = .{};

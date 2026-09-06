@@ -88,6 +88,13 @@ var dbg_trace_sa1_n: usize = 0;
 /// per 32 KiB-bank offset. A math site the S-CPU never runs there can be
 /// a direct I-RAM cell access in that copy instead of a COP.
 pub var dbg_upper_mapped: bool = false;
+/// The lap tick's cell (a low-WRAM address; 0 = ticks are pad polls) and
+/// its pending edge: a write taking the cell from zero to nonzero, on
+/// either CPU (the game's main loop marks its own lap this way — Super
+/// Metroid's `$05B4`, set by the loop's NMI wait and cleared by the NMI).
+/// The S-CPU bus takes the edge on its next data access.
+pub var lap_cell: u16 = 0;
+pub var lap_pending: bool = false;
 pub var dbg_scpu_set: ?[]u8 = null;
 /// TEMP diagnostics, BW-RAM window conversions: report data accesses to the
 /// ABANDONED WRAM homes. Once the low 8 KiB moves to $6000-$7FFF and banks
@@ -365,7 +372,27 @@ pub fn Cpu(comptime BusT: type) type {
             }
         }
 
+        fn noteLap(self: *Self, addr: u24, value: u8) void {
+            const bank: u8 = @intCast(addr >> 16);
+            const a16: u16 = @truncate(addr);
+            const sysbank = (bank & 0x7F) < 0x40;
+            const off: ?u16 = if (bank == 0x7E or bank == 0x40) a16 else if (sysbank and a16 < 0x2000) a16 else if (sysbank and a16 >= 0x6000 and a16 < 0x8000) a16 - 0x6000 else null;
+            if (off == null or off.? != lap_cell or value == 0) return;
+            // a peek, not a bus read: the bus read would move the open-bus
+            // data register and change what the game sees next
+            const o: usize = off.?;
+            const in_wram = bank == 0x7E or (sysbank and a16 < 0x2000);
+            const old: u8 = if (@hasField(BusT, "wram"))
+                (if (in_wram) self.bus.wram.data[o] else self.bus.sa1.bwram[o])
+            else if (@hasField(BusT, "bwram"))
+                self.bus.bwram[o]
+            else
+                return;
+            if (old == 0) lap_pending = true;
+        }
+
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
+            if (lap_cell != 0) self.noteLap(addr, value);
             if (dbg_stale != 0) self.noteStale(addr, 'w');
             if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
             if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);

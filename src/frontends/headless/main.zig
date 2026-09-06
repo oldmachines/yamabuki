@@ -122,6 +122,10 @@ const Args = struct {
     /// TEMP window debugging (undocumented): write WRAM+BWRAM+VRAM to this
     /// file after the run.
     dump_ram: ?[]const u8 = null,
+    /// --lap-cell <hex16>: tick per write of this low-WRAM cell (the game's
+    /// lap counter) instead of per pad poll; a --repoll then writes a per-lap
+    /// (version 4) take. A per-lap take sets it on load.
+    lap_cell: u16 = 0,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -569,6 +573,7 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_vram) |vpath| dumpVram(io, con, vpath);
     defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
+    if (args.lap_cell != 0) core.wdc65816.lap_cell = args.lap_cell;
     if (args.split_scpu_set != null) {
         const m = try gpa.alloc(u8, 0x40 * 0x8000);
         @memset(m, 0);
@@ -606,13 +611,16 @@ fn run(init: std.process.Init) !void {
         feed.step(con, i);
         // Recording per poll needs the latch cleared every frame; the feed
         // only does so for a per-poll source (and has already taken it).
-        if (args.repoll != null) _ = con.takeInputPolled();
+        if (args.repoll != null) {
+            _ = con.takeInputPolled();
+            _ = con.takeLapPassed();
+        }
         con.runFrame();
-        if (mov) |m| if (m.per_poll and movie_end == null and feed.cursor + 1 >= m.frames.len and con.inputPolled()) {
+        if (mov) |m| if (m.per_poll and movie_end == null and feed.cursor + 1 >= m.frames.len and (if (m.lap_cell != 0) con.lapPassed() else con.inputPolled())) {
             movie_end = i + m.tail_frames;
         };
         if (args.repoll != null) {
-            if (con.inputPolled()) {
+            if (if (args.lap_cell != 0) con.lapPassed() else con.inputPolled()) {
                 try repoll.append(feed.last);
                 repoll_tail = 0;
             } else repoll_tail += 1;
@@ -691,6 +699,7 @@ fn run(init: std.process.Init) !void {
             .anchor = if (args.repoll_poweron) null else m.anchor,
             .per_poll = true,
             .tail_frames = repoll_tail,
+            .lap_cell = args.lap_cell,
         };
         const bytes = try util.movie.encode(gpa, pm);
         defer gpa.free(bytes);
@@ -971,6 +980,7 @@ fn loadMovie(
         fail(out);
     };
     m.start_srm = util.movie.loadStartSrm(io, gpa, path);
+    if (m.lap_cell != 0) core.wdc65816.lap_cell = m.lap_cell; // a per-lap take: every console of this run ticks per lap
     const crc = util.movie.imageCrc(image);
     if (m.rom_crc != crc) {
         if (args.movie_ignore_crc) {
@@ -5375,6 +5385,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_vram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ppu")) {
             out.dump_ppu = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--lap-cell")) {
+            out.lap_cell = try std.fmt.parseInt(u16, it.next() orelse return error.MissingValue, 16);
         } else if (std.mem.eql(u8, a, "--repoll")) {
             out.repoll = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--repoll-poweron")) {

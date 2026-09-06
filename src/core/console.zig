@@ -85,7 +85,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "polled_consumed", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "polled_consumed", "lap_latch", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -178,6 +178,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// bus's own flag at frame end; a per-poll input feed advances on it.
         /// Diagnostic, not machine state: in `serialize_skip`.
         polled_latch: bool,
+        lap_latch: bool,
         /// A poll the frontend already took (`takeInputPolled`) since the
         /// profiler's last frame boundary — the boundary sits at vblank start,
         /// the game's own poll comes after it, and a per-poll feed takes the
@@ -199,6 +200,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.bus.ppu.pal = self.region == .pal;
             self.skip_render = false;
             self.polled_latch = false;
+            self.lap_latch = false;
             self.polled_consumed = false;
             self.reset();
         }
@@ -269,6 +271,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.scanline = 0;
             self.frame +%= 1;
             self.polled_latch = self.polled_latch or self.bus.input_polled;
+            self.lap_latch = self.lap_latch or self.bus.lap_polled;
         }
 
         /// Whether the game has read the controller since the last `take`.
@@ -282,6 +285,19 @@ pub fn Console(comptime cfg: CoreConfig) type {
             if (p) self.polled_consumed = true;
             self.polled_latch = false;
             self.bus.input_polled = false;
+            return p;
+        }
+
+        /// Whether the game's lap counter (`bus.lap_cell`) was written since
+        /// the last `takeLapPassed` — the lap tick of a per-lap take.
+        pub fn lapPassed(self: *const Self) bool {
+            return self.lap_latch or self.bus.lap_polled;
+        }
+
+        pub fn takeLapPassed(self: *Self) bool {
+            const p = self.lapPassed();
+            self.lap_latch = false;
+            self.bus.lap_polled = false;
             return p;
         }
 
@@ -1303,6 +1319,18 @@ pub const AnyConsole = union(Accuracy) {
     pub fn takeInputPolled(self: *AnyConsole) bool {
         switch (self.*) {
             inline else => |*c| return c.takeInputPolled(),
+        }
+    }
+
+    pub fn lapPassed(self: *const AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.lapPassed(),
+        }
+    }
+
+    pub fn takeLapPassed(self: *AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.takeLapPassed(),
         }
     }
 
