@@ -7,6 +7,7 @@
 //! traffic for free.
 
 const std = @import("std");
+const wdc65816 = @import("../cpu/wdc65816.zig");
 const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
@@ -95,6 +96,13 @@ pub const Bus = struct {
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
+    /// S-CPU overclock divisor (1 = real). The CPU's own bus and internal
+    /// cycles advance the master clock 1/n as fast; DMA, PPU and APU keep
+    /// their timing. A verification REFERENCE, not a game mode: a stock
+    /// image that never lags pairs per poll with a slowdown-removing
+    /// conversion, where the real one forks on every lag difference.
+    overclock: u8 = 1,
+    oc_acc: u32 = 0,
     /// Address of the most recent *data* read / write (`Cpu.read8`/`Cpu.write8`),
     /// or `no_data_access`. Set by the CPU — never by an instruction fetch, and
     /// never by a stack push or pull, both of which go straight to the bus.
@@ -111,6 +119,22 @@ pub const Bus = struct {
     /// frame in which it stays false is a frame the main loop never came around:
     /// a dropped frame. Diagnostic only; nothing in the core reads it.
     input_polled: bool,
+    /// The LAP tick: set when the game's own lap counter (`lap_cell`, a
+    /// low-WRAM address at any of its homes) is written. A game that polls
+    /// the pad every NMI, lag frames included, ticks per FRAME on its
+    /// polls — and a slowdown-removing conversion runs a different number
+    /// of laps per frame wherever stock lagged, so per-poll pairing forks
+    /// on every lag difference. Per lap, the logic pairs by construction.
+    lap_polled: bool,
+    /// Per-lap input delivery (a version-4 take): the entries the feed
+    /// staged for the coming laps, applied to the joypad AT each lap edge
+    /// (inside the frame — a two-lap frame consumes two), and the pads
+    /// seen at the edges, for a per-lap recording.
+    lap_feed: [16][2]u16,
+    lap_feed_n: u8,
+    lap_feed_i: u8,
+    lap_rec: [16][2]u16,
+    lap_rec_n: u8,
     /// Behavioral-verification hook (same optional-diagnostic pattern as the
     /// coverage map): when set, the FIRST controller poll after the harness
     /// clears `input_polled` snapshots WRAM into it. The poll is the one
@@ -187,6 +211,12 @@ pub const Bus = struct {
         self.last_data_read = no_data_access;
         self.last_data_write = no_data_access;
         self.input_polled = false;
+        self.lap_polled = false;
+        self.lap_feed_n = 0;
+        self.lap_feed_i = 0;
+        self.lap_rec_n = 0;
+        self.overclock = 1;
+        self.oc_acc = 0;
         self.tick_snap = null;
         self.vector_pull = false;
         self.mdr = 0;
@@ -316,7 +346,18 @@ pub const Bus = struct {
 
     /// One CPU internal cycle (no bus access).
     pub inline fn idle(self: *Bus) void {
-        self.clock += timing.speed_fast;
+        self.cpuCycles(timing.speed_fast);
+    }
+
+    /// The S-CPU's own cycles, under the overclock divisor.
+    pub inline fn cpuCycles(self: *Bus, n: u32) void {
+        if (self.overclock <= 1) {
+            self.clock += n;
+            return;
+        }
+        self.oc_acc += n;
+        self.clock += self.oc_acc / self.overclock;
+        self.oc_acc %= self.overclock;
     }
 
     /// Side-effect-free read for diagnostics (the profiler's opcode peek):
@@ -356,7 +397,7 @@ pub const Bus = struct {
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             const v = p[addr & (page_size - 1)];
             self.mdr = v;
             return v;
@@ -409,7 +450,7 @@ pub const Bus = struct {
         self.mdr = value;
         const idx = addr >> 13;
         if (self.page_write[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             p[addr & (page_size - 1)] = value;
             return;
         }
@@ -430,7 +471,28 @@ pub const Bus = struct {
     /// a data READ of a WRAM byte not yet written this tick marks it live —
     /// it was consumed as input state. Called from the CPU's data-access
     /// wrappers, never from fetches.
+    /// The lap tick, raised by either CPU's write hook (`wdc65816.lap_pending`:
+    /// the lap cell went from zero to nonzero — the main loop's own
+    /// once-per-lap mark) and taken here on the S-CPU's next data access,
+    /// where the verifier's snapshot lives.
+    inline fn noteLapEdge(self: *Bus) void {
+        if (wdc65816.lap_pending) {
+            wdc65816.lap_pending = false;
+            self.lap_polled = true;
+            if (self.lap_rec_n < self.lap_rec.len) {
+                self.lap_rec[self.lap_rec_n] = self.joy.buttons;
+                self.lap_rec_n += 1;
+            }
+            if (self.lap_feed_i < self.lap_feed_n) {
+                self.joy.buttons = self.lap_feed[self.lap_feed_i];
+                self.lap_feed_i += 1;
+            }
+            self.tickSnap();
+        }
+    }
+
     pub fn noteTickRead(self: *Bus, addr: u24) void {
+        self.noteLapEdge();
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
         if (t.written[off >> 3] & (@as(u8, 1) << @intCast(off & 7)) != 0) return;
@@ -438,6 +500,7 @@ pub const Bus = struct {
     }
 
     pub fn noteTickWrite(self: *Bus, addr: u24) void {
+        self.noteLapEdge();
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
         const bit = @as(u8, 1) << @intCast(off & 7);
@@ -449,6 +512,11 @@ pub const Bus = struct {
     /// behavioral verifier only — the once-per-frame tick snapshot.
     inline fn notePoll(self: *Bus) void {
         self.input_polled = true;
+        if (wdc65816.lap_cell == 0) self.tickSnap();
+    }
+
+    /// The behavioral verifier's once-per-tick snapshot.
+    inline fn tickSnap(self: *Bus) void {
         if (self.tick_snap) |t| {
             if (!t.captured) {
                 t.captured = true;
@@ -483,7 +551,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         // MMIO exists only in the system area (banks $00-$3F / $80-$BF),
         // except the large-LoROM DSP-1 ports in banks $60-$6F.
@@ -605,7 +673,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         if (!isSystemBank(bank)) {
             if (self.dsp1Port(bank, a16)) |sr| {

@@ -48,8 +48,15 @@
 //!  --- version 2 only ---
 //!    32     4  anchor length in bytes (0 = starts at power-on)
 //!    36     -  anchor: a save state as written by `Console.saveState`
-//!  --- both ---
-//!     -     -  frame count x { u16 port0 mask, u16 port1 mask }
+//!  --- version 3 only (per-poll take; see `version_polls`) ---
+//!    36     4  tail frames: frames run after the last poll before the stop
+//!    40     -  anchor (length at 32, may be 0)
+//!  --- version 4 only (per-LAP take; see `version_laps`) ---
+//!    40     2  lap cell: the low-WRAM address the game's lap counter lives at
+//!    42     -  anchor (length at 32, may be 0)
+//!  --- all ---
+//!     -     -  entry count x { u16 port0 mask, u16 port1 mask }
+//!              (one per frame in versions 1 and 2, one per controller poll in 3)
 //!
 //! Version 1 is still read, and still WRITTEN for power-on recordings, so the
 //! existing corpus stays valid in both directions: a v2 file appears only when
@@ -72,6 +79,22 @@ pub const file_ext = ".ymv";
 /// Anchor ceiling: a save state is well under a megabyte; a header claiming
 /// more is corrupt, and the check runs before any allocation.
 pub const anchor_max = 8 * 1024 * 1024;
+/// Format 3: one entry per CONTROLLER POLL instead of per frame. The pad
+/// holds an entry until the game reads it (the bus's poll flag), then the
+/// next takes over — so a lag frame consumes nothing and the same take
+/// replays on any build of the game whose logic is behaviorally equivalent,
+/// which is what the SA-1 verifier certifies. Layout: the v2 header, then
+/// u32 tail frames (frames run after the last poll before the take was
+/// stopped — the end hashes describe the machine after them), then the
+/// anchor (length may be 0), then the entries.
+pub const version_polls: u16 = 3;
+pub const header_len_v3 = 40;
+/// A per-lap take: one entry per write of the game's lap counter, held
+/// across the lag frames in between. The tick a slowdown-removing
+/// conversion can be paired on (a per-poll take forks wherever stock
+/// lagged: the game polled every frame, and ran fewer laps).
+pub const version_laps: u16 = 4;
+pub const header_len_v4 = 42;
 
 /// Frame-count ceiling: ~9 hours at 60 fps. A header past it is corrupt,
 /// not ambitious.
@@ -99,10 +122,22 @@ pub const Movie = struct {
     /// null means the movie starts at power-on. A replay that ignores this is
     /// not a replay — feed it to `loadState` before the first frame.
     anchor: ?[]u8 = null,
+    /// Format 3: `frames` are per-poll entries, not per-frame ones.
+    per_poll: bool = false,
+    /// Format 3: frames run after the last poll before the stop.
+    tail_frames: u32 = 0,
+    /// Version 4: the lap counter's address (0 = a per-poll take).
+    lap_cell: u16 = 0,
+    /// Not in the file: the battery save the take started from, read from
+    /// the `<take>.start.srm` sidecar beside it (see `loadStartSrm`). A
+    /// power-on take with a start save is the cross-build form of a take
+    /// recorded from a save: no machine state to seed, only the save chip.
+    start_srm: ?[]u8 = null,
 
     pub fn deinit(self: *Movie, gpa: std.mem.Allocator) void {
         gpa.free(self.frames);
         if (self.anchor) |a| gpa.free(a);
+        if (self.start_srm) |s| gpa.free(s);
         self.* = undefined;
     }
 };
@@ -110,18 +145,23 @@ pub const Movie = struct {
 /// Serialize to caller-owned bytes. An anchored movie is written as version 2;
 /// a power-on one stays version 1 so older builds keep reading it.
 pub fn encode(gpa: std.mem.Allocator, m: Movie) ![]u8 {
-    const head: usize = if (m.anchor != null) header_len_v2 else header_len;
+    const head: usize = if (m.per_poll and m.lap_cell != 0) header_len_v4 else if (m.per_poll) header_len_v3 else if (m.anchor != null) header_len_v2 else header_len;
     const alen: usize = if (m.anchor) |a| a.len else 0;
     const out = try gpa.alloc(u8, head + alen + m.frames.len * 4);
     @memcpy(out[0..4], magic);
-    std.mem.writeInt(u16, out[4..6], if (m.anchor != null) version else version_plain, .little);
+    std.mem.writeInt(u16, out[4..6], if (m.per_poll and m.lap_cell != 0) version_laps else if (m.per_poll) version_polls else if (m.anchor != null) version else version_plain, .little);
     out[6] = m.accuracy;
     out[7] = m.region;
     std.mem.writeInt(u32, out[8..12], m.rom_crc, .little);
     std.mem.writeInt(u32, out[12..16], @intCast(m.frames.len), .little);
     std.mem.writeInt(u64, out[16..24], m.end_frame_hash, .little);
     std.mem.writeInt(u64, out[24..32], m.end_audio_hash, .little);
-    if (m.anchor) |a| {
+    if (m.per_poll) {
+        std.mem.writeInt(u32, out[32..36], @intCast(alen), .little);
+        std.mem.writeInt(u32, out[36..40], m.tail_frames, .little);
+        if (m.lap_cell != 0) std.mem.writeInt(u16, out[40..42], m.lap_cell, .little);
+        if (m.anchor) |a| @memcpy(out[head..][0..a.len], a);
+    } else if (m.anchor) |a| {
         std.mem.writeInt(u32, out[32..36], @intCast(a.len), .little);
         @memcpy(out[header_len_v2..][0..a.len], a);
     }
@@ -138,7 +178,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
     const ver = std.mem.readInt(u16, bytes[4..6], .little);
-    if (ver != version and ver != version_plain) return error.BadVersion;
+    if (ver != version and ver != version_plain and ver != version_polls and ver != version_laps) return error.BadVersion;
     const count = std.mem.readInt(u32, bytes[12..16], .little);
     if (count > frames_max) return error.TooLong;
 
@@ -146,11 +186,23 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
     // the length field nor the blob.
     var head: usize = header_len;
     var alen: usize = 0;
-    if (ver == version) {
+    var tail: u32 = 0;
+    var lap_cell: u16 = 0;
+    if (ver == version or ver == version_polls or ver == version_laps) {
         if (bytes.len < header_len_v2) return error.Truncated;
         alen = std.mem.readInt(u32, bytes[32..36], .little);
         if (alen > anchor_max) return error.TooLong;
         head = header_len_v2;
+        if (ver == version_polls or ver == version_laps) {
+            if (bytes.len < header_len_v3) return error.Truncated;
+            tail = std.mem.readInt(u32, bytes[36..40], .little);
+            head = header_len_v3;
+        }
+        if (ver == version_laps) {
+            if (bytes.len < header_len_v4) return error.Truncated;
+            lap_cell = std.mem.readInt(u16, bytes[40..42], .little);
+            head = header_len_v4;
+        }
     }
     if (bytes.len < head + alen + @as(usize, count) * 4) return error.Truncated;
 
@@ -171,8 +223,75 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Movie {
         .end_audio_hash = std.mem.readInt(u64, bytes[24..32], .little),
         .frames = frames,
         .anchor = anchor,
+        .per_poll = ver == version_polls or ver == version_laps,
+        .lap_cell = lap_cell,
+        .tail_frames = tail,
     };
 }
+
+/// `<take>.start.srm` for `<take>.ymv`, in the caller's buffer.
+pub fn startSrmPath(buf: []u8, movie_path: []const u8) ?[]const u8 {
+    if (movie_path.len <= file_ext.len or !std.mem.endsWith(u8, movie_path, file_ext)) return null;
+    return std.fmt.bufPrint(buf, "{s}.start.srm", .{movie_path[0 .. movie_path.len - file_ext.len]}) catch null;
+}
+
+/// The take's start-save sidecar, or null when there is none.
+pub fn loadStartSrm(io: std.Io, gpa: std.mem.Allocator, movie_path: []const u8) ?[]u8 {
+    var buf: [1024]u8 = undefined;
+    const p = startSrmPath(&buf, movie_path) orelse return null;
+    return std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(1024 * 1024)) catch null;
+}
+
+/// The input feed for a replay loop: call `step` right before each frame.
+/// A per-frame take (formats 1 and 2) indexes by the frame number handed
+/// in; a per-poll take advances its own cursor only after a frame in
+/// which the game read the pad, and holds the current entry until then.
+/// Past the end the pads read idle. Any console type with `setButtons` and
+/// `takeInputPolled` (every core console, and AnyConsole) can be fed.
+pub const Feed = struct {
+    mov: ?Movie,
+    cursor: usize = 0,
+    /// The entry fed to the last `step`.
+    last: [2]u16 = .{ 0, 0 },
+
+    pub fn init(mov: ?Movie) Feed {
+        return .{ .mov = mov };
+    }
+
+    pub fn step(self: *Feed, con: anytype, frame: usize) void {
+        const m = self.mov orelse return;
+        if (m.per_poll and m.lap_cell != 0) {
+            // Per lap, inside the frame: the console applies the staged entries
+            // at each lap edge; here only the staging moves, by what the last
+            // frame consumed.
+            _ = con.takeLapPassed();
+            self.cursor += con.lapFeedStage(if (self.cursor < m.frames.len) m.frames[self.cursor..] else m.frames[m.frames.len..]);
+            self.last = if (self.cursor < m.frames.len) m.frames[self.cursor] else .{ 0, 0 };
+            return;
+        }
+        if (m.per_poll) {
+            if (con.takeInputPolled()) self.cursor += 1;
+        } else self.cursor = frame;
+        const f: [2]u16 = if (self.cursor < m.frames.len) m.frames[self.cursor] else .{ 0, 0 };
+        self.last = f;
+        con.setButtons(0, f[0]);
+        con.setButtons(1, f[1]);
+    }
+
+    /// Every entry has been consumed (per poll) or passed (per frame).
+    pub fn done(self: *const Feed) bool {
+        const m = self.mov orelse return true;
+        return self.cursor >= m.frames.len;
+    }
+
+    /// A frame budget for a loop that must outlast the take: its frames
+    /// (per frame), or four times its polls plus a tail (per poll — a lag
+    /// frame consumes nothing, so the frame count is unknown in advance).
+    pub fn budget(mov: ?Movie) usize {
+        const m = mov orelse return 0;
+        return if (m.per_poll) m.frames.len * 4 + 600 + m.tail_frames else m.frames.len;
+    }
+};
 
 /// CRC32 of an image, the same polynomial BPS uses — movie identity matches
 /// patch identity on purpose.
@@ -293,4 +412,69 @@ test "movie: refusals — magic, version, truncation, absurd length" {
     try testing.expectError(error.Truncated, parse(gpa, &buf));
     std.mem.writeInt(u32, buf[12..16], frames_max + 1, .little);
     try testing.expectError(error.TooLong, parse(gpa, &buf));
+}
+
+test "movie: a per-poll take round-trips with its tail and anchor, and feeds per poll" {
+    const gpa = testing.allocator;
+    const anchor = try gpa.dupe(u8, &[_]u8{ 'Y', 'M', 'B', 'K', 1, 2, 3 });
+    const frames = try gpa.dupe([2]u16, &[_][2]u16{ .{ 0x0080, 0 }, .{ 0x0040, 0 }, .{ 0x0020, 0 } });
+    var m: Movie = .{
+        .accuracy = 0,
+        .region = 0,
+        .rom_crc = 0x12345678,
+        .end_frame_hash = 7,
+        .end_audio_hash = 8,
+        .frames = frames,
+        .anchor = anchor,
+        .per_poll = true,
+        .tail_frames = 42,
+    };
+    defer m.deinit(gpa);
+    const bytes = try encode(gpa, m);
+    defer gpa.free(bytes);
+    try testing.expectEqual(version_polls, std.mem.readInt(u16, bytes[4..6], .little));
+    try testing.expectEqual(header_len_v3 + anchor.len + 3 * 4, bytes.len);
+    var back = try parse(gpa, bytes);
+    defer back.deinit(gpa);
+    try testing.expect(back.per_poll);
+    try testing.expectEqual(@as(u32, 42), back.tail_frames);
+    try testing.expectEqualSlices(u8, anchor, back.anchor.?);
+    try testing.expectEqualSlices([2]u16, frames, back.frames);
+
+    // A stand-in console: the game polls on every other frame. The feed
+    // must hold each entry across the lag frame and advance on the poll.
+    const Pad = struct {
+        polled: bool = false,
+        fed: [2]u16 = .{ 0, 0 },
+        fn setButtons(self: *@This(), port: u8, mask: u16) void {
+            self.fed[port] = mask;
+        }
+        fn takeInputPolled(self: *@This()) bool {
+            const p = self.polled;
+            self.polled = false;
+            return p;
+        }
+        fn takeLapPassed(_: *@This()) bool {
+            return false;
+        }
+        fn lapFeedStage(_: *@This(), _: []const [2]u16) u8 {
+            return 0;
+        }
+    };
+    var pad: Pad = .{};
+    var feed: Feed = .init(back);
+    const expect = [_]u16{ 0x80, 0x80, 0x40, 0x40, 0x20, 0x20, 0, 0 };
+    for (expect, 0..) |want, i| {
+        feed.step(&pad, i);
+        try testing.expectEqual(want, pad.fed[0]);
+        pad.polled = i % 2 == 1; // the game reads the pad on odd frames
+    }
+    try testing.expect(feed.done());
+    // A per-frame take ignores the poll flag and indexes by frame.
+    var pf: Movie = .{ .accuracy = 0, .region = 0, .rom_crc = 0, .end_frame_hash = 0, .end_audio_hash = 0, .frames = frames };
+    var feed2: Feed = .init(pf);
+    pad.polled = false;
+    feed2.step(&pad, 2);
+    try testing.expectEqual(@as(u16, 0x20), pad.fed[0]);
+    pf.frames = &.{};
 }

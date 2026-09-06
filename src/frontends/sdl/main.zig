@@ -12,6 +12,9 @@
 //!   F5 save state (<rom>.state)   F9 load state   F1 reset   P pause
 //!   Tab or right trigger (hold) fast-forward      Esc quit
 //!   , / .  cycle shaders (fixed keys; only presets baked for this GPU)
+//!   F      toggle fullscreen (fixed key)
+//!   F11    takes screen: continue any recording of this game, from its end state
+//!          (instant) or from its beginning (replay at full speed); F10 saves it
 //!
 //! Settings persist in `config.zon` under the OS's per-user data directory
 //! (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki\` on Windows,
@@ -72,8 +75,24 @@ const Args = struct {
     /// margin. Fast core only — refused together with `--accurate`.
     wide: u32 = 0,
     /// `--movie <file>`: replay a recorded playthrough (.ymv) from power-on;
-    /// live input takes over when it ends. Needs an explicit ROM argument.
+    /// live input takes over when it ends. Needs an explicit ROM argument. A
+    /// per-poll take (format 3, every take recorded now) that starts at
+    /// power-on also replays on another build of the same game — the SA-1
+    /// conversion continues the stock game's takes, lag frames and all.
     movie: ?[]const u8 = null,
+    /// `--record`: start an input-movie take at power-on, before the first
+    /// frame runs, so the boot frames are in it and no anchor is needed.
+    record: bool = false,
+    /// `--continue` (with `--movie`): replay the take at full speed, then keep
+    /// recording from its last frame — the new file carries the old inputs
+    /// plus the new ones, from the same start, so a long playthrough grows as
+    /// one take instead of a chain of saves.
+    continue_take: bool = false,
+    /// `--srm <file>` (with `--record`): start the take from this battery save
+    /// instead of blank SRAM. The take stays a power-on one and the save is
+    /// written beside it as `<take>.start.srm`, which every replay path loads
+    /// first — so the take carries no machine state and replays on any build.
+    srm: ?[]const u8 = null,
     /// `--poke ADDR=VAL`: cheat writes held after every frame.
     pokes: [util.cheat.max_pokes]util.cheat.Poke = undefined,
     n_pokes: usize = 0,
@@ -115,6 +134,16 @@ pub fn main(init: std.process.Init) !void {
                 "  --poke a=v  same, but exact: no relocation mirror\n" ++
                 "  --movie f   replay a recorded playthrough (.ymv) from power-on; live input\n" ++
                 "              takes over when it ends (record in-game with the F10 hotkey)\n" ++
+                "  --record    start recording a .ymv at power-on, before the first frame;\n" ++
+                "              F10 stops and saves it (F10 alone cannot promise frame 0)\n" ++
+                "  --continue  with --movie: keep recording from the take's end; the saved file is\n" ++
+                "              the whole take, old inputs plus new. Starts from the take's <take>.end.state\n" ++
+                "              when that still loads on this build, else replays the take at full speed\n" ++
+                "  --srm f     with --record: start the take from this battery save (.srm)\n" ++
+                "              instead of blank SRAM; it rides beside the take as <take>.start.srm\n" ++
+                "              and every replay loads it first (any build of the game). Every\n" ++
+                "              --record session writes its own save next to the .ymv as\n" ++
+                "              <take>.srm, so the next session can continue from it\n" ++
                 "  --shot writes PREFIX-<frame>.ppm at each frame in --shot-frames,\n" ++
                 "  or at the final frame when --shot-frames is omitted.\n",
             .{},
@@ -247,6 +276,10 @@ fn makeOptions(
         .rom_crc = booted.rom_crc,
         .accuracy = booted.accuracy,
         .movie = mov,
+        .movie_path = args.movie,
+        .record = args.record,
+        .srm = args.srm,
+        .continue_take = args.continue_take,
         .pokes = args.pokes,
         .n_pokes = args.n_pokes,
         .patch_name = booted.patch_name,
@@ -263,12 +296,20 @@ fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted,
         try err.flush();
         return error.BootFailed;
     };
-    const m = util.movie.parse(gpa, bytes) catch |e| {
+    var m = util.movie.parse(gpa, bytes) catch |e| {
         try err.print("error: '{s}' is not a valid movie: {s}\n", .{ path, @errorName(e) });
         try err.flush();
         return error.BootFailed;
     };
-    if (m.rom_crc != b.rom_crc) {
+    m.start_srm = util.movie.loadStartSrm(io, gpa, path);
+    // A per-poll take that starts at power-on (with or without a start
+    // save) carries no machine state, only inputs indexed by the game's own
+    // controller reads: it replays on any build of the game whose logic is
+    // behaviorally the same. The picture may differ; the inputs will not.
+    if (m.rom_crc != b.rom_crc and m.per_poll and m.anchor == null) {
+        try err.print("movie: '{s}' is a per-poll take from another build (crc32 {x:0>8}; this is {x:0>8}) — replaying it here; the end hashes are advisory\n", .{ path, m.rom_crc, b.rom_crc });
+        try err.flush();
+    } else if (m.rom_crc != b.rom_crc) {
         try err.print(
             "error: movie '{s}' was recorded on image crc32 {x:0>8}; this session plays {x:0>8}\n" ++
                 "       (the movie identifies the image as played — a soft-patched game needs the same patch choice)\n",
@@ -294,6 +335,16 @@ fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted,
     // An anchored movie's inputs mean nothing without the machine they were
     // recorded against, so restoring it is part of loading the movie — and a
     // state this console refuses is as fatal as a CRC mismatch.
+    if (m.start_srm) |sb| {
+        if (saves.loadSramBytes(b.con, sb)) {
+            try err.print("movie: start save loaded from {s}'s .start.srm sidecar ({d} bytes)\n", .{ path, sb.len });
+        } else {
+            try err.print("error: the take's .start.srm sidecar ({d} bytes) does not fit this cart's save\n", .{sb.len});
+            try err.flush();
+            return error.BootFailed;
+        }
+        try err.flush();
+    }
     if (m.anchor) |a| {
         b.con.loadState(a) catch |e| {
             try err.print("error: movie '{s}' carries a start state this build cannot restore: {s}\n" ++
@@ -301,9 +352,9 @@ fn loadMovieFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, b: Booted,
             try err.flush();
             return error.BootFailed;
         };
-        try err.print("movie: {s} — {} frames, replaying from its start state\n", .{ path, m.frames.len });
+        try err.print("movie: {s} — {} {s}, replaying from its start state\n", .{ path, m.frames.len, if (m.per_poll) "polls" else "frames" });
     } else {
-        try err.print("movie: {s} — {} frames, replaying from power-on\n", .{ path, m.frames.len });
+        try err.print("movie: {s} — {} {s}, replaying from power-on{s}\n", .{ path, m.frames.len, if (m.per_poll) "polls" else "frames", if (m.start_srm != null) " with its start save" else "" });
     }
     try err.flush();
     return m;
@@ -585,6 +636,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             args.n_pokes = util.cheat.parseList(v, &args.pokes, args.n_pokes) catch
                 return error.BadPoke;
+        } else if (std.mem.eql(u8, a, "--record")) {
+            args.record = true;
+        } else if (std.mem.eql(u8, a, "--continue")) {
+            args.continue_take = true;
+        } else if (std.mem.eql(u8, a, "--srm")) {
+            args.srm = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--movie")) {
             args.movie = it.next() orelse return error.MissingValue;
         } else if (rom == null) {

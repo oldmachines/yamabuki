@@ -74,7 +74,11 @@ pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 /// needs to know which CPU it is on. The game's own vblank wait,
 /// reading the mirror, becomes the frame fence.
 pub const SplitIo = struct {
-    entry: u16,
+    /// 24-bit CPU address; bank $00 for the tail flavor, any code bank
+    /// for the mainloop flavor (the stub and trampoline are placed in the
+    /// entry's own bank, so its RTS-shaped return and bank-local jumps
+    /// stay sound).
+    entry: u24,
     /// A pure-writer body runs on BOTH CPUs (its MMIO writes vanish on
     /// the SA-1); a handshake body — one that READ-WAITS on an MMIO
     /// echo — would spin forever on SA-1 open bus, so post-engage the
@@ -96,14 +100,26 @@ pub const SplitSpec = struct {
     /// Each gets the enqueue prefix; its first 3 bytes must be whole
     /// instructions with no branch.
     io_entries: []const SplitIo,
-    /// Address ranges (bank $00) whose absolute reads of $4212 and
+    /// Address ranges (24-bit) whose absolute reads of $4212 and
     /// $4218-$421F swap to the I-RAM mirrors — the mainline's vblank
     /// wait and pad reads. Boot-path readers stay native.
-    vbl_ranges: []const [2]u16,
-    /// Where the split engages: the main loop's top (bank $00). Its
-    /// first 4 bytes must be whole instructions with no branch. Ignored
-    /// when `tail` is set.
-    mainloop: u16 = 0,
+    vbl_ranges: []const [2]u24,
+    /// Where the split engages: the main loop's top (24-bit, any bank).
+    /// Its first 4 to 8 bytes must be whole flow-free instructions (a
+    /// JSL is fine — it returns into the displaced copy; a JSR, branch or
+    /// jump is not); the site keeps a JML and NOP fill. Ignored when
+    /// `tail` is set.
+    mainloop: u24 = 0,
+    /// Mainloop flavor, dual image: the S-CPU instruction addresses the
+    /// split's census saw run while the upper copy was mapped (the NMI and
+    /// IRQ handlers, the IO bodies the pump replays, their callees), sorted.
+    /// A math site outside this set is the SA-1's alone in that copy and
+    /// becomes a direct I-RAM cell access — the same opcode, the cell for
+    /// the register — instead of a COP (measured: the COP handler was 65%
+    /// of a gameplay lap, the game itself 25%). Trigger stores (the
+    /// multiplier's B, the divisor, the mode-7 inputs) keep the COP: the
+    /// shadow has to compute. Empty = every site is a COP.
+    shared_sites: []const u24 = &.{},
     /// NMI-TAIL flavor (the shape Gradius III actually has: the whole
     /// engine runs inside the NMI handler). `tail` is the boundary in
     /// the handler — the vblank-timed upload cluster before it stays on
@@ -129,10 +145,31 @@ pub const SplitSpec = struct {
     /// starved the mainline's staging sweep mid-list, and the unterminated
     /// list wedged the options screen black — while the verified stages
     /// never touch those paths).
-    mode_cell: u8 = 0,
+    /// Tail flavor: a direct-page offset. Mainloop flavor: a 16-bit
+    /// low-WRAM address (read at its window home, `+$6000`, through bank
+    /// $00 — both CPUs see the same BW-RAM byte); the loop belongs to the
+    /// SA-1 while the cell holds `mode_value` and to the S-CPU otherwise,
+    /// ownership changing hands at the anchor, once per lap at most.
+    mode_cell: u16 = 0,
     mode_value: u8 = 0,
+    /// Mainloop flavor: the gate accepts the whole range `mode_value ..=
+    /// mode_hi` when `mode_hi` is nonzero — gameplay plus the door
+    /// transitions ($08-$0C on Super Metroid), where the visible slowdown
+    /// lives. Zero = the single value.
+    mode_hi: u8 = 0,
     mode_gate: bool = false,
 };
+
+/// File offset of a 24-bit LoROM code address (banks $00-$3F and their
+/// $80-$BF mirrors alias the same bytes).
+fn splitFile(a: u24) usize {
+    return @as(usize, (a >> 16) & 0x7F) * 0x8000 + (@as(usize, a & 0xFFFF) - 0x8000);
+}
+
+/// Coverage flags of a site, whichever mirror the game ran it in.
+fn splitUsage(usage: []const u8, a: u24) u8 {
+    return usage[a] | usage[a ^ 0x80_0000];
+}
 
 /// The split's I-RAM cells, clear of the offload mailbox ($3780-$378F).
 const split_ring_wr: u16 = 0x3790; // SA-1 appends
@@ -140,7 +177,7 @@ const split_ring_rd: u16 = 0x3791; // S-CPU drains
 const split_vbl_mirror: u16 = 0x3792; // live $4212 image
 const split_pad_mirror: u16 = 0x3794; // $4218-$421F, 8 bytes
 const split_cell_d: u16 = 0x379C; // game D at engage
-const split_cell_p: u16 = 0x379D; // game P at engage
+const split_cell_p: u16 = 0x36E8; // game P at engage -- NOT $379D: that is cell_d's high byte, and the engage stub's P store turned the game's D=$6000 into P<<8 (measured: D=$8100 at the first gameplay hand-over, the IRQ handler's LDX $AB read ROM, and the S-CPU jumped into $80:0000)
 const split_cell_s: u16 = 0x379E; // game S at engage (16-bit)
 const split_ring: u16 = 0x37A0; // 16 ids
 const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
@@ -162,6 +199,57 @@ const split_ring2_rd: u16 = 0x37B9;
 const split_ring2: u16 = 0x3680; // 24 records of [id][D.lo][D.hi][pad] — bursts (a boss-area SFX barrage) lapped a 12-slot ring and the drain replayed a blank record
 const split_sa1_stack: u16 = 0x3778; // the old dispatcher stack slot, free in split mode
 const split_pump_stack: u16 = 0x37F0;
+/// Mainloop flavor: the pump's stack lives in REAL WRAM (freed by the
+/// relocation), not I-RAM — the stack page is the CPU discriminator, and
+/// a pump on a $3xxx page would replay a body whose nested IO calls take
+/// themselves for the SA-1 and enqueue to a drain that is busy with them.
+const split_ml_pump_stack: u16 = 0x1EFF;
+/// Mainloop flavor: the SA-1's stack top. The tail flavor's $3778 leaves
+/// 120 bytes above the split's cells at $36E0; a game loop's call depth
+/// wants more, and I-RAM below $3600 is free of every cell.
+const split_ml_sa1_stack: u16 = 0x35FF;
+/// The COP handler's direct page (16 bytes of I-RAM scratch).
+const split_cop_dp: u16 = 0x3640;
+// Inline-argument calls (a JSL followed by n data bytes the callee reads
+// through its return address and skips on return — Super Metroid's
+// $88:8435 and $80:91A9): the SA-1's stub captures the caller's return
+// frame, the S-CPU's replay copies the n bytes into I-RAM behind a fake
+// frame, and an RTL after them pops the drain's own frame.
+const split_cell_ret: u16 = 0x3720; // the caller's pushed PC (2) and bank (1, +1 junk)
+const split_args: u16 = 0x3724; // up to 8 argument bytes, then the RTL
+const split_asc_a: u16 = 0x3730; // the replay helper's register parking
+const split_asc_x: u16 = 0x3732;
+const split_asc_y: u16 = 0x3734;
+const split_cell_pret: u16 = 0x3736; // the P a replayed body returned with
+const split_scr_pw: u16 = 0x3737; // scratch: the caller's widths
+/// Mainloop flavor: the loop's context at the anchor when ownership
+/// changes hands (A/X/Y here; D, DBR, P, S in the engage cells), and
+/// the owner cell: 1 = the SA-1 runs the laps, 0 = the S-CPU does.
+const split_ctx_a: u16 = 0x36E0;
+const split_ctx_x: u16 = 0x36E2;
+const split_ctx_y: u16 = 0x36E4;
+const split_owner: u16 = 0x36E6;
+/// The dispatch pointer's bank byte, right after `split_cell_t`.
+const split_cell_tb: u16 = 0x37C4;
+/// The math shadow (mainloop flavor): the S-CPU's multiplier/divider
+/// registers as I-RAM cells the SA-1 side computes into — $4202/$4203
+/// (multiplicands), $4204-$4206 (dividend, divisor; the byte after the
+/// divisor stays zero so a 16-bit subtract reads it as such), then
+/// $4214/$4215 (quotient) and $4216/$4217 (remainder / product).
+const split_math_a: u16 = 0x36F0;
+const split_math_div: u16 = 0x36F2;
+const split_math_q: u16 = 0x36F6;
+const split_math_r: u16 = 0x36F8;
+// The PPU's mode-7 multiplier ($211B x $211C -> $2134-$2136), which games
+// use as a signed 16x8 multiplier (Super Metroid's trig helper at
+// $A9:C460: Ridley's tail collapsed onto one point without it). Cells in
+// register order so the handler's offset arithmetic stays linear: off =
+// reg - $20DB ($211B -> $40, $211C -> $41, $2134-6 -> $59-$5B).
+const split_m7_last: u16 = 0x36FA; // the byte last written to $211B
+const split_m7b: u16 = 0x36FB; // $211C, signed 8-bit
+const split_m7_prod: u16 = 0x36FC; // $2134-$2136: the 24-bit signed product
+const split_m7a: u16 = 0x36EA; // the composed 16-bit M7A (hi = last byte, lo = the latch before it)
+const split_m7_latch: u16 = 0x36EC; // the write-twice latch
 
 pub const Reason = enum {
     coprocessor,
@@ -226,6 +314,9 @@ pub const Stats = struct {
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
+    /// Mirror-bank `JSL`s re-banked on their de-mirrored twin's evidence,
+    /// at sites no coverage reached — see `demirrorTwinJsls`.
+    rewritten_twin_jsls: u32 = 0,
     /// Battery-SRAM sites re-banked into BW-RAM $20000+ (bank $42), offsets
     /// normalized by the chip's mirror mask.
     rewritten_sram: u32 = 0,
@@ -266,6 +357,49 @@ pub const Stats = struct {
     rewritten_hi_banks: u32 = 0,
     /// Measured $A0-$BF bank values re-banked -$80 (>2 MiB window mode).
     rewritten_a0_banks: u32 = 0,
+    /// Super Metroid room-state level-data pointer banks re-banked -$20 by
+    /// the room-graph walk (`rebankSmRoomLevelPointers`) at states no
+    /// surface loaded; the rooms/states counts are what the walk reached.
+    rewritten_room_level_banks: u32 = 0,
+    room_walk_rooms: u32 = 0,
+    room_walk_states: u32 = 0,
+    /// Non-zero when the walk refused: the $8F address that failed
+    /// validation. Nothing was rewritten.
+    room_walk_refused_at: u32 = 0,
+    /// Super Metroid tileset-table pointer banks de-mirrored by
+    /// `rebankSmTilesetTable` (the picture's tile table/GFX/palette) at
+    /// tilesets no surface loaded; `tileset_records` is the table length.
+    rewritten_tileset_banks: u32 = 0,
+    tileset_records: u32 = 0,
+    tileset_refused_at: u32 = 0,
+    /// Super Metroid enemy-header bank bytes (+$0C) de-mirrored by
+    /// `rebankSmEnemyHeaders` at species no surface met; `enemy_headers` is
+    /// how many records validated as headers.
+    rewritten_enemy_banks: u32 = 0,
+    enemy_headers: u32 = 0,
+    /// Pointer-seed immediates (see `rebankSmPointerSeeds`): sites whose
+    /// `LDA #imm / STA dp` seeds a long pointer's bank or low-WRAM
+    /// address, and the immediates rewritten (the rest were proven).
+    pointer_seed_sites: u32 = 0,
+    rewritten_pointer_seeds: u32 = 0,
+    /// Area map tilemap table (see `rebankSmAreaMapTable`): entries
+    /// validated, bank bytes de-mirrored, or the $82 address that refused.
+    area_map_entries: u32 = 0,
+    rewritten_area_map_banks: u32 = 0,
+    area_map_refused_at: u32 = 0,
+    /// Super Metroid background (library) DMA-list source banks de-mirrored
+    /// (the BG2 picture) across the records the room walk reached.
+    rewritten_bg_banks: u32 = 0,
+    bg_records: u32 = 0,
+    /// Super Metroid `JSL $80:B0FF` inline destination banks re-banked
+    /// $7E/$7F -> $40/$41 (`rebankSmDecompInlineDests`); `decomp_inline_sites`
+    /// is every such site whose destination is WRAM.
+    rewritten_decomp_inline_banks: u32 = 0,
+    decomp_inline_sites: u32 = 0,
+    /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
+    /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
+    /// by later code — see `demirrorQueueBankImms`.
+    rewritten_queue_imms: u32 = 0,
     /// Misfit-bank DBR-pin sites patched with a translate-in thunk
     /// (window mode): the pinned bank maps -$20/-$80 at runtime, the
     /// table byte stays stock.
@@ -285,6 +419,13 @@ pub const Stats = struct {
     /// and covered hazards the audit found (WAI/STP, or an MMIO read the
     /// split leaves unhandled) — each a 24-bit CPU address, capped.
     split_mul: u8 = 0,
+    /// Mainloop flavor: math sites shadowed (uncapped).
+    split_math_sites: u32 = 0,
+    split_math_direct: u32 = 0,
+    split_inline_args: u8 = 0,
+    split_trigger_jsl: u32 = 0,
+    /// Mainloop flavor: the dual image is in effect (see emitSplit).
+    split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
     n_split_hazards: u8 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
@@ -2864,7 +3005,7 @@ const wg_prologue_len = 21;
 /// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
 /// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
-const wg_window_shim_max = 33 + 48;
+const wg_window_shim_max = 33 + 72;
 /// What the shim must program before releasing the SA-1 from reset:
 /// its reset vector and — S-CPU-side registers both — its IRQ vector,
 /// aimed at the watchdog's abort handler.
@@ -2874,7 +3015,7 @@ const WinBoot = struct { crv: u16, civ: u16 };
 /// The split flavor's carve budget: tok + mini-tok + sloop + the mul
 /// helper + up to 26 stub/trampoline pairs. Bank $00's whole padding
 /// run must cover shim + this.
-const split_disp_max: u32 = 1200;
+const split_disp_max: u32 = 1520;
 const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
 
 /// Context-split thunk: the DBR dispatch plus both flavors of the
@@ -3082,6 +3223,16 @@ const FarPad = struct {
     keep_bank: u32 = 0,
     keep_lo: u32 = 0,
     keep_hi: u32 = 0,
+
+    /// Padding in ONE named bank, for a stub that must share its site's
+    /// bank (a bank-local JMP/JSR/RTS shape). A fresh scan each call:
+    /// everything handed out before has been written, so it reads as
+    /// occupied — callers must write exactly what they asked for. Bank
+    /// $00 keeps the carve reserved.
+    fn nextIn(self: *@This(), bank: u32, need: u32, res_at: u32, res_len: u32) ?u32 {
+        var pa = padAllocFor(self.out, self.header_off, bank, res_at, res_len);
+        return pa.next(need);
+    }
 
     fn next(self: *@This(), need: u32) ?u32 {
         if (self.bank == 0) {
@@ -3480,7 +3631,7 @@ fn rebankDasbWrites(
 /// the shim's Super-MMC programming ($00-$1F/$80-$9F -> MB0, $20-$3F -> MB1,
 /// $A0-$BF -> MB2), which is where the de-mirror pass parks the content.
 /// Only ROM homes are mapped; a bank with no fixed ROM home returns null.
-fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
+pub fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
     const bank: u32 = (cpu >> 16) & 0xFF;
     const a16: u32 = cpu & 0xFFFF;
     if (a16 < 0x8000) return null;
@@ -3522,6 +3673,1089 @@ fn relocateHdmaIndirect(out: []u8, tables: []const u24, res: *Result) void {
             f += 3;
         }
     }
+}
+
+/// Bank immediates bound for a dispatch queue, BY SIGNATURE, coverage or
+/// not — the same stance as the `STA $00 / JMP ($0000)` macro net, and for
+/// the same reason: post-fork trajectories pull queue entries no finite
+/// stock profile can lead to. The shape is Super Metroid's sound-library
+/// enqueue:
+///
+///     consumer:  LDA $6FA6,X ... XBA / PHA / PLB / PLB
+///                (bank in the loaded word's LOW byte: the column it
+///                loads from is a BANK COLUMN)
+///     producer:  LDA #$00A3 ... STA $6FA6,X
+///                (the bank travels as a 16-bit immediate, consumed
+///                thousands of cycles later by different code)
+///
+/// The measured pointer-bank net re-banks the producers a profiled run
+/// executed; a missed one BRKs into the game's crash trap on the first
+/// off-profile timeline that pulls its entry (measured: Super Metroid's
+/// attract, where the conversion's own lag differential queues a handler
+/// stock timing never queues — and the evidence loop can never close it,
+/// because every cover replay dies at that BRK before the PLB proves the
+/// byte). The consumer's XBA/PHA/PLB/PLB tail names the column
+/// statically; every producer keyed on that exact column then re-banks by
+/// the same de-mirror map as the measured net. Columns are matched in
+/// their POST-rewrite window form ($6000-$7FFF), so the pass runs after
+/// the operand rewrites and never invents a column the walk did not
+/// already move.
+fn demirrorQueueBankImms(out: []u8, wide: bool) u32 {
+    // Pass 1: bank columns, from the consumer signature. The XBA/PHA/
+    // PLB/PLB tail is the key; the column is the last `LDA abs,X` with a
+    // window operand in the handful of bytes before it.
+    var cols: [16]u16 = undefined;
+    var n_cols: usize = 0;
+    var f: usize = 0;
+    while (f + 4 <= out.len) : (f += 1) {
+        if (!(out[f] == 0xEB and out[f + 1] == 0x48 and out[f + 2] == 0xAB and out[f + 3] == 0xAB)) continue;
+        var col: ?u16 = null;
+        var b: usize = f -| 12;
+        while (b + 3 <= f) : (b += 1) {
+            if (out[b] != 0xBD) continue;
+            const v = std.mem.readInt(u16, out[b + 1 ..][0..2], .little);
+            if (v >= wg_bw_window and v < wg_bw_window + 0x2000) col = v;
+        }
+        const c = col orelse continue;
+        var known = false;
+        for (cols[0..n_cols]) |e| {
+            if (e == c) known = true;
+        }
+        if (!known and n_cols < cols.len) {
+            cols[n_cols] = c;
+            n_cols += 1;
+        }
+    }
+    // Pass 2: producers keyed on those exact columns.
+    var n: u32 = 0;
+    for (cols[0..n_cols]) |c| {
+        f = 0;
+        while (f + 6 <= out.len) : (f += 1) {
+            if (out[f] != 0xA9 or out[f + 2] != 0x00 or out[f + 3] != 0x9D) continue;
+            if (std.mem.readInt(u16, out[f + 4 ..][0..2], .little) != c) continue;
+            const bank = out[f + 1];
+            if (bank == 0x7E or bank == 0x7F) {
+                out[f + 1] = bank - 0x3E; // WRAM -> BW-RAM $40/$41
+            } else if (wide and bank >= 0xA0 and bank <= 0xBF) {
+                out[f + 1] = bank - 0x80; // MB1 mirror -> its de-mirror home
+            } else if (wide and bank >= 0xC0 and bank <= 0xDF) {
+                out[f + 1] = bank - 0x20; // misfit bank -> its parked home
+            } else continue;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Mirror-bank `JSL`s in code no surface reached, re-banked on the evidence
+/// of their own de-mirrored twin.
+///
+/// Three of the six freezes Super Metroid's players found (findings §4f)
+/// were one shape: a `JSL $A0-$BF:addr` at a site byte-identical to stock.
+/// Nothing flags it — it is simply code no surface executed and the static
+/// walk never reached, and the de-mirror pass above is coverage-gated.
+/// Under the shim, region 3 carries MB2, so the call lands in a different
+/// megabyte and BRKs. A census of one build found 51 distinct targets
+/// across 628 call sites: one freeze per play session, indefinitely.
+///
+/// The proof that needs no coverage is the routine's OWN de-mirrored form.
+/// In the CONVERTED image the same entry is already called as
+/// `JSL $20-$3F:addr` by code that IS covered, and called repeatedly — the
+/// observed counts run 20-77 per target. (Stock has no such call: Super
+/// Metroid reaches everything through $80-$DF. The twin is minted by the
+/// coverage-gated de-mirror pass, and this pass spends it.) So the mirror form names MB1 content, and re-banking it -$80 is
+/// exactly the rewrite the de-mirror pass would have made had a surface
+/// reached the site.
+///
+/// Two consequences of keying on the twin, both load-bearing:
+///
+///   * It stays off data. A byte triple in compressed graphics must be
+///     preceded by `$22` AND match one of a few dozen specific 24-bit entry
+///     addresses; over a 3 MiB image that is ~0.04 expected false hits.
+///   * It introduces no new code for the walk to arbitrate. A covered call
+///     to the twin is *why* the body is evidenced, so `extendCoverage` has
+///     already walked and rewritten it (`$A0 & 0x7F` is `$20` — the walk's
+///     LoROM fold happens to be the de-mirror for this range). This net
+///     rewrites operands only, which is what makes it landable where a
+///     blind 628-byte rewrite was not.
+fn demirrorTwinJsls(gpa: std.mem.Allocator, image: []const u8, out: []u8, cov: []const u8) !u32 {
+    // Covered calls per de-mirrored target, indexed by bank $20-$3F and
+    // addr16 >= $8000 — the only shape a twin can have. Saturating u8.
+    const calls = try gpa.alloc(u8, 0x20 * 0x8000);
+    defer gpa.free(calls);
+    @memset(calls, 0);
+
+    var bank: u32 = 0;
+    while (bank < 0x40) : (bank += 1) {
+        const bank_file = bank * 0x8000;
+        if (bank_file >= image.len) break;
+        var a16: u32 = 0x8000;
+        while (a16 < 0x1_0000) : (a16 += 1) {
+            const cpu = (bank << 16) | a16;
+            if ((cov[cpu] | cov[0x80_0000 | cpu]) & usage_map.flag_opcode == 0) continue;
+            const file = bank_file + (a16 - 0x8000);
+            // Read the CONVERTED image: stock never writes the $20-$3F form
+            // (Super Metroid calls everything through $80-$DF), so the twin
+            // exists only after the coverage-gated de-mirror pass above has
+            // rewritten the covered sites. That pass is what mints the
+            // evidence this one spends.
+            if (file + 3 >= image.len or out[file] != 0x22) continue;
+            const tb = out[file + 3];
+            if (tb < 0x20 or tb > 0x3F) continue;
+            const t = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+            if (t < 0x8000) continue;
+            const idx = (@as(usize, tb - 0x20) << 15) | (t - 0x8000);
+            if (calls[idx] != 0xFF) calls[idx] += 1;
+        }
+    }
+
+    // Now the sites nothing reached. Scanned over the whole file, because
+    // "the walk never got here" is the defining property of the class.
+    var n: u32 = 0;
+    var file: usize = 0;
+    while (file + 3 < image.len) : (file += 1) {
+        if (image[file] != 0x22) continue;
+        const bk = image[file + 3];
+        if (bk < 0xA0 or bk > 0xBF) continue;
+        if (out[file + 3] != bk) continue; // already rewritten; not ours
+        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
+        if (t < 0x8000) continue;
+        const idx = (@as(usize, bk - 0xA0) << 15) | (t - 0x8000);
+        if (calls[idx] < 2) continue; // one call is a coincidence
+        out[file + 3] = bk - 0x80;
+        n += 1;
+    }
+    return n;
+}
+
+test "demirrorTwinJsls: twin evidence re-banks the mirror form, once is not enough" {
+    const gpa = testing.allocator;
+    var img: [0x18_0000]u8 = @splat(0);
+    // Two covered calls to $A0:C0AE, in bank $00 at $8000 and $8004. Stock
+    // spells them the mirror way; the de-mirror pass has already re-banked
+    // them in `out`, which is the only place the twin evidence exists.
+    img[0] = 0x22;
+    img[1] = 0xAE;
+    img[2] = 0xC0;
+    img[3] = 0xA0;
+    img[4] = 0x22;
+    img[5] = 0xAE;
+    img[6] = 0xC0;
+    img[7] = 0xA0;
+    // One covered call to $21:9000 — evidenced only once.
+    img[8] = 0x22;
+    img[9] = 0x00;
+    img[10] = 0x90;
+    img[11] = 0x21;
+    // Uncovered mirror forms of both, plus a mirror JSL to an unevidenced
+    // target and one whose addr16 is not in the ROM half.
+    const u = 0x10_0000;
+    img[u + 0] = 0x22;
+    img[u + 1] = 0xAE;
+    img[u + 2] = 0xC0;
+    img[u + 3] = 0xA0; // -> re-banked
+    img[u + 4] = 0x22;
+    img[u + 5] = 0x00;
+    img[u + 6] = 0x90;
+    img[u + 7] = 0xA1; // one twin call only -> left alone
+    img[u + 8] = 0x22;
+    img[u + 9] = 0x34;
+    img[u + 10] = 0xD2;
+    img[u + 11] = 0xB7; // no twin evidence -> left alone
+    img[u + 12] = 0x22;
+    img[u + 13] = 0x10;
+    img[u + 14] = 0x00;
+    img[u + 15] = 0xA0; // addr16 below $8000 -> left alone
+
+    const cov = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(cov);
+    @memset(cov, 0);
+    for ([_]u32{ 0x008000, 0x008004, 0x008008 }) |c| cov[c] = usage_map.flag_opcode;
+
+    var out: [0x18_0000]u8 = img;
+    out[3] = 0x20; // what the coverage-gated de-mirror pass produced
+    out[7] = 0x20;
+    try testing.expectEqual(@as(u32, 1), try demirrorTwinJsls(gpa, &img, &out, cov));
+    try testing.expectEqual(@as(u8, 0x20), out[u + 3]);
+    try testing.expectEqual(@as(u8, 0xA1), out[u + 7]);
+    try testing.expectEqual(@as(u8, 0xB7), out[u + 11]);
+    try testing.expectEqual(@as(u8, 0xA0), out[u + 15]);
+}
+
+
+/// Super Metroid's room-state level-data pointers, re-banked by walking the
+/// room graph instead of waiting for a surface to load each state.
+///
+/// Every room state carries a 3-byte pointer to its compressed level data,
+/// and every one of them names MB2 ($C2-$CE). Under the >2 MiB shim MB2
+/// lives $20 lower, so the byte must become $A2-$AE — and the only pass
+/// that does that is `hi_proven`, which needs the profile to have watched
+/// the loader read that exact byte. A state no surface ever loaded keeps
+/// its stock bank, the decompressor ($80:B0FF) reads the wrong megabyte,
+/// and the room arrives with no geometry at all: Samus walks through walls
+/// into a phantom special block and Super Metroid's own `BRA *` assertion
+/// at $84:B3A6 (measured 2026-09-02 on the Ceres escape states). One build
+/// had 40 such bytes proven against ~750 untouched — every room past the
+/// first door off the landing site.
+///
+/// No shape identifies the byte on its own (a `$CD` after a word is common
+/// in a bank of tables), but the structure that reaches it is exact and
+/// finite: door headers ($83) name rooms ($8F); a room's condition list
+/// names its states; a state's first three bytes are the pointer. The walk
+/// starts at the landing site and follows doors until it runs out. It is
+/// all-or-nothing on the rewrite side: any state that fails validation
+/// refuses the whole pass, because a misparse here rewrites data. A door
+/// whose destination does not look like a room header is skipped, not
+/// fatal — elevators and one-way transitions name no room.
+///
+/// Reads STOCK bytes (`image`); a bank byte `hi_proven` already re-banked
+/// in `out` is left as it is.
+pub const SmRoomWalk = struct {
+    rooms: u32 = 0,
+    states: u32 = 0,
+    rebanked: u32 = 0,
+    /// Background (library) records processed, and their source banks
+    /// de-mirrored (see the BG pass in `rebankSmRoomLevelPointers`).
+    bg_records: u32 = 0,
+    bg_banks: u32 = 0,
+    /// Non-zero when the pass refused: the $8F address of the header that
+    /// failed validation. Nothing was rewritten.
+    refused_at: u32 = 0,
+};
+
+fn smConditionArgBytes(cond: u16) ?u8 {
+    // Each condition routine's skip path is `INX` x (args + 2) / `RTS`; these
+    // widths are read off those routines in bank $8F.
+    return switch (cond) {
+        0xE5EB => 2, // entered through door X
+        0xE612, 0xE629 => 1, // boss bit / event bit in the current area
+        0xE5FF, 0xE640, 0xE652, 0xE669, 0xE678 => 0,
+        else => null,
+    };
+}
+
+fn rebankSmRoomLevelPointers(gpa: std.mem.Allocator, image: []const u8, out: []u8) !SmRoomWalk {
+    const f8f: usize = 0x0F * 0x8000; // bank $8F: room + state headers
+    const f83: usize = 0x03 * 0x8000; // bank $83: door headers
+    var walk: SmRoomWalk = .{};
+    if (image.len < f8f + 0x8000) return walk;
+    const R = struct {
+        img: []const u8,
+        fn b(self: @This(), base: usize, a16: u32) u8 {
+            return self.img[base + (a16 - 0x8000)];
+        }
+        fn w(self: @This(), base: usize, a16: u32) u16 {
+            return std.mem.readInt(u16, self.img[base + (a16 - 0x8000) ..][0..2], .little);
+        }
+        fn looksLikeRoom(self: @This(), a16: u32) bool {
+            if (a16 < 0x8000 or a16 > 0xFFFF - 0x0B - 2) return false;
+            const area = self.b(f8f, a16 + 1);
+            const wd = self.b(f8f, a16 + 4);
+            const ht = self.b(f8f, a16 + 5);
+            return area < 8 and wd >= 1 and wd <= 16 and ht >= 1 and ht <= 16 and self.w(f8f, a16 + 9) >= 0x8000;
+        }
+    };
+    const r: R = .{ .img = image };
+
+    const visited = try gpa.alloc(bool, 0x8000);
+    defer gpa.free(visited);
+    @memset(visited, false);
+    var queue: [1024]u16 = undefined;
+    var qn: usize = 0;
+    var states: [2048]u32 = undefined;
+    var sn: usize = 0;
+
+    // Two roots, because the door graph has two components: Zebes hangs
+    // off the landing site, and Ceres is entered by the new-game warp and
+    // left by the escape warp — no door crosses between them. A root that
+    // does not parse as a room is skipped (a different revision), not fatal.
+    for ([_]u16{ 0x91F8, 0xDF45 }) |root| {
+        if (!r.looksLikeRoom(root) or visited[root - 0x8000]) continue;
+        visited[root - 0x8000] = true;
+        queue[qn] = root;
+        qn += 1;
+    }
+    if (qn == 0) return walk;
+
+    var qi: usize = 0;
+    while (qi < qn) : (qi += 1) {
+        const room: u32 = queue[qi];
+        walk.rooms += 1;
+        // Condition list -> states, then the inline default state.
+        var p: u32 = room + 11;
+        var guard: u8 = 0;
+        while (true) : (guard += 1) {
+            if (guard > 16 or p > 0xFFFF - 2) {
+                walk.refused_at = room;
+                return walk;
+            }
+            const cond = r.w(f8f, p);
+            if (cond == 0xE5E6) {
+                if (sn == states.len) {
+                    walk.refused_at = room;
+                    return walk;
+                }
+                states[sn] = p + 2;
+                sn += 1;
+                break;
+            }
+            const nargs = smConditionArgBytes(cond) orelse {
+                walk.refused_at = room;
+                return walk;
+            };
+            const st = r.w(f8f, p + 2 + nargs);
+            if (st < 0x8000 or sn == states.len) {
+                walk.refused_at = room;
+                return walk;
+            }
+            states[sn] = st;
+            sn += 1;
+            p += 2 + @as(u32, nargs) + 2;
+        }
+        // Door list: words naming door headers in $83, ended by whatever
+        // follows (the next room header's index/area word is < $8000).
+        var d: u32 = r.w(f8f, room + 9);
+        var di: u8 = 0;
+        while (di < 32 and d <= 0xFFFF - 1) : ({
+            di += 1;
+            d += 2;
+        }) {
+            const dp = r.w(f8f, d);
+            if (dp < 0x8000 or dp > 0xFFFF - 12) break;
+            const dest = r.w(f83, dp);
+            if (dest == 0) continue; // elevator / no room
+            if (!r.looksLikeRoom(dest)) continue;
+            if (visited[dest - 0x8000]) continue;
+            visited[dest - 0x8000] = true;
+            if (qn == queue.len) {
+                walk.refused_at = room;
+                return walk;
+            }
+            queue[qn] = dest;
+            qn += 1;
+        }
+    }
+    walk.states = @intCast(sn);
+
+    // Validate every state before touching a byte: level pointer into
+    // MB2's ROM half, tileset index in range.
+    for (states[0..sn]) |st| {
+        if (st > 0xFFFF - 26) {
+            walk.refused_at = st;
+            return walk;
+        }
+        const lo = r.w(f8f, st);
+        const bk = r.b(f8f, st + 2);
+        const tileset = r.b(f8f, st + 3);
+        if (lo < 0x8000 or bk < 0xC2 or bk > 0xCE or tileset >= 0x1D) {
+            walk.refused_at = st;
+            return walk;
+        }
+    }
+    for (states[0..sn]) |st| {
+        const f = f8f + (st - 0x8000) + 2;
+        if (out[f] != image[f]) continue; // hi_proven got here first
+        out[f] -= 0x20;
+        walk.rebanked += 1;
+    }
+
+    // Each state also names a BACKGROUND (library) record at +$16 — a DMA
+    // list that paints BG2. Its source banks are the same evidence-gated
+    // class as the level pointer: a record no surface loaded keeps its stock
+    // banks and the DMA reads the wrong megabyte, so the room renders correct
+    // foreground over garbage background (measured 2026-09-02 on the Parlor,
+    // $92FD; a three-byte hand-patch of this record's banks made it clean).
+    // Unlike the level pointer this pass is PER-RECORD graceful, not
+    // all-or-nothing: a state's BG word legitimately points at code or
+    // nothing, so a record that does not parse as a clean list is skipped,
+    // never fatal — exactly the door-walk's "names no room" rule. The list's
+    // command widths are read off Super Metroid's own BG interpreter.
+    for (states[0..sn]) |st| {
+        const bg = r.w(f8f, st + 0x16);
+        if (bg < 0x8000 or bg > 0xFFF0) continue;
+        const ok = rebankSmBgRecord(image, out, bg, &walk);
+        if (ok) walk.bg_records += 1;
+    }
+    return walk;
+}
+
+/// Walk one Super Metroid background (library) record and de-mirror the
+/// source bank of every copy command. Returns false — translating nothing —
+/// the instant the bytes stop looking like a BG list (an unknown command, an
+/// out-of-range source bank, or no terminator within the cap), so a state
+/// whose +$16 points at code or data is left untouched. Widths are Super
+/// Metroid's: $0002 src+dest+size (7), $0004 src+dest (5), $0008 (7), $000A
+/// (2), $000C (2), $000E src+3 words (9), $0000 ends. Only $0002/$0004/$0008/
+/// $000E carry a 3-byte source at payload +0; its bank is payload byte 2.
+fn rebankSmBgRecord(image: []const u8, out: []u8, ptr: u16, walk: *SmRoomWalk) bool {
+    const f8f: usize = 0x0F * 0x8000;
+    var pending: [64]usize = undefined; // byte offsets staged for translation
+    var np: usize = 0;
+    var a: u32 = ptr;
+    var steps: u8 = 0;
+    while (steps < 64) : (steps += 1) {
+        if (a + 2 > 0x1_0000) return false;
+        const cmd = std.mem.readInt(u16, image[f8f + (a - 0x8000) ..][0..2], .little);
+        if (cmd == 0x0000) {
+            // A clean list. Commit the staged source banks now — nothing was
+            // written while the parse could still fail.
+            for (pending[0..np]) |f| {
+                if (out[f] != image[f]) continue; // hi_proven got here first
+                const bank = out[f];
+                out[f] = if (bank >= 0xC0 and bank <= 0xDF)
+                    bank - 0x20
+                else if (bank >= 0xA0 and bank <= 0xBF)
+                    bank - 0x80
+                else
+                    bank - 0x3E; // $7E/$7F -> $40/$41
+                walk.bg_banks += 1;
+            }
+            return true;
+        }
+        const payload: u32 = switch (cmd) {
+            0x0002, 0x0008 => 7,
+            0x0004 => 5,
+            0x000A, 0x000C => 2,
+            0x000E => 9,
+            else => return false,
+        };
+        if (cmd == 0x0002 or cmd == 0x0004 or cmd == 0x0008 or cmd == 0x000E) {
+            const bf = a + 2 + 2; // command word, then source lo/hi, then bank
+            if (bf >= 0x1_0000) return false;
+            const bank = image[f8f + (bf - 0x8000)];
+            // A real source bank is WRAM or ROM; anything else means a
+            // misparse, and we must not translate the byte we mistook.
+            if (!(bank == 0x7E or bank == 0x7F or (bank >= 0x80 and bank <= 0xDF))) return false;
+            if ((bank == 0x7E or bank == 0x7F or (bank >= 0xA0 and bank <= 0xDF)) and np < pending.len) {
+                pending[np] = f8f + (bf - 0x8000);
+                np += 1;
+            }
+        }
+        a += 2 + payload;
+    }
+    return false; // no terminator within the cap — not a list we understand
+}
+
+pub const SmInlineDests = struct {
+    /// `JSL $80:B0FF` sites whose inline destination names WRAM ($7E/$7F).
+    sites: u32 = 0,
+    /// Of those, the bank bytes this pass re-banked ($7E/$7F -> $40/$41).
+    rebanked: u32 = 0,
+};
+
+/// Super Metroid's decompressor, `JSL $80:B0FF`, takes its DESTINATION as a
+/// 3-byte long pointer sitting INLINE in the code stream right after the
+/// JSL: the routine pulls the return address, reads the pointer through it
+/// and advances the return by 3. That pointer is data — nothing executes
+/// it — so relocation-by-execution cannot see it; the profiler proves a
+/// site only when a recording drives that exact call and traces the byte
+/// into a $7E store. Measured 2026-09-03: v38 had the door-transition
+/// tileset loader's sites proven and the load-game loader's raw
+/// ($82:EAF5/$82:EB06 — the same loads, on the path the Ceres escape takes
+/// to Zebes). The tileset's tile table then decompressed into REAL WRAM
+/// $7E:A800 while the game read the stale table at $40:A800, so every room
+/// whose tileset first loads through that path painted the previous
+/// tileset's blocks ($9A44: correct geometry, wrong textures). Stock has 63
+/// sites, v38 left 29 raw; a hand patch of those 29 bank bytes made the
+/// room pixel-correct. Same class as the room-state level pointer and the
+/// background record: a bank byte a structure carries.
+///
+/// Signature-validated: the four JSL bytes, then an inline bank of $7E/$7F.
+/// Any other bank — a ROM destination, or data that merely spells the JSL
+/// — is left untouched; a byte `hi_proven` already re-banked in `out` is
+/// left alone.
+fn rebankSmDecompInlineDests(image: []const u8, out: []u8) SmInlineDests {
+    var r: SmInlineDests = .{};
+    if (image.len < 7) return r;
+    const sig = [_]u8{ 0x22, 0xFF, 0xB0, 0x80 }; // JSL $80:B0FF
+    var i: usize = 0;
+    while (i + 7 <= image.len) : (i += 1) {
+        if (!std.mem.eql(u8, image[i..][0..4], &sig)) continue;
+        const bank = image[i + 6];
+        if (bank != 0x7E and bank != 0x7F) continue;
+        r.sites += 1;
+        if (out[i + 6] != bank) continue; // hi_proven got here first
+        out[i + 6] = bank - 0x3E; // $7E/$7F -> $40/$41
+        r.rebanked += 1;
+    }
+    return r;
+}
+
+test "rebankSmDecompInlineDests: inline WRAM destinations re-banked, proven and ROM ones left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    // $82:E845 `JSL $80:B0FF` ; dl $7E:A000   (the CRE tile table)
+    // $82:E856 `JSL $80:B0FF` ; dl $7E:A800   (the tileset tile table)
+    // $82:E7F4 `JSL $80:B0FF` ; dl $7F:0000   (level data)
+    // $82:F000 `JSL $80:B0FF` ; dl $C2:1234   (not WRAM: untouched)
+    const sites = [_]struct { a: u16, lo: u16, bank: u8 }{
+        .{ .a = 0xE845, .lo = 0xA000, .bank = 0x7E },
+        .{ .a = 0xE856, .lo = 0xA800, .bank = 0x7E },
+        .{ .a = 0xE7F4, .lo = 0x0000, .bank = 0x7F },
+        .{ .a = 0xF000, .lo = 0x1234, .bank = 0xC2 },
+    };
+    const f82: usize = 0x02 * 0x8000;
+    for (sites) |s| {
+        const o = f82 + (@as(usize, s.a) - 0x8000);
+        img[o] = 0x22;
+        img[o + 1] = 0xFF;
+        img[o + 2] = 0xB0;
+        img[o + 3] = 0x80;
+        std.mem.writeInt(u16, img[o + 4 ..][0..2], s.lo, .little);
+        img[o + 6] = s.bank;
+    }
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    // hi_proven already re-banked the level-data site.
+    out[f82 + (0xE7F4 - 0x8000) + 6] = 0x41;
+    const r = rebankSmDecompInlineDests(img, out);
+    try testing.expectEqual(@as(u32, 3), r.sites);
+    try testing.expectEqual(@as(u32, 2), r.rebanked);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + (0xE845 - 0x8000) + 6]);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + (0xE856 - 0x8000) + 6]);
+    try testing.expectEqual(@as(u8, 0x41), out[f82 + (0xE7F4 - 0x8000) + 6]); // untouched
+    try testing.expectEqual(@as(u8, 0xC2), out[f82 + (0xF000 - 0x8000) + 6]); // untouched
+    // The inline address bytes are never touched.
+    try testing.expectEqual(@as(u8, 0x00), out[f82 + (0xE845 - 0x8000) + 4]);
+    try testing.expectEqual(@as(u8, 0xA0), out[f82 + (0xE845 - 0x8000) + 5]);
+}
+
+test "rebankSmBgRecord: copy-command source banks de-mirrored, non-list skipped" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const wr = struct {
+        fn b(buf: []u8, a16: u16, v: u8) void {
+            buf[0x0F * 0x8000 + (@as(usize, a16) - 0x8000)] = v;
+        }
+    }.b;
+    // A clean list at $B000: $0004 src $BA:8DE7 dest $4000 ; $0002 src $7E:4000
+    // dest $4800 size $0800 ; $0000. Bank bytes at $B004 ($BA) and $B00B ($7E).
+    const rec = [_]u8{ 0x04, 0x00, 0xE7, 0x8D, 0xBA, 0x00, 0x40, 0x02, 0x00, 0x00, 0x40, 0x7E, 0x00, 0x48, 0x00, 0x08, 0x00, 0x00 };
+    for (rec, 0..) |v, i| wr(img, 0xB000 + @as(u16, @intCast(i)), v);
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    var walk: SmRoomWalk = .{};
+    try testing.expect(rebankSmBgRecord(img, out, 0xB000, &walk));
+    try testing.expectEqual(@as(u32, 2), walk.bg_banks);
+    try testing.expectEqual(@as(u8, 0x3A), out[f8f + (0xB004 - 0x8000)]); // BA -> 3A
+    try testing.expectEqual(@as(u8, 0x40), out[f8f + (0xB00B - 0x8000)]); // 7E -> 40
+    // hi_proven already took the first bank: it is left alone.
+    @memcpy(out, img);
+    out[f8f + (0xB004 - 0x8000)] = 0x3A;
+    var w2: SmRoomWalk = .{};
+    try testing.expect(rebankSmBgRecord(img, out, 0xB000, &w2));
+    try testing.expectEqual(@as(u32, 1), w2.bg_banks); // only the $7E one
+    // A pointer into code ($000A then a non-command word) is not a list:
+    // nothing is translated.
+    for ([_]u8{ 0x0A, 0x00, 0x00, 0x00, 0xA0, 0x7B, 0x82, 0x22 }, 0..) |v, i|
+        wr(img, 0xC000 + @as(u16, @intCast(i)), v);
+    @memcpy(out, img);
+    var w3: SmRoomWalk = .{};
+    try testing.expect(!rebankSmBgRecord(img, out, 0xC000, &w3));
+    try testing.expectEqual(@as(u32, 0), w3.bg_banks);
+}
+
+/// Super Metroid's tileset table: the room-graph walk fixes each room's
+/// LEVEL data pointer, but the room also names a TILESET, and the tileset is
+/// three more MB2 pointers — tile table, tile graphics, palette — that the
+/// loader copies into $07C0 and decompresses the picture from. A tileset no
+/// profiled surface loaded keeps its stock banks, all three decompress from
+/// the wrong megabyte, and the room renders as tile garbage over a wrong
+/// palette (measured 2026-09-03 on the Climb, $96BA, tileset 3: 15 of the 29
+/// records — half the game's tilesets — were raw in v41; a hand patch of the
+/// 45 bank bytes made the room pixel-correct). Same evidence-gated class as
+/// the level pointer, one table over. (A first version of this pass, v35,
+/// was written against the Parlor and changed nothing there — the Parlor's
+/// tileset was already proven — and was reverted as a wrong theory. The
+/// theory was wrong for that room, not wrong.)
+///
+/// The table is a fixed contiguous run of 9-byte records ($8F:E6A2..E7A7 on
+/// this ROM — the pointer list at $E7A7 begins exactly where the records
+/// end), each three 3-byte pointers into MB2. All-or-nothing, like the room
+/// walk: every record's three banks must be real MB2 ($A0-$DF) or the whole
+/// pass refuses, because a misparse rewrites graphics data. The de-mirror
+/// map: $C0-$DF content lives $20 lower, $A0-$BF (the CRE's mirror-of-MB1
+/// home) $80 lower. Reads stock bytes; leaves a byte `hi_proven` already
+/// re-banked in `out` alone.
+const sm_tileset_lo: u16 = 0xE6A2;
+const sm_tileset_hi: u16 = 0xE7A7;
+
+fn rebankSmTilesetTable(image: []const u8, out: []u8) SmRoomWalk {
+    const f8f: usize = 0x0F * 0x8000;
+    var walk: SmRoomWalk = .{};
+    if (image.len < f8f + 0x8000) return walk;
+    const b = struct {
+        fn at(img: []const u8, a16: u16) u8 {
+            return img[0x0F * 0x8000 + (@as(usize, a16) - 0x8000)];
+        }
+    }.at;
+
+    // Validate the whole table before touching a byte.
+    var a: u16 = sm_tileset_lo;
+    var recs: u32 = 0;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        inline for (.{ 2, 5, 8 }) |k| {
+            const bank = b(image, a + k);
+            if (bank < 0xA0 or bank > 0xDF) {
+                walk.refused_at = a;
+                return walk;
+            }
+        }
+        recs += 1;
+    }
+    if (recs == 0) return walk;
+
+    a = sm_tileset_lo;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        inline for (.{ 2, 5, 8 }) |k| {
+            const f = f8f + (@as(usize, a) + k - 0x8000);
+            if (out[f] == image[f]) {
+                const bank = out[f];
+                out[f] = if (bank >= 0xC0) bank - 0x20 else bank - 0x80;
+                walk.rebanked += 1;
+            }
+        }
+    }
+    walk.states = recs;
+    return walk;
+}
+
+test "rebankSmTilesetTable: every record's banks de-mirrored, proven left alone, anomaly refuses" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const putrec = struct {
+        fn f(buf: []u8, a16: u16, lo: u16, bank: u8) void {
+            const o = 0x0F * 0x8000 + (@as(usize, a16) - 0x8000);
+            std.mem.writeInt(u16, buf[o..][0..2], lo, .little);
+            buf[o + 2] = bank;
+        }
+    }.f;
+    // Fill $E6A2..E7A7 with 9-byte records (three MB2 pointers each).
+    var a: u16 = sm_tileset_lo;
+    while (a + 9 <= sm_tileset_hi) : (a += 9) {
+        putrec(img, a + 0, 0xBEEE, 0xC1); // tile table -> A1
+        putrec(img, a + 3, 0xF911, 0xBA); // tile GFX   -> 3A
+        putrec(img, a + 6, 0xB015, 0xC2); // palette    -> A2
+    }
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    // hi_proven already re-banked the first record's tile-table bank.
+    out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)] = 0xA1;
+
+    const w = rebankSmTilesetTable(img, out);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    try testing.expectEqual(@as(u32, 29), w.states);
+    try testing.expectEqual(@as(u32, 29 * 3 - 1), w.rebanked); // all but the proven one
+    try testing.expectEqual(@as(u8, 0xA1), out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)]); // untouched
+    try testing.expectEqual(@as(u8, 0x3A), out[f8f + (@as(usize, sm_tileset_lo) + 5 - 0x8000)]); // BA -> 3A
+    try testing.expectEqual(@as(u8, 0xA2), out[f8f + (@as(usize, sm_tileset_lo) + 8 - 0x8000)]); // C2 -> A2
+    // A record with a non-MB2 bank refuses the whole pass, rewriting nothing.
+    putrec(img, sm_tileset_lo + 9 + 2, 0xBEEE, 0x12);
+    @memcpy(out, img);
+    const w2 = rebankSmTilesetTable(img, out);
+    try testing.expectEqual(sm_tileset_lo + @as(u16, 9), w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqual(@as(u8, 0xC1), out[f8f + (@as(usize, sm_tileset_lo) + 2 - 0x8000)]);
+}
+
+/// Super Metroid's enemy headers: 64-byte records at $A0:CEBF.. ($40 apart,
+/// through $F7BF), one per enemy species. Byte +$0C is the enemy's BANK —
+/// the bank its AI routines, its palette (+$02) and its instruction lists
+/// live in, $A2-$B7 on this ROM, i.e. MB1 addressed through its $A0-$BF
+/// mirror. The game reads it as data (into the enemy's RAM slot, then
+/// through long pointers and the AI dispatch), so it is the same
+/// evidence-gated class as the level pointer: an enemy no recording met
+/// keeps its stock bank, and on the converted map $A0-$BF is MB2, so its
+/// palette comes from the wrong megabyte and its AI runs from it. Measured
+/// 2026-09-03 in $9A44: the six Chozo-face sprites ($EA7F, proven) share
+/// palette slot 7 with $CEFF (raw); $CEFF's palette read from $A2:8912
+/// returned MB2's $C2:8912 and painted the faces wrong. 164 headers carry
+/// such a bank; v43 had 130 raw. A hand patch made the second load write
+/// the stock palette.
+///
+/// Per-record validated, not all-or-nothing: the run of true headers ends
+/// somewhere in $F1xx-$F7xx and is followed by 64-byte-aligned records of
+/// another shape (they carry a plausible bank byte but AI pointers below
+/// $8000), so each record must look like a header — bank in $A0-$BF and
+/// both the init AI (+$12) and main AI (+$18) pointers in ROM ($8000+) —
+/// or it is skipped untouched. Translation is -$80 ($A0-$BF -> $20-$3F).
+/// Leaves a byte `hi_proven` already re-banked in `out` alone.
+const sm_enemy_hdr_lo: u16 = 0xCEBF;
+const sm_enemy_hdr_hi: u16 = 0xF800;
+
+fn rebankSmEnemyHeaders(image: []const u8, out: []u8) SmRoomWalk {
+    const fa0: usize = 0x20 * 0x8000; // bank $A0 (= $20) file offset
+    var walk: SmRoomWalk = .{};
+    if (image.len < fa0 + 0x8000) return walk;
+    // The table is not one 64-byte grid: a second run of headers starts
+    // at $F153, 20 bytes off the first grid's phase (the enemy whose raw
+    // bank byte sent the CPU into the wrong megabyte lived at $F693). So
+    // the walk is stride 2 over the whole range, and a record is a header
+    // when it sits on the first grid and passes the original check, or
+    // anywhere and passes a stricter one — the bank's pad byte zero, every
+    // AI pointer (init, main, grapple, hurt, frozen) in ROM, a plausible
+    // part count. Measured on the stock image: 139 on the grid, 26 off it,
+    // no two within 64 bytes of each other.
+    var h: u32 = sm_enemy_hdr_lo;
+    while (h + 0x40 <= sm_enemy_hdr_hi) : (h += 2) {
+        const o = fa0 + (h - 0x8000);
+        const bank = image[o + 0x0C];
+        const init_ai = std.mem.readInt(u16, image[o + 0x12 ..][0..2], .little);
+        const main_ai = std.mem.readInt(u16, image[o + 0x18 ..][0..2], .little);
+        if (bank < 0xA0 or bank > 0xBF or init_ai < 0x8000 or main_ai < 0x8000) continue;
+        const on_grid = (h - sm_enemy_hdr_lo) % 0x40 == 0;
+        if (!on_grid) {
+            const grapple = std.mem.readInt(u16, image[o + 0x1A ..][0..2], .little);
+            const hurt = std.mem.readInt(u16, image[o + 0x1C ..][0..2], .little);
+            const frozen = std.mem.readInt(u16, image[o + 0x1E ..][0..2], .little);
+            const parts = std.mem.readInt(u16, image[o + 0x14 ..][0..2], .little);
+            if (image[o + 0x0D] != 0 or grapple < 0x8000 or hurt < 0x8000 or frozen < 0x8000 or parts > 0x10) continue;
+        }
+        walk.states += 1;
+        if (out[o + 0x0C] != image[o + 0x0C]) continue; // hi_proven got here first
+        out[o + 0x0C] = bank - 0x80;
+        walk.rebanked += 1;
+    }
+    return walk;
+}
+
+/// Super Metroid's AREA MAP TABLE: seven 3-byte long pointers at $82:964A,
+/// one per area, naming that area's map tilemap in bank $B5. The HUD
+/// minimap ($90:AA7C) and the pause map ($82:953F) copy an entry into a
+/// direct-page pointer and read the tilemap through it — a bank byte that
+/// lives in a table, never in an operand, so no execution-driven rebanker
+/// sees it, and on the conversion bank $B5 is not the megabyte the map
+/// lives in: the minimap drew text glyphs instead of map cells. The bytes
+/// are de-mirrored in place ($A0-$BF -> -$80), all or nothing, after every
+/// entry validates (bank $B5, address in ROM); a byte a recording already
+/// proved is left as the evidence wrote it. Title-gated like the others.
+const sm_area_map_lo: u16 = 0x964A;
+const sm_area_map_entries: u16 = 7;
+fn rebankSmAreaMapTable(image: []const u8, out: []u8) SmRoomWalk {
+    const f82: usize = 0x02 * 0x8000;
+    var walk: SmRoomWalk = .{};
+    if (image.len < f82 + 0x8000) return walk;
+    var e: u16 = 0;
+    while (e < sm_area_map_entries) : (e += 1) {
+        const o = f82 + (sm_area_map_lo - 0x8000) + @as(usize, e) * 3;
+        const addr = std.mem.readInt(u16, image[o..][0..2], .little);
+        if (image[o + 2] != 0xB5 or addr < 0x8000) {
+            walk.refused_at = sm_area_map_lo + e * 3;
+            return walk;
+        }
+    }
+    walk.states = sm_area_map_entries;
+    e = 0;
+    while (e < sm_area_map_entries) : (e += 1) {
+        const o = f82 + (sm_area_map_lo - 0x8000) + @as(usize, e) * 3 + 2;
+        if (out[o] != image[o]) continue; // proven first
+        out[o] = image[o] - 0x80;
+        walk.rebanked += 1;
+    }
+    return walk;
+}
+
+test "rebankSmAreaMapTable: seven entries de-mirrored, a proven one kept, a bad entry refuses the table" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f82: usize = 0x02 * 0x8000;
+    const t = f82 + (sm_area_map_lo - 0x8000);
+    const table = [_]u8{ 0x00, 0x90, 0xB5, 0x00, 0x80, 0xB5, 0x00, 0xA0, 0xB5, 0x00, 0xB0, 0xB5, 0x00, 0xC0, 0xB5, 0x00, 0xD0, 0xB5, 0x00, 0xE0, 0xB5 };
+    @memcpy(img[t..][0..table.len], &table);
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[t + 5] = 0x35; // entry 1 already proven
+    const w = rebankSmAreaMapTable(img, out);
+    try testing.expectEqual(@as(u32, 7), w.states);
+    try testing.expectEqual(@as(u32, 6), w.rebanked);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    for (0..7) |i| try testing.expectEqual(@as(u8, 0x35), out[t + i * 3 + 2]);
+    // A bad entry refuses the whole table, touching nothing.
+    img[t + 3 * 3 + 2] = 0x7E;
+    @memcpy(out, img);
+    const w2 = rebankSmAreaMapTable(img, out);
+    try testing.expectEqual(@as(u32, sm_area_map_lo + 9), w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqualSlices(u8, img, out);
+}
+
+/// Super Metroid seeds long pointers in the direct page from IMMEDIATES:
+/// the map routine does `LDA #$007E / STA $05` for the tilemap buffer's
+/// bank and `LDA #$0000 / STA $0B`, `LDA #$07F7 / STA $09` for the
+/// explored-map bits it then reads through `LDA [$09]`. Nothing indexes
+/// those constants, no bank register carries them, so neither the
+/// de-mirror map nor the evidence-based rebankers reach them: the map
+/// drew from the abandoned WRAM homes (the garbled pause map). This
+/// pass finds the idiom by signature and translates the seed: a bank
+/// word $007E/$007F becomes $0040/$0041 when a long-indirect access
+/// through that slot's pointer follows within 256 bytes; a low-WRAM
+/// address word (under $2000) gains $6000 — the window's home — when
+/// its bank slot is seeded with $0000 within 64 bytes either way and
+/// the same use follows. Measured on the stock image: 9 bank seeds and
+/// 3 address seeds in banks $80-$B4, every one a pointer the game
+/// dereferences; the 5 that recordings had already proven are left as
+/// the evidence wrote them. Title-gated like the other nets.
+fn rebankSmPointerSeeds(image: []const u8, out: []u8) SmInlineDests {
+    var st: SmInlineDests = .{};
+    var bank: u8 = 0x80;
+    while (bank <= 0xB4) : (bank += 1) {
+        const base: usize = @as(usize, bank & 0x7F) * 0x8000;
+        if (image.len < base + 0x8000) break;
+        const blk = image[base .. base + 0x8000];
+        var i: usize = 0;
+        while (i + 5 <= blk.len) : (i += 1) {
+            if (blk[i] != 0xA9 or blk[i + 3] != 0x85) continue;
+            const imm: u16 = @as(u16, blk[i + 1]) | @as(u16, blk[i + 2]) << 8;
+            const slot = blk[i + 4];
+            if (imm == 0x7E or imm == 0x7F) {
+                if (slot < 2 or !smLongIndirectUse(blk, i + 5, slot - 2)) continue;
+                st.sites += 1;
+                if (out[base + i + 1] != image[base + i + 1]) continue; // proven first
+                out[base + i + 1] = if (imm == 0x7E) 0x40 else 0x41;
+                st.rebanked += 1;
+            } else if (imm != 0 and imm < 0x2000) {
+                if (slot > 0xFD or !smLongIndirectUse(blk, i + 5, slot)) continue;
+                // The bank slot seeded with $0000 nearby: the pointer names
+                // bank 0, whose low 8 KiB is the WRAM mirror.
+                const lo: usize = i -| 64;
+                const hi: usize = @min(blk.len - 5, i + 64);
+                var k: usize = lo;
+                var seeded = false;
+                while (k < hi) : (k += 1) {
+                    if (blk[k] == 0xA9 and blk[k + 1] == 0 and blk[k + 2] == 0 and blk[k + 3] == 0x85 and blk[k + 4] == slot + 2) {
+                        seeded = true;
+                        break;
+                    }
+                }
+                if (!seeded) continue;
+                st.sites += 1;
+                if (out[base + i + 1] != image[base + i + 1] or out[base + i + 2] != image[base + i + 2]) continue;
+                const moved = imm + 0x6000;
+                out[base + i + 1] = @truncate(moved);
+                out[base + i + 2] = @truncate(moved >> 8);
+                st.rebanked += 1;
+            }
+        }
+    }
+    return st;
+}
+
+/// A `[dp]` or `[dp],Y` access (the eight ALU ops' long-indirect forms:
+/// opcode low bits $07/$17) through `slot` within 256 bytes from `from`.
+fn smLongIndirectUse(blk: []const u8, from: usize, slot: u8) bool {
+    var j = from;
+    const end = @min(blk.len - 1, from + 256);
+    while (j < end) : (j += 1) {
+        const lo5 = blk[j] & 0x1F;
+        if ((lo5 == 0x07 or lo5 == 0x17) and blk[j + 1] == slot) return true;
+    }
+    return false;
+}
+
+test "rebankSmPointerSeeds: bank and low-WRAM address seeds of dereferenced pointers, proven ones left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0xEA);
+    const f82: usize = 0x02 * 0x8000;
+    // The map idiom: bank seed for slot $03, address seed for slot $09 with
+    // its bank slot $0B seeded $0000, both dereferenced later.
+    const code = [_]u8{
+        0xA9, 0x00, 0x30, 0x85, 0x03, // LDA #$3000 / STA $03
+        0xA9, 0x7E, 0x00, 0x85, 0x05, // LDA #$007E / STA $05   -> $0040
+        0xA9, 0x00, 0x00, 0x85, 0x0B, // LDA #$0000 / STA $0B
+        0xA9, 0xF7, 0x07, 0x85, 0x09, // LDA #$07F7 / STA $09   -> $67F7
+        0xA7, 0x09, //                   LDA [$09]
+        0x97, 0x03, //                   STA [$03],Y
+        0xA9, 0x7F, 0x00, 0x85, 0x40, // LDA #$007F / STA $40: never dereferenced -> untouched
+        0xA9, 0x10, 0x00, 0x85, 0x20, // LDA #$0010 / STA $20: no bank seed -> untouched
+        0xA7, 0x20, //                   LDA [$20]
+    };
+    @memcpy(img[f82 + 0x1000 ..][0..code.len], &code);
+    // A seed a recording already proved: `out` differs from `image` there.
+    @memcpy(img[f82 + 0x2000 ..][0..7], &[_]u8{ 0xA9, 0x7E, 0x00, 0x85, 0x05, 0xA7, 0x03 });
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[f82 + 0x2000 + 1] = 0x40;
+    const st = rebankSmPointerSeeds(img, out);
+    try testing.expectEqual(@as(u32, 3), st.sites);
+    try testing.expectEqual(@as(u32, 2), st.rebanked);
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + 0x1000 + 6]);
+    try testing.expectEqual(@as(u16, 0x67F7), std.mem.readInt(u16, out[f82 + 0x1000 + 16 ..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0x7F), out[f82 + 0x1000 + 25]);
+    try testing.expectEqual(@as(u16, 0x0010), std.mem.readInt(u16, out[f82 + 0x1000 + 30 ..][0..2], .little));
+    try testing.expectEqual(@as(u8, 0x40), out[f82 + 0x2000 + 1]);
+}
+
+test "rebankSmEnemyHeaders: header banks de-mirrored, proven and non-header records left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const fa0: usize = 0x20 * 0x8000;
+    const hdr = struct {
+        fn put(buf: []u8, a16: u16, bank: u8, init_ai: u16, main_ai: u16) void {
+            const o = 0x20 * 0x8000 + (@as(usize, a16) - 0x8000);
+            buf[o + 0x0C] = bank;
+            std.mem.writeInt(u16, buf[o + 0x12 ..][0..2], init_ai, .little);
+            std.mem.writeInt(u16, buf[o + 0x18 ..][0..2], main_ai, .little);
+        }
+    }.put;
+    hdr(img, 0xCEBF, 0xA2, 0x8DBA, 0x8E30); // a real header -> $22
+    hdr(img, 0xCEFF, 0xA2, 0x8DBA, 0x8E30); // real, but already proven in `out`
+    hdr(img, 0xEA7F, 0xA8, 0xE7BC, 0xE812); // real -> $28
+    hdr(img, 0xF17F, 0xB7, 0x0000, 0x0009); // bank plausible, AI pointers not: skipped
+    hdr(img, 0xF13F, 0x02, 0x8000, 0x8000); // bank not a mirror: skipped
+    // Off the first grid (the second run's phase): needs the strict check.
+    hdr(img, 0xF693, 0xB2, 0xFD02, 0xFD32); // -> $32 once its other AI pointers are in ROM
+    for ([_]usize{ 0x1A, 0x1C, 0x1E }) |k| std.mem.writeInt(u16, img[fa0 + (0xF693 - 0x8000) + k ..][0..2], 0x800F, .little);
+    std.mem.writeInt(u16, img[fa0 + (0xF693 - 0x8000) + 0x14 ..][0..2], 1, .little);
+    hdr(img, 0xF6D5, 0xB2, 0xFD02, 0xFD32); // off both grids, grapple AI not in ROM: skipped
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[fa0 + (0xCEFF - 0x8000) + 0x0C] = 0x22;
+    const w = rebankSmEnemyHeaders(img, out);
+    try testing.expectEqual(@as(u32, 4), w.states);
+    try testing.expectEqual(@as(u32, 3), w.rebanked);
+    try testing.expectEqual(@as(u8, 0x32), out[fa0 + (0xF693 - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0xB2), out[fa0 + (0xF6D5 - 0x8000) + 0x0C]); // skipped
+    try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEBF - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0x22), out[fa0 + (0xCEFF - 0x8000) + 0x0C]); // untouched
+    try testing.expectEqual(@as(u8, 0x28), out[fa0 + (0xEA7F - 0x8000) + 0x0C]);
+    try testing.expectEqual(@as(u8, 0xB7), out[fa0 + (0xF17F - 0x8000) + 0x0C]); // skipped
+    try testing.expectEqual(@as(u8, 0x02), out[fa0 + (0xF13F - 0x8000) + 0x0C]); // skipped
+}
+
+test "rebankSmRoomLevelPointers: every state reached through doors, proven bytes left alone" {
+    const gpa = testing.allocator;
+    const img = try gpa.alloc(u8, 0x18_0000);
+    defer gpa.free(img);
+    @memset(img, 0);
+    const f8f: usize = 0x0F * 0x8000;
+    const f83: usize = 0x03 * 0x8000;
+    const put16 = struct {
+        fn f(buf: []u8, base: usize, a16: u32, v: u16) void {
+            std.mem.writeInt(u16, buf[base + (a16 - 0x8000) ..][0..2], v, .little);
+        }
+    }.f;
+    // Room A at $91F8: area 0, 1x1, door list at $9260; conditions:
+    // E629 <event 1> -> state $9240 ; E5E6 -> default state inline.
+    const a: u32 = 0x91F8;
+    img[f8f + (a - 0x8000) + 1] = 0; // area
+    img[f8f + (a - 0x8000) + 4] = 1; // width
+    img[f8f + (a - 0x8000) + 5] = 1; // height
+    put16(img, f8f, a + 9, 0x9260);
+    put16(img, f8f, a + 11, 0xE629);
+    img[f8f + (a + 13 - 0x8000)] = 1;
+    put16(img, f8f, a + 14, 0x9240);
+    put16(img, f8f, a + 16, 0xE5E6);
+    const a_def: u32 = a + 18;
+    put16(img, f8f, a_def, 0xC330);
+    img[f8f + (a_def + 2 - 0x8000)] = 0xCD;
+    img[f8f + (a_def + 3 - 0x8000)] = 0x0F;
+    // A's event state at $9240: level $C2:9000, tileset 3
+    put16(img, f8f, 0x9240, 0x9000);
+    img[f8f + (0x9242 - 0x8000)] = 0xC2;
+    img[f8f + (0x9243 - 0x8000)] = 0x03;
+    // A's door list: a door to room B, an elevator door, then the next header word (< $8000)
+    put16(img, f8f, 0x9260, 0x9000);
+    put16(img, f8f, 0x9262, 0x9010);
+    put16(img, f8f, 0x9264, 0x0102);
+    put16(img, f83, 0x9000, 0x9300); // door -> room B
+    put16(img, f83, 0x9010, 0x0000); // elevator
+    // Room B at $9300: area 1, 2x1, default state only, one door back to A
+    const b: u32 = 0x9300;
+    img[f8f + (b - 0x8000) + 1] = 1;
+    img[f8f + (b - 0x8000) + 4] = 2;
+    img[f8f + (b - 0x8000) + 5] = 1;
+    put16(img, f8f, b + 9, 0x9340);
+    put16(img, f8f, b + 11, 0xE5E6);
+    const b_def: u32 = b + 13;
+    put16(img, f8f, b_def, 0xB846);
+    img[f8f + (b_def + 2 - 0x8000)] = 0xC5;
+    img[f8f + (b_def + 3 - 0x8000)] = 0x10;
+    put16(img, f8f, 0x9340, 0x9020);
+    put16(img, f8f, 0x9342, 0x0000);
+    put16(img, f83, 0x9020, 0x91F8);
+
+    // Room C at $DF45 (the Ceres root): no door reaches it from A or B.
+    const c: u32 = 0xDF45;
+    img[f8f + (c - 0x8000) + 1] = 6;
+    img[f8f + (c - 0x8000) + 4] = 1;
+    img[f8f + (c - 0x8000) + 5] = 1;
+    put16(img, f8f, c + 9, 0xDF80);
+    put16(img, f8f, c + 11, 0xE5E6);
+    const c_def: u32 = c + 13;
+    put16(img, f8f, c_def, 0xB000);
+    img[f8f + (c_def + 2 - 0x8000)] = 0xCD;
+    img[f8f + (c_def + 3 - 0x8000)] = 0x0F;
+    put16(img, f8f, 0xDF80, 0x0000);
+
+    const out = try gpa.alloc(u8, img.len);
+    defer gpa.free(out);
+    @memcpy(out, img);
+    out[f8f + (a_def + 2 - 0x8000)] = 0xAD; // hi_proven already re-banked A's default
+
+    const w = try rebankSmRoomLevelPointers(gpa, img, out);
+    try testing.expectEqual(@as(u32, 0), w.refused_at);
+    try testing.expectEqual(@as(u32, 3), w.rooms);
+    try testing.expectEqual(@as(u32, 4), w.states);
+    try testing.expectEqual(@as(u32, 3), w.rebanked);
+    try testing.expectEqual(@as(u8, 0xAD), out[f8f + (c_def + 2 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xAD), out[f8f + (a_def + 2 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xA2), out[f8f + (0x9242 - 0x8000)]);
+    try testing.expectEqual(@as(u8, 0xA5), out[f8f + (b_def + 2 - 0x8000)]);
+    // A state whose level pointer is outside MB2 refuses the whole pass and rewrites nothing.
+    img[f8f + (b_def + 2 - 0x8000)] = 0x8F;
+    @memcpy(out, img);
+    const w2 = try rebankSmRoomLevelPointers(gpa, img, out);
+    try testing.expectEqual(b_def, w2.refused_at);
+    try testing.expectEqual(@as(u32, 0), w2.rebanked);
+    try testing.expectEqual(@as(u8, 0xC2), out[f8f + (0x9242 - 0x8000)]);
+}
+
+test "demirrorQueueBankImms: consumer names the column, producers re-bank" {
+    var buf: [64]u8 = @splat(0x60); // RTS filler
+    // consumer: LDA $6FA6,X / STA $7786 / XBA / PHA / PLB / PLB
+    @memcpy(buf[4..14], &[_]u8{ 0xBD, 0xA6, 0x6F, 0x8D, 0x86, 0x77, 0xEB, 0x48, 0xAB, 0xAB });
+    // producers against the same column: mirror, WRAM, misfit, and native
+    @memcpy(buf[20..26], &[_]u8{ 0xA9, 0xA3, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[26..32], &[_]u8{ 0xA9, 0x7E, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[32..38], &[_]u8{ 0xA9, 0xC5, 0x00, 0x9D, 0xA6, 0x6F });
+    @memcpy(buf[38..44], &[_]u8{ 0xA9, 0x33, 0x00, 0x9D, 0xA6, 0x6F }); // already native: untouched
+    // a producer against a DIFFERENT column: untouched
+    @memcpy(buf[44..50], &[_]u8{ 0xA9, 0xA3, 0x00, 0x9D, 0xB0, 0x6F });
+    try testing.expectEqual(@as(u32, 3), demirrorQueueBankImms(&buf, true));
+    try testing.expectEqual(@as(u8, 0x23), buf[21]);
+    try testing.expectEqual(@as(u8, 0x40), buf[27]);
+    try testing.expectEqual(@as(u8, 0xA5), buf[33]);
+    try testing.expectEqual(@as(u8, 0x33), buf[39]);
+    try testing.expectEqual(@as(u8, 0xA3), buf[45]);
+    // narrow image: the de-mirror arms stay put, WRAM still re-banks
+    var buf2: [64]u8 = buf;
+    buf2[21] = 0xA3;
+    buf2[27] = 0x7E;
+    buf2[33] = 0xC5;
+    try testing.expectEqual(@as(u32, 1), demirrorQueueBankImms(&buf2, false));
+    try testing.expectEqual(@as(u8, 0xA3), buf2[21]);
+    try testing.expectEqual(@as(u8, 0x40), buf2[27]);
+    try testing.expectEqual(@as(u8, 0xC5), buf2[33]);
 }
 
 /// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
@@ -4314,21 +5548,26 @@ fn extendCoverage(
 /// A split anchor's displaced prefix must be whole instructions with no
 /// flow op: both the enqueue stub and the pump trampoline re-execute
 /// those bytes at a different address.
-fn splitPrefixSpan(out: []const u8, usage: []const u8, entry: u16, need: u32) u32 {
+fn splitPrefixSpan(out: []const u8, usage: []const u8, entry: u24, need: u32) u32 {
     var pc: u32 = entry;
     while (pc - entry < need) {
-        const op = out[pc - 0x8000];
+        if ((pc & 0xFFFF) + 8 > 0x10000) return 0;
+        const op = out[splitFile(@intCast(pc))];
         switch (op) {
-            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x22 => return 0,
+            // Branches, jumps, bank-local calls, returns, PER/BRL: a copy
+            // of these means something else. A JSL ($22) is position-
+            // independent and returns into the copy, so it may ride.
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x62, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x02, 0xCB, 0xDB => return 0,
             else => {},
         }
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
+        const u = splitUsage(usage, @intCast(pc));
+        const m8 = u & usage_map.flag_m != 0;
+        const x8 = u & usage_map.flag_x != 0;
         pc += usage_map.instrLen(op, m8, x8);
     }
     // Anything past `need` is NOP-filled at the site, so the enqueue
     // stub's RTS (landing at entry+3) walks fill until the boundary.
-    return if (pc - entry <= 6) pc - entry else 0;
+    return if (pc - entry <= 8) pc - entry else 0;
 }
 
 /// S5: emit the mainline/NMI split scaffold into the bank-$00 carve
@@ -4341,12 +5580,14 @@ fn emitSplit(
     d: []u8,
     base16: u16,
     far: *FarPad,
+    carve: u32,
+    carve_len: u32,
     refusal: *?Refusal,
     res: *Result,
 ) Error!void {
     // Anchor shapes first: nothing is written until every check holds.
     if (spec.tail == 0) {
-        if (splitPrefixSpan(out, usage, spec.mainloop, 4) != 4)
+        if (splitPrefixSpan(out, usage, spec.mainloop, 4) < 4)
             return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
     } else if (out[spec.tail - 0x8000] != 0x22 or spec.tail_epilogue == 0) {
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail });
@@ -4362,16 +5603,22 @@ fn emitSplit(
     // $3794+, inside the declared ranges only. The pump feeds the cells
     // continuously post-engage; boot-path readers outside the ranges
     // keep the real registers.
-    for (spec.vbl_ranges) |r| {
+    var displaced: [512]Displaced = undefined;
+    var n_displaced: u32 = 0;
+    if (spec.tail == 0) {
+        try emitSplitReaders(out, usage, spec, far, carve, carve_len, &displaced, &n_displaced, refusal);
+    } else for (spec.vbl_ranges) |r| {
         var pc: u32 = r[0];
         while (pc < r[1]) {
-            const op = out[pc - 0x8000];
-            const m8 = usage[pc] & usage_map.flag_m != 0;
-            const x8 = usage[pc] & usage_map.flag_x != 0;
+            const f = splitFile(@intCast(pc));
+            const op = out[f];
+            const u = splitUsage(usage, @intCast(pc));
+            const m8 = u & usage_map.flag_m != 0;
+            const x8 = u & usage_map.flag_x != 0;
             const len = usage_map.instrLen(op, m8, x8);
             const md = usage_map.mode(op);
             if (len == 3 and (md == .abs or md == .abs_x or md == .abs_y)) {
-                const v = std.mem.readInt(u16, out[pc - 0x8000 + 1 ..][0..2], .little);
+                const v = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
                 const nv: u16 = if (v == 0x4212)
                     split_vbl_mirror
                 else if (v >= 0x4218 and v <= 0x421F)
@@ -4379,7 +5626,7 @@ fn emitSplit(
                 else
                     0;
                 if (nv != 0)
-                    std.mem.writeInt(u16, out[pc - 0x8000 + 1 ..][0..2], nv, .little);
+                    std.mem.writeInt(u16, out[f + 1 ..][0..2], nv, .little);
             }
             pc += len;
         }
@@ -4394,7 +5641,19 @@ fn emitSplit(
     // only — anything looser is a named refusal, not a guess.
     var mul_sites: [4]u32 = undefined;
     var n_mul: usize = 0;
-    {
+    var math_sites: [1024]MathSite = undefined;
+    var n_math_sites: u32 = 0;
+    // The DUAL IMAGE (mainloop flavor, 8 MiB images): the lower 4 MiB is
+    // the S-CPU's game, stock bytes at every math site; the upper 4 MiB a
+    // copy that carries the COP sites, and the mapper registers switch the
+    // whole cartridge between them at each ownership handoff. Measured on
+    // Super Metroid: with COPs in the one image, the S-CPU's own eras ran
+    // ~150 cycles slower per math access, the Ceres intro gained lag
+    // frames, and the frame-counter-fed state forked for good.
+    const dual = spec.tail == 0 and out.len >= 8 * 1024 * 1024;
+    if (spec.tail == 0) {
+        try emitSplitMath(out, usage, far, carve, carve_len, spec.shared_sites, &math_sites, &n_math_sites, refusal, res);
+    } else {
         var bank: u32 = 0;
         while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
             var aa: u32 = 0x8000;
@@ -4457,7 +5716,17 @@ fn emitSplit(
                 const file = bank * 0x8000 + (aa - 0x8000);
                 const op = out[file];
                 var hazard = op == 0xCB or op == 0xDB;
-                if (!hazard and (op == 0xAD or op == 0xAC or op == 0xAE or op == 0x2C or op == 0xCD)) {
+                // every absolute read/compare/RMW form, plus the indexed reads
+                // whose base sits in the register file (X unknown: unshadowed)
+                const abs_read = switch (op) {
+                    0xAD, 0xAC, 0xAE, 0x2C, 0xCD, 0x6D, 0xED, 0x2D, 0x0D, 0x4D, 0xEC, 0xCC => true, // loads, compares, ALU
+                    0xEE, 0xCE, 0x0E, 0x4E, 0x2E, 0x6E, 0x0C, 0x1C => true, // RMW
+                    0xBD, 0xBC, 0xBE, 0xB9, 0x7D, 0x79, 0xFD, 0xF9, 0xDD, 0xD9, 0x3D, 0x39, 0x1D, 0x19, 0x5D, 0x59, 0x3C => true, // indexed
+                    0xAF, 0xBF, 0x6F, 0x7F, 0xEF, 0xFF, 0xCF, 0xDF, 0x2F, 0x3F, 0x0F, 0x1F, 0x4F, 0x5F => true, // long forms (a $00-bank long read of the register file)
+                    else => false,
+                };
+                const long_form = op & 0x0F == 0x0F;
+                if (!hazard and abs_read and (!long_form or (out[file + 3] & 0x7F) < 0x40)) {
                     const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
                     hazard = (v >= 0x2100 and v <= 0x21FF) or (v >= 0x4200 and v <= 0x43FF);
                 }
@@ -4536,7 +5805,7 @@ fn emitSplit(
         // takes it every menu frame and wedged at engage (frame 232).
         var tok_mode_at: usize = 0;
         if (spec.mode_gate) {
-            put(d, &cur, &.{ 0xA5, spec.mode_cell, 0xC9, spec.mode_value });
+            put(d, &cur, &.{ 0xA5, @truncate(spec.mode_cell), 0xC9, spec.mode_value });
             put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ over the BRL
             tok_mode_at = cur;
             put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the nested-native branch (patched)
@@ -4664,7 +5933,7 @@ fn emitSplit(
         // chain, and $9231's 16-bit fill count in Y truncated to 8 bits
         // (measured: the option screen cleared 256 of each map's 1024
         // words and the menu logo stayed behind the text).
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // LDA cell_p / PHA / PLP
+        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48, 0x28 }); // LDA cell_p / PHA / PLP
         put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the head's context
         put(d, &cur, &.{ 0x4C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8) });
         // The SA-1 island: unwind the pins (the head's own D/B come
@@ -4886,85 +6155,1087 @@ fn emitSplit(
         return;
     }
 
-    // --- pump loop (S-CPU): feed the mirrors, drain the ring ----------
+    // === MAINLOOP FLAVOR ==============================================
+    // Ownership of the loop changes hands at the anchor, once per lap at
+    // most: the SA-1 runs the laps while the mode cell says gameplay,
+    // the S-CPU runs them natively otherwise (loads, transitions, menus —
+    // the eras whose producer/consumer handshakes assume one CPU). While
+    // the SA-1 owns the loop the S-CPU sits in the pump: mirrors, ring,
+    // and the owner cell. Context (A/X/Y/P/D/DBR, and S on the S-CPU
+    // side) crosses through I-RAM cells; each CPU keeps its own stack.
+    const ml24 = spec.mainloop;
+    const mlspan = splitPrefixSpan(out, usage, ml24, 4);
+    const mode_home: u16 = if (spec.mode_cell < 0x2000) spec.mode_cell + 0x6000 else spec.mode_cell;
+
+    // --- pump loop (S-CPU): mirrors, ring, owner --------------------
     const pump16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
     put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), @truncate(split_vbl_mirror >> 8) });
-    put(d, &cur, &.{ 0xC2, 0x20 }); // REP #$20 -- pads as words
-    var pi: u16 = 0;
-    while (pi < 8) : (pi += 2) {
-        put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pi), 0x42, 0x8D, @truncate(split_pad_mirror + pi), @truncate((split_pad_mirror + pi) >> 8) });
-    }
-    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
-    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
-    const beq_at = cur;
-    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ pump (patched below)
-    put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 }); // TAX / LDA ring,X / PHA
-    put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
-    put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // PLA / ASL / TAX
-    const jsr_tbl_at = cur;
-    put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) -- patched below
-    put(d, &cur, &.{ 0xE2, 0x30, 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release (the stubs spin on the ack now)
+    // The PAD mirrors are NOT fed here: a read of $4218-$421F is a poll,
+    // and the verifier pairs the two runs poll-for-poll — a pump reading
+    // the pads thousands of times a frame generated ticks on frames stock
+    // never polled (measured: a 4-frame tick skew and a fork from it).
+    // The game's own poll feeds them: the reader helper the NMI handler's
+    // pad read wears stores what it read (see emitSplitReaders).
+    // The check-and-consume is a critical section: the NMI hook drains too,
+    // and one interrupting between the pump's check and its consume would
+    // take the entry and leave the pump replaying a stale slot. The
+    // in-replay cell marks the section; the hook stands down while set.
+    put(d, &cur, &.{ 0xEE, @truncate(split_in_replay), 0x37 }); // in_replay := 1
+    const drain_call_at = cur;
+    put(d, &cur, &.{ 0x20, 0x00, 0x00 }); // JSR drain_one (patched; returns at once when empty)
+    put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 }); // in_replay := 0
+    // Does the loop still belong to the SA-1? BNE-over-BRL: the takeover
+    // sits past the drain routine and the NMI hook, out of a short branch's
+    // reach (measured: the truncated offset branched backward into the
+    // boot, and the game re-ran its reset path every frame).
+    put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) });
+    put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the BRL
+    const brl_take_at = cur;
+    put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL takeover (patched)
     put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
-    d[beq_at + 1] = @bitCast(@as(i8, @intCast(@as(i32, pump16) - (@as(i32, base16) + @as(i32, @intCast(beq_at)) + 2))));
+    // drain_one (SEP #$30, DBR $00 on entry; RTS): one ring entry — the
+    // caller's D/DBR/registers/widths come back from the stub's capture
+    // (RPC serializes, so one cell set holds), the dispatch goes through a
+    // 24-bit pointer with an RTL-shaped frame pushed by hand, and the
+    // release is the ack bump after. Called by the pump, and by the NMI
+    // hook: a deferred call made just before the S-CPU's NMI would else
+    // wait the whole handler out, milliseconds per call.
+    const drain16: u16 = base16 + @as(u16, @intCast(cur));
+    std.mem.writeInt(u16, d[drain_call_at + 1 ..][0..2], drain16, .little);
+    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
+    const drain_empty_at = cur;
+    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the RTS (patched): nothing pending
+    put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 }); // TAX / LDA ring,X / PHA
+    put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 }); // rd consumes early
+    put(d, &cur, &.{ 0x68, 0x0A, 0x0A, 0xAA }); // PLA / ASL / ASL / TAX -- id*4
+    put(d, &cur, &.{ 0xC2, 0x20 });
+    const tbl_lo_at = cur;
+    put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl,X (patched)
+    put(d, &cur, &.{ 0x8D, @truncate(split_cell_t), 0x37 });
+    put(d, &cur, &.{ 0xE2, 0x20 });
+    const tbl_bank_at = cur;
+    put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl+2,X (patched)
+    put(d, &cur, &.{ 0x8D, @truncate(split_cell_tb), 0x37 });
+    put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // caller D
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // caller DBR
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAE, @truncate(split_cell_x), 0x37, 0xAC, @truncate(split_cell_y), 0x37 });
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48 }); // widths only
+    put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_a), 0x37, 0x28 }); // A, then PLP
+    const ret1: u16 = base16 + @as(u16, @intCast(cur)) + 7;
+    put(d, &cur, &.{ 0x4B, 0xF4, @truncate(ret1 - 1), @truncate((ret1 - 1) >> 8) }); // PHK / PEA return-1
+    put(d, &cur, &.{ 0xDC, @truncate(split_cell_t), 0x37 }); // JML [cell_t]
+    std.debug.assert(base16 + @as(u16, @intCast(cur)) == ret1);
+    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x68, 0x8F, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00 }); // the body's P, for the caller
+    put(d, &cur, &.{ 0xE2, 0x30, 0x4B, 0xAB }); // widths, DBR back
+    put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
+    d[drain_empty_at + 1] = @intCast(cur - (drain_empty_at + 2));
+    put(d, &cur, &.{0x60}); // RTS
+    // --- the NMI hook: drain a pending entry before the game's handler ---
+    // Everything the interrupted code had is put back before the JML, so
+    // the handler's own RTI pops the original frame. Widths are unknown at
+    // entry: PHP first, then REP #$30, so every push and pull is 16-bit.
+    const nmi_vec = std.mem.readInt(u16, out[0x7FEA..0x7FEC], .little);
+    const hook16: u16 = base16 + @as(u16, @intCast(cur));
+    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB, 0xE2, 0x30 }); // PHP / REP / PHA PHX PHY PHD PHB / PHK PLB / SEP #$30
+    put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) }); // the SA-1 owns the loop?
+    put(d, &cur, &.{ 0xF0, 0x08 }); // BEQ over the call: nothing to drain in the S-CPU's own eras
+    put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 }); // the pump mid-drain? stand down
+    put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the call
+    put(d, &cur, &.{ 0x20, @truncate(drain16), @truncate(drain16 >> 8) });
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAB, 0x2B, 0x7A, 0xFA, 0x68, 0x28 }); // REP / PLB PLD PLY PLX PLA / PLP
+    put(d, &cur, &.{ 0x5C, @truncate(nmi_vec), @truncate(nmi_vec >> 8), 0x00 }); // JML the game's handler
+    std.mem.writeInt(u16, out[0x7FEA..0x7FEC], hook16, .little);
+    // (No NMI hook in the S-CPU's copy. A pure-stock lower copy with a
+    // per-NMI mode check was tried — s19h — and forked the tier's intro at
+    // frame 2386: a hook on every NMI pays its ~45 cycles on every frame
+    // of a long lag streak, and the intro's 51-frame load became 52
+    // ($05BB, the record of consecutive lag frames). The anchor pays per
+    // LAP — once for that load — and passes.)
+    // takeover (S-CPU): the SA-1 handed the loop back — its context is
+    // in the cells; the game stack is where the S-CPU left it.
+    std.mem.writeInt(u16, d[brl_take_at + 1 ..][0..2], @intCast(cur - (brl_take_at + 3)), .little);
+    if (dual) {
+        // The S-CPU's copy back: megabytes 0/1/0/2 (SEP #$30 is live).
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x20, 0x22, 0xA9, 0x81, 0x8D, 0x21, 0x22 });
+        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x22, 0x22, 0xA9, 0x82, 0x8D, 0x23, 0x22 });
+    }
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAD, @truncate(split_cell_s), 0x37, 0x1B }); // S
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // D
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // DBR
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48 }); // P, pushed for the PLP
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAE, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0xAC, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8) });
+    put(d, &cur, &.{ 0xAD, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x28 }); // A / PLP
+    const take_jml_at = cur;
+    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML tramp (patched)
 
-    // --- engage (S-CPU, via the displaced JML from the mainloop) ------
+    // --- engage (both CPUs, every lap, via the anchor's JML) ----------
     const engage16: u16 = base16 + @as(u16, @intCast(cur));
-    // The anchor is SHARED: the S-CPU hits it once at engage, and the
-    // SA-1 passes through it on every mainloop lap thereafter. The
-    // engaged cell splits the two: zero exactly once, at first arrival.
-    // (Width-safe: a 16-bit LDA reads the zero neighbor into the high
-    // byte, and BEQ judges the pair.)
-    put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37, 0xF0, 0x04 }); // LDA engaged / BEQ first
-    const lap_jml_at = cur;
-    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML mainloop_tramp (patched below)
-    put(d, &cur, &.{ 0x4B, 0xAB, 0x08, 0xE2, 0x20 }); // PHK/PLB, PHP, SEP #$20
-    put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP: open I-RAM to the S-CPU — every cell store below bounces without this
-    put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
-    put(d, &cur, &.{0x68}); // PLA — the pushed game P
-    put(d, &cur, &.{ 0x8D, @truncate(split_cell_p), 0x37 }); // game P
-    put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 }); // ring reset: boot-phase enqueues are stale, drop them
-    put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8D, @truncate(split_cell_d), 0x37 }); // game D
-    put(d, &cur, &.{ 0x3B, 0x8D, @truncate(split_cell_s), 0x37 }); // game S
-    const prologue16: u16 = base16 + @as(u16, @intCast(cur)) + 26;
-    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, @truncate(prologue16), 0x8D, 0x03, 0x22 }); // CRV lo
-    put(d, &cur, &.{ 0xA9, @truncate(prologue16 >> 8), 0x8D, 0x04, 0x22 }); // CRV hi
-    put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
-    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_pump_stack), @truncate(split_pump_stack >> 8), 0x1B });
-    put(d, &cur, &.{ 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
-    std.debug.assert(base16 + @as(u16, @intCast(cur)) == prologue16);
+    put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48 }); // PHP / REP #$20 / PHA
+    put(d, &cur, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
+    put(d, &cur, &.{ 0xD0, 0x03 }); // BNE the S-CPU path
+    const eng_sa1_at = cur;
+    put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the SA-1 arrival (patched)
+    // S-CPU: the gate (I-RAM was opened by the shim at reset).
+    put(d, &cur, &.{ 0xE2, 0x20 });
+    var eng_native_at: usize = 0;
+    var eng_native2_at: usize = 0;
+    if (spec.mode_gate) {
+        put(d, &cur, &.{ 0xC2, 0x20, 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // LDA $00:home (16-bit)
+        put(d, &cur, &.{ 0x29, 0xFF, 0x00, 0xC9, spec.mode_value, 0x00 }); // AND #$00FF / CMP #lo
+        if (spec.mode_hi == 0) {
+            put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ hand over
+            eng_native_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+        } else {
+            // lo <= mode <= hi: below lo or above hi is native
+            put(d, &cur, &.{ 0xB0, 0x03 }); // BCS on
+            eng_native_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+            put(d, &cur, &.{ 0xC9, spec.mode_hi +% 1, 0x00, 0x90, 0x03 }); // CMP #hi+1 / BCC hand over
+            eng_native2_at = cur;
+            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL native (patched)
+        }
+    }
+    // hand over: publish the context, first-engage the SA-1 once, own := SA-1
+    put(d, &cur, &.{ 0xC2, 0x30, 0x68, 0x8F, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x00 }); // A
+    put(d, &cur, &.{ 0x8A, 0x8F, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0x00 }); // X
+    put(d, &cur, &.{ 0x98, 0x8F, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8), 0x00 }); // Y
+    put(d, &cur, &.{ 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00 }); // D
+    put(d, &cur, &.{ 0xE2, 0x20, 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 }); // DBR
+    put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x00 }); // P (pushed at entry)
+    put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x8F, @truncate(split_cell_s), 0x37, 0x00, 0xE2, 0x20 }); // S
+    put(d, &cur, &.{ 0xAF, @truncate(split_engaged), 0x37, 0x00 });
+    const eng_released_at = cur;
+    put(d, &cur, &.{ 0xD0, 0x00 }); // BNE released (patched)
+    put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 }); // ring reset (DBR is the game's: I-RAM aliases in every bank < $40 / $80-$BF)
+    put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 }); // no drain in flight
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := S-CPU until the SA-1 waits
+    const eng_crv_at = cur;
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x03, 0x22, 0x00, 0xA9, 0x00, 0x8F, 0x04, 0x22, 0x00 }); // CRV (patched)
+    put(d, &cur, &.{ 0xA9, 0x01, 0x8F, @truncate(split_engaged), 0x37, 0x00 }); // engaged := 1
+    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // release the SA-1
+    d[eng_released_at + 1] = @intCast(cur - (eng_released_at + 2));
+    if (dual) {
+        // The SA-1's copy: regions C/D/E/F onto megabytes 4/5/4/6 (the
+        // shim's own E/F choice, one copy up). Both CPUs sit in bank $00
+        // code identical in both copies while this takes effect.
+        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x85, 0x8F, 0x21, 0x22, 0x00 });
+        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x86, 0x8F, 0x23, 0x22, 0x00 });
+    }
+    put(d, &cur, &.{ 0xA9, 0x01, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := SA-1
+    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_ml_pump_stack), @truncate(split_ml_pump_stack >> 8), 0x1B }); // the pump stack
+    put(d, &cur, &.{ 0x4B, 0xAB, 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) }); // DBR := $00, into the pump
+    // native (S-CPU, mode gate says not gameplay): this CPU runs the lap.
+    if (spec.mode_gate) std.mem.writeInt(u16, d[eng_native_at + 1 ..][0..2], @intCast(cur - (eng_native_at + 3)), .little);
+    if (spec.mode_gate and spec.mode_hi != 0) std.mem.writeInt(u16, d[eng_native2_at + 1 ..][0..2], @intCast(cur - (eng_native2_at + 3)), .little);
+    put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x28 }); // PLA / PLP
+    const nat_jml_at = cur;
+    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML tramp (patched)
+    // the SA-1's arrival: gameplay -> the lap; else hand back and wait.
+    std.mem.writeInt(u16, d[eng_sa1_at + 1 ..][0..2], @intCast(cur - (eng_sa1_at + 3)), .little);
+    var sa1_back_at: usize = 0;
+    var sa1_back2_at: usize = 0;
+    if (spec.mode_gate) {
+        put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // 16-bit (REP #$20 is live)
+        put(d, &cur, &.{ 0x29, 0xFF, 0x00, 0xC9, spec.mode_value, 0x00 });
+        if (spec.mode_hi == 0) {
+            sa1_back_at = cur;
+            put(d, &cur, &.{ 0xD0, 0x00 }); // BNE hand back (patched)
+        } else {
+            sa1_back_at = cur;
+            put(d, &cur, &.{ 0x90, 0x00 }); // BCC hand back (patched): below lo
+            put(d, &cur, &.{ 0xC9, spec.mode_hi +% 1, 0x00 }); // CMP #hi+1
+            sa1_back2_at = cur;
+            put(d, &cur, &.{ 0xB0, 0x00 }); // BCS hand back (patched): above hi
+        }
+    }
+    put(d, &cur, &.{ 0x68, 0x28 }); // PLA / PLP
+    const sa1_lap_jml_at = cur;
+    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML tramp (patched)
+    var sa1_wait_jmp_at: usize = 0;
+    if (spec.mode_gate) {
+        d[sa1_back_at + 1] = @intCast(cur - (sa1_back_at + 2));
+        if (spec.mode_hi != 0) d[sa1_back2_at + 1] = @intCast(cur - (sa1_back2_at + 2));
+        put(d, &cur, &.{ 0xC2, 0x30, 0x68, 0x8F, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x00 });
+        put(d, &cur, &.{ 0x8A, 0x8F, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0x00 });
+        put(d, &cur, &.{ 0x98, 0x8F, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8), 0x00 });
+        put(d, &cur, &.{ 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00 });
+        put(d, &cur, &.{ 0xE2, 0x20, 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
+        put(d, &cur, &.{ 0x68, 0x8F, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x00 });
+        put(d, &cur, &.{ 0xA9, 0x00, 0x8F, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // owner := S-CPU, last
+        sa1_wait_jmp_at = cur;
+        put(d, &cur, &.{ 0x4C, 0x00, 0x00 }); // JMP the SA-1 wait (patched)
+    }
 
-    // --- SA-1 prologue: gates, game S/D/P, into the mainline ----------
+    // --- SA-1 prologue: gates, own I-RAM stack, then wait for the loop --
+    const prologue16: u16 = base16 + @as(u16, @intCast(cur));
+    d[eng_crv_at + 1] = @truncate(prologue16);
+    d[eng_crv_at + 7] = @truncate(prologue16 >> 8);
     put(d, &cur, &.{ 0x78, 0x18, 0xFB }); // SEI / native
     put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP: I-RAM writable
     put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE: BW-RAM writes
     put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0 -- the identity window
-    put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply mode, for the helper
-    // The SA-1's OWN I-RAM stack, in this flavor too: the stack page is
-    // the CPU discriminator everywhere, and two CPUs sharing the game
-    // stack was never sound anyway.
-    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_sa1_stack), @truncate(split_sa1_stack >> 8), 0x1B });
-    put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // game D
-    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // game P
+    put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply mode, for the shadow
+    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_ml_sa1_stack), @truncate(split_ml_sa1_stack >> 8), 0x1B });
+    const sa1_wait16: u16 = base16 + @as(u16, @intCast(cur));
+    if (spec.mode_gate) std.mem.writeInt(u16, d[sa1_wait_jmp_at + 1 ..][0..2], sa1_wait16, .little);
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAF, @truncate(split_owner), @truncate(split_owner >> 8), 0x00 }); // wait: owner == SA-1?
+    put(d, &cur, &.{ 0xF0, 0xF8 }); // BEQ the wait (-8)
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // D
+    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_dbr), 0x37, 0x48, 0xAB }); // DBR
+    put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), @truncate(split_cell_p >> 8), 0x48 }); // P for the PLP
+    put(d, &cur, &.{ 0xC2, 0x30, 0xAE, @truncate(split_ctx_x), @truncate(split_ctx_x >> 8), 0xAC, @truncate(split_ctx_y), @truncate(split_ctx_y >> 8) });
+    put(d, &cur, &.{ 0xAD, @truncate(split_ctx_a), @truncate(split_ctx_a >> 8), 0x28 }); // A / PLP
     const tramp16: u16 = base16 + @as(u16, @intCast(cur)) + 4;
     put(d, &cur, &.{ 0x5C, @truncate(tramp16), @truncate(tramp16 >> 8), 0x00 });
-    // --- mainloop trampoline: the displaced 4 bytes, then onward ------
+    // --- mainloop trampoline: the displaced bytes, then onward ---------
     std.debug.assert(base16 + @as(u16, @intCast(cur)) == tramp16);
-    std.mem.writeInt(u16, d[lap_jml_at + 1 ..][0..2], tramp16, .little);
-    @memcpy(d[cur .. cur + 4], out[spec.mainloop - 0x8000 ..][0..4]);
-    cur += 4;
-    put(d, &cur, &.{ 0x5C, @truncate(spec.mainloop + 4), @truncate((spec.mainloop + 4) >> 8), 0x00 });
+    for ([_]usize{ take_jml_at, nat_jml_at, sa1_lap_jml_at }) |at| std.mem.writeInt(u16, d[at + 1 ..][0..2], tramp16, .little);
+    @memcpy(d[cur .. cur + mlspan], out[splitFile(ml24)..][0..mlspan]);
+    cur += mlspan;
+    const onward: u24 = @intCast(@as(u32, ml24) + mlspan);
+    put(d, &cur, &.{ 0x5C, @truncate(onward), @truncate(onward >> 8), @truncate(onward >> 16) });
 
-    try emitSplitIo(out, usage, spec, d, &cur, base16, jsr_tbl_at, far, refusal, res);
+    try emitSplitIoBanked(out, usage, spec, d, &cur, base16, tbl_lo_at, tbl_bank_at, far, carve, carve_len, &displaced, &n_displaced, refusal, res);
 
     if (cur > wg_window_shim_max + split_disp_max)
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
 
     // --- displace the mainloop anchor, last -----------------------------
-    out[spec.mainloop - 0x8000] = 0x5C; // JML engage
-    std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
-    out[spec.mainloop - 0x8000 + 3] = 0x00;
+    const mf = splitFile(ml24);
+    out[mf] = 0x5C; // JML engage
+    std.mem.writeInt(u16, out[mf + 1 ..][0..2], engage16, .little);
+    out[mf + 3] = 0x00;
+    if (mlspan > 4) @memset(out[mf + 4 ..][0 .. mlspan - 4], 0xEA);
     res.stats.split_engage_addr = engage16;
+
+    if (dual) {
+        // The SA-1's copy, COP sites and all; then the S-CPU's copy gets
+        // its stock bytes back at every math site.
+        const half: usize = 4 * 1024 * 1024;
+        @memcpy(out[half .. 2 * half], out[0..half]);
+        for (math_sites[0..n_math_sites]) |ms| {
+            const f = splitFile(ms.addr);
+            @memcpy(out[f..][0..ms.len], ms.bytes[0..ms.len]);
+        }
+        // ... and its IO entries and readers too: the S-CPU's own eras run
+        // stock bytes everywhere but the anchor. (When the SA-1 owns the
+        // loop the mapper shows the S-CPU the upper copy, whose stubs and
+        // readers still serve its NMI handler and the pump's replays.)
+        for (displaced[0..n_displaced]) |ds| {
+            const f = splitFile(ds.addr);
+            @memcpy(out[f..][0..ds.len], ds.bytes[0..ds.len]);
+        }
+        // The NMI hook too: only the SA-1's copy vectors NMI through it (the
+        // vector lives in each copy's bank $00). The S-CPU's own eras run
+        // the game's handler untouched — measured: the hook's ~70 cycles on
+        // every intro NMI were enough to fork the intro. The anchor stays
+        // in both copies: its cost is per lap, which a lag streak pays once.
+        std.mem.writeInt(u16, out[0x7FEA..0x7FEC], nmi_vec, .little);
+        res.stats.split_dual = true;
+    }
+}
+
+/// The mainloop flavor's IO machinery, bank-general: for each routine a
+/// drain trampoline and an enqueue stub in the ROUTINE'S OWN bank (its
+/// RTS-shaped return and bank-local jumps stay sound), and a 24-bit
+/// dispatch table in the carve the pump jumps through. Disciplines:
+/// plain (the SA-1 runs the body too — its MMIO writes vanish — and the
+/// pump replays it, no wait), `deferred` (the SA-1 skips the body and
+/// waits for the replay: a handshake, or shared state that must land in
+/// order). `ff` has no frame-exit phase to ride here and is treated as
+/// deferred.
+/// An inline-argument callee: `LDA $03,S` (its return address) ...
+/// `ADC #n` ... `STA $03,S` (skipping the n bytes after the JSL). Returns n.
+fn inlineArgs(out: []const u8, entry: u24) u8 {
+    const f = splitFile(entry);
+    if (f + 64 > out.len) return 0;
+    const b = out[f..][0..64];
+    var seen_lda = false;
+    var n: u8 = 0;
+    var i: usize = 0;
+    while (i + 2 < b.len) : (i += 1) {
+        if (b[i] == 0xA3 and b[i + 1] == 0x03) seen_lda = true;
+        if (seen_lda and b[i] == 0x69 and b[i + 2] == 0x00 and b[i + 1] != 0 and b[i + 1] <= 8) n = b[i + 1];
+        if (seen_lda and n != 0 and b[i] == 0x83 and b[i + 1] == 0x03) return n;
+    }
+    return 0;
+}
+
+fn emitSplitIoBanked(
+    out: []u8,
+    usage: []const u8,
+    spec: SplitSpec,
+    d: []u8,
+    curp: *usize,
+    base16: u16,
+    tbl_lo_at: usize,
+    tbl_bank_at: usize,
+    far: *FarPad,
+    carve: u32,
+    carve_len: u32,
+    disp: *[512]Displaced,
+    n_disp: *u32,
+    refusal: *?Refusal,
+    res: *Result,
+) Error!void {
+    var cur = curp.*;
+    var tramp24: [26]u24 = undefined;
+    var stub16: [26]u16 = undefined;
+    for (spec.io_entries, 0..) |io, i| {
+        const span = splitPrefixSpan(out, usage, io.entry, 3);
+        if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        const bank: u32 = (io.entry >> 16) & 0x7F;
+        const e16: u16 = @truncate(io.entry);
+        const bank_byte: u8 = @intCast(io.entry >> 16);
+        const deferred = io.deferred or io.ff;
+        const args = inlineArgs(out, io.entry);
+        if (args != 0 and !(io.rtl and deferred)) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        if (args != 0) res.stats.split_inline_args += 1;
+
+        // The trampoline: [JSR/JSL helper][RTL][helper: prefix; JMP body+span]
+        // — or, for an inline-argument callee, [JSL far helper][helper...]:
+        // the far helper copies the argument bytes behind a fake frame and
+        // jumps into the helper (see split_args).
+        var tb: [40]u8 = undefined;
+        var tc: usize = 0;
+        const t_need: u32 = if (args != 0) 4 + span + 3 else if (io.rtl) 5 + span + 3 else 4 + span + 3;
+        const tat = far.nextIn(bank, t_need, if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = t_need });
+        const t16: u16 = @intCast(0x8000 + (tat % 0x8000));
+        if (args != 0) {
+            const helper: u24 = (@as(u24, bank_byte) << 16) | (t16 + 4);
+            var ab: [160]u8 = undefined;
+            var ac: usize = 0;
+            put(&ab, &ac, &.{ 0x08, 0xC2, 0x30 }); // PHP / REP #$30
+            put(&ab, &ac, &.{ 0x8F, @truncate(split_asc_a), @truncate(split_asc_a >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x8A, 0x8F, @truncate(split_asc_x), @truncate(split_asc_x >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x98, 0x8F, @truncate(split_asc_y), @truncate(split_asc_y >> 8), 0x00 });
+            put(&ab, &ac, &.{ 0x0B, 0xF4, @truncate(split_cop_dp), @truncate(split_cop_dp >> 8), 0x2B }); // PHD / D := scratch
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_cell_ret), @truncate(split_cell_ret >> 8), 0x00, 0x1A, 0x85, 0x00 }); // ptr := ret + 1
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xAF, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00, 0x85, 0x02, 0xC2, 0x20 }); // bank
+            put(&ab, &ac, &.{ 0xA0, 0x00, 0x00, 0xA2, 0x00, 0x00 });
+            var k: u8 = 0;
+            while (k < args) : (k += 2) {
+                put(&ab, &ac, &.{ 0xB7, 0x00, 0x9F, @truncate(split_args), @truncate(split_args >> 8), 0x00, 0xC8, 0xC8, 0xE8, 0xE8 }); // LDA [$00],Y / STA args,X
+            }
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xA9, 0x6B, 0x8F, @truncate(split_args + args), @truncate((split_args + args) >> 8), 0x00, 0xC2, 0x20 }); // the RTL after them
+            // the JSL frame (at $04,S past PHP and PHD) becomes the fake one
+            put(&ab, &ac, &.{ 0xA9, @truncate(split_args - 1), @truncate((split_args - 1) >> 8), 0x83, 0x04 });
+            // the frame's bank is the CALLER'S: a callee may record it as a data
+            // bank (Super Metroid's HDMA-object spawner stores it beside the list
+            // pointer it took from the arguments — measured: bank $00 there sent
+            // the object's interpreter into ROM); I-RAM aliases in every code
+            // bank, so the argument bytes and the RTL after them read the same.
+            put(&ab, &ac, &.{ 0xE2, 0x20, 0xAF, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00, 0x83, 0x06, 0xC2, 0x30, 0x2B }); // bank / PLD
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_x), @truncate(split_asc_x >> 8), 0x00, 0xAA });
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_y), @truncate(split_asc_y >> 8), 0x00, 0xA8 });
+            put(&ab, &ac, &.{ 0xAF, @truncate(split_asc_a), @truncate(split_asc_a >> 8), 0x00, 0x28 }); // A, then PLP
+            put(&ab, &ac, &.{ 0x5C, @truncate(helper), @truncate(helper >> 8), @truncate(helper >> 16) }); // JML helper
+            const fat = far.next(@intCast(ac)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(ac) });
+            @memcpy(out[fat .. fat + ac], ab[0..ac]);
+            const far24: u24 = @intCast(((fat / 0x8000) << 16) | (0x8000 + (fat % 0x8000)));
+            put(&tb, &tc, &.{ 0x22, @truncate(far24), @truncate(far24 >> 8), @truncate(far24 >> 16) }); // JSL far helper
+        } else if (io.rtl) {
+            const helper = t16 + 5;
+            put(&tb, &tc, &.{ 0x22, @truncate(helper), @truncate(helper >> 8), bank_byte, 0x6B });
+        } else {
+            const helper = t16 + 4;
+            put(&tb, &tc, &.{ 0x20, @truncate(helper), @truncate(helper >> 8), 0x6B });
+        }
+        @memcpy(tb[tc .. tc + span], out[splitFile(io.entry)..][0..span]);
+        tc += span;
+        put(&tb, &tc, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) });
+        std.debug.assert(tc == t_need);
+        @memcpy(out[tat .. tat + tc], tb[0..tc]);
+        tramp24[i] = (@as(u24, bank_byte) << 16) | t16;
+
+        // The enqueue stub, in the same bank. The CPU test comes FIRST and
+        // the S-CPU's path is an early exit (~35 cycles: measured, the full
+        // capture on every native-era call cost a razor-edge transition lap
+        // its vblank, one lag frame, and a permanent fork); only the SA-1
+        // captures and enqueues.
+        var fb: [200]u8 = undefined;
+        var fc: usize = 0;
+        put(&fb, &fc, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP / REP #$20 / PHA / TSC & $F000 == $3000?
+        const scpu_at = fc;
+        put(&fb, &fc, &.{ 0xD0, 0x00 }); // BNE the S-CPU exit (patched)
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP — the caller's A and P back
+        // A comes back from the STACK, not from the cell: a cell store made
+        // with SIWP closed bounces, and reading it back handed every
+        // boot-time IO body a garbage A.
+        put(&fb, &fc, &.{ 0x08, 0xC2, 0x30, 0x48 }); // PHP / REP #$30 / PHA
+        if (args != 0) {
+            // the game's JSL frame sits at $04,S: PC, then the bank
+            put(&fb, &fc, &.{ 0xA3, 0x04, 0x8F, @truncate(split_cell_ret), @truncate(split_cell_ret >> 8), 0x00 });
+            put(&fb, &fc, &.{ 0xA3, 0x06, 0x8F, @truncate(split_cell_ret + 2), @truncate((split_cell_ret + 2) >> 8), 0x00 });
+        }
+        put(&fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
+        put(&fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
+        put(&fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP — caller state fully intact
+        put(&fb, &fc, &.{ 0x48, 0xDA, 0x5A, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHY/PHP/SEP #$30
+        // Caller D/DBR/P to the replay; enqueue; wait if deferred.
+        put(&fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00, 0xE2, 0x20 });
+        put(&fb, &fc, &.{ 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
+        put(&fb, &fc, &.{ 0xA3, 0x01, 0x8F, @truncate(split_cell_pw), 0x37, 0x00 }); // caller P
+        put(&fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00, 0x8F, @truncate(split_scr_a), 0x37, 0x00 }); // old ack
+        put(&fb, &fc, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X
+        put(&fb, &fc, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
+        put(&fb, &fc, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
+        if (deferred) {
+            put(&fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00 }); // spin: ack
+            put(&fb, &fc, &.{ 0xCF, @truncate(split_scr_a), 0x37, 0x00 }); // still the old one?
+            put(&fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
+            // The flags the body returned with (a `CLC; RTL` is a return
+            // value), under the caller's own widths — the pushes below
+            // were made in those.
+            put(&fb, &fc, &.{ 0xA3, 0x01, 0x29, 0x30, 0x8F, @truncate(split_scr_pw), @truncate(split_scr_pw >> 8), 0x00 });
+            put(&fb, &fc, &.{ 0xAF, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00, 0x29, 0xCF });
+            put(&fb, &fc, &.{ 0x0F, @truncate(split_scr_pw), @truncate(split_scr_pw >> 8), 0x00, 0x83, 0x01 });
+            put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+            if (args != 0) {
+                // skip the inline bytes, as the body would have
+                put(&fb, &fc, &.{ 0x08, 0xC2, 0x20, 0x48, 0xA3, 0x04, 0x18, 0x69, args, 0x00, 0x83, 0x04, 0x68, 0x28 });
+            }
+            put(&fb, &fc, &[_]u8{if (io.rtl) 0x6B else 0x60}); // pop the GAME frame, in the body's own bank
+        } else {
+            put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+            @memcpy(fb[fc .. fc + span], out[splitFile(io.entry)..][0..span]);
+            fc += span;
+            put(&fb, &fc, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) }); // back into the body
+        }
+        // the S-CPU: A and P back, the prefix, the body
+        fb[scpu_at + 1] = @intCast(fc - (scpu_at + 2));
+        put(&fb, &fc, &.{ 0x68, 0x28 }); // PLA / PLP
+        @memcpy(fb[fc .. fc + span], out[splitFile(io.entry)..][0..span]);
+        fc += span;
+        put(&fb, &fc, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) }); // back into the body
+        const sat = far.nextIn(bank, @intCast(fc), if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(fc) });
+        @memcpy(out[sat .. sat + fc], fb[0..fc]);
+        stub16[i] = @intCast(0x8000 + (sat % 0x8000));
+    }
+    // The dispatch table: 4-byte entries (lo, hi, bank, 0).
+    const tbl16: u16 = base16 + @as(u16, @intCast(cur));
+    for (spec.io_entries, 0..) |_, i| {
+        put(d, &cur, &.{ @truncate(tramp24[i]), @truncate(tramp24[i] >> 8), @truncate(tramp24[i] >> 16), 0x00 });
+    }
+    std.mem.writeInt(u16, d[tbl_lo_at + 1 ..][0..2], tbl16, .little);
+    std.mem.writeInt(u16, d[tbl_bank_at + 1 ..][0..2], tbl16 + 2, .little);
+
+    // --- displacements, last: everything they jump into now exists ----
+    for (spec.io_entries, 0..) |io, i| {
+        const span = splitPrefixSpan(out, usage, io.entry, 3);
+        const f = splitFile(io.entry);
+        if (n_disp.* == disp.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        disp[n_disp.*] = .{ .addr = io.entry, .len = @intCast(span), .bytes = undefined };
+        @memcpy(disp[n_disp.*].bytes[0..span], out[f..][0..span]);
+        n_disp.* += 1;
+        out[f] = 0x4C; // JMP stub — bank-local, frameless
+        std.mem.writeInt(u16, out[f + 1 ..][0..2], stub16[i], .little);
+        if (span > 3) @memset(out[f + 3 ..][0 .. span - 3], 0xEA);
+    }
+    res.stats.split_io = @intCast(spec.io_entries.len);
+    curp.* = cur;
+}
+
+/// The mainloop flavor's `$4212` / joypad readers. A reader the game shares
+/// between boot and gameplay (Super Metroid's four-vblank wait at
+/// `$80:8436`, measured: the boot hung in it once the operand was swapped
+/// to a mirror nobody fed yet) cannot simply read the mirror: on the
+/// S-CPU the real register is right, always; only the SA-1 needs the
+/// pump-fed cell. Each 3-byte absolute read of `$4212`/`$4218-$421F` in
+/// the declared ranges becomes a bank-local JSR to a helper in the
+/// site's bank that discriminates by stack page and performs the SAME
+/// opcode against the register (S-CPU) or the mirror (SA-1, through a
+/// long form when the opcode has one — the SA-1's DBR is whatever the
+/// game left) after restoring the caller's P, so the flags the branch
+/// after the read looks at are the load's own.
+fn emitSplitReaders(out: []u8, usage: []const u8, spec: SplitSpec, far: *FarPad, carve: u32, carve_len: u32, disp: *[512]Displaced, n_disp: *u32, refusal: *?Refusal) Error!void {
+    for (spec.vbl_ranges) |r| {
+        // Keyed on the coverage map's instruction starts, not decoded from
+        // the range's first byte: a range given by hand starts wherever it
+        // starts (measured: a walk from mid-instruction missed $80:8525).
+        var pc: u32 = r[0];
+        while (pc < r[1]) : (pc += 1) {
+            const f = splitFile(@intCast(pc));
+            const op = out[f];
+            const u = splitUsage(usage, @intCast(pc));
+            const m8 = u & usage_map.flag_m != 0;
+            const x8 = u & usage_map.flag_x != 0;
+            const len = usage_map.instrLen(op, m8, x8);
+            const is_read = switch (op) {
+                0xAD, 0xAE, 0xAC, 0x2C, 0xCD, 0xEC, 0xCC, 0x0D, 0x2D, 0x4D, 0x6D, 0xED => true,
+                else => false,
+            };
+            if (len == 3 and is_read and u & usage_map.flag_opcode != 0) {
+                const v = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
+                const mirror: u16 = if (v == 0x4212)
+                    split_vbl_mirror
+                else if (v >= 0x4218 and v <= 0x421F)
+                    split_pad_mirror + (v - 0x4218)
+                else
+                    0;
+                if (mirror != 0) {
+                    // A-register ops have a long form (op | $02); the rest
+                    // read the mirror through the DBR.
+                    const long_op: ?u8 = switch (op) {
+                        0xAD, 0xCD, 0x0D, 0x2D, 0x4D, 0x6D, 0xED => op | 0x02,
+                        else => null,
+                    };
+                    var hb: [40]u8 = undefined;
+                    var hc: usize = 0;
+                    put(&hb, &hc, &.{ 0x08, 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // PHP / REP #$20 / TSC / AND / CMP
+                    // A pad LOAD on the S-CPU also feeds the mirror (STA/STX/STY
+                    // leave the flags alone, so the branch after the read still
+                    // sees the load's own): the game's poll is the feed.
+                    const feed_op: ?u8 = if (v >= 0x4218) switch (op) {
+                        0xAD => @as(u8, 0x8F), // STA long
+                        0xAE => @as(u8, 0x8E), // STX abs (I-RAM aliases in every code bank)
+                        0xAC => @as(u8, 0x8C), // STY abs
+                        else => null,
+                    } else null;
+                    const scpu_len: u8 = if (feed_op) |fo| (if (fo == 0x8F) 9 else 8) else 5;
+                    put(&hb, &hc, &.{ 0xF0, scpu_len }); // BEQ the SA-1 read
+                    put(&hb, &hc, &.{ 0x28, op, @truncate(v), @truncate(v >> 8) }); // PLP / the read, real
+                    if (feed_op) |fo| {
+                        if (fo == 0x8F) {
+                            put(&hb, &hc, &.{ 0x8F, @truncate(mirror), @truncate(mirror >> 8), 0x00 });
+                        } else {
+                            put(&hb, &hc, &.{ fo, @truncate(mirror), @truncate(mirror >> 8) });
+                        }
+                    }
+                    put(&hb, &hc, &.{0x60}); // RTS
+                    if (long_op) |lo| {
+                        put(&hb, &hc, &.{ 0x28, lo, @truncate(mirror), @truncate(mirror >> 8), 0x00, 0x60 });
+                    } else {
+                        put(&hb, &hc, &.{ 0x28, op, @truncate(mirror), @truncate(mirror >> 8), 0x60 });
+                    }
+                    const bank: u32 = (pc >> 16) & 0x7F;
+                    const at = far.nextIn(bank, @intCast(hc), if (bank == 0) carve else 0, if (bank == 0) carve_len else 0) orelse
+                        return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(hc) });
+                    @memcpy(out[at .. at + hc], hb[0..hc]);
+                    const h16: u16 = @intCast(0x8000 + (at % 0x8000));
+                    if (n_disp.* == disp.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(pc) });
+                    disp[n_disp.*] = .{ .addr = @intCast(pc), .len = 3, .bytes = undefined };
+                    @memcpy(disp[n_disp.*].bytes[0..3], out[f..][0..3]);
+                    n_disp.* += 1;
+                    out[f] = 0x20; // JSR helper — bank-local, the same 3 bytes
+                    std.mem.writeInt(u16, out[f + 1 ..][0..2], h16, .little);
+                }
+            }
+        }
+    }
+}
+
+/// The math shadow (mainloop flavor). The S-CPU's multiplier and divider
+/// ($4202-$4206 in, $4214-$4217 out) are open bus on the SA-1, and the
+/// game loop uses them from dozens of sites in no fixed idiom (measured
+/// on Super Metroid: 46-70 touches per frame). Each covered absolute
+/// store or load of those registers is displaced with a JSL to a helper
+/// that runs the original instruction on the S-CPU and, on the SA-1
+/// (stack page $3xxx), the same access against I-RAM cells — a write of
+/// $4203 computing the 8x8 product through the SA-1's arithmetic unit,
+/// a write of $4206 the unsigned 16/8 quotient and remainder in software
+/// (exact, divide-by-zero included: quotient $FFFF, remainder the
+/// dividend). Each site is displaced by a bank-local JSR (the same 3
+/// bytes) to a helper in its own bank; no neighbouring instruction is
+/// copied.
+/// A site the split displaced, with the bytes it replaced — so the
+/// S-CPU's copy of the game can have them back (see the dual image).
+const MathSite = struct { addr: u24, len: u8, bytes: [8]u8 };
+const Displaced = struct { addr: u24, len: u8, bytes: [8]u8 };
+
+/// Whether any covered branch, jump or call in `addr`'s bank lands on
+/// `addr` — a displaced instruction there would be skipped by that path.
+fn splitTargeted(out: []const u8, usage: []const u8, addr: u24) bool {
+    const bank: u32 = (addr >> 16) & 0x7F;
+    const a16: u16 = @truncate(addr);
+    var pc: u32 = 0x8000;
+    while (pc < 0x10000) : (pc += 1) {
+        const ac: u24 = @intCast((bank << 16) | pc);
+        const u = splitUsage(usage, ac);
+        if (u & usage_map.flag_opcode == 0) continue;
+        const f = splitFile(ac);
+        const op = out[f];
+        switch (op) {
+            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80 => {
+                const rel: i8 = @bitCast(out[f + 1]);
+                const t: i32 = @as(i32, @intCast(pc)) + 2 + rel;
+                if (t == a16) return true;
+            },
+            0x82, 0x62 => {
+                const rel: i16 = @bitCast(std.mem.readInt(u16, out[f + 1 ..][0..2], .little));
+                const t: i32 = @as(i32, @intCast(pc)) + 3 + rel;
+                if (t == a16) return true;
+            },
+            0x4C, 0x20 => {
+                if (std.mem.readInt(u16, out[f + 1 ..][0..2], .little) == a16) return true;
+            },
+            0x5C, 0x22 => {
+                if (std.mem.readInt(u16, out[f + 1 ..][0..2], .little) == a16 and (out[f + 3] & 0x7F) == bank) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn emitSplitMath(out: []u8, usage: []const u8, far: *FarPad, carve: u32, carve_len: u32, shared: []const u24, sites: *[1024]MathSite, n_out: *u32, refusal: *?Refusal, res: *Result) Error!void {
+    // The shared calculators, once.
+    var calc: [224]u8 = undefined;
+    var cc: usize = 0;
+    // mulcalc: product := A-cell * B-cell (8x8 unsigned fits the signed 16x16 unit)
+    put(&calc, &cc, &.{ 0x08, 0xC2, 0x20, 0x48, 0xE2, 0x20 }); // PHP / REP #$20 / PHA / SEP #$20
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_a), @truncate(split_math_a >> 8), 0x00, 0x8D, 0x51, 0x22, 0x9C, 0x52, 0x22 }); // MA
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_a + 1), @truncate((split_math_a + 1) >> 8), 0x00, 0x8D, 0x53, 0x22, 0x9C, 0x54, 0x22 }); // MB (triggers)
+    put(&calc, &cc, &.{ 0xEA, 0xEA, 0xEA, 0xC2, 0x20, 0xAD, 0x06, 0x23 }); // the unit's 5 cycles; product low word
+    put(&calc, &cc, &.{ 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00, 0x68, 0x28, 0x6B }); // -> remainder/product cells; PLA/PLP/RTL
+    const mul_len = cc;
+    // divcalc: unsigned 16/8, restoring shift-subtract, 16 rounds
+    put(&calc, &cc, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0xE2, 0x20 }); // PHP / REP #$30 / PHA / PHX / SEP #$20
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div + 2), @truncate((split_math_div + 2) >> 8), 0x00 }); // divisor
+    put(&calc, &cc, &.{ 0xD0, 0x0F }); // BNE ok
+    put(&calc, &cc, &.{ 0xC2, 0x20, 0xA9, 0xFF, 0xFF, 0x8F, @truncate(split_math_q), @truncate(split_math_q >> 8), 0x00 }); // q := $FFFF
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div), @truncate(split_math_div >> 8), 0x00 }); // r := dividend
+    put(&calc, &cc, &.{ 0x80, 0x24 }); // BRA store-r (patched below by construction)
+    // ok:
+    put(&calc, &cc, &.{ 0xC2, 0x20, 0xAF, @truncate(split_math_div), @truncate(split_math_div >> 8), 0x00 }); // dividend
+    // The SA-1's own divider for a dividend below $8000 (its dividend is
+    // signed): 5 cycles where the shift-subtract loop below cost ~400 —
+    // measured: that loop was 45% of a door transition's SA-1 time, and the
+    // transitions ran slower than stock's. Divisor's high byte is zero (the
+    // cell past it). Divide mode on ($2250 bit 1), multiply mode back after.
+    put(&calc, &cc, &.{ 0x30, 0x33 }); // BMI the software path
+    put(&calc, &cc, &.{ 0xE2, 0x20, 0xA9, 0x01, 0x8D, 0x50, 0x22, 0xC2, 0x20 }); // MCNT := divide (bit 0; bit 1 is the accumulate mode)
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div), @truncate((split_math_div) >> 8), 0x00, 0x8D, 0x51, 0x22 }); // MA := dividend (reloaded: the mode write went through A)
+    put(&calc, &cc, &.{ 0xAF, @truncate(split_math_div + 2), @truncate((split_math_div + 2) >> 8), 0x00 }); // divisor (16-bit, high byte zero)
+    put(&calc, &cc, &.{ 0x8D, 0x53, 0x22 }); // MB (the $2254 write triggers)
+    put(&calc, &cc, &.{ 0xEA, 0xEA, 0xEA }); // the unit's 5 cycles
+    put(&calc, &cc, &.{ 0xAD, 0x06, 0x23, 0x8F, @truncate(split_math_q), @truncate(split_math_q >> 8), 0x00 }); // quotient
+    put(&calc, &cc, &.{ 0xAD, 0x08, 0x23, 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00 }); // remainder
+    put(&calc, &cc, &.{ 0xE2, 0x20, 0x9C, 0x50, 0x22, 0xC2, 0x20 }); // ACM := multiply
+    put(&calc, &cc, &.{ 0xFA, 0x68, 0x28, 0x6B }); // PLX / PLA / PLP / RTL
+    // software path (dividend >= $8000): restoring shift-subtract, 16 rounds
+    put(&calc, &cc, &.{ 0x8F, @truncate(split_math_q), @truncate(split_math_q >> 8), 0x00 }); // q := dividend (shift register)
+    put(&calc, &cc, &.{ 0xA9, 0x00, 0x00, 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00 }); // r := 0
+    put(&calc, &cc, &.{ 0xA2, 0x10, 0x00 }); // LDX #16
+    const loop_at = cc;
+    put(&calc, &cc, &.{ 0x0E, @truncate(split_math_q), @truncate(split_math_q >> 8) }); // ASL q (DBR-relative: I-RAM aliases in every code bank)
+    put(&calc, &cc, &.{ 0x2E, @truncate(split_math_r), @truncate(split_math_r >> 8) }); // ROL r
+    put(&calc, &cc, &.{ 0xAD, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x38, 0xED, @truncate(split_math_div + 2), @truncate((split_math_div + 2) >> 8) }); // r - divisor (the byte past it is zero)
+    put(&calc, &cc, &.{ 0x90, 0x06 }); // BCC skip
+    put(&calc, &cc, &.{ 0x8D, @truncate(split_math_r), @truncate(split_math_r >> 8), 0xEE, @truncate(split_math_q), @truncate(split_math_q >> 8) }); // r := diff; INC q
+    put(&calc, &cc, &.{0xCA}); // DEX
+    const back: i32 = @as(i32, @intCast(loop_at)) - (@as(i32, @intCast(cc)) + 2);
+    put(&calc, &cc, &.{ 0xD0, @bitCast(@as(i8, @intCast(back))) }); // BNE loop
+    put(&calc, &cc, &.{ 0xFA, 0x68, 0x28, 0x6B }); // PLX / PLA / PLP / RTL
+    // the zero-divisor branch's store-r lands on a PLX: give it its own tail
+    const zero_tail = cc;
+    put(&calc, &cc, &.{ 0x8F, @truncate(split_math_r), @truncate(split_math_r >> 8), 0x00, 0xFA, 0x68, 0x28, 0x6B });
+    // fix the BRA: from its own end to zero_tail
+    {
+        var i: usize = mul_len;
+        while (i + 1 < cc) : (i += 1) {
+            if (calc[i] == 0x80 and calc[i + 1] == 0x24) {
+                calc[i + 1] = @intCast(zero_tail - (i + 2));
+                break;
+            }
+        }
+    }
+    const cat = far.next(@intCast(cc)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(cc) });
+    @memcpy(out[cat .. cat + cc], calc[0..cc]);
+    const mul24: u24 = @intCast(((cat / 0x8000) << 16) | (0x8000 + (cat % 0x8000)));
+    const div24: u24 = mul24 + @as(u24, @intCast(mul_len));
+    // The mode-7 calculators as far routines (for the JSL-shaped trigger
+    // sites; the COP handler keeps its inline copy): m7a composes M7A from
+    // the last-written byte and the latch, both recompute the product.
+    // Long addressing throughout — the caller's DBR is anything.
+    var m7c: [96]u8 = undefined;
+    var mc: usize = 0;
+    put(&m7c, &mc, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP / SEP #$20 / PHA
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x00, 0x8F, @truncate(split_m7a + 1), @truncate((split_m7a + 1) >> 8), 0x00 }); // hi := last
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x00, 0x8F, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x00 }); // lo := latch
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x00, 0x8F, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x00 }); // latch := last
+    put(&m7c, &mc, &.{ 0x68, 0x28 }); // PLA / PLP -- falls into the product
+    const m7b_off = mc;
+    put(&m7c, &mc, &.{ 0x08, 0xC2, 0x20, 0x48 }); // PHP / REP #$20 / PHA
+    put(&m7c, &mc, &.{ 0xAF, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x00, 0x8F, 0x51, 0x22, 0x00 }); // MA := M7A
+    put(&m7c, &mc, &.{ 0xE2, 0x20, 0xAF, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x00, 0x8F, 0x53, 0x22, 0x00 }); // MB lo
+    put(&m7c, &mc, &.{ 0xA9, 0x00, 0x2C, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x10, 0x02, 0xA9, 0xFF }); // sign-extend (BIT abs: DBR is a code bank, I-RAM aliases there)
+    put(&m7c, &mc, &.{ 0x8F, 0x54, 0x22, 0x00, 0xEA, 0xEA, 0xEA }); // MB hi (triggers) / 5 cycles
+    put(&m7c, &mc, &.{ 0xC2, 0x20, 0xAF, 0x06, 0x23, 0x00, 0x8F, @truncate(split_m7_prod), @truncate(split_m7_prod >> 8), 0x00 }); // product low word
+    put(&m7c, &mc, &.{ 0xE2, 0x20, 0xAF, 0x08, 0x23, 0x00, 0x8F, @truncate(split_m7_prod + 2), @truncate((split_m7_prod + 2) >> 8), 0x00 }); // byte 2
+    put(&m7c, &mc, &.{ 0xC2, 0x20, 0x68, 0x28, 0x6B }); // REP / PLA / PLP / RTL
+    const m7at = far.next(@intCast(mc)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(mc) });
+    @memcpy(out[m7at .. m7at + mc], m7c[0..mc]);
+    const m7a24: u24 = @intCast(((m7at / 0x8000) << 16) | (0x8000 + (m7at % 0x8000)));
+    const m7b24: u24 = m7a24 + @as(u24, @intCast(m7b_off));
+
+    // The sites. Each 3-byte absolute access becomes `COP nn / NOP`: a
+    // software interrupt whose handler (bank $00, the native COP vector —
+    // the SA-1 reads the same ROM vector) finds the site's descriptor by
+    // its bank and signature byte and performs the one instruction on
+    // the interrupted registers: the real register on the S-CPU, the
+    // cell on the SA-1, loads landing in the saved register with the
+    // saved P's N/Z set as the load would have. No bytes in the site's
+    // bank, no neighbouring instruction copied — the previous shapes
+    // (a JSL over a span, a bank-local JSR) each failed on Super
+    // Metroid: a `PHA` in a span, a bank with 63 free bytes.
+    const Desc = struct { addr: u24, off: u8, kind: u8, opi: u8, len: u8 };
+    // kind 7, "operate": the site's own opcode re-run against the fetched
+    // value (ADC $4216 was 70 of Super Metroid's 250 product reads — the
+    // scroll code's `ADC $4216` read open bus on the SA-1 and the camera
+    // walked off on the first gameplay lap). Index = position here.
+    const operate_ops = [_]u8{ 0x6D, 0xED, 0xCD, 0x2D, 0x0D, 0x4D, 0x2C, 0xEC, 0xCC }; // ADC SBC CMP AND ORA EOR BIT CPX CPY
+    const operate_dp = [_]u8{ 0x65, 0xE5, 0xC5, 0x25, 0x05, 0x45, 0x24, 0xE4, 0xC4 }; // their direct-page forms
+    var descs: [1024]Desc = undefined;
+    var n_sites: u32 = 0;
+    var per_bank: [0x40]u16 = @splat(0);
+    {
+        var bank: u32 = 0;
+        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
+            var aa: u32 = 0x8000;
+            while (aa < 0xFFFD) : (aa += 1) {
+                const ac: u24 = @intCast((bank << 16) | aa);
+                const u = splitUsage(usage, ac);
+                if (u & usage_map.flag_opcode == 0) continue;
+                const file = splitFile(ac);
+                const op = out[file];
+                var opi: u8 = 0;
+                const kind: u8 = switch (op) {
+                    0x8D, 0x8F => 0, // STA abs / long
+                    0x8E => 1,
+                    0x8C => 2,
+                    0x9C => 3,
+                    0xAD, 0xAF => 4, // LDA abs / long
+                    0xAE => 5,
+                    0xAC => 6,
+                    else => blk: {
+                        const i = std.mem.indexOfScalar(u8, &operate_ops, op) orelse continue;
+                        opi = @intCast(i);
+                        break :blk 7;
+                    },
+                };
+                const long = op == 0x8F or op == 0xAF;
+                if (long and (out[file + 3] & 0x7F) >= 0x40) continue; // a long form names a bank without the register file
+                const reg = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                const math_in = reg >= 0x4202 and reg <= 0x4206;
+                const math_out = reg >= 0x4214 and reg <= 0x4217;
+                const m7_in = reg == 0x211B or reg == 0x211C;
+                const m7_out = reg >= 0x2134 and reg <= 0x2136;
+                if (!(kind <= 3 and (math_in or m7_in)) and !(kind >= 4 and (math_out or m7_out))) continue;
+                const idx_reg = kind == 1 or kind == 2 or kind == 5 or kind == 6 or (kind == 7 and opi >= 7);
+                const wide = if (idx_reg) u & usage_map.flag_x == 0 else u & usage_map.flag_m == 0;
+                if (m7_in and wide) continue; // a 16-bit store straddles M7A and M7B: not a shape the shadow models (the audit does not list stores; none seen)
+                if (n_sites == descs.len or per_bank[bank] == 256)
+                    return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                const off: u8 = if (m7_in or m7_out) @intCast(reg - 0x20DB) else @intCast(reg - 0x4202);
+                const len: u8 = if (long) 4 else 3;
+                // Direct cell access for the SA-1's own sites: no trigger to
+                // run, no S-CPU ever here in this copy.
+                const trigger = kind <= 3 and (off == 1 or (off == 0 and wide) or off == 4 or (off == 3 and wide) or off == 0x40 or off == 0x41);
+                // A trigger store as a JSL to its own far routine (measured: the
+                // COP dispatch was ~95 instructions per site, 0.18 frame of a
+                // gameplay lap and a quarter of a door transition's SA-1 time).
+                // The 3-byte site needs the instruction after it to ride along:
+                // a whole, covered, relocatable one — no flow, no push/pull, no
+                // stack move, no register-file access, and nothing branches to it.
+                if (trigger and (long or blk: {
+                    const nf = file + 3;
+                    const nu = splitUsage(usage, ac + 3);
+                    if (nu & usage_map.flag_opcode == 0) break :blk false;
+                    const nop = out[nf];
+                    switch (nop) {
+                        0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x62, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x02, 0xCB, 0xDB => break :blk false, // flow
+                        0x48, 0xDA, 0x5A, 0x08, 0x8B, 0x0B, 0x4B, 0xF4, 0xD4, 0x68, 0xFA, 0x7A, 0x28, 0xAB, 0x2B, 0x3B, 0x1B, 0x9A, 0xBA, 0x22 => break :blk false, // push/pull/stack/JSL
+                        else => if (nop & 0x0F == 0x03) break :blk false, // stack-relative: the frame is three deeper inside the routine
+                    }
+                    const nlen = usage_map.instrLen(nop, nu & usage_map.flag_m != 0, nu & usage_map.flag_x != 0);
+                    if (nlen < 1 or 3 + @as(u32, nlen) > 8) break :blk false;
+                    if (nlen >= 3) {
+                        const nreg = std.mem.readInt(u16, out[nf + 1 ..][0..2], .little);
+                        if ((nreg >= 0x2100 and nreg <= 0x21FF) or (nreg >= 0x4200 and nreg <= 0x43FF)) break :blk false;
+                    }
+                    if (splitTargeted(out, usage, ac + 3)) break :blk false;
+                    break :blk true;
+                })) {
+                    const site_len: u32 = if (long) 4 else 3;
+                    const span: u32 = if (long) 4 else 3 + @as(u32, usage_map.instrLen(out[file + 3], splitUsage(usage, ac + 3) & usage_map.flag_m != 0, splitUsage(usage, ac + 3) & usage_map.flag_x != 0));
+                    var tb: [96]u8 = undefined;
+                    var tcn: usize = 0;
+                    // PHP / REP #$20 / PHA / TSC / AND / CMP / BEQ sa1 / PLA / PLP / the real store / displaced / RTL
+                    put(&tb, &tcn, &.{ 0x08, 0xC2, 0x20, 0x48, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 });
+                    const beq_at = tcn;
+                    put(&tb, &tcn, &.{ 0xF0, 0x00 }); // (patched)
+                    put(&tb, &tcn, &.{ 0x68, 0x28 }); // PLA / PLP
+                    @memcpy(tb[tcn .. tcn + site_len], out[file..][0..site_len]); // the original store, real register
+                    tcn += if (long) 4 else 3;
+                    if (span > site_len) {
+                        @memcpy(tb[tcn .. tcn + (span - site_len)], out[file + site_len ..][0 .. span - site_len]);
+                        tcn += span - site_len;
+                    }
+                    put(&tb, &tcn, &.{0x6B}); // RTL
+                    // SA-1: PLA / PLP, then registers and flags kept around the cell store + calc
+                    tb[beq_at + 1] = @intCast(tcn - (beq_at + 2));
+                    put(&tb, &tcn, &.{ 0x68, 0x28, 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // PLA PLP / PHP REP #$30 PHA PHX PHY
+                    const reg_kind = kind & 3; // 0 A, 1 X, 2 Y, 3 zero
+                    switch (reg_kind) {
+                        1 => put(&tb, &tcn, &.{0x8A}), // TXA
+                        2 => put(&tb, &tcn, &.{0x98}), // TYA
+                        3 => put(&tb, &tcn, &.{ 0xA9, 0x00, 0x00 }), // LDA #0
+                        else => {},
+                    }
+                    const cell: u16 = if (off < 8) split_math_a + off else split_m7_last + (off - 0x40);
+                    if (wide) {
+                        put(&tb, &tcn, &.{ 0x8F, @truncate(cell), @truncate(cell >> 8), 0x00 }); // 16-bit store
+                    } else {
+                        put(&tb, &tcn, &.{ 0xE2, 0x20, 0x8F, @truncate(cell), @truncate(cell >> 8), 0x00, 0xC2, 0x20 });
+                    }
+                    const calc24: u24 = switch (off) {
+                        0, 1 => mul24,
+                        3, 4 => div24,
+                        0x40 => m7a24,
+                        else => m7b24,
+                    };
+                    put(&tb, &tcn, &.{ 0x22, @truncate(calc24), @truncate(calc24 >> 8), @truncate(calc24 >> 16) });
+                    put(&tb, &tcn, &.{ 0x7A, 0xFA, 0x68, 0x28 }); // PLY PLX PLA PLP
+                    if (span > site_len) {
+                        @memcpy(tb[tcn .. tcn + (span - site_len)], out[file + site_len ..][0 .. span - site_len]);
+                        tcn += span - site_len;
+                    }
+                    put(&tb, &tcn, &.{0x6B}); // RTL
+                    const tat = far.next(@intCast(tcn)) orelse return refuse(refusal, .{ .reason = .no_free_space, .detail = @intCast(tcn) });
+                    @memcpy(out[tat .. tat + tcn], tb[0..tcn]);
+                    const t24: u24 = @intCast(((tat / 0x8000) << 16) | (0x8000 + (tat % 0x8000)));
+                    if (n_out.* == sites.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                    sites[n_out.*] = .{ .addr = ac, .len = @intCast(span), .bytes = undefined };
+                    @memcpy(sites[n_out.*].bytes[0..span], out[file..][0..span]);
+                    n_out.* += 1;
+                    out[file] = 0x22;
+                    std.mem.writeInt(u16, out[file + 1 ..][0..2], @truncate(t24), .little);
+                    out[file + 3] = @truncate(t24 >> 16);
+                    if (span > 4) @memset(out[file + 4 ..][0 .. span - 4], 0xEA);
+                    res.stats.split_trigger_jsl += 1;
+                    continue;
+                }
+                const is_shared = std.sort.binarySearch(u24, shared, ac, struct {
+                    fn f(k: u24, v: u24) std.math.Order {
+                        return std.math.order(k, v);
+                    }
+                }.f) != null;
+                if (!trigger and !is_shared and shared.len != 0) {
+                    const cell: u16 = if (off < 8) split_math_a + off else if (off < 0x40) split_math_q - 0x12 + off else if (off < 0x59) split_m7_last + (off - 0x40) else split_m7_prod + (off - 0x59);
+                    if (n_out.* == sites.len) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
+                    sites[n_out.*] = .{ .addr = ac, .len = len, .bytes = undefined };
+                    @memcpy(sites[n_out.*].bytes[0..len], out[file..][0..len]);
+                    n_out.* += 1;
+                    std.mem.writeInt(u16, out[file + 1 ..][0..2], cell, .little); // the opcode and (for a long form) the bank stay
+                    res.stats.split_math_direct += 1;
+                    continue;
+                }
+                descs[n_sites] = .{ .addr = ac, .off = off, .kind = kind | (if (wide) @as(u8, 0x80) else 0), .opi = opi, .len = len };
+                n_sites += 1;
+                per_bank[bank] += 1;
+            }
+        }
+    }
+    if (n_sites != 0) {
+        // Block: [handler][bank table: 64 words][per-bank descriptors].
+        var hb: [1024]u8 = undefined;
+        var hc: usize = 0;
+        put(&hb, &hc, &.{ 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB }); // REP #$30 / PHA PHX PHY PHD PHB / PHK PLB
+        put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x09 }); // the SA-1 skips the SIWP open
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA9, 0xFF, 0x8D, 0x29, 0x22, 0xC2, 0x20 }); // SIWP := $FF (boot-time COPs run before any engage)
+        put(&hb, &hc, &.{ 0xF4, @truncate(split_cop_dp), @truncate(split_cop_dp >> 8), 0x2B }); // PEA / PLD: D = the scratch page
+        put(&hb, &hc, &.{ 0xA3, 0x0B, 0x3A, 0x85, 0x00 }); // LDA $0B,S (PC) / DEC / STA $00 — the signature's address
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x0D, 0x85, 0x02 }); // SEP #$20 / LDA $0D,S (PBR) / STA $02
+        put(&hb, &hc, &.{ 0xA7, 0x00, 0x85, 0x03 }); // LDA [$00] / STA $03 — nn
+        put(&hb, &hc, &.{ 0xC2, 0x20, 0xA5, 0x02, 0x29, 0x3F, 0x00, 0x0A, 0xAA }); // REP / LDA $02 / AND #$3F (the mirror bit off: the table is 64 banks) / ASL / TAX
+        const bank_tbl_ref = hc;
+        put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x85, 0x04 }); // LDA banktbl,X (patched) / STA $04
+        put(&hb, &hc, &.{ 0xA5, 0x03, 0x29, 0xFF, 0x00, 0x85, 0x0E, 0x0A, 0x18, 0x65, 0x0E, 0x18, 0x65, 0x04, 0xAA }); // nn*3 + base -> X
+        put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x85, 0x06 }); // LDA $0000,X / STA $06: $06 = off, $07 = kind|wide
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xBD, 0x02, 0x00, 0x85, 0x10, 0xC2, 0x20 }); // $10 = the operate opcode index
+        // the target: the register (S-CPU) or the cell (SA-1), into [$08]
+        put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xF0, 0x16 }); // BEQ the SA-1's cell (22 bytes on)
+        // S-CPU: the register — $4202 + off, or $20DB + off for the mode-7 set
+        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00, 0xC9, 0x40, 0x00, 0xB0, 0x06 }); // off >= $40 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, 0x02, 0x42, 0x80, 0x30 }); // reg = $4202 + off; BRA store (6 + 42 bytes on)
+        put(&hb, &hc, &.{ 0x18, 0x69, 0xDB, 0x20, 0x80, 0x2A }); // reg = $20DB + off; BRA store (42 bytes of SA-1 path)
+        // SA-1: the cell — three ranges, the mode-7 product's and inputs' apart
+        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00 });
+        put(&hb, &hc, &.{ 0xC9, 0x59, 0x00, 0x90, 0x06 }); // off < $59 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_m7_prod - 0x59), @truncate((split_m7_prod - 0x59) >> 8), 0x80, 0x1A }); // cell = $36FC + (off - $59)
+        put(&hb, &hc, &.{ 0xC9, 0x40, 0x00, 0x90, 0x06 }); // off < $40 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_m7_last - 0x40), @truncate((split_m7_last - 0x40) >> 8), 0x80, 0x0F }); // cell = $36FA + (off - $40)
+        put(&hb, &hc, &.{ 0xC9, 0x08, 0x00, 0xB0, 0x06 }); // off < 8 ?
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_math_a), @truncate(split_math_a >> 8), 0x80, 0x04 }); // cell = $36F0 + off
+        put(&hb, &hc, &.{ 0x18, 0x69, @truncate(split_math_q - 0x12), @truncate((split_math_q - 0x12) >> 8) }); // cell = $36E4 + off
+        put(&hb, &hc, &.{ 0x85, 0x08, 0x64, 0x0A }); // STA $08 / STZ $0A (pointer bank 0)
+        // kind
+        put(&hb, &hc, &.{ 0xA5, 0x07, 0x29, 0x07, 0x00, 0xC9, 0x04, 0x00 }); // LDA $07 / AND #7 / CMP #4
+        put(&hb, &hc, &.{ 0x90, 0x03 }); // BCC stores, over the BRL
+        const brl_loads_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL loads (patched; past a short branch's reach)
+        // stores: the value from the saved register
+        put(&hb, &hc, &.{ 0xC9, 0x00, 0x00, 0xD0, 0x04, 0xA3, 0x08, 0x80, 0x15 }); // A
+        put(&hb, &hc, &.{ 0xC9, 0x01, 0x00, 0xD0, 0x04, 0xA3, 0x06, 0x80, 0x0C }); // X
+        put(&hb, &hc, &.{ 0xC9, 0x02, 0x00, 0xD0, 0x04, 0xA3, 0x04, 0x80, 0x03 }); // Y
+        put(&hb, &hc, &.{ 0xA9, 0x00, 0x00 }); // STZ: zero
+        put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x04, 0x87, 0x08, 0x80, 0x06 }); // BIT $06 (N = wide) / wide: STA [$08]
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0x87, 0x08, 0xC2, 0x20 }); // narrow: SEP / STA [$08] / REP
+        // SA-1: the triggers
+        put(&hb, &hc, &.{ 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 });
+        put(&hb, &hc, &.{ 0xF0, 0x03 }); // BEQ over the BRL: the SA-1 goes on to the triggers
+        const bne_exit1_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL exit (patched; the exit is past a short branch's reach)
+        put(&hb, &hc, &.{ 0xA5, 0x06, 0x29, 0xFF, 0x00 }); // off
+        put(&hb, &hc, &.{ 0xC9, 0x40, 0x00, 0xD0, 0x03 }); // $211B -> the M7A compose + product (BNE over the BRL: the block sits past the exit)
+        const brl_m7a_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // (patched)
+        put(&hb, &hc, &.{ 0xC9, 0x41, 0x00, 0xD0, 0x03 }); // $211C -> the product
+        const brl_m7b_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // (patched)
+        put(&hb, &hc, &.{ 0xC9, 0x01, 0x00, 0xF0, 0x17 }); // $4203 -> mul
+        put(&hb, &hc, &.{ 0xC9, 0x04, 0x00, 0xF0, 0x18 }); // $4206 -> div
+        put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x0A }); // narrow: exit
+        put(&hb, &hc, &.{ 0xC9, 0x00, 0x00, 0xF0, 0x09 }); // wide $4202 -> mul
+        put(&hb, &hc, &.{ 0xC9, 0x03, 0x00, 0xF0, 0x0A }); // wide $4205 -> div
+        const bra_exit2_at = hc;
+        put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        put(&hb, &hc, &.{ 0xEA, 0xEA }); // pad, keeps the branch arithmetic above exact
+        const mul_call_at = hc;
+        put(&hb, &hc, &.{ 0x22, @truncate(mul24), @truncate(mul24 >> 8), @truncate(mul24 >> 16) });
+        const bra_exit3_at = hc;
+        put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        const div_call_at = hc;
+        put(&hb, &hc, &.{ 0x22, @truncate(div24), @truncate(div24 >> 8), @truncate(div24 >> 16) });
+        const bra_exit4_at = hc;
+        put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        // loads: A = kind (4/5/6); three copies, one per saved slot
+        const loads_at = hc;
+        std.mem.writeInt(u16, hb[brl_loads_at + 1 ..][0..2], @intCast(loads_at - (brl_loads_at + 3)), .little);
+        put(&hb, &hc, &.{ 0xC9, 0x07, 0x00 }); // kind 7: operate
+        const beq_operate_at = hc;
+        put(&hb, &hc, &.{ 0xF0, 0x00 }); // BEQ operate (patched)
+        put(&hb, &hc, &.{ 0xC9, 0x05, 0x00, 0xF0, 0x20, 0xB0, 0x40 }); // 5 -> X copy, 6 -> Y copy, else A
+        const slots = [_]u8{ 0x09, 0x07, 0x05 }; // A, X, Y saved slots, +1 for the PHP
+        var exit_patches: [3]usize = undefined;
+        for (slots, 0..) |sl, k| {
+            put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x04, 0xA7, 0x08, 0x80, 0x04 }); // wide: LDA [$08]
+            put(&hb, &hc, &.{ 0xE2, 0x20, 0xA7, 0x08 }); // narrow: SEP / LDA [$08]
+            put(&hb, &hc, &.{ 0x08, 0x83, sl, 0xE2, 0x20, 0x68, 0x29, 0x82, 0x85, 0x0C }); // PHP / STA slot,S / SEP / PLA / AND #$82 / STA $0C
+            put(&hb, &hc, &.{ 0xA3, 0x0A, 0x29, 0x7D, 0x05, 0x0C, 0x83, 0x0A }); // saved P: keep all but N/Z, merge
+            exit_patches[k] = hc;
+            put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        }
+        std.debug.assert(hc - loads_at - 12 == 96); // three 32-byte copies
+        const exit_at = hc;
+        put(&hb, &hc, &.{ 0xC2, 0x30, 0xAB, 0x2B, 0x7A, 0xFA, 0x68, 0x40 }); // REP #$30 / PLB PLD PLY PLX PLA / RTI
+        // operate: the value into $0E, then the caller's A/X/Y/P back and
+        // the site's opcode run against $0E in its direct-page form — the
+        // caller's widths and carry govern, the result P lands in the
+        // saved P, A in the saved A (M-width: an 8-bit op leaves B alone).
+        // Dispatch by RTS through a pushed stub address: X is free for the
+        // lookup while the caller's X is still on the frame.
+        const operate_at = hc;
+        hb[beq_operate_at + 1] = @intCast(operate_at - (beq_operate_at + 2));
+        put(&hb, &hc, &.{ 0x24, 0x06, 0x10, 0x06, 0xA7, 0x08, 0x85, 0x0E, 0x80, 0x08 }); // wide: LDA [$08] / STA $0E
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA7, 0x08, 0x85, 0x0E, 0xC2, 0x20 }); // narrow: SEP / LDA [$08] / STA $0E / REP
+        put(&hb, &hc, &.{ 0xA5, 0x10, 0x29, 0xFF, 0x00, 0x0A, 0xAA }); // LDA $10 / AND #$FF / ASL / TAX
+        const optbl_ref = hc;
+        put(&hb, &hc, &.{ 0xBD, 0x00, 0x00, 0x3A, 0x48 }); // LDA optbl,X (patched) / DEC / PHA: the stub, for the RTS
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x0C, 0x48 }); // SEP #$20 / LDA $0C,S (caller P) / PHA
+        // the caller's X, Y, A from the frame (S-relative offsets after the
+        // two pushes above: A at $0B, X at $09, Y at $07)
+        put(&hb, &hc, &.{ 0xC2, 0x30, 0xA3, 0x09, 0xAA, 0xA3, 0x07, 0xA8, 0xA3, 0x0B }); // REP #$30 / LDA $09,S / TAX / LDA $07,S / TAY / LDA $0B,S
+        put(&hb, &hc, &.{ 0x28, 0x60 }); // PLP / RTS -> the stub
+        var stub_at: [operate_ops.len]usize = undefined;
+        var join_patches: [operate_ops.len]usize = undefined;
+        for (operate_dp, 0..) |dp, k| {
+            stub_at[k] = hc;
+            put(&hb, &hc, &.{ dp, 0x0E }); // op $0E
+            join_patches[k] = hc;
+            put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA join (patched)
+        }
+        const join_at = hc;
+        for (join_patches) |at| hb[at + 1] = @intCast(join_at - (at + 2));
+        put(&hb, &hc, &.{ 0x08, 0x83, 0x09 }); // PHP / STA $09,S -- A back (M-width)
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xA3, 0x01, 0x83, 0x0B, 0x68 }); // SEP / LDA $01,S (result P) / STA $0B,S (saved P) / PLA
+        const bra_exit5_at = hc;
+        put(&hb, &hc, &.{ 0x80, 0x00 }); // BRA exit (patched)
+        // the mode-7 multiplier (SA-1 only; REP #$20 is live, DBR 0, D scratch):
+        // a $211B write composes M7A = value<<8 | latch and latches the value
+        // (the register's own write-twice shape); either input recomputes
+        // the signed 16x8 product through MA/MB with M7B sign-extended.
+        std.mem.writeInt(u16, hb[brl_m7a_at + 1 ..][0..2], @intCast(hc - (brl_m7a_at + 3)), .little);
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x8D, @truncate(split_m7a + 1), @truncate((split_m7a + 1) >> 8) }); // SEP / hi := last
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0x8D, @truncate(split_m7a), @truncate(split_m7a >> 8) }); // lo := latch
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7_last), @truncate(split_m7_last >> 8), 0x8D, @truncate(split_m7_latch), @truncate(split_m7_latch >> 8), 0xC2, 0x20 }); // latch := last / REP
+        std.mem.writeInt(u16, hb[brl_m7b_at + 1 ..][0..2], @intCast(hc - (brl_m7b_at + 3)), .little);
+        put(&hb, &hc, &.{ 0xAD, @truncate(split_m7a), @truncate(split_m7a >> 8), 0x8D, 0x51, 0x22 }); // MA := M7A (16-bit)
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x8D, 0x53, 0x22 }); // MB lo
+        put(&hb, &hc, &.{ 0xA9, 0x00, 0x2C, @truncate(split_m7b), @truncate(split_m7b >> 8), 0x10, 0x02, 0xA9, 0xFF }); // sign-extend
+        put(&hb, &hc, &.{ 0x8D, 0x54, 0x22, 0xEA, 0xEA, 0xEA }); // MB hi (triggers) / the unit's 5 cycles
+        put(&hb, &hc, &.{ 0xC2, 0x20, 0xAD, 0x06, 0x23, 0x8D, @truncate(split_m7_prod), @truncate(split_m7_prod >> 8) }); // product low word
+        put(&hb, &hc, &.{ 0xE2, 0x20, 0xAD, 0x08, 0x23, 0x8D, @truncate(split_m7_prod + 2), @truncate((split_m7_prod + 2) >> 8), 0xC2, 0x20 }); // byte 2
+        const brl_exit6_at = hc;
+        put(&hb, &hc, &.{ 0x82, 0x00, 0x00 }); // BRL exit (patched)
+        const optbl_at = hc;
+        hc += operate_ops.len * 2;
+        std.mem.writeInt(u16, hb[bne_exit1_at + 1 ..][0..2], @intCast(exit_at - (bne_exit1_at + 3)), .little);
+        std.mem.writeInt(i16, hb[brl_exit6_at + 1 ..][0..2], @intCast(@as(isize, @intCast(exit_at)) - @as(isize, @intCast(brl_exit6_at + 3))), .little); // backward: the block sits past the exit
+        hb[bra_exit2_at + 1] = @intCast(exit_at - (bra_exit2_at + 2));
+        hb[bra_exit3_at + 1] = @intCast(exit_at - (bra_exit3_at + 2));
+        hb[bra_exit4_at + 1] = @intCast(exit_at - (bra_exit4_at + 2));
+        for (exit_patches) |at| hb[at + 1] = @intCast(exit_at - (at + 2));
+        hb[bra_exit5_at + 1] = @bitCast(@as(i8, @intCast(@as(isize, @intCast(exit_at)) - @as(isize, @intCast(bra_exit5_at + 2)))));
+        std.debug.assert(mul_call_at == bne_exit1_at + 3 + 5 + 16 + 5 + 5 + 4 + 5 + 5 + 2 + 2); // the trigger branches land on the calls
+        std.debug.assert(div_call_at == mul_call_at + 6);
+        // the block
+        const bank_tbl_at = hc;
+        const desc_at = hc + 0x80;
+        const total: u32 = @intCast(desc_at + @as(usize, n_sites) * 3);
+        const at = far.nextIn(0, total, carve, carve_len) orelse
+            return refuse(refusal, .{ .reason = .no_free_space, .detail = total });
+        const base: u16 = @intCast(0x8000 + at);
+        std.mem.writeInt(u16, hb[bank_tbl_ref + 1 ..][0..2], base + @as(u16, @intCast(bank_tbl_at)), .little);
+        std.mem.writeInt(u16, hb[optbl_ref + 1 ..][0..2], base + @as(u16, @intCast(optbl_at)), .little);
+        for (stub_at, 0..) |sa, k| std.mem.writeInt(u16, hb[optbl_at + k * 2 ..][0..2], base + @as(u16, @intCast(sa)), .little);
+        @memcpy(out[at .. at + hc], hb[0..hc]);
+        // per-bank descriptor tables, sites numbered in address order
+        var next: [0x40]u16 = undefined;
+        var cursor: usize = desc_at;
+        for (0..0x40) |bk| {
+            next[bk] = 0;
+            const t: u16 = base + @as(u16, @intCast(cursor));
+            std.mem.writeInt(u16, out[at + bank_tbl_at + bk * 2 ..][0..2], t, .little);
+            cursor += @as(usize, per_bank[bk]) * 3;
+        }
+        for (descs[0..n_sites]) |dsc| {
+            const bk: usize = (dsc.addr >> 16) & 0x3F;
+            const t = std.mem.readInt(u16, out[at + bank_tbl_at + bk * 2 ..][0..2], .little) - 0x8000;
+            const nn = next[bk];
+            next[bk] += 1;
+            out[t + nn * 3] = dsc.off;
+            out[t + nn * 3 + 1] = dsc.kind;
+            out[t + nn * 3 + 2] = dsc.opi;
+            const file = splitFile(dsc.addr);
+            sites[n_out.*] = .{ .addr = dsc.addr, .len = dsc.len, .bytes = undefined };
+            @memcpy(sites[n_out.*].bytes[0..dsc.len], out[file..][0..dsc.len]);
+            n_out.* += 1;
+            out[file] = 0x02; // COP
+            out[file + 1] = @intCast(nn);
+            @memset(out[file + 2 ..][0 .. dsc.len - 2], 0xEA);
+        }
+        // the native COP vector, both CPUs' (the SA-1 does not intercept it)
+        std.mem.writeInt(u16, out[0x7FE4..0x7FE6], base, .little);
+    }
+    res.stats.split_mul = @intCast(@min(n_sites, 255));
+    res.stats.split_math_sites = n_sites + res.stats.split_math_direct;
 }
 
 /// The shared IO machinery: per-routine drain trampolines, enqueue
@@ -4998,6 +7269,7 @@ fn emitSplitIo(
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
         if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+        const e16: u16 = @truncate(io.entry);
         tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
         if (io.rtl) {
             const helper = tramp_addrs[i] + 5;
@@ -5006,9 +7278,9 @@ fn emitSplitIo(
             const helper = tramp_addrs[i] + 4;
             put(d, &cur, &.{ 0x20, @truncate(helper), @truncate(helper >> 8), 0x60 });
         }
-        @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
+        @memcpy(d[cur .. cur + span], out[splitFile(io.entry)..][0..span]);
         cur += span;
-        put(d, &cur, &.{ 0x4C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8) });
+        put(d, &cur, &.{ 0x4C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8) });
     }
     // Enqueue stubs live in the FAR pool — seventeen of them overran
     // the carve, and a stripped assert let the overflow eat the shim.
@@ -5106,9 +7378,10 @@ fn emitSplitIo(
         put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
         {
             const span = splitPrefixSpan(out, usage, io.entry, 3);
-            @memcpy(fb[fc .. fc + span], out[io.entry - 0x8000 ..][0..span]);
+            const e16: u16 = @truncate(io.entry);
+            @memcpy(fb[fc .. fc + span], out[splitFile(io.entry)..][0..span]);
             fc += span;
-            put(fb, &fc, &.{ 0x5C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8), 0x00 }); // JML back into the body
+            put(fb, &fc, &.{ 0x5C, @truncate(e16 + @as(u16, @intCast(span))), @truncate((e16 + @as(u16, @intCast(span))) >> 8), 0x00 }); // JML back into the body
         }
         if (fc > need) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
         std.mem.writeInt(u16, d[hop_jml_at + 1 ..][0..2], fbase, .little);
@@ -5123,9 +7396,10 @@ fn emitSplitIo(
     // --- displacements, last: everything they jump into now exists ----
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
-        out[io.entry - 0x8000] = 0x4C; // JMP enq — frameless, so pushes in the prefix are legal
-        std.mem.writeInt(u16, out[io.entry - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
-        if (span > 3) @memset(out[io.entry - 0x8000 + 3 ..][0 .. span - 3], 0xEA);
+        const f = splitFile(io.entry);
+        out[f] = 0x4C; // JMP enq — frameless, so pushes in the prefix are legal
+        std.mem.writeInt(u16, out[f + 1 ..][0..2], enq_addrs[i], .little);
+        if (span > 3) @memset(out[f + 3 ..][0 .. span - 3], 0xEA);
     }
     res.stats.split_io = @intCast(spec.io_entries.len);
     curp.* = cur;
@@ -5740,10 +8014,25 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         sites[n_sites] = .{ .file = file, .kind = kind, .reg = v, .idx = idx };
                         n_sites += 1;
-                    } else return refuse(refusal, .{
-                        .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
-                        .detail = cpu_addr,
-                    });
+                    } else {
+                        // Window mode: leave the site native rather than
+                        // refuse. If DBR is really WRAM at runtime, the
+                        // value re-bank to $40/$41 makes the native absolute
+                        // read the moved byte anyway — linear BW-RAM carries
+                        // the whole 64 KiB, not just the window's 8 —  and
+                        // under any other DBR the read returns what stock's
+                        // bus returned (open bus, cart space), except the
+                        // window range itself, which verification arbitrates.
+                        // Measured on Super Metroid: Ridley's AI does
+                        // LDA $7820 under an unproven DBR (open bus on the
+                        // stock cart) and refused the whole conversion over
+                        // a read the game discards.
+                        if (window) continue;
+                        return refuse(refusal, .{
+                            .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
+                            .detail = cpu_addr,
+                        });
+                    }
                 },
                 .long, .long_x => {
                     const b = image[file + 3];
@@ -5959,6 +8248,10 @@ pub fn convertWholeGame(
         }
     }
     res.stats.rewritten_demirror = n_demirror;
+    // The class the coverage-gated pass above structurally cannot see:
+    // mirror JSLs at sites no surface and no walk ever reached.
+    if (image.len > 0x20_0000)
+        res.stats.rewritten_twin_jsls = try demirrorTwinJsls(gpa, image, out, cov);
     res.stats.expanded_to = if (win_expand_to > image.len) win_expand_to else 0;
     {
         var ab: u32 = 0;
@@ -6514,6 +8807,7 @@ pub fn convertWholeGame(
             }
         }
     }
+    if (bwram) res.stats.rewritten_queue_imms += demirrorQueueBankImms(out, out.len > 0x20_0000);
     // Measured pointer-bank sources: table bytes (and immediate operands
     // the shape pass above didn't already reach) that carry $7E/$7F into
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is
@@ -6591,6 +8885,38 @@ pub fn convertWholeGame(
             }
         }
     };
+    // Data no evidence can reach in full: Super Metroid's room-state level
+    // pointers, one per state, each naming MB2. The profile proves the
+    // states it loaded; the room graph names all of them.
+    if (bwram and image.len > 0x20_0000) {
+        const hdr = header_mod.detect(image) catch null;
+        if (hdr != null and std.mem.startsWith(u8, &hdr.?.title, "Super Metroid")) {
+            const walk = try rebankSmRoomLevelPointers(gpa, image, out);
+            res.stats.rewritten_room_level_banks = walk.rebanked;
+            res.stats.room_walk_rooms = walk.rooms;
+            res.stats.room_walk_states = walk.states;
+            res.stats.room_walk_refused_at = walk.refused_at;
+            res.stats.rewritten_bg_banks = walk.bg_banks;
+            res.stats.bg_records = walk.bg_records;
+            const inl = rebankSmDecompInlineDests(image, out);
+            res.stats.rewritten_decomp_inline_banks = inl.rebanked;
+            res.stats.decomp_inline_sites = inl.sites;
+            const ts = rebankSmTilesetTable(image, out);
+            res.stats.rewritten_tileset_banks = ts.rebanked;
+            res.stats.tileset_records = ts.states;
+            res.stats.tileset_refused_at = ts.refused_at;
+            const en = rebankSmEnemyHeaders(image, out);
+            res.stats.rewritten_enemy_banks = en.rebanked;
+            res.stats.enemy_headers = en.states;
+            const ps = rebankSmPointerSeeds(image, out);
+            res.stats.pointer_seed_sites = ps.sites;
+            res.stats.rewritten_pointer_seeds = ps.rebanked;
+            const am = rebankSmAreaMapTable(image, out);
+            res.stats.area_map_entries = am.states;
+            res.stats.rewritten_area_map_banks = am.rebanked;
+            res.stats.area_map_refused_at = am.refused_at;
+        }
+    }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
     // $A0-$BF -> -$80 (MB1's home), $C0-$DF -> -$20 (MB2's home), else
     // untouched. Both idioms span 4 bytes at the site.
@@ -7097,6 +9423,20 @@ pub fn convertWholeGame(
         }
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
+        // The mainloop split's stubs and COP handler store into I-RAM from
+        // the S-CPU from the first frame on (boot-time IO calls, boot-time
+        // math), long before the engage stub's own SIWP open: open it here.
+        if (ml_split != null) {
+            wn = emitStore(d, wn, 0x2229, 0xFF);
+            // The split's cells are power-on garbage until the first engage
+            // resets them — and the NMI hook drains the ring from the first
+            // frame (measured: boot-era NMIs replayed nonsense ids and the
+            // intro gained four lag frames). Zero them here.
+            wn = emitStore(d, wn, split_ring_wr, 0x00);
+            wn = emitStore(d, wn, split_ring_rd, 0x00);
+            wn = emitStore(d, wn, split_in_replay, 0x00);
+            wn = emitStore(d, wn, split_owner, 0x00);
+        }
         if (boot) |b| {
             // Boot the SA-1 into the window dispatcher; the async busy
             // flag starts idle (I-RAM is garbage at power-on, and SIWP
@@ -7122,7 +9462,7 @@ pub fn convertWholeGame(
         std.debug.assert(wn <= wg_window_shim_max);
         // Reset -> shim; the other vectors stay the game's own unless an
         // async offload injected its NMI prologue above.
-        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, &far, refusal, &res);
+        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, &far, carve, carve_len, refusal, &res);
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
@@ -9265,7 +11605,7 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     for ([_]u32{ 0x8050, 0x8051, 0x8054, 0x8055 }) |a| markOp(bytes, a);
 
     const io = [_]SplitIo{ .{ .entry = 0x8040 }, .{ .entry = 0x8060, .deferred = true, .rtl = true } };
-    const vr = [_][2]u16{.{ 0x8014, 0x8040 }};
+    const vr = [_][2]u24{.{ 0x8014, 0x8040 }};
     var ref: ?Refusal = null;
     const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
         .io_entries = &io,
@@ -9278,8 +11618,8 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     // The anchors wear their displacements.
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x0040]); // JMP enq
-    // The mainloop's $4212 reads look at the mirror now.
-    try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x0019..0x001B], .little));
+    // The mainloop's $4212 read goes through a reader helper now.
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0018]);
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
@@ -9310,6 +11650,207 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     try testing.expect(con.bus.sa1.bwram[0x0102] >= 3);
     try testing.expect(con.bus.sa1.bwram[0x0102] <= con.bus.sa1.bwram[0x0100]);
     // And the low-WRAM home of the counter stayed abandoned.
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
+}
+
+test "split mainloop: a second bank, the mode-gate handoff and the math shadow" {
+    // The bank-general mainloop flavor end to end. The loop lives in bank
+    // $01 and alternates the mode cell every lap, so ownership ping-pongs
+    // between the CPUs at the anchor; each lap multiplies 12x13 and
+    // divides 1000/7 through the S-CPU's math registers and ACCUMULATES
+    // the results — a lap the SA-1 computes wrong (its shadow) or a lap
+    // lost in a handoff breaks the totals against the lap count. An
+    // RTS-shaped IO routine in bank $01 writes WMDATA (real on the S-CPU
+    // only, replayed by the pump for the SA-1's laps); a deferred RTL one
+    // in bank $00 counts its own runs.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    const rom = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(rom);
+    for (rom, 0..) |*b, i| b.* = @truncate(0x11 + i *% 7);
+    {
+        const h = rom[0x7FC0..][0..64];
+        @memcpy(h[0..21], "WG MIGRATION TEST    ");
+        h[0x15] = 0x20;
+        h[0x16] = 0x00;
+        h[0x17] = 7; // 128 KiB
+        h[0x18] = 0;
+        std.mem.writeInt(u16, h[0x1C..0x1E], 0xFFFF, .little);
+        std.mem.writeInt(u16, h[0x1E..0x20], 0x0000, .little);
+        @memset(h[0x20..0x40], 0);
+        std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+        std.mem.writeInt(u16, h[0x2A..0x2C], 0x8050, .little); // NMI
+    }
+    @memset(rom[0x1000..0x7FC0], 0xFF); // bank $00 carve space
+    @memset(rom[0x8000..0x10000], 0xFF); // bank $01: the loop, then padding
+    // bank $00: boot, the deferred RTL routine, the NMI handler
+    @memcpy(rom[0x0000..0x001C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
+        0xA9, 0x10, 0x8D, 0x82, 0x21, // LDA #$10 / STA $2182
+        0x9C, 0x83, 0x21, // STZ $2183
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
+        0xF4, 0x00, 0x01, 0x2B, // PEA $0100 / PLD (the shift moves it to $6100) — a nonzero D the lap USES (below): a
+        // handoff that hands the SA-1 a wrong D breaks the remainder total
+        // (the cells once overlapped: P's store clobbered D's high byte)
+        0x5C, 0x00, 0x80, 0x01, // JML $01:8000
+    });
+    @memcpy(rom[0x0060..0x0064], &[_]u8{ 0xEE, 0x02, 0x01, 0x6B }); // INC $0102 / RTL
+    @memcpy(rom[0x0050..0x0056], &[_]u8{ 0x48, 0xAD, 0x10, 0x42, 0x68, 0x40 }); // NMI ack
+    // bank $01: the loop
+    const loop = [_]u8{
+        0xC2, 0x20, 0xEA, 0xEA, 0xEA, // 8000 anchor: REP #$20 and NOPs (5 bytes: the site keeps a JML + fill)
+        0xE2, 0x20, // 8005 SEP #$20
+        0xAD, 0x12, 0x42, // 8007 LDA $4212 (mirror-swapped)
+        0x10, 0xFB, // 800A BPL — wait for vblank
+        0xA9, 0x0C, 0x8D, 0x02, 0x42, // 800C LDA #12 / STA $4202
+        0xA9, 0x0D, 0x8D, 0x03, 0x42, // 8011 LDA #13 / STA $4203
+        0xEA, 0xEA, 0xEA, 0xEA, // 8016 the multiplier's 8 cycles
+        0xC2, 0x20, // 801A REP #$20
+        0xAD, 0x16, 0x42, // 801C LDA $4216 — the product
+        0x18, 0x6D, 0x04, 0x01, 0x8D, 0x04, 0x01, // 801F CLC / ADC $0104 / STA $0104
+        0xA9, 0xE8, 0x03, 0x8D, 0x04, 0x42, // 8026 LDA #1000 / STA $4204 (16-bit dividend)
+        0xE2, 0x20, // 802C SEP #$20
+        0xA9, 0x07, 0x8D, 0x06, 0x42, // 802E LDA #7 / STA $4206
+        0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, // 8033 the divider's 16 cycles
+        0xC2, 0x20, // 803B REP #$20
+        0xAD, 0x14, 0x42, // 803D LDA $4214 — the quotient
+        0x18, 0x6D, 0x06, 0x01, 0x8D, 0x06, 0x01, // 8040 += into $0106
+        0xA5, 0x08, 0xEA, // 8047 LDA $08 — the remainder total, direct-page ($6108: D=$6100)
+        0x18, 0x6D, 0x16, 0x42, 0x85, 0x08, 0xEA, // 804A CLC / ADC $4216 — the remainder, through an ALU read of the register / STA $08
+        0xE2, 0x20, // 8051 SEP #$20
+        0x20, 0x80, 0x80, // 8053 JSR $8080 — the RTS-shaped IO routine (bank $01)
+        0x22, 0x60, 0x80, 0x00, // 8056 JSL $00:8060 — the deferred RTL one
+        0xC2, 0x20, 0xEE, 0x00, 0x01, 0xE2, 0x20, // 805A the lap counter (16-bit), at the lap's END
+        0xAD, 0x00, 0x01, 0x29, 0x01, 0x8D, 0x10, 0x01, // 8061 LDA $0100 / AND #1 / STA $0110 — the mode cell
+        0x4C, 0x90, 0x80, // 8069 JMP $8090 — the mode-7 multiply, then around
+    };
+    @memcpy(rom[0x8000 .. 0x8000 + loop.len], &loop);
+    @memcpy(rom[0x8080..0x8087], &[_]u8{ 0xAD, 0x00, 0x01, 0x8D, 0x80, 0x21, 0x60 }); // LDA $0100 / STA $2180 / RTS
+    // the PPU's mode-7 multiplier as a signed 16x8 unit: -2 x 3 = -6 into $010A
+    @memcpy(rom[0x8090..0x80B2], &[_]u8{
+        0xE2, 0x20, // 8090 SEP #$20
+        0xA9, 0xFE, 0x8D, 0x1B, 0x21, // 8092 LDA #$FE / STA $211B (low)
+        0xA9, 0xFF, 0x8F, 0x1B, 0x21, 0x00, // 8097 LDA #$FF / STA $00:211B (high, long form)
+        0xA9, 0x03, 0x8D, 0x1C, 0x21, // 809D LDA #3 / STA $211C
+        0xC2, 0x20, // 80A2 REP #$20
+        0xAF, 0x34, 0x21, 0x00, // 80A4 LDA $00:2134 (long form) — the product's low word: $FFFA
+        0x18, 0x6D, 0x0A, 0x01, 0x8D, 0x0A, 0x01, // 80A8 CLC / ADC $010A / STA $010A
+        0x4C, 0x00, 0x80, // 80AF JMP $8000
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const mark = struct {
+        fn f(u: []u8, a: u32, m8: bool) void {
+            u[a] |= usage_map.flag_opcode | usage_map.flag_exec | usage_map.flag_x;
+            if (m8) u[a] |= usage_map.flag_m;
+        }
+    }.f;
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8017, 0x8018 }) |a| mark(bytes, a, true);
+    for ([_]u32{ 0x8060, 0x8063, 0x8050, 0x8051, 0x8054, 0x8055 }) |a| mark(bytes, a, true);
+    // the loop: 8-bit until 801A, 16-bit to 802C, 8-bit to 803B, 16-bit to 8051, 8-bit after
+    for ([_]u32{ 0x8000, 0x8002, 0x8003, 0x8004, 0x8005, 0x8007, 0x800A, 0x800C, 0x800E, 0x8011, 0x8013, 0x8016, 0x8017, 0x8018, 0x8019, 0x801A }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x801C, 0x801F, 0x8020, 0x8023, 0x8026, 0x8029, 0x802C }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x802E, 0x8030, 0x8033, 0x8034, 0x8035, 0x8036, 0x8037, 0x8038, 0x8039, 0x803A, 0x803B }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x8049, 0x804A, 0x804B, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x8053, 0x8056, 0x805A, 0x805C, 0x805F, 0x8061, 0x8064, 0x8066, 0x8069, 0x8080, 0x8083, 0x8086 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x8090, 0x8092, 0x8094, 0x8097, 0x8099, 0x809D, 0x809F, 0x80A2 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x80A4, 0x80A8, 0x80A9, 0x80AC, 0x80AF }) |a| mark(bytes, 0x01_0000 | a, false);
+
+    const io = [_]SplitIo{ .{ .entry = 0x01_8080 }, .{ .entry = 0x00_8060, .deferred = true, .rtl = true } };
+    const vr = [_][2]u24{.{ 0x01_8005, 0x01_8069 }};
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
+        .io_entries = &io,
+        .vbl_ranges = &vr,
+        .mainloop = 0x01_8000,
+        .mode_cell = 0x0110,
+        .mode_value = 0,
+        .mode_gate = true,
+    }, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 2), res.stats.split_io);
+    try testing.expect(res.stats.split_engage_addr != 0);
+    // Eleven math sites shadowed (seven on the S-CPU's unit, four on the
+    // mode-7 one): the five trigger stores as JSLs to their own far
+    // routines, the six others as COPs; the one hazard the audit lists is
+    // the NMI handler's $4210 ack read, which only the S-CPU ever runs.
+    try testing.expectEqual(@as(u8, 6), res.stats.split_mul);
+    try testing.expectEqual(@as(u32, 5), res.stats.split_trigger_jsl);
+    try testing.expectEqual(@as(u8, 1), res.stats.n_split_hazards);
+    try testing.expectEqual(@as(u24, 0x00_8051), res.stats.split_hazards[0]);
+    // The anchors wear their displacements, in their own banks.
+    try testing.expectEqual(@as(u8, 0x5C), res.image[0x8000]); // JML engage at $01:8000
+    try testing.expectEqual(@as(u8, 0xEA), res.image[0x8004]); // the 5th byte NOP-filled
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x8080]); // JMP stub at $01:8080
+    try testing.expect(std.mem.readInt(u16, res.image[0x8081..0x8083], .little) >= 0x8000); // a bank-$01 stub
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x0060]); // JMP stub at $00:8060
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x800E]); // COP at STA $4202
+    try testing.expectEqual(@as(u8, 0xEA), res.image[0x8010]);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x804B]); // COP at ADC $4216: the operate kind
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8099]); // JSL at STA $00:211B (a 4-byte site: no rider)
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8013]); // JSL at STA $4203, carrying the NOP after it
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x80A4]); // COP at LDA $00:2134
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x01_8000);
+    con.bus.sa1.trace = trace;
+    for (0..12) |_| con.runFrame();
+
+    const laps = std.mem.readInt(u16, con.bus.sa1.bwram[0x0100..0x0102], .little);
+    const acc_mul = std.mem.readInt(u16, con.bus.sa1.bwram[0x0104..0x0106], .little);
+    const acc_q = std.mem.readInt(u16, con.bus.sa1.bwram[0x0106..0x0108], .little);
+    const acc_r = std.mem.readInt(u16, con.bus.sa1.bwram[0x0108..0x010A], .little);
+    const acc_m7 = std.mem.readInt(u16, con.bus.sa1.bwram[0x010A..0x010C], .little);
+    // Laps ran on BOTH CPUs (the SA-1's trace saw the loop; the gate
+    // alternates), and the math totals match the lap count exactly:
+    // the shadow's product, quotient and remainder equal the S-CPU's.
+    try testing.expect(trace.total > 0);
+    try testing.expect(laps >= 6);
+    // The run stops mid-lap: the lap in flight may have done its sums and
+    // not yet counted itself, so the totals stand for `laps` or `laps + 1`
+    // laps — the same number for all three.
+    // (the lap in flight may also have stopped BETWEEN its three sums, so
+    // each total is exact for its own count, the counts descending)
+    const k_mul: u16 = acc_mul / 156;
+    const k_q: u16 = acc_q / 142;
+    const k_r: u16 = acc_r / 6;
+    try testing.expect(k_mul == laps or k_mul == laps + 1);
+    try testing.expect(k_q == laps or k_q == laps + 1);
+    try testing.expect(k_r == laps or k_r == laps + 1);
+    try testing.expect(k_mul >= k_q and k_q >= k_r);
+    try testing.expectEqual(@as(u16, k_mul *% 156), acc_mul);
+    try testing.expectEqual(@as(u16, k_q *% 142), acc_q);
+    try testing.expectEqual(@as(u16, k_r *% 6), acc_r);
+    // the mode-7 product: -6 per lap, on both units (it follows the lap
+    // counter, so the total stands for `laps` or `laps - 1`)
+    const neg6: u16 = 0xFFFA;
+    try testing.expect(acc_m7 == laps *% neg6 or acc_m7 == (laps -% 1) *% neg6);
+    // The IO routine's WMDATA writes landed in real WRAM — natively on the
+    // S-CPU's laps, through the pump on the SA-1's.
+    var wm_writes: usize = 0;
+    for (con.bus.wram.data[0x1000..0x1100]) |b| {
+        if (b != 0) wm_writes += 1;
+    }
+    try testing.expect(wm_writes >= 4);
+    // The deferred routine ran once per lap, never twice.
+    const deferred_runs = std.mem.readInt(u16, con.bus.sa1.bwram[0x0102..0x0104], .little);
+    try testing.expect(deferred_runs >= 4);
+    try testing.expect(deferred_runs <= laps);
+    // The low-WRAM homes stayed abandoned.
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
 }
 

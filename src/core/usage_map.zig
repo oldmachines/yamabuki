@@ -249,9 +249,20 @@ pub const PtrBankEvidence = struct {
     /// and rendered the room as a full-screen tile-sheet).
     hdma_tables: [max_hdma_tables]u24,
     n_hdma_tables: usize,
+    /// FIFO cursor for `addHdmaTable` once the list is full. A scrolling
+    /// HDMA effect re-arms with a SHIFTED table base every frame, so the
+    /// distinct-address family is unbounded and fills any fixed list; a
+    /// silent drop at capacity then starves every later surface (measured:
+    /// Super Metroid's Ceres-ARRIVAL $2105 table, armed 14,680 times by
+    /// the gameplay surface, lost to the attract surface's scroll-effect
+    /// churn). Overwriting the oldest instead keeps whatever still arms:
+    /// a table re-armed every frame re-enters at worst one eviction later,
+    /// and the relocation walk is idempotent, so a shifted base costs a
+    /// slot but never a wrong byte.
+    ht_cursor: usize,
 
     pub const none: u32 = 0xFFFF_FFFF;
-    pub const max_hdma_tables = 32;
+    pub const max_hdma_tables = 128;
     pub const max_proven = 256;
     pub const max_unres = 48;
     pub const max_xl = 32;
@@ -277,13 +288,18 @@ pub const PtrBankEvidence = struct {
         .n_xl = 0,
         .hdma_tables = undefined,
         .n_hdma_tables = 0,
+        .ht_cursor = 0,
     };
 
     pub fn addHdmaTable(self: *PtrBankEvidence, table: u24) void {
         for (self.hdma_tables[0..self.n_hdma_tables]) |t| if (t == table) return;
-        if (self.n_hdma_tables == max_hdma_tables) return;
-        self.hdma_tables[self.n_hdma_tables] = table;
-        self.n_hdma_tables += 1;
+        if (self.n_hdma_tables < max_hdma_tables) {
+            self.hdma_tables[self.n_hdma_tables] = table;
+            self.n_hdma_tables += 1;
+        } else {
+            self.hdma_tables[self.ht_cursor] = table;
+            self.ht_cursor = (self.ht_cursor + 1) % max_hdma_tables;
+        }
     }
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
