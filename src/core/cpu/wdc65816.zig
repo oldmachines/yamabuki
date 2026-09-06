@@ -362,7 +362,7 @@ pub fn Cpu(comptime BusT: type) type {
                     value >= dbg_watch_val_min)
                 {
                     const has_clk = @hasField(BusT, "clock");
-                    const clk: u64 = if (has_clk) self.bus.clock else 0;
+                    const clk: u64 = if (has_clk) self.bus.clock else if (@hasField(BusT, "last_sync") and @hasField(BusT, "budget")) self.bus.last_sync -% @as(u64, @intCast(@max(self.bus.budget, 0))) else 0;
                     if (has_clk and clk >= dbg_watch_from) dbg_watch_armed = true;
                     if ((has_clk and clk >= dbg_watch_from) or (!has_clk and dbg_watch_armed)) {
                         dbg_watch_n += 1;
