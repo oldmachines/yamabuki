@@ -6239,51 +6239,19 @@ fn emitSplit(
     const hook16: u16 = base16 + @as(u16, @intCast(cur));
     put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x0B, 0x8B, 0x4B, 0xAB, 0xE2, 0x30 }); // PHP / REP / PHA PHX PHY PHD PHB / PHK PLB / SEP #$30
     put(d, &cur, &.{ 0xAD, @truncate(split_owner), @truncate(split_owner >> 8) }); // the SA-1 owns the loop?
-    const bne_owned_at = cur;
-    put(d, &cur, &.{ 0xD0, 0x00 }); // BNE owned (patched)
-    // S-CPU-owned, in the SA-1's copy (the lower hook brought it here and
-    // the mode left the range before the anchor engaged): back to the
-    // pure-stock copy, whose laps cost nothing.
-    if (dual) {
-        if (spec.mode_gate) {
-            put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 }); // LDA $00:home (8-bit)
-            put(d, &cur, &.{ 0xC9, spec.mode_value, 0x90, 0x04 }); // below lo: switch (BCC over the range check)
-            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0x90, 0x18 }); // in range: out (BCC over the 24-byte switch)
-        }
-        put(d, &cur, &.{ 0xA9, 0x80, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x81, 0x8F, 0x21, 0x22, 0x00 });
-        put(d, &cur, &.{ 0xA9, 0x80, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x82, 0x8F, 0x23, 0x22, 0x00 }); // 24 bytes: megabytes 0/1/0/2
-    }
-    const bra_hook_out_at = cur;
-    put(d, &cur, &.{ 0x80, 0x00 }); // BRA out (patched)
-    d[bne_owned_at + 1] = @intCast(cur - (bne_owned_at + 2));
+    put(d, &cur, &.{ 0xF0, 0x08 }); // BEQ over the call: nothing to drain in the S-CPU's own eras
     put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 }); // the pump mid-drain? stand down
     put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the call
     put(d, &cur, &.{ 0x20, @truncate(drain16), @truncate(drain16 >> 8) });
-    d[bra_hook_out_at + 1] = @intCast(cur - (bra_hook_out_at + 2));
     put(d, &cur, &.{ 0xC2, 0x30, 0xAB, 0x2B, 0x7A, 0xFA, 0x68, 0x28 }); // REP / PLB PLD PLY PLX PLA / PLP
     put(d, &cur, &.{ 0x5C, @truncate(nmi_vec), @truncate(nmi_vec >> 8), 0x00 }); // JML the game's handler
     std.mem.writeInt(u16, out[0x7FEA..0x7FEC], hook16, .little);
-    // --- the LOWER copy's NMI hook (dual image): the pure-stock copy has no
-    // anchor at all — its laps are stock's, cycle for cycle (measured: the
-    // anchor's ~120 cycles a lap flipped razor-edge intro laps; even v66's
-    // thunks shift two). Once a frame it reads the mode cell and, in the
-    // gate's range, maps the SA-1's copy in: the lap in flight finishes
-    // there and the next anchor engages. Long stores: the interrupted DBR
-    // is anything.
-    var hooklo16: u16 = 0;
-    if (dual) {
-        hooklo16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP / SEP #$20 / PHA
-        if (spec.mode_gate) {
-            put(d, &cur, &.{ 0xAF, @truncate(mode_home), @truncate(mode_home >> 8), 0x00 });
-            put(d, &cur, &.{ 0xC9, spec.mode_value, 0x90, 0x1C }); // below lo: out (BCC over 4 + 24)
-            put(d, &cur, &.{ 0xC9, (if (spec.mode_hi != 0) spec.mode_hi else spec.mode_value) +% 1, 0xB0, 0x18 }); // above hi: out (BCS over 24)
-        }
-        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x20, 0x22, 0x00, 0xA9, 0x85, 0x8F, 0x21, 0x22, 0x00 });
-        put(d, &cur, &.{ 0xA9, 0x84, 0x8F, 0x22, 0x22, 0x00, 0xA9, 0x86, 0x8F, 0x23, 0x22, 0x00 }); // 24 bytes: megabytes 4/5/4/6 (measured: a 20-byte hop landed on the last store and wrote the mode into FXB)
-        put(d, &cur, &.{ 0x68, 0x28 }); // PLA / PLP
-        put(d, &cur, &.{ 0x5C, @truncate(nmi_vec), @truncate(nmi_vec >> 8), 0x00 }); // JML the game's handler
-    }
+    // (No NMI hook in the S-CPU's copy. A pure-stock lower copy with a
+    // per-NMI mode check was tried — s19h — and forked the tier's intro at
+    // frame 2386: a hook on every NMI pays its ~45 cycles on every frame
+    // of a long lag streak, and the intro's 51-frame load became 52
+    // ($05BB, the record of consecutive lag frames). The anchor pays per
+    // LAP — once for that load — and passes.)
     // takeover (S-CPU): the SA-1 handed the loop back — its context is
     // in the cells; the game stack is where the S-CPU left it.
     std.mem.writeInt(u16, d[brl_take_at + 1 ..][0..2], @intCast(cur - (brl_take_at + 3)), .little);
@@ -6436,8 +6404,6 @@ fn emitSplit(
 
     // --- displace the mainloop anchor, last -----------------------------
     const mf = splitFile(ml24);
-    var anchor_bytes: [8]u8 = undefined;
-    @memcpy(anchor_bytes[0..mlspan], out[mf..][0..mlspan]);
     out[mf] = 0x5C; // JML engage
     std.mem.writeInt(u16, out[mf + 1 ..][0..2], engage16, .little);
     out[mf + 3] = 0x00;
@@ -6461,11 +6427,12 @@ fn emitSplit(
             const f = splitFile(ds.addr);
             @memcpy(out[f..][0..ds.len], ds.bytes[0..ds.len]);
         }
-        // The anchor too: the S-CPU's copy is stock byte for byte. Its NMI
-        // vector goes through the lower hook, which maps the SA-1's copy in
-        // when the mode enters the gate's range (see hooklo16).
-        @memcpy(out[mf..][0..mlspan], anchor_bytes[0..mlspan]);
-        std.mem.writeInt(u16, out[0x7FEA..0x7FEC], hooklo16, .little);
+        // The NMI hook too: only the SA-1's copy vectors NMI through it (the
+        // vector lives in each copy's bank $00). The S-CPU's own eras run
+        // the game's handler untouched — measured: the hook's ~70 cycles on
+        // every intro NMI were enough to fork the intro. The anchor stays
+        // in both copies: its cost is per lap, which a lag streak pays once.
+        std.mem.writeInt(u16, out[0x7FEA..0x7FEC], nmi_vec, .little);
         res.stats.split_dual = true;
     }
 }
