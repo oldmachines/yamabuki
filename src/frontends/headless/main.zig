@@ -899,6 +899,18 @@ fn saveRegion(cart: anytype) ?[]u8 {
 /// Drop a battery save into the save region: zero it, then the file's
 /// bytes at the front (a smaller chip's save in a larger region reads back
 /// through the game's own mirroring). False when nothing takes it.
+/// A take's `.start.srm` sidecar into a fresh console, before any anchor
+/// state: every surface replay the generator or the verifier makes must
+/// start from the save the take was recorded on. MEASURED without this:
+/// the save-anchored per-poll surfaces replayed from a save-less power-on
+/// on BOTH machines (the title screen and the attract), their walls never
+/// drifted, and the wide gate "passed" them — vacuously.
+fn applySidecar(con: anytype, mov: ?util.movie.Movie) void {
+    const m = mov orelse return;
+    const data = m.start_srm orelse return;
+    _ = loadSaveBytes(con.bus.cart, data);
+}
+
 fn loadSaveBytes(cart: anytype, data: []const u8) bool {
     const region = saveRegion(cart) orelse return false;
     if (data.len == 0 or data.len > region.len) return false;
@@ -1148,6 +1160,7 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
         gpa.destroy(con);
     }
     con.init(cart);
+    applySidecar(con, mov);
     // Anchored runs learn the mask from the anchored scene — a mask
     // learned at the attract demo says nothing about a gameplay stage's
     // wall-coupled bytes.
@@ -1371,10 +1384,11 @@ fn verifyBehavioral(
         oc_lo: u8 = 0,
         oc_hi: u8 = 0,
 
-        fn init(al: std.mem.Allocator, image: []const u8) !@This() {
+        fn init(al: std.mem.Allocator, image: []const u8, m: ?util.movie.Movie) !@This() {
             const cart = try core.Cartridge.load(al, image);
             const con = try al.create(core.FastConsole);
             con.init(cart);
+            applySidecar(con, m);
             const snap = try al.create(core.bus.Bus.TickSnap);
             snap.* = .{};
             @memset(&snap.live, 0);
@@ -1414,8 +1428,8 @@ fn verifyBehavioral(
         }
     };
 
-    var base = try Side.init(gpa, base_image);
-    var conv = try Side.init(gpa, conv_image);
+    var base = try Side.init(gpa, base_image, mov);
+    var conv = try Side.init(gpa, conv_image, mov);
     conv.pad = dbg_conv_pad;
     base.oc = dbg_ref_overclock;
     base.oc_cell = dbg_ref_oc_cell;
@@ -2576,6 +2590,7 @@ fn runSa1Gen(
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
     con.usage = &umap;
+    applySidecar(con, movAt(movs, 0));
     if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
         try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
         try out.flush();
@@ -2606,6 +2621,7 @@ fn runSa1Gen(
         const con_s = try gpa.create(core.ProfilingConsole);
         con_s.init(cart_s);
         con_s.usage = &umap;
+        applySidecar(con_s, movAt(movs, s));
         if (surfaceAnchor(movs, s, verify_state)) |sb| try con_s.loadState(sb);
         var audio_s = core.console.audio_hash_init;
         var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
@@ -2644,6 +2660,7 @@ fn runSa1Gen(
             const con_p = try gpa.create(core.ProfilingConsole);
             con_p.init(cart_p);
             con_p.usage = &umap;
+            applySidecar(con_p, movAt(movs, s));
             if (surfaceAnchor(movs, s, verify_state)) |sb| try con_p.loadState(sb);
             var feed_p: util.movie.Feed = .init(movAt(movs, s));
             for (0..totals[s] + cov_pad) |i| {
@@ -3280,6 +3297,7 @@ fn runSa1Gen(
         var fail_frame: u32 = 0;
         var equiv: util.Equivalence = .identical;
         var fail_mov: ?util.movie.Movie = null;
+        var fail_s: usize = 0;
         var conv_sum: @TypeOf(sum) = undefined;
         for (0..n_surf) |s| {
             // Evidence-only movie: it profiled into the union above; its
@@ -3298,6 +3316,7 @@ fn runSa1Gen(
                 const cart2 = try core.Cartridge.load(gpa, res.image);
                 const con2 = try gpa.create(core.ProfilingConsole);
                 con2.init(cart2);
+                applySidecar(con2, movAt(movs, s));
                 if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
                 var feed2: util.movie.Feed = .init(movAt(movs, s));
                 for (0..s_total) |i| {
@@ -3362,6 +3381,7 @@ fn runSa1Gen(
                 passed = null;
                 equiv = s_equiv;
                 fail_mov = movAt(movs, s);
+                fail_s = s;
                 if (n_surf > 1) try out.print("  surface {} of {} FAILED: {s}\n", .{ s + 1, n_surf, fail_why });
                 break;
             }
@@ -3423,7 +3443,7 @@ fn runSa1Gen(
             try out.print("verification FAILED: {s}", .{fail_why});
             if (equiv != .equivalent) try out.print(" (first at frame {})", .{fail_frame});
             try out.print(".\n  No patch written.\n", .{});
-            if (equiv == .identical) try printEnvelopeDiag(out, env_base, env_conv_s[0], fail_frame, total);
+            if (equiv == .identical) try printEnvelopeDiag(out, env_base_s[fail_s], env_conv_s[fail_s], fail_frame, totals[fail_s]);
             if (equiv == .divergent) {
                 try out.print(
                     \\  Either uncovered code touches moved state, or the game animates through
