@@ -126,6 +126,15 @@ pub const Bus = struct {
     /// of laps per frame wherever stock lagged, so per-poll pairing forks
     /// on every lag difference. Per lap, the logic pairs by construction.
     lap_polled: bool,
+    /// Per-lap input delivery (a version-4 take): the entries the feed
+    /// staged for the coming laps, applied to the joypad AT each lap edge
+    /// (inside the frame — a two-lap frame consumes two), and the pads
+    /// seen at the edges, for a per-lap recording.
+    lap_feed: [16][2]u16,
+    lap_feed_n: u8,
+    lap_feed_i: u8,
+    lap_rec: [16][2]u16,
+    lap_rec_n: u8,
     /// Behavioral-verification hook (same optional-diagnostic pattern as the
     /// coverage map): when set, the FIRST controller poll after the harness
     /// clears `input_polled` snapshots WRAM into it. The poll is the one
@@ -203,6 +212,9 @@ pub const Bus = struct {
         self.last_data_write = no_data_access;
         self.input_polled = false;
         self.lap_polled = false;
+        self.lap_feed_n = 0;
+        self.lap_feed_i = 0;
+        self.lap_rec_n = 0;
         self.overclock = 1;
         self.oc_acc = 0;
         self.tick_snap = null;
@@ -467,6 +479,14 @@ pub const Bus = struct {
         if (wdc65816.lap_pending) {
             wdc65816.lap_pending = false;
             self.lap_polled = true;
+            if (self.lap_rec_n < self.lap_rec.len) {
+                self.lap_rec[self.lap_rec_n] = self.joy.buttons;
+                self.lap_rec_n += 1;
+            }
+            if (self.lap_feed_i < self.lap_feed_n) {
+                self.joy.buttons = self.lap_feed[self.lap_feed_i];
+                self.lap_feed_i += 1;
+            }
             self.tickSnap();
         }
     }

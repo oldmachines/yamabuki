@@ -301,6 +301,25 @@ pub fn Console(comptime cfg: CoreConfig) type {
             return p;
         }
 
+        /// Stage up to 16 per-lap entries for the coming frame's lap edges;
+        /// returns how many the previous staging consumed.
+        pub fn lapFeedStage(self: *Self, entries: []const [2]u16) u8 {
+            const consumed = self.bus.lap_feed_i;
+            const n: u8 = @intCast(@min(entries.len, self.bus.lap_feed.len));
+            @memcpy(self.bus.lap_feed[0..n], entries[0..n]);
+            self.bus.lap_feed_n = n;
+            self.bus.lap_feed_i = 0;
+            return consumed;
+        }
+
+        /// The pads recorded at the frame's lap edges; cleared.
+        pub fn lapRecTake(self: *Self, buf: *[16][2]u16) u8 {
+            const n = self.bus.lap_rec_n;
+            @memcpy(buf[0..n], self.bus.lap_rec[0..n]);
+            self.bus.lap_rec_n = 0;
+            return n;
+        }
+
         fn stepScanline(self: *Self) void {
             const line = self.scanline;
             const io = &self.bus.cpuio;
@@ -1331,6 +1350,18 @@ pub const AnyConsole = union(Accuracy) {
     pub fn takeLapPassed(self: *AnyConsole) bool {
         switch (self.*) {
             inline else => |*c| return c.takeLapPassed(),
+        }
+    }
+
+    pub fn lapFeedStage(self: *AnyConsole, entries: []const [2]u16) u8 {
+        switch (self.*) {
+            inline else => |*c| return c.lapFeedStage(entries),
+        }
+    }
+
+    pub fn lapRecTake(self: *AnyConsole, buf: *[16][2]u16) u8 {
+        switch (self.*) {
+            inline else => |*c| return c.lapRecTake(buf),
         }
     }
 

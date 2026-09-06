@@ -631,7 +631,15 @@ fn run(init: std.process.Init) !void {
             movie_end = i + m.tail_frames;
         };
         if (args.repoll != null) {
-            if (if (args.lap_cell != 0) con.lapPassed() else con.inputPolled()) {
+            if (args.lap_cell != 0) {
+                // per lap: every edge of the frame, in order
+                var recs: [16][2]u16 = undefined;
+                const n = con.lapRecTake(&recs);
+                if (n != 0) {
+                    for (recs[0..n]) |r| try repoll.append(r);
+                    repoll_tail = 0;
+                } else repoll_tail += 1;
+            } else if (con.inputPolled()) {
                 try repoll.append(feed.last);
                 repoll_tail = 0;
             } else repoll_tail += 1;

@@ -260,8 +260,17 @@ pub const Feed = struct {
 
     pub fn step(self: *Feed, con: anytype, frame: usize) void {
         const m = self.mov orelse return;
+        if (m.per_poll and m.lap_cell != 0) {
+            // Per lap, inside the frame: the console applies the staged entries
+            // at each lap edge; here only the staging moves, by what the last
+            // frame consumed.
+            _ = con.takeLapPassed();
+            self.cursor += con.lapFeedStage(if (self.cursor < m.frames.len) m.frames[self.cursor..] else m.frames[m.frames.len..]);
+            self.last = if (self.cursor < m.frames.len) m.frames[self.cursor] else .{ 0, 0 };
+            return;
+        }
         if (m.per_poll) {
-            if (if (m.lap_cell != 0) con.takeLapPassed() else con.takeInputPolled()) self.cursor += 1;
+            if (con.takeInputPolled()) self.cursor += 1;
         } else self.cursor = frame;
         const f: [2]u16 = if (self.cursor < m.frames.len) m.frames[self.cursor] else .{ 0, 0 };
         self.last = f;
@@ -447,6 +456,9 @@ test "movie: a per-poll take round-trips with its tail and anchor, and feeds per
         }
         fn takeLapPassed(_: *@This()) bool {
             return false;
+        }
+        fn lapFeedStage(_: *@This(), _: []const [2]u16) u8 {
+            return 0;
         }
     };
     var pad: Pad = .{};
