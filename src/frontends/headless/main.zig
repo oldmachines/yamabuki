@@ -323,8 +323,10 @@ const Args = struct {
 /// Default frames to profile: 60 seconds at 60 Hz, on top of the skipped boot.
 const report_frames_default: u32 = 3600;
 
-/// Input surfaces one generator run accepts (each `--movie` is one).
-const max_movies: usize = 6;
+/// Input surfaces one generator run accepts (each `--movie` or
+/// `--evidence-movie` is one). Super Metroid's recipe reached six with the
+/// soft-reset take; eight leaves room.
+const max_movies: usize = 8;
 /// Cover pairs a recipe may carry. The Super Metroid campaign reached 24 —
 /// the old cap, hit with a usage error — on its fourth stock take.
 const max_cover_pairs: usize = 64;
