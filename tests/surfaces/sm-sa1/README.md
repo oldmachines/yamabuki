@@ -131,6 +131,36 @@ The patch applies to the stock ROM and produces an 8 MiB image: the lower
 4 MiB is v66's conversion with the split's anchor, the upper the same with
 the SA-1's shadows (`docs/SM_SA1_FINDINGS.md` §10).
 
+### The split ship, second cut (v68)
+
+`sm-sa1-v68.bps.cmd` is v67's recipe with two more takes and one more input
+file. The takes are `recordings/stock-gameover-quit.ymv` (with its
+`.start.srm`: the Tourian save, Samus drained by the Metroids, NO to "TRY
+AGAIN?") and `recordings/stock-timeup-softreset-polls.ymv` (the per-poll
+twin of the 38-minute power-on take, which adds no coverage on stock but
+replays on any build); both are evidence movies and stock cover pairs. The
+quit take is the fix for a hang every earlier patch had: the boot's second
+entry at `$80:8462`, which the game's own soft reset jumps to, had never
+been executed by an evidence take, so the window relocation left its stack
+and direct-page setup un-shifted. The input file is
+`sm-sa1-v68.scpu.set`, re-recorded on the s19h image over nine takes (the
+two Tourian takes among them). The generator now accepts eight movies.
+
+Inside the image, against v67: the SA-1's divides use its hardware divider,
+the multiplier trigger stores are `JSL` sites instead of `COP` ones, the two
+inline-argument callees (`$88:8435`, `$80:91A9`) are handled, and the plasma
+projectile handler is covered — so a late-game save plays. The gate is still
+gameplay only (`--wg-split-mode 0998:08`): the wide gate that also offloads
+door transitions is measured in `docs/SM_SA1_FINDINGS.md` §10 (s19i) but
+cannot pass the per-poll tier, structurally, and does not ship.
+
+Verified behaviorally equivalent over all eight surfaces, v67's verdict
+profile. On the Tourian Metroid-room take (`recordings/tourian-metroids.ymv`):
+slowdown 626 of 10,000 frames on stock, 310 on v68; lag frames 863 to 610;
+S-CPU utilisation 67% to 21%. Door transitions keep stock's timing. The
+per-poll quit take `recordings/stock-gameover-quit-polls.ymv` replays on
+any build and walks the soft reset into a new game on v68.
+
 ### What v25 does not include
 
 `sm-sa1-v25.bps.cmd` passes the three scripted surfaces and nothing else: no
