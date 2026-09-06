@@ -96,6 +96,13 @@ pub const Bus = struct {
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
+    /// S-CPU overclock divisor (1 = real). The CPU's own bus and internal
+    /// cycles advance the master clock 1/n as fast; DMA, PPU and APU keep
+    /// their timing. A verification REFERENCE, not a game mode: a stock
+    /// image that never lags pairs per poll with a slowdown-removing
+    /// conversion, where the real one forks on every lag difference.
+    overclock: u8 = 1,
+    oc_acc: u32 = 0,
     /// Address of the most recent *data* read / write (`Cpu.read8`/`Cpu.write8`),
     /// or `no_data_access`. Set by the CPU — never by an instruction fetch, and
     /// never by a stack push or pull, both of which go straight to the bus.
@@ -325,7 +332,18 @@ pub const Bus = struct {
 
     /// One CPU internal cycle (no bus access).
     pub inline fn idle(self: *Bus) void {
-        self.clock += timing.speed_fast;
+        self.cpuCycles(timing.speed_fast);
+    }
+
+    /// The S-CPU's own cycles, under the overclock divisor.
+    pub inline fn cpuCycles(self: *Bus, n: u32) void {
+        if (self.overclock <= 1) {
+            self.clock += n;
+            return;
+        }
+        self.oc_acc += n;
+        self.clock += self.oc_acc / self.overclock;
+        self.oc_acc %= self.overclock;
     }
 
     /// Side-effect-free read for diagnostics (the profiler's opcode peek):
@@ -365,7 +383,7 @@ pub const Bus = struct {
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             const v = p[addr & (page_size - 1)];
             self.mdr = v;
             return v;
@@ -418,7 +436,7 @@ pub const Bus = struct {
         self.mdr = value;
         const idx = addr >> 13;
         if (self.page_write[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             p[addr & (page_size - 1)] = value;
             return;
         }
@@ -511,7 +529,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         // MMIO exists only in the system area (banks $00-$3F / $80-$BF),
         // except the large-LoROM DSP-1 ports in banks $60-$6F.
@@ -633,7 +651,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         if (!isSystemBank(bank)) {
             if (self.dsp1Port(bank, a16)) |sr| {

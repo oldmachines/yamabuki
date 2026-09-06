@@ -126,6 +126,9 @@ const Args = struct {
     /// lap counter) instead of per pad poll; a --repoll then writes a per-lap
     /// (version 4) take. A per-lap take sets it on load.
     lap_cell: u16 = 0,
+    /// --ref-overclock <n>: the behavioral tier's BASELINE runs its S-CPU n
+    /// times faster (a lag-free stock reference; see Bus.overclock).
+    ref_overclock: u8 = 1,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -513,6 +516,10 @@ fn run(init: std.process.Init) !void {
         return;
     }
     if (args.behavioral_probe) |cpath| {
+        dbg_ref_overclock = args.ref_overclock;
+        dbg_ref_oc_cell = args.wg_split_mode_cell;
+        dbg_ref_oc_lo = args.wg_split_mode_value;
+        dbg_ref_oc_hi = if (args.wg_split_mode_hi != 0) args.wg_split_mode_hi else args.wg_split_mode_value;
         try runBehavioralProbe(io, gpa, out, args, core.header.stripCopierHeader(image), cpath, movs);
         return;
     }
@@ -574,6 +581,10 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
     if (args.lap_cell != 0) core.wdc65816.lap_cell = args.lap_cell;
+    dbg_ref_overclock = args.ref_overclock;
+    dbg_ref_oc_cell = args.wg_split_mode_cell;
+    dbg_ref_oc_lo = args.wg_split_mode_value;
+    dbg_ref_oc_hi = if (args.wg_split_mode_hi != 0) args.wg_split_mode_hi else args.wg_split_mode_value;
     if (args.split_scpu_set != null) {
         const m = try gpa.alloc(u8, 0x40 * 0x8000);
         @memset(m, 0);
@@ -1058,6 +1069,11 @@ fn loadMovie(
 /// must follow it or every press lands early in game-time and forks the
 /// run). Set by the undocumented --conv-pad flag.
 pub var dbg_conv_pad: u32 = 0;
+/// --ref-overclock: the verifier's baseline S-CPU divisor.
+pub var dbg_ref_overclock: u8 = 1;
+pub var dbg_ref_oc_cell: u16 = 0;
+pub var dbg_ref_oc_lo: u8 = 0;
+pub var dbg_ref_oc_hi: u8 = 0;
 /// Undocumented --site-ev <hex24>[,<hex24>...]: after profiling, print the
 /// union evidence byte and coverage flags for each instruction address.
 pub var dbg_site_ev: [16]u32 = @splat(0);
@@ -1121,6 +1137,10 @@ fn learnWallMask(gpa: std.mem.Allocator, image: []const u8, mov: ?util.movie.Mov
     var lag_run: u32 = 0;
     var feed: util.movie.Feed = .init(mov);
     for (0..total) |i| {
+        if (dbg_ref_overclock > 1 and i >= 300) {
+            const v = con.bus.wram.data[dbg_ref_oc_cell];
+            con.bus.overclock = if (dbg_ref_oc_cell != 0 and v >= dbg_ref_oc_lo and v <= dbg_ref_oc_hi) dbg_ref_overclock else 1;
+        }
         if (stepBehavioralFrame(con, snap, &feed, @intCast(i))) {
             if (lag_run > 0 and lag_run <= lag_run_max and ticks > 0) {
                 for (0..lag_run) |r| {
@@ -1305,6 +1325,15 @@ fn verifyBehavioral(
         /// return value alone cannot tell those apart, and conflating
         /// them is what made the tier reject faster builds.
         span: u32 = 0,
+        /// The reference overclock, engaged once the boot is behind (an
+        /// overclocked S-CPU breaks the APU upload's handshake timing).
+        oc: u8 = 1,
+        /// ... and only while the mode cell holds a value in the split's
+        /// gate range: the eras the SA-1 runs. Elsewhere the reference keeps
+        /// real timing (an overclocked intro wedges on its own delay loops).
+        oc_cell: u16 = 0,
+        oc_lo: u8 = 0,
+        oc_hi: u8 = 0,
 
         fn init(al: std.mem.Allocator, image: []const u8) !@This() {
             const cart = try core.Cartridge.load(al, image);
@@ -1323,6 +1352,10 @@ fn verifyBehavioral(
             if (self.feed.mov == null) self.feed = .init(m);
             const from = self.frame;
             while (self.frame < budget) {
+                if (self.oc > 1 and self.frame >= 300) {
+                    const v = self.con.bus.wram.data[self.oc_cell];
+                    self.con.bus.overclock = if (self.oc_cell != 0 and v >= self.oc_lo and v <= self.oc_hi) self.oc else 1;
+                }
                 const ticked = stepBehavioralFrame(self.con, self.snap, &self.feed, self.frame -| self.pad);
                 self.frame += 1;
                 if (ticked) {
@@ -1347,6 +1380,10 @@ fn verifyBehavioral(
     var base = try Side.init(gpa, base_image);
     var conv = try Side.init(gpa, conv_image);
     conv.pad = dbg_conv_pad;
+    base.oc = dbg_ref_overclock;
+    base.oc_cell = dbg_ref_oc_cell;
+    base.oc_lo = dbg_ref_oc_lo;
+    base.oc_hi = dbg_ref_oc_hi;
     if (state) |sb| {
         try base.con.loadState(sb);
         try seedConverted(conv.con, sb, plan, res);
@@ -5385,6 +5422,8 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_vram = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--dump-ppu")) {
             out.dump_ppu = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--ref-overclock")) {
+            out.ref_overclock = try std.fmt.parseInt(u8, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--lap-cell")) {
             out.lap_cell = try std.fmt.parseInt(u16, it.next() orelse return error.MissingValue, 16);
         } else if (std.mem.eql(u8, a, "--repoll")) {
