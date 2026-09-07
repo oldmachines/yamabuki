@@ -1248,13 +1248,15 @@ fn writeScpuSet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
 
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
     const fc = &con.fast;
-    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800 + 0x10000) catch unreachable;
+    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800 + 0x10000 + 0x200 + 0x220) catch unreachable;
     @memset(buf, 0);
     @memcpy(buf[0..0x20000], &fc.bus.wram.data);
     if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
     @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
     if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
     @memcpy(buf[0x50800..][0..0x10000], &fc.bus.apu.aram);
+    @memcpy(buf[0x60800..][0..0x200], std.mem.sliceAsBytes(fc.bus.ppu.cgram[0..256]));
+    @memcpy(buf[0x60A00..][0..0x220], &fc.bus.ppu.oam);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf }) catch {};
     std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
     if (fc.bus.cart.chip == .sa1)

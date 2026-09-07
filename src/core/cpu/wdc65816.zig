@@ -111,6 +111,29 @@ var dbg_stale_n: usize = 0;
 /// hit — the history that led into the bad path, which a forward trace
 /// can never afford to keep.
 pub var dbg_stale_ring: bool = false;
+
+/// A DMA (or HDMA) engine's A-bus access into an abandoned WRAM home —
+/// the class the CPU-side hook can never see. Measured: Super Metroid's
+/// PLM draw routine hands a WRAM pointer to a VRAM write as its DMA
+/// source; with the pointer un-shifted the DMA read the abandoned home and
+/// every revealed block drew as garbage, while `--stale` stayed silent.
+/// Reports each distinct source once, keyed on the address itself
+/// (the CPU keys on PBR:PC).
+pub fn noteStaleDma(kind: []const u8, addr: u24, clk: u64) void {
+    if (dbg_stale == 0) return;
+    const bank: u8 = @intCast(addr >> 16);
+    const a16: u16 = @truncate(addr);
+    const abandoned = bank == 0x7E or bank == 0x7F or
+        ((bank & 0x7F) < 0x40 and a16 < 0x2000);
+    if (!abandoned) return;
+    if (clk < dbg_stale_from) return;
+    const key: u32 = 0x8000_0000 | @as(u32, addr);
+    for (dbg_stale_seen[0..dbg_stale_n]) |k| if (k == key) return;
+    if (dbg_stale_n == dbg_stale_seen.len or dbg_stale_n == dbg_stale) return;
+    dbg_stale_seen[dbg_stale_n] = key;
+    dbg_stale_n += 1;
+    std.debug.print("[stale] {s} addr={x:0>6} clk={d}\n", .{ kind, addr, clk });
+}
 const StaleRingEntry = struct { pbr: u8, pc: u16, c: u16, x: u16, y: u16, d: u16, dbr: u8, p: u8 };
 var dbg_ring: [8192]StaleRingEntry = undefined;
 var dbg_ring_n: usize = 0;

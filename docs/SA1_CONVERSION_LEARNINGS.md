@@ -713,6 +713,18 @@ program counter names it. That check needs no baseline, no movie
 pairing, no lag reasoning: it is a property of the converted image
 alone. `--stale <max-sites>` reports each offending (PBR,PC) once.
 
+The detector hooks the CPU's data reads and writes, and since the
+draw-pointer bug of Super Metroid's destructible blocks it also hooks
+the DMA engine: a general-purpose channel's A-bus start (`D>` reading,
+`D<` writing), an HDMA table read (`HT`) and each HDMA transfer's
+source (`H>` direct, `H*` indirect) into an abandoned home are reported
+once per address. That class never passes through a CPU access — the
+game hands a pointer to a channel and the channel does the reading —
+and it stayed invisible until the hook existed. (The block-word bug
+itself turned out to be a CPU read through a stale pointer; the DMA
+hook was built while proving that, and it stays because the next one
+may not be.)
+
 Run against the laser recording, the shipped conversion produced
 twelve sites. Eight were tiny-base indexed absolutes — four loads and,
 critically, **four stores**, including `STA $0030,Y` at `$02:8C8B`

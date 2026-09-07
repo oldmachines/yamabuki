@@ -13,6 +13,7 @@
 //! overriding the per-access charge the bus accessors would otherwise add.
 
 const std = @import("std");
+const wdc65816 = @import("../cpu/wdc65816.zig");
 
 /// GDMA timing: a fixed per-DMA setup, a per-active-channel overhead, and a
 /// per-byte transfer cost, all in master cycles. These replace the bus
@@ -273,6 +274,8 @@ pub const Dma = struct {
         // the chip has no path back into the cartridge.
         const decompress = bus.cart.chip == .sdd1 and !b_to_a and bus.sdd1.channelArmed(i);
         if (decompress) bus.sdd1.beginTransfer(i, (@as(u24, ch.a_bank) << 16) | ch.a_addr);
+        if (a_guarded or ch.a_bank == 0x7E or ch.a_bank == 0x7F)
+            wdc65816.noteStaleDma(if (b_to_a) "D<" else "D>", (@as(u24, ch.a_bank) << 16) | ch.a_addr, bus.clock);
 
         var remaining = total;
         var p: usize = 0;
@@ -347,6 +350,7 @@ pub const Dma = struct {
                 (@as(u24, ch.indirect_bank) << 16) | ch.count
             else
                 (@as(u24, ch.a_bank) << 16) | ch.table_addr;
+            wdc65816.noteStaleDma(if (indirect) "H*" else "H>", a, bus.clock);
             if (b_to_a) {
                 aWrite(bus, a, bus.read8(b));
             } else {
@@ -361,6 +365,7 @@ pub const Dma = struct {
         _ = self;
         const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.table_addr;
         ch.table_addr +%= 1;
+        wdc65816.noteStaleDma("HT", a, bus.clock);
         return aRead(bus, a);
     }
 
