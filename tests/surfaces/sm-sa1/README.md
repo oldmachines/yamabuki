@@ -194,7 +194,7 @@ which lists every rewritten writer no generation run produced (the hardware
 counterpart of `--stale`). Without a generation, `--mmio-out <file>` on a
 stock replay of the same take makes a reference.
 
-### The split ship, fourth cut (v70) — the whole game's code, on proven boundaries
+### The split ship, fourth cut (v70) — the whole game's code, on proven boundaries; see v71
 
 `sm-sa1-v70.bps.cmd` is v69's recipe plus one input, `--code-map "$CODEMAP"`:
 the instruction-boundary map of the whole ROM, derived from the
@@ -226,6 +226,42 @@ instruction a known transform in both copies. The two human takes replay
 clean against `sm-sa1-v70.bps.mmio`. The numbers are v69's (the same
 gameplay gate): the Tourian Metroid room 310 slowdown frames against stock's
 626, utilisation 21% against 67%, door transitions stock-timed.
+
+### The split ship, fifth cut (v71) — a stored pointer moves with the window
+
+`sm-sa1-v71.bps.cmd` is v70's recipe unchanged; the generator gained one
+rule under the code map. The player's first session on v70
+(`recordings/v70-take0001-polls.ymv`) shot the destructible blocks of green
+Brinstar and every block it revealed drew as a crossed tile: the PLM draw
+routine builds its instruction list in low WRAM and hands its address to the
+draw code as an immediate, `LDA #CustomDrawInst_NumberOfBlocks` at
+`$84:8B3B`, which the evidence-gated pointer-seed rule had never reached (a
+profiled dereference proves a seed; this one's dereference runs through a
+thunk that resolves the index at run time and never left a proof). With the
+pointer un-shifted the draw code read the block word through the abandoned
+WRAM home, and on the SA-1 that home is open bus.
+
+The disassembly names such immediates with a WRAM label, and the oracle now
+exports that as a code-map flag (0x40, `wram_pointer_sites`): a 16-bit
+immediate the disassembly labels with a low-WRAM address and the next
+instruction stores. The generator shifts every one of them by the window
+offset, no evidence required. Three sites moved that v70 had left:
+`$84:8B3B` (the draw list), `$82:9EE5` (`MapTilesExplored`, the pause map's
+explored-tile table) and `$88:AE05` (`HUDBG2XPositionScrollingSky`, the
+indirect address the Wrecked Ship's scrolling-sky HDMA table points at — a
+DMA-side read of an abandoned home, the class no CPU hook sees). The patch
+is v70's plus those six bytes and the checksum; the S-CPU set is v70's.
+
+Verified behaviorally equivalent over all eight surfaces; the oracle and the
+explainer are as clean as v70's; the patched stock ROM equals the generated
+image byte for byte. The v70 take replays clean with the revealed blocks
+drawn as stock draws them and zero MMIO offenders against
+`sm-sa1-v71.bps.mmio`. `--stale` on that take still names three sites the
+recipe leaves un-shifted on purpose of evidence — the enemy-projectile
+palette loads at `$86:8030`/`$86:8033` and the enemy-death AI read at
+`$A0:A3B9`, all three run with garbage in X by stock's own callers (the
+disassembly's note) — see `docs/SM_SA1_FINDINGS.md` §10 (v71) for what
+they read and why they are not this cut's.
 
 ### What v25 does not include
 
