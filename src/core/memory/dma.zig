@@ -54,6 +54,11 @@ pub const Channel = struct {
 /// memory the window conversion abandoned is invisible to the stale-access
 /// detector. It shows up only as graphics that never arrive.
 pub var dbg_dma: usize = 0;
+/// Only log GDMA at or after this master clock. The trace has a fixed
+/// quota that fills early in a long take, so an event near the end (a
+/// pause-menu draw after a full session) is never reached without a
+/// lower bound. Pairs with the CPU `--watch-from`.
+pub var dbg_dma_from: u64 = 0;
 var dbg_dma_seen: [4096]u64 = @splat(0);
 var dbg_dma_n: usize = 0;
 
@@ -65,6 +70,7 @@ fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: 
     // Dedup within a ~370-frame bucket only: the same (src, reg) upload
     // recurring in a LATER scene (the Ceres re-upload after the intro) must
     // print again, or the trace claims a region was never written twice.
+    if (clk < dbg_dma_from) return;
     const key: u64 = (clk / (357366 * 370)) << 40 | @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
     for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
     if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;

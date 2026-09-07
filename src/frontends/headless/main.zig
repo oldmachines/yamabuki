@@ -5897,8 +5897,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             const v = it.next() orelse return error.MissingValue;
             core.wdc65816.dbg_dmabank = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, a, "--dma-trace")) {
+            // "<max>" or "<max>:<from-clock>"
             const v = it.next() orelse return error.MissingValue;
-            core.dma.dbg_dma = try std.fmt.parseInt(usize, v, 10);
+            var pit = std.mem.splitScalar(u8, v, ':');
+            core.dma.dbg_dma = try std.fmt.parseInt(usize, pit.next().?, 10);
+            if (pit.next()) |fc| core.dma.dbg_dma_from = try std.fmt.parseInt(u64, fc, 10);
         } else if (std.mem.eql(u8, a, "--no-color-math")) {
             core.ppu.dbg_no_color_math = true;
         } else if (std.mem.eql(u8, a, "--bg-disable")) {
