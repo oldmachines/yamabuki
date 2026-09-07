@@ -28,7 +28,7 @@ import sys
 
 FLAG_OPCODE = 0x10
 FLAG_EXEC = 0x20
-ADDR_RE = re.compile(r";([0-9A-F]{6});\s*$")
+ADDR_RE = re.compile(r";([0-9A-F]{6});")   # the address comment may carry more comment after it
 DATA_TOKENS = ("DB", "DW", "DL", "DD", "FILL", "PAD", "INCBIN", "TABLE", "%")
 
 
@@ -210,10 +210,17 @@ def export_code_map(inst, data, path):
     an immediate the operand width the assembler suffix names (`.B` = 8-bit,
     `.W` = 16-bit): the width flags a static walk needs and cannot infer."""
     m = bytearray(0x1000000)
+    # The disassembly accounts for every byte of the ROM: what it does not
+    # write as an instruction is data (tables behind macros, included
+    # binaries, padding). Default the covered banks to data, then mark.
+    banks = {a >> 16 for a in inst}
+    for b in banks:
+        for a in range((b << 16) | 0x8000, (b << 16) | 0x10000):
+            m[a] = MAP_DATA
     for a in data:
         m[a] |= MAP_DATA
     for a, line in inst.items():
-        m[a] |= MAP_START
+        m[a] = MAP_START
         body = line.split(";")[0].strip()
         while body and body.split(None, 1)[0].strip("+-") == "":
             body = body.split(None, 1)[1].strip() if " " in body else ""
@@ -231,7 +238,7 @@ def export_code_map(inst, data, path):
                 else:
                     m[a] |= MAP_M_KNOWN | (MAP_M8 if imm8 else 0)
         for k in range(1, instr_len(line)):
-            m[a + k] |= MAP_INTERIOR
+            m[a + k] = MAP_INTERIOR
     with open(path, "wb") as f:
         f.write(m)
     print(f"wrote {path}: {len(inst)} starts, {len(data)} data bytes")
