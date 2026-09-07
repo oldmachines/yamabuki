@@ -161,7 +161,7 @@ S-CPU utilisation 67% to 21%. Door transitions keep stock's timing. The
 per-poll quit take `recordings/stock-gameover-quit-polls.ymv` replays on
 any build and walks the soft reset into a new game on v68.
 
-### The split ship, third cut (v69) — supersedes v68
+### The split ship, third cut (v69) — supersedes v68; see v70
 
 `sm-sa1-v69.bps.cmd` is v68's recipe plus one stock cover pair,
 `recordings/v68-take0001-polls.ymv` (the first human session on v68), and a
@@ -193,6 +193,39 @@ game logic. The generator writes the sets beside the patch as
 which lists every rewritten writer no generation run produced (the hardware
 counterpart of `--stale`). Without a generation, `--mmio-out <file>` on a
 stock replay of the same take makes a reference.
+
+### The split ship, fourth cut (v70) — the whole game's code, on proven boundaries
+
+`sm-sa1-v70.bps.cmd` is v69's recipe plus one input, `--code-map "$CODEMAP"`:
+the instruction-boundary map of the whole ROM, derived from the
+InsaneFirebat/sm_disassembly sources (P.JBoy's bank logs, assemblable) by
+
+    python tools/sm_disasm_oracle.py <sm_disassembly>/src --export "$CODEMAP"
+
+The map is 16 MiB and is not committed; the disassembly is at
+https://github.com/InsaneFirebat/sm_disassembly (commit 77633e2 was used).
+With it the generator refuses any static decode, dispatcher mark, pointer
+seed or rewrite at a byte the disassembly places inside an instruction or in
+data, takes each immediate's width from the assembler suffix, and seeds its
+static walk with every instruction start the disassembly names — so every
+instruction of the game is relocated, played or not, on boundaries a human
+wrote down. Without the map the generator's own heuristics apply, as for any
+game (`docs/SM_SA1_FINDINGS.md` §10, "the disassembly oracle").
+
+What that changed: the walk now reaches 132,315 instructions instead of
+69,299; 38,309 instructions of the S-CPU's copy are rewritten instead of
+20,334; 469 math sites are shadowed instead of 329 and 954 thunks dispatch
+instead of 435. And the seven instructions of bank `$B3` (Norfair's Gamet
+and Geega) that every patch from v66 to v69 corrupted are stock's again,
+with the 273 data bytes the static walk had been rewriting around them.
+
+Verified behaviorally equivalent over all eight surfaces with the MMIO gate
+silent; `tools/sm_disasm_oracle.py` reports no opcode flag inside an
+instruction or on data, and the byte-by-byte explainer finds every changed
+instruction a known transform in both copies. The two human takes replay
+clean against `sm-sa1-v70.bps.mmio`. The numbers are v69's (the same
+gameplay gate): the Tourian Metroid room 310 slowdown frames against stock's
+626, utilisation 21% against 67%, door transitions stock-timed.
 
 ### What v25 does not include
 

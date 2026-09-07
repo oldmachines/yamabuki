@@ -484,6 +484,7 @@ fn run(init: std.process.Init) !void {
         try out.flush();
         std.process.exit(2);
     };
+    try loadCodeMap(io, gpa, out, args);
 
     var image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
         try out.print("error: cannot read ROM '{s}'\n", .{args.rom});
@@ -4232,6 +4233,7 @@ fn reportSa1(
         writeMmioRef(io, mpath, image, mmio_base_g[0..mmio_n_g], mmio_conv_g[0..mmio_n_g]) catch {};
         try out.print("wrote {s} (the MMIO writer sets, for --mmio-ref)\n", .{mpath});
     }
+    try writeCovOut(io, gpa, out, args);
     if (args.window) {
         try out.print(
             \\uniform window relocation (v17's architecture):
