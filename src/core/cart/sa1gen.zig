@@ -311,6 +311,8 @@ pub const Stats = struct {
     shim_addr: u16 = 0,
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
+    /// Sites skipped because their operand bytes carry an opcode flag (two decodes overlapping).
+    skipped_overlap: u32 = 0,
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
@@ -5197,6 +5199,9 @@ comptime {
     std.debug.assert(wg_service.len == 89);
 }
 
+/// Debug: addresses whose first static decode as an opcode is reported with the path that reached them.
+pub var dbg_walk_watch: [8]u32 = @splat(0);
+
 /// `--wg-static`: extend the S1 coverage map by recursive-descent
 /// disassembly. Every dynamically covered opcode is a PROVEN instruction
 /// start with proven M/X widths — the profiler recorded them — which
@@ -5226,7 +5231,7 @@ fn extendCoverage(
     defer gpa.free(seen);
     @memset(seen, false);
 
-    const Item = struct { addr: u24, m8: bool, x8: bool };
+    const Item = struct { addr: u24, m8: bool, x8: bool, from: u32 = 0xFFFF_FFFF };
     var stack: std.array_list.Managed(Item) = .init(gpa);
     defer stack.deinit();
 
@@ -5268,6 +5273,7 @@ fn extendCoverage(
             var addr: u32 = item.addr;
             var m8 = item.m8;
             var x8 = item.x8;
+            var prev: u32 = item.from;
             walk: while (true) {
                 const wbank = addr >> 16;
                 const a16 = addr & 0xFFFF;
@@ -5279,10 +5285,27 @@ fn extendCoverage(
                 const dyn = usage[cpu0] | usage[0x80_0000 | cpu0];
                 if (dyn & (usage_map.flag_read | usage_map.flag_write) != 0 and
                     dyn & usage_map.flag_opcode == 0) break;
+                // The INTERIOR of an executed instruction is not a place
+                // to start decoding either: the profiler proved an opcode
+                // before it and the bytes here are its operand. A path
+                // that arrives mid-instruction (a misread width upstream,
+                // a table walked as code) would otherwise decode the
+                // operand as an opcode and REWRITE what follows. Measured
+                // on Super Metroid: `AND #$FC / STA $2117` walked from its
+                // immediate — `$FC $8D $17` read as `JSR ($178D,X)` — and
+                // the window shift turned the store into `STA $2177`, the
+                // APU mailbox mirror: every patch from v66 to v68 fed the
+                // sound driver a stray byte at four VRAM-address sites, and
+                // it died on the first one a session reached (a death, a
+                // loud room), leaving the death jingle's engine upload
+                // waiting forever.
+                if (dyn & usage_map.flag_exec != 0 and dyn & usage_map.flag_opcode == 0) break;
                 seen[file] = true;
                 const op = image[file];
                 const len: u32 = usage_map.instrLen(op, m8, x8);
                 if (a16 + len > 0x10000) break;
+                for (dbg_walk_watch) |w| if (w != 0 and (w & 0x3F_FFFF) == (addr & 0x3F_FFFF) and ext[addr] & usage_map.flag_opcode == 0)
+                    std.debug.print("[walk] opcode at ${x:0>6} op={x:0>2} m8={} x8={} from=${x:0>6} (seed={}) dyn={x:0>2} round={}\n", .{ addr, op, m8, x8, prev & 0xFF_FFFF, @as(u32, @intCast(0xFFFF_FFFF - prev)), dyn, round });
                 if (ext[addr] & usage_map.flag_opcode == 0) {
                     ext[addr] &= ~(usage_map.flag_m | usage_map.flag_x);
                     ext[addr] |= usage_map.flag_opcode | usage_map.flag_exec |
@@ -5308,13 +5331,13 @@ fn extendCoverage(
                     },
                     0x4C => { // JMP abs: bank-confined
                         const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8, .from = addr });
                         break;
                     },
                     0x5C, 0x22 => { // JML long / JSL long
                         const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
                         const tb: u32 = image[file + 3] & 0x7F;
-                        try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
+                        try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8, .from = addr });
                         if (op == 0x5C) break; // JSL falls through on return
                         // A JSL the profiled run EXECUTED whose return address
                         // it never marked as an opcode is a call with INLINE
@@ -5363,18 +5386,18 @@ fn extendCoverage(
                     },
                     0x20 => { // JSR abs: target plus fall-through
                         const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8, .from = addr });
                     },
                     0x80, 0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
                         const rel: i8 = @bitCast(image[file + 1]);
                         const t = (a16 +% 2 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8, .from = addr });
                         if (op == 0x80) break; // BRA is unconditional
                     },
                     0x82 => { // BRL
                         const rel: i16 = @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little));
                         const t = (a16 +% 3 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
+                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8, .from = addr });
                         break;
                     },
                     // Indirect control transfers: statically opaque. (JSR
@@ -5382,6 +5405,7 @@ fn extendCoverage(
                     0x6C, 0x7C, 0xDC => break,
                     else => {},
                 }
+                prev = addr;
                 addr += len;
                 continue :walk;
             }
@@ -5417,6 +5441,7 @@ fn extendCoverage(
             }
         }
         var ptr_bank = [_]u8{0} ** 0x2000; // cell -> dispatcher bank + 1
+        var cell_reached = [_]bool{false} ** 0x2000; // a dispatcher shape for the cell sits in reached code
         var pb2: u32 = 0;
         while (pb2 < 0x40) : (pb2 += 1) {
             if (pb2 * 0x8000 >= image.len) break;
@@ -5440,8 +5465,26 @@ fn extendCoverage(
                         const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
                         const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
                             dflags & usage_map.flag_opcode == 0;
+                        // EXECUTED-INTERIOR gate, and a REACH requirement for
+                        // activation: an opcode-shaped byte the profile fetched
+                        // as an OPERAND is an immediate, not a dispatcher, and a
+                        // cell whose only dispatcher shapes sit in bytes nothing
+                        // ever executed or walked is not a dispatch cell at all.
+                        // Measured on Super Metroid: `$178D` is a plain WRAM
+                        // variable with one covered store; its four "dispatchers"
+                        // were the immediates of `AND #$FC` / `LDA #$7C` before
+                        // `STA $2117`, two inside executed code and two in code
+                        // nothing reached. The cell activated, the four bytes were
+                        // marked as starts, and the shift of their "operand" turned
+                        // each store into `STA $2177` — the APU mailbox mirror.
+                        const interior = dflags & usage_map.flag_exec != 0 and dflags & usage_map.flag_opcode == 0;
+                        const eflags = ext[cpu2] | ext[0x80_0000 | cpu2];
+                        const reached = (dflags | eflags) & usage_map.flag_exec != 0;
                         const cell = std.mem.readInt(u16, image[f2 + 1 ..][0..2], .little);
-                        if (cell < 0x2000 and !data_only) ptr_bank[cell] = @intCast(pb2 + 1);
+                        if (cell < 0x2000 and !data_only and !interior) {
+                            ptr_bank[cell] = @intCast(pb2 + 1);
+                            if (reached) cell_reached[cell] = true;
+                        }
                     }
                 }
             }
@@ -5468,7 +5511,7 @@ fn extendCoverage(
                 if (fa + 6 > image.len) continue;
                 if (image[fa] != 0xA9 or image[fa + 3] != 0x8D) continue;
                 const acell = std.mem.readInt(u16, image[fa + 4 ..][0..2], .little);
-                if (acell < 0x2000 and ptr_bank[acell] != 0) cell_active[acell] = true;
+                if (acell < 0x2000 and ptr_bank[acell] != 0 and cell_reached[acell]) cell_active[acell] = true;
             }
         }
         var sb3: u32 = 0;
@@ -5493,11 +5536,11 @@ fn extendCoverage(
                 if (tfile >= image.len) continue;
                 const x8_3 = covered3 and fl3 & usage_map.flag_x != 0;
                 if (!seen[tfile]) {
-                    try stack.append(.{ .addr = @intCast(taddr), .m8 = false, .x8 = x8_3 });
+                    try stack.append(.{ .addr = @intCast(taddr), .m8 = false, .x8 = x8_3, .from = 0xFFFF_FFFE });
                     grew = true;
                 }
                 if (!covered3 and !seen[f3]) {
-                    try stack.append(.{ .addr = @intCast(c3), .m8 = false, .x8 = x8_3 });
+                    try stack.append(.{ .addr = @intCast(c3), .m8 = false, .x8 = x8_3, .from = 0xFFFF_FFFD });
                     grew = true;
                 }
             }
@@ -5529,6 +5572,20 @@ fn extendCoverage(
                 const mflags = usage[msite] | usage[0x80_0000 | msite];
                 if (mflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
                     mflags & usage_map.flag_opcode == 0) continue;
+                // And the EXECUTED-INTERIOR gate: a byte the profile fetched
+                // as an operand is not an instruction start either. This raw
+                // scan matches opcode-shaped IMMEDIATES — measured on Super
+                // Metroid: `AND #$FC` / `LDA #$7C` followed by `STA $2117`
+                // read as `JSR ($178D,X)` / `JMP ($178D,X)` on an active
+                // cell, got marked as dispatchers, and the window shift of
+                // that "operand" turned the store into `STA $2177`, the APU
+                // mailbox mirror: the sound driver took the VRAM address
+                // byte as a request and died, and every patch from v66 to
+                // v68 hung at the first death that reached one of the four
+                // sites. The same for a start whose "operand" bytes carry an
+                // opcode of their own (two decodes cannot overlap).
+                if (mflags & usage_map.flag_exec != 0 and mflags & usage_map.flag_opcode == 0) continue;
+                if ((ext[msite + 1] | ext[0x80_0000 | (msite + 1)] | ext[msite + 2] | ext[0x80_0000 | (msite + 2)]) & usage_map.flag_opcode != 0) continue;
                 if (ext[msite] & usage_map.flag_opcode == 0) {
                     ext[msite] &= ~(usage_map.flag_m | usage_map.flag_x);
                     ext[msite] |= usage_map.flag_opcode | usage_map.flag_exec;
@@ -8371,6 +8428,33 @@ pub fn convertWholeGame(
             if ((cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
+            // Two opcodes cannot overlap. A site whose operand bytes carry
+            // an opcode flag of their own is a decode that started inside
+            // another instruction — a stale flag from a cover harvested
+            // on an image whose code lay elsewhere, or a static path that
+            // arrived mid-instruction — and rewriting its "operand" would
+            // corrupt the real instruction after it. MEASURED on Super
+            // Metroid: `$FC $8D $17` (the immediate of `AND #$FC` and the
+            // `STA $2117` after it) carried an opcode flag on the `$FC`,
+            // decoded as `JSR ($178D,X)`, and the window shift turned the
+            // store into `STA $2177` — the APU mailbox mirror. Four sites,
+            // every patch from v66 to v68, the sound driver dead on the
+            // first one a session reached. Skip the overlapping site; the
+            // instruction it overlaps is the one the profile proved.
+            {
+                const fl_site = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                const site_len = usage_map.instrLen(op, fl_site & usage_map.flag_m != 0, fl_site & usage_map.flag_x != 0);
+                var overlap = false;
+                var k: u32 = 1;
+                while (k < site_len and a16 + k < 0x10000) : (k += 1) {
+                    const ic = cpu_addr + k;
+                    if ((cov[ic] | cov[0x80_0000 | ic]) & usage_map.flag_opcode != 0) overlap = true;
+                }
+                if (overlap) {
+                    res.stats.skipped_overlap += 1;
+                    continue;
+                }
+            }
             if (bwram) {
                 // A WRAM bank byte materialized by an immediate and stored —
                 // the bank slot of a long pointer the game will dereference

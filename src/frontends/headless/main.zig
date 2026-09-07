@@ -136,6 +136,8 @@ const Args = struct {
     /// On a plain run of a conversion image, `--ref-overclock` alone
     /// overclocks that image's CPUs the same way (a measurement).
     conv_overclock: u8 = 1,
+    /// --apu-port-trace: print every write to APU port 3 with its clock (debug).
+    apu_port_trace: bool = false,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -591,6 +593,7 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_ppu) |ppath| dumpPpu(io, out, con, ppath);
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
     if (args.lap_cell != 0) core.wdc65816.lap_cell = args.lap_cell;
+    if (args.apu_port_trace) core.apu.dbg_port_trace = true;
     dbg_ref_overclock = args.ref_overclock;
     dbg_conv_overclock = args.conv_overclock;
     dbg_ref_oc_cell = args.wg_split_mode_cell;
@@ -990,16 +993,18 @@ fn writeScpuSet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
 
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
     const fc = &con.fast;
-    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800) catch unreachable;
+    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800 + 0x10000) catch unreachable;
     @memset(buf, 0);
     @memcpy(buf[0..0x20000], &fc.bus.wram.data);
     if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);
     @memcpy(buf[0x40000..][0..0x10000], std.mem.sliceAsBytes(fc.bus.ppu.vram[0..0x8000]));
     if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x50000..][0..0x800], &fc.bus.sa1.iram);
+    @memcpy(buf[0x50800..][0..0x10000], &fc.bus.apu.aram);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf }) catch {};
     std.debug.print("[dump] pc={x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} s={x:0>4} dbr={x:0>2} p={x:0>2} clk={}\n", .{ fc.cpu.regs.pbr, fc.cpu.regs.pc, fc.cpu.regs.c, fc.cpu.regs.x, fc.cpu.regs.y, fc.cpu.regs.d, fc.cpu.regs.s, fc.cpu.regs.dbr, fc.cpu.regs.p, fc.bus.clock });
     if (fc.bus.cart.chip == .sa1)
         std.debug.print("[dump] sa1 pc={x:0>2}:{x:0>4} smeg={x} cmeg={x} id={x:0>2} busy={x:0>2}\n", .{ fc.bus.sa1.cpu.regs.pbr, fc.bus.sa1.cpu.regs.pc, fc.bus.sa1.smeg, fc.bus.sa1.cmeg, fc.bus.sa1.iram[0x387], fc.bus.sa1.iram[0x38A] });
+    std.debug.print("[dump] apu pc={x:0>4} control={x:0>2} in={x:0>2} {x:0>2} {x:0>2} {x:0>2} out={x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ fc.bus.apu.smp.regs.pc, fc.bus.apu.control, fc.bus.apu.cpu_in[0], fc.bus.apu.cpu_in[1], fc.bus.apu.cpu_in[2], fc.bus.apu.cpu_in[3], fc.bus.apu.cpu_out[0], fc.bus.apu.cpu_out[1], fc.bus.apu.cpu_out[2], fc.bus.apu.cpu_out[3] });
 }
 
 /// Load a .ymv and refuse every mismatch that would make the replay a lie:
@@ -5485,6 +5490,16 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
             out.dump_ppu = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--ref-overclock")) {
             out.ref_overclock = try std.fmt.parseInt(u8, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--walk-watch")) {
+            const v = it.next() orelse return error.MissingValue;
+            var wit = std.mem.splitScalar(u8, v, ',');
+            var wi: usize = 0;
+            while (wit.next()) |one| : (wi += 1) {
+                if (wi == core.sa1gen.dbg_walk_watch.len) break;
+                core.sa1gen.dbg_walk_watch[wi] = try std.fmt.parseInt(u24, one, 16);
+            }
+        } else if (std.mem.eql(u8, a, "--apu-port-trace")) {
+            out.apu_port_trace = true;
         } else if (std.mem.eql(u8, a, "--conv-overclock")) {
             out.conv_overclock = try std.fmt.parseInt(u8, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--lap-cell")) {
