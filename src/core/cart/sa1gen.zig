@@ -4847,6 +4847,59 @@ fn idxThunkBodyShort(op: u8, v: u16, ret: u8) [idx_thunk_short_len]u8 {
     };
 }
 
+/// The WRAPPING index thunk: a real table base ($100 <= v <= $1F00)
+/// whose measured index runs from a valid slot to garbage. Super Metroid's
+/// enemy-projectile spawn and enemy-death paths read `Enemy.palette,X` /
+/// `Enemy.AI,X` with X the caller left behind (the disassembly says so of
+/// both), so one site reads the enemy table and, a frame later, ROM or the
+/// low mirror of the NEXT bank — `$0F96 + $F345` carries into `$87:02DB`.
+/// A single operand cannot follow: shifted, the ROM case reads $6000 off;
+/// as written, the in-table case reads the abandoned home (open bus on the
+/// SA-1 — the site stayed on the stale list of every take that spawned
+/// one). The thunk asks where BASE+INDEX lands, in 16 bits: below $2000
+/// is the window, and so is a wrap past $10000-v, where the shifted
+/// operand's own carry puts the read in the next bank's window. Between
+/// them the operand runs as written. A is scratch only for the P check;
+/// the caller's A comes back before the op (ORA sites need it).
+///
+///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low  ; x8: base+idx < base+$100
+///   CPY #($2000-v) / BCC low
+///   CPY #($10000-v) / BCS low
+///   rom: PLA / PLP / op v / ret
+///   low: PLA / PLP / op v+$6000 / ret
+const idx_thunk_wrap_len: u32 = 32;
+fn idxThunkBodyWrap(op: u8, v: u16, ret: u8) [idx_thunk_wrap_len]u8 {
+    const sh: u16 = v + wg_bw_window;
+    const lim: u16 = 0x2000 - v;
+    const wrap: u16 = @intCast(0x10000 - @as(u32, v));
+    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
+    return .{
+        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
+        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x10, // LDA $02,S / BIT #$10 / BNE low
+        cp, @truncate(lim), @truncate(lim >> 8), 0x90, 0x0B, // CPY #lim / BCC low
+        cp, @truncate(wrap), @truncate(wrap >> 8), 0xB0, 0x06, // CPY #wrap / BCS low
+        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: as written
+        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
+    };
+}
+
+test "idxThunkBodyWrap: branch targets land on the window arm, thresholds are base-relative" {
+    const b = idxThunkBodyWrap(0xBD, 0x0F96, 0x60);
+    // every branch reaches offset 26 (the window arm's PLA)
+    try testing.expectEqual(@as(usize, 26), 10 + @as(usize, b[9]));
+    try testing.expectEqual(@as(usize, 26), 15 + @as(usize, b[14]));
+    try testing.expectEqual(@as(usize, 26), 20 + @as(usize, b[19]));
+    try testing.expectEqual(@as(u8, 0x68), b[26]);
+    try testing.expectEqual(@as(u8, 0xE0), b[10]); // CPX for abs,X
+    try testing.expectEqual(@as(u16, 0x2000 - 0x0F96), @as(u16, b[11]) | @as(u16, b[12]) << 8);
+    try testing.expectEqual(@as(u16, 0x10000 - 0x0F96), @as(u16, b[16]) | @as(u16, b[17]) << 8);
+    try testing.expectEqual(@as(u16, 0x0F96), @as(u16, b[23]) | @as(u16, b[24]) << 8);
+    try testing.expectEqual(@as(u16, 0x6F96), @as(u16, b[29]) | @as(u16, b[30]) << 8);
+    const y = idxThunkBodyWrap(0xB9, 0x0F8A, 0x6B);
+    try testing.expectEqual(@as(u8, 0xC0), y[10]); // CPY for abs,Y
+    try testing.expectEqual(@as(u8, 0x6B), y[31]);
+}
+
 /// The index-dispatch thunk body (see the emission comment in
 /// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
 fn idxThunkBody(op: u8, v: u16, ret: u8) [idx_thunk_len]u8 {
@@ -8859,8 +8912,17 @@ pub fn convertWholeGame(
                     // JSR/RTS per access. `--wg-static` is what puts those
                     // sites in coverage in the first place.
                     const im = usage_map.mode(op);
-                    if (window and v < 0x100 and (im == .abs_x or im == .abs_y) and
-                        (e == 0 or e == usage_map.site_wram_low | usage_map.site_rom))
+                    // A real table base whose index was measured both in
+                    // the table and past it (see `idxThunkBodyWrap`): the
+                    // pointer-idiom rule below never admits it (v >= $100)
+                    // and the evidence rule would leave it as written.
+                    const wrap_mixed = window and v >= 0x100 and v <= 0x1F00 and
+                        (im == .abs_x or im == .abs_y) and
+                        e & usage_map.site_wram_low != 0 and
+                        e & usage_map.site_wram_bank == 0 and
+                        e != usage_map.site_wram_low;
+                    if (wrap_mixed or (window and v < 0x100 and (im == .abs_x or im == .abs_y) and
+                        (e == 0 or e == usage_map.site_wram_low | usage_map.site_rom)))
                     {
                         if (n_ithunks == idx_thunk_max)
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
@@ -9300,13 +9362,17 @@ pub fn convertWholeGame(
         op: u8,
         idx: bool,
         pin: bool,
-        /// Which of the three index bodies this site takes (see each one).
+        /// Which of the four index bodies this site takes (see each one).
+        fn wrap(self: @This()) bool {
+            return self.idx and !self.pin and self.v >= 0x100;
+        }
         fn v2(self: @This()) bool {
-            return self.idx and !self.pin and (self.op == 0xB9 or self.op == 0xBD);
+            return self.idx and !self.pin and !self.wrap() and (self.op == 0xB9 or self.op == 0xBD);
         }
         fn len(self: @This()) u32 {
             if (!self.idx) return split_thunk_len;
             if (self.pin) return idx_thunk_len;
+            if (self.wrap()) return idx_thunk_wrap_len;
             return if (self.v2()) idx_thunk_v2_len else idx_thunk_short_len;
         }
     };
@@ -9428,6 +9494,8 @@ pub fn convertWholeGame(
                         placeThunk(out, &pad, &far, &splitThunkBody(t.op, t.v, 0x60), &splitThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else if (t.pin)
                         placeThunk(out, &pad, &far, &idxThunkBody(t.op, t.v, 0x60), &idxThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
+                    else if (t.wrap())
+                        placeThunk(out, &pad, &far, &idxThunkBodyWrap(t.op, t.v, 0x60), &idxThunkBodyWrap(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else if (t.v2())
                         placeThunk(out, &pad, &far, &idxThunkBodyV2(t.op, t.v, 0x60), &idxThunkBodyV2(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else
