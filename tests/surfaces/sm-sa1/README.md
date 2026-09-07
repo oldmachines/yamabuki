@@ -227,7 +227,7 @@ clean against `sm-sa1-v70.bps.mmio`. The numbers are v69's (the same
 gameplay gate): the Tourian Metroid room 310 slowdown frames against stock's
 626, utilisation 21% against 67%, door transitions stock-timed.
 
-### The split ship, fifth cut (v71) — a stored pointer moves with the window
+### The split ship, fifth cut (v71) — a stored pointer moves with the window; see v72
 
 `sm-sa1-v71.bps.cmd` is v70's recipe unchanged; the generator gained one
 rule under the code map. The player's first session on v70
@@ -262,6 +262,35 @@ palette loads at `$86:8030`/`$86:8033` and the enemy-death AI read at
 `$A0:A3B9`, all three run with garbage in X by stock's own callers (the
 disassembly's note) — see `docs/SM_SA1_FINDINGS.md` §10 (v71) for what
 they read and why they are not this cut's.
+
+### The split ship, sixth cut (v72) — the wrapping index thunk
+
+`sm-sa1-v72.bps.cmd` is v71's recipe unchanged; the generator gained one
+more thunk shape. v71 left three executed sites reading an abandoned home,
+the ones `--stale` kept naming: `Enemy.palette,X` and `Enemy.GFXOffset,X`
+at `$86:8030`/`$86:8033` (the enemy-projectile spawn) and `Enemy.AI,X` at
+`$A0:A3B9` (`EnemyDeath`'s grapple check). All three read an enemy-table
+field with whatever X the caller happened to leave — the disassembly notes
+both callers pass values not meant as an index — so one frame the index
+points into the table and the next it points past it, into ROM or the low
+mirror of the next bank. No single operand serves both: shifted by the
+window offset the in-ROM case reads `$6000` off, left as written the
+in-table case reads the WRAM home, which on the SA-1 is open bus.
+
+These are the only three sites in the whole game the conversion audit calls
+`left_mixed` (measured low WRAM, but not only). The new thunk
+(`idxThunkBodyWrap`) dispatches on where BASE+INDEX lands in 16 bits: below
+`$2000` is the window, and so is a wrap past `$10000 - base`, where the
+shifted operand's own carry lands the read in the next bank's window;
+between them the operand runs as written. Patch 158,587 bytes = v71 plus the
+three thunks and their `JSR` redirects; the S-CPU set is v71's.
+
+Verified behaviorally equivalent over all eight surfaces; the oracle and the
+explainer are clean; the patched stock ROM equals the generated image. The
+v70 take's `--stale` list, which named these three on v71, is empty on v72;
+the v69 take syncs with a silent MMIO gate. What a player now meets when an
+enemy projectile spawns or an enemy dies is the enemy's own palette and
+death animation, not open-bus garbage.
 
 ### What v25 does not include
 
