@@ -5202,6 +5202,50 @@ comptime {
 /// Debug: addresses whose first static decode as an opcode is reported with the path that reached them.
 pub var dbg_walk_watch: [8]u32 = @splat(0);
 
+/// `--code-map`: a hand-made disassembly's verdict on every ROM byte, one
+/// flag byte per CPU address in the bank-$80 form (see
+/// tools/sm_disasm_oracle.py --export). An OPTIONAL input: the generator
+/// works from coverage alone, and where a map exists it (1) refuses any
+/// static decode, dispatcher mark, pointer seed or rewrite at a byte the
+/// map places inside an instruction or in data, (2) takes an immediate's
+/// operand width from the map instead of the walk's guess, and (3) seeds
+/// the static walk with every instruction start it names. Measured on
+/// Super Metroid without it: the static walk decoded bank $B3's enemy
+/// spritemaps and instruction lists as code and the relocation corrupted
+/// seven Gamet/Geega instructions and 273 data bytes nothing had ever
+/// executed; with it, the walk cannot leave the code.
+pub var dbg_code_map: ?[]const u8 = null;
+pub const cm_start: u8 = 0x10;
+pub const cm_interior: u8 = 0x20;
+pub const cm_data: u8 = 0x80;
+pub const cm_m_known: u8 = 0x04;
+pub const cm_x_known: u8 = 0x08;
+pub const cm_m8: u8 = 0x02;
+pub const cm_x8: u8 = 0x01;
+
+/// The map's flags for a CPU address (either mirror), 0 without a map.
+pub fn codeMapAt(a: u32) u8 {
+    const m = dbg_code_map orelse return 0;
+    const hi = (a | 0x80_0000) & 0xFF_FFFF;
+    return m[hi];
+}
+
+/// A byte the map places inside an instruction or in data: never a start.
+pub fn codeMapForbids(a: u32) bool {
+    const cm = codeMapAt(a);
+    return cm != 0 and cm & cm_start == 0;
+}
+
+/// Debug (`--cov-out`): after a generation, the coverage the relocation
+/// walked — the profiled union (`dbg_usage_kept`) and its static
+/// extension (`dbg_cov_kept`), one byte per CPU address (usage_map flags) —
+/// so an external oracle (a hand-made disassembly) can audit every
+/// instruction boundary the generator believed, not just the ones a
+/// session happened to reach.
+pub var dbg_keep_cov: bool = false;
+pub var dbg_usage_kept: ?[]u8 = null;
+pub var dbg_cov_kept: ?[]u8 = null;
+
 /// `--wg-static`: extend the S1 coverage map by recursive-descent
 /// disassembly. Every dynamically covered opcode is a PROVEN instruction
 /// start with proven M/X widths — the profiler recorded them — which
@@ -5237,6 +5281,19 @@ fn extendCoverage(
 
     if (header.reset_vector >= 0x8000)
         try stack.append(.{ .addr = header.reset_vector, .m8 = true, .x8 = true });
+    if (dbg_code_map) |cm| {
+        // Every instruction start the map names is a seed. Widths along
+        // the path come from the map at each immediate, so the seed's own
+        // guess only matters up to the first one.
+        var mcpu: u32 = 0x80_8000;
+        while (mcpu < 0xC0_0000) : (mcpu += 1) {
+            if (mcpu & 0xFFFF < 0x8000) continue;
+            if (cm[mcpu] & cm_start == 0) continue;
+            const lo: u32 = mcpu - 0x80_0000;
+            if (lo >> 16 >= 0x40) continue;
+            try stack.append(.{ .addr = @intCast(lo), .m8 = true, .x8 = true, .from = 0xFFFF_FFFC });
+        }
+    }
     var sbank: u32 = 0;
     while (sbank < 0x40) : (sbank += 1) {
         if (sbank * 0x8000 >= image.len) break;
@@ -5300,6 +5357,11 @@ fn extendCoverage(
                 // loud room), leaving the death jingle's engine upload
                 // waiting forever.
                 if (dyn & usage_map.flag_exec != 0 and dyn & usage_map.flag_opcode == 0) break;
+                // The code map's veto and its widths (see `dbg_code_map`).
+                const cmf = codeMapAt(cpu0);
+                if (cmf != 0 and cmf & cm_start == 0) break;
+                if (cmf & cm_m_known != 0) m8 = cmf & cm_m8 != 0;
+                if (cmf & cm_x_known != 0) x8 = cmf & cm_x8 != 0;
                 seen[file] = true;
                 const op = image[file];
                 const len: u32 = usage_map.instrLen(op, m8, x8);
@@ -5462,6 +5524,7 @@ fn extendCoverage(
                         // whole door sprite band as confetti).
                         if (!bank_has_exec[pb2]) continue;
                         const cpu2 = (pb2 << 16) | pa2;
+                        if (codeMapForbids(cpu2)) continue;
                         const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
                         const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
                             dflags & usage_map.flag_opcode == 0;
@@ -5532,6 +5595,7 @@ fn extendCoverage(
                 if (covered3 and fl3 & usage_map.flag_m != 0) continue;
                 const db3: u32 = ptr_bank[cell] - 1;
                 const taddr: u32 = (db3 << 16) | tgt;
+                if (codeMapForbids(taddr)) continue;
                 const tfile = db3 * 0x8000 + (tgt - 0x8000);
                 if (tfile >= image.len) continue;
                 const x8_3 = covered3 and fl3 & usage_map.flag_x != 0;
@@ -5565,6 +5629,7 @@ fn extendCoverage(
                 const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
                 if (mcell >= 0x2000 or !cell_active[mcell]) continue;
                 const msite = (mb2 << 16) | ma2;
+                if (codeMapForbids(msite)) continue;
                 // Same DATA-GATE as the ptr_bank scan: a byte the profile READ
                 // without executing is data, and marking it as a dispatcher
                 // start window-shifts a fake operand inside it (the Ceres
@@ -7565,6 +7630,10 @@ pub fn convertWholeGame(
     // when asked. `usage` stays the authority on what actually ran — the
     // refusal policy keys on it.
     const cov: []const u8 = if (static_walk) try extendCoverage(gpa, image, header, usage) else usage;
+    if (dbg_keep_cov) {
+        dbg_usage_kept = try gpa.dupe(u8, usage);
+        dbg_cov_kept = try gpa.dupe(u8, cov);
+    }
     defer if (static_walk) gpa.free(@constCast(cov));
     // Reach, for the audit: instructions the profile never ran that the
     // recursive descent found anyway.
@@ -8428,6 +8497,10 @@ pub fn convertWholeGame(
             if ((cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
+            if (codeMapForbids(cpu_addr)) {
+                res.stats.skipped_overlap += 1;
+                continue;
+            }
             // Two opcodes cannot overlap. A site whose operand bytes carry
             // an opcode flag of their own is a decode that started inside
             // another instruction — a stale flag from a cover harvested

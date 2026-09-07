@@ -153,6 +153,14 @@ const Args = struct {
     /// still read as stock's instruction is reported separately (stock
     /// code the reference never reached, not a relocation).
     mmio_stock: ?[]const u8 = null,
+    /// --cov-out <prefix>: with --gen-sa1-patch, write the coverage the
+    /// relocation walked as `<prefix>.usage` (the profiled union) and
+    /// `<prefix>.cov` (its static extension), one usage_map flag byte per
+    /// CPU address — for tools/sm_disasm_oracle.py.
+    cov_out: ?[]const u8 = null,
+    /// --code-map <file>: a hand-made disassembly's per-byte verdict (see
+    /// tools/sm_disasm_oracle.py --export and sa1gen.dbg_code_map).
+    code_map: ?[]const u8 = null,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -609,6 +617,7 @@ fn run(init: std.process.Init) !void {
     defer if (args.dump_ram) |dpath| dumpRam(io, gpa, con, dpath);
     if (args.lap_cell != 0) core.wdc65816.lap_cell = args.lap_cell;
     if (args.apu_port_trace) core.apu.dbg_port_trace = true;
+    try loadCodeMap(io, gpa, out, args);
     dbg_ref_overclock = args.ref_overclock;
     dbg_conv_overclock = args.conv_overclock;
     dbg_ref_oc_cell = args.wg_split_mode_cell;
@@ -960,6 +969,43 @@ fn saveRegion(cart: anytype) ?[]u8 {
 var mmio_base_g: [max_movies]*core.bus.Bus.MmioWriters = undefined;
 var mmio_conv_g: [max_movies]*core.bus.Bus.MmioWriters = undefined;
 var mmio_n_g: usize = 0;
+
+/// `--cov-out`: the coverage maps the generator kept (see sa1gen.dbg_keep_cov).
+fn writeCovOut(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, args: Args) !void {
+    const prefix = args.cov_out orelse return;
+    const pairs = [_]struct { suffix: []const u8, data: ?[]u8 }{
+        .{ .suffix = ".usage", .data = core.sa1gen.dbg_usage_kept },
+        .{ .suffix = ".cov", .data = core.sa1gen.dbg_cov_kept },
+    };
+    for (pairs) |pr| {
+        const data = pr.data orelse continue;
+        const path = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, pr.suffix });
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch {
+            try out.print("error: cannot write '{s}'\n", .{path});
+            continue;
+        };
+        try out.print("wrote {s} ({} bytes)\n", .{ path, data.len });
+    }
+}
+
+/// `--code-map`: the disassembly's per-byte verdict into the generator
+/// (see sa1gen.dbg_code_map). Loaded once, by whichever path runs.
+fn loadCodeMap(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, args: Args) !void {
+    if (core.sa1gen.dbg_code_map != null) return;
+    if (args.code_map) |cmp| {
+        const data = std.Io.Dir.cwd().readFileAlloc(io, cmp, gpa, .limited(32 * 1024 * 1024)) catch {
+            try out.print("error: cannot read the code map '{s}'\n", .{cmp});
+            try out.flush();
+            std.process.exit(1);
+        };
+        if (data.len != 0x100_0000) {
+            try out.print("error: the code map '{s}' is {} bytes, expected a 16 MiB flag map\n", .{ cmp, data.len });
+            try out.flush();
+            std.process.exit(1);
+        }
+        core.sa1gen.dbg_code_map = data;
+}
+}
 
 /// Is `pc` inside the stock image's padding — the $FF runs where the
 /// generator plants its own code (stubs, thunks, the split's handlers)?
@@ -2537,6 +2583,7 @@ fn runGenerate(
         @max(1, @as(u32, @intCast(m.frames.len)) -| args.skip)
     else
         gen_frames_default;
+    try loadCodeMap(io, gpa, out, args);
     const total = args.skip + frames;
 
     try out.print("baseline + verify runs, {} frames each ({d:.0}s)...\n", .{ total, @as(f64, @floatFromInt(total)) / 60.0 });
@@ -3082,6 +3129,13 @@ fn runSa1Gen(
             const file = bank * 0x8000 + (a16 - 0x8000);
             if (file >= image.len or file >= ci.len) continue;
             if (image[file] != ci[file]) continue; // scaffolding / rewritten opcode
+            // A cover's opcode inside an instruction the stock profile
+            // proved (executed, not a start) is a harvest from an image
+            // whose code lay elsewhere, not coverage. Measured: three such
+            // flags from two old conversion covers sat inside
+            // `JSR NormalEnemyTouchAI` and `ORA #$2000`.
+            const ubm = ub[pc] | ub[pc ^ 0x80_0000];
+            if (ubm & core.usage_map.flag_exec != 0 and ubm & core.usage_map.flag_opcode == 0) continue;
             if (ub[pc] & core.usage_map.flag_opcode == 0) merged += 1;
             ub[pc] |= tmp[pc];
             if (tmp_ev[pc] != 0) {
@@ -3472,6 +3526,7 @@ fn runSa1Gen(
             if (args.save_attempt) |ap|
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ap, .data = res.image });
             try printAudit(out, image, ub, &res);
+            try writeCovOut(io, gpa, out, args);
             try out.flush();
             return;
         }
@@ -5740,6 +5795,11 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 if (wi == core.sa1gen.dbg_walk_watch.len) break;
                 core.sa1gen.dbg_walk_watch[wi] = try std.fmt.parseInt(u24, one, 16);
             }
+        } else if (std.mem.eql(u8, a, "--code-map")) {
+            out.code_map = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--cov-out")) {
+            out.cov_out = it.next() orelse return error.MissingValue;
+            core.sa1gen.dbg_keep_cov = true;
         } else if (std.mem.eql(u8, a, "--mmio-stock")) {
             out.mmio_stock = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--mmio-out")) {
