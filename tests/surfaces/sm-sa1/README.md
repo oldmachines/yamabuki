@@ -178,6 +178,22 @@ S-CPU set (`sm-sa1-v69.scpu.set` is byte-identical to v68's), the same
 numbers. Verified behaviorally equivalent over all eight surfaces; the
 session's take replays through its death to game over.
 
+### The MMIO gate and the `.mmio` file
+
+Since v69's successor every generation also compares, per surface, the set of
+(register, instruction) pairs that write hardware on the conversion against
+stock's set over all surfaces; a rewritten site that writes a register stock
+never wrote from there fails the surface. The gate exists because the
+behavioral tier compares game logic and the v66-v68 sound-driver bug was not
+game logic. The generator writes the sets beside the patch as
+`<patch>.bps.mmio`; a human take on a conversion is checked against it with
+
+    yamabuki-headless <conv.sfc> --movie <take.ymv> --mmio-ref <patch>.bps.mmio --mmio-stock "$STOCK"
+
+which lists every rewritten writer no generation run produced (the hardware
+counterpart of `--stale`). Without a generation, `--mmio-out <file>` on a
+stock replay of the same take makes a reference.
+
 ### What v25 does not include
 
 `sm-sa1-v25.bps.cmd` passes the three scripted surfaces and nothing else: no

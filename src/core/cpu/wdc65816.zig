@@ -120,11 +120,15 @@ pub fn Cpu(comptime BusT: type) type {
     return struct {
         const Self = @This();
 
-        pub const serialize_skip = .{"bus"};
+        pub const serialize_skip = .{ "bus", "instr_pc" };
 
         bus: *BusT,
         regs: Regs,
         state: ExecState,
+        /// The address of the instruction in flight (regs.pc has moved
+        /// past its operand by the time it writes): what the MMIO writer
+        /// set records as the writer. Diagnostic, not machine state.
+        instr_pc: u16 = 0,
         nmi_pending: bool,
         /// One-instruction service grace for an NMI asserted at an
         /// instruction boundary (see setNmi).
@@ -186,6 +190,7 @@ pub fn Cpu(comptime BusT: type) type {
                 },
                 .running => {},
             }
+            self.instr_pc = self.regs.pc;
 
             // Emulation mode pins the stack to page 1: normalize before the
             // instruction uses S, and again after native-only instructions
@@ -396,6 +401,7 @@ pub fn Cpu(comptime BusT: type) type {
             if (dbg_stale != 0) self.noteStale(addr, 'w');
             if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
             if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);
+            if (@hasField(BusT, "mmio_writers")) if (self.bus.mmio_writers) |w| w.noteWrite(addr, self.regs.pbr, self.instr_pc);
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
             if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);

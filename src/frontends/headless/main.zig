@@ -138,6 +138,21 @@ const Args = struct {
     conv_overclock: u8 = 1,
     /// --apu-port-trace: print every write to APU port 3 with its clock (debug).
     apu_port_trace: bool = false,
+    /// --mmio-ref <file>: on a plain replay of a conversion, report every
+    /// hardware-register write from a site the generation never saw write
+    /// that register (the `.mmio` file written beside a patch: stock's
+    /// writer set and the verified conversion's). The MMIO analogue of
+    /// `--stale` for a human take.
+    mmio_ref: ?[]const u8 = null,
+    /// --mmio-out <file>: on a plain replay, write this run's writer set as
+    /// a reference (`S` lines) plus the image's padding ranges (`P` lines) —
+    /// run it on STOCK to make a reference for `--mmio-ref` without a
+    /// generation.
+    mmio_out: ?[]const u8 = null,
+    /// --mmio-stock <stock.sfc>: with --mmio-ref, a writer whose bytes
+    /// still read as stock's instruction is reported separately (stock
+    /// code the reference never reached, not a relocation).
+    mmio_stock: ?[]const u8 = null,
     /// --split-scpu-set <file>: record (and merge into the file) every S-CPU
     /// instruction address run while a split's upper copy was mapped.
     split_scpu_set: ?[]const u8 = null,
@@ -605,6 +620,43 @@ fn run(init: std.process.Init) !void {
         core.wdc65816.dbg_scpu_set = m;
     }
     defer if (args.split_scpu_set) |sp| writeScpuSet(io, gpa, sp);
+    var mmio_seen: ?*core.bus.Bus.MmioWriters = null;
+    if ((args.mmio_ref != null or args.mmio_out != null) and con.* == .fast) {
+        mmio_seen = try core.bus.Bus.MmioWriters.create(gpa);
+        con.fast.bus.mmio_writers = mmio_seen;
+    }
+    defer if (mmio_seen) |seen| {
+        if (args.mmio_out) |op| {
+            const one = [_]*core.bus.Bus.MmioWriters{seen};
+            const none = [_]*core.bus.Bus.MmioWriters{};
+            writeMmioRef(io, op, image, &one, &none) catch |e| std.debug.print("[mmio] cannot write '{s}': {s}\n", .{ op, @errorName(e) });
+            std.debug.print("[mmio] wrote {s} ({} writer pair(s))\n", .{ op, seen.set.count() });
+        }
+        if (args.mmio_ref) |rp| {
+            const ref = loadMmioRef(io, gpa, rp) catch null;
+            if (ref) |r| {
+                const stock_img: ?[]const u8 = if (args.mmio_stock) |sp| blk: {
+                    const raw = std.Io.Dir.cwd().readFileAlloc(io, sp, gpa, .limited(16 * 1024 * 1024)) catch break :blk null;
+                    break :blk core.header.stripCopierHeader(raw);
+                } else null;
+                var n: u32 = 0;
+                var n_stock: u32 = 0;
+                var it = seen.set.keyIterator();
+                while (it.next()) |k| {
+                    const reg: u16 = @intCast(k.* >> 24);
+                    const pc: u24 = @intCast(k.* & 0xFF_FFFF);
+                    if (r.set.has(reg, pc) or r.inPadding(pc)) continue;
+                    if (stock_img) |st| if (stockBytesAt(st, image, pc)) {
+                        n_stock += 1;
+                        continue;
+                    };
+                    n += 1;
+                    if (n <= 40) std.debug.print("[mmio] ${X:0>4} written from ${X:0>2}:{X:0>4} — a rewritten site no run of the reference wrote it from\n", .{ reg, pc >> 16, pc & 0xFFFF });
+                }
+                std.debug.print("[mmio] {} rewritten writer(s) outside the reference; {} stock-identical writer(s) the reference never reached\n", .{ n, n_stock });
+            } else std.debug.print("[mmio] cannot read the reference '{s}'\n", .{rp});
+        }
+    };
     defer if (args.dump_srm) |spath| dumpSrm(io, con, spath);
 
     // Drain audio every frame (the ring holds ~15 frames); hash the stream
@@ -902,6 +954,162 @@ fn saveRegion(cart: anytype) ?[]u8 {
 /// Drop a battery save into the save region: zero it, then the file's
 /// bytes at the front (a smaller chip's save in a larger region reads back
 /// through the game's own mirroring). False when nothing takes it.
+/// The MMIO gate's writer sets for the generation in flight (per surface:
+/// stock's and the conversion's), kept at file scope so the report that
+/// writes the patch can export them beside it.
+var mmio_base_g: [max_movies]*core.bus.Bus.MmioWriters = undefined;
+var mmio_conv_g: [max_movies]*core.bus.Bus.MmioWriters = undefined;
+var mmio_n_g: usize = 0;
+
+/// Is `pc` inside the stock image's padding — the $FF runs where the
+/// generator plants its own code (stubs, thunks, the split's handlers)?
+/// A hardware write from there is the conversion's own machinery, not a
+/// relocated game instruction, and the MMIO gate lets it through.
+fn pcInPadding(stock: []const u8, pc: u24) bool {
+    const bank: u32 = (pc >> 16) & 0x7F;
+    const a16: u32 = pc & 0xFFFF;
+    if (bank >= 0x40 or a16 < 0x8000) return false;
+    const file = bank * 0x8000 + (a16 - 0x8000);
+    if (file >= stock.len) return false;
+    return stock[file] == 0xFF;
+}
+
+/// Do the conversion's bytes at `pc` still read as stock's instruction?
+/// Four bytes cover any absolute or long store. A dual image is checked
+/// in both copies: the write may have come from either, and a site the
+/// generator rewrote in one copy is not stock's instruction there.
+fn stockBytesAt(stock: []const u8, conv: []const u8, pc: u24) bool {
+    const bank: u32 = (pc >> 16) & 0x7F;
+    const a16: u32 = pc & 0xFFFF;
+    if (bank >= 0x40 or a16 < 0x8000) return false;
+    const file = bank * 0x8000 + (a16 - 0x8000);
+    if (file + 4 > stock.len or file + 4 > conv.len) return false;
+    if (!std.mem.eql(u8, stock[file..][0..4], conv[file..][0..4])) return false;
+    // The dual image's upper copy sits at the image's half (the lower copy
+    // is padded to that), not at the stock ROM's length.
+    if (conv.len >= stock.len * 2) {
+        const up = conv.len / 2 + file;
+        if (up + 4 <= conv.len and !std.mem.eql(u8, stock[file..][0..4], conv[up..][0..4])) return false;
+    }
+    return true;
+}
+
+/// The MMIO gate's verdict for one surface: every (register, pc) the
+/// conversion wrote that stock never wrote on ANY surface, from a site
+/// whose bytes the generator changed. Two filters, both needed: the
+/// union across surfaces because a run that forked (a lag-changed take)
+/// reaches stock code this surface's baseline did not; the byte check
+/// because such code, unrewritten, is stock's own instruction and not
+/// this gate's business. What remains is a rewritten instruction that
+/// lands on hardware — the shape that killed the sound driver. Returns
+/// the offenders' count and prints up to eight of them.
+fn mmioGate(out: *std.Io.Writer, stock: []const u8, conv_image: []const u8, base: []const *core.bus.Bus.MmioWriters, conv: *const core.bus.Bus.MmioWriters) !u32 {
+    var n: u32 = 0;
+    var it = conv.set.keyIterator();
+    while (it.next()) |k| {
+        const reg: u16 = @intCast(k.* >> 24);
+        const pc: u24 = @intCast(k.* & 0xFF_FFFF);
+        var known = false;
+        for (base) |b| if (b.has(reg, pc)) {
+            known = true;
+        };
+        if (known) continue;
+        if (pcInPadding(stock, pc)) continue;
+        if (stockBytesAt(stock, conv_image, pc)) continue;
+        n += 1;
+        if (n <= 8) {
+            try out.print("  mmio gate: ${X:0>4} written from ${X:0>2}:{X:0>4} — a rewritten site stock never writes it from", .{ reg, pc >> 16, pc & 0xFFFF });
+            var shown: u32 = 0;
+            for (base) |b| {
+                var bit = b.set.keyIterator();
+                while (bit.next()) |bk| {
+                    if (@as(u16, @intCast(bk.* >> 24)) != reg) continue;
+                    if (shown == 0) try out.print(" (stock:", .{});
+                    if (shown < 6) try out.print(" ${X:0>2}:{X:0>4}", .{ (bk.* >> 16) & 0xFF, bk.* & 0xFFFF });
+                    shown += 1;
+                }
+            }
+            if (shown > 6) try out.print(" +{}", .{shown - 6});
+            if (shown > 0) try out.print(")", .{});
+            try out.print("\n", .{});
+        }
+    }
+    if (n > 8) try out.print("  mmio gate: ... {} more\n", .{n - 8});
+    return n;
+}
+
+/// The `.mmio` file beside a patch: `S reg pc` lines for stock's writer
+/// set over every verified surface, `C reg pc` for the conversion's.
+fn writeMmioRef(io: std.Io, path: []const u8, stock: []const u8, base: []const *core.bus.Bus.MmioWriters, conv: []const *core.bus.Bus.MmioWriters) !void {
+    var buf: std.array_list.Managed(u8) = .init(std.heap.page_allocator);
+    defer buf.deinit();
+    try appendPaddingLines(&buf, stock);
+    var line: [32]u8 = undefined;
+    for (base) |b| {
+        var it = b.set.keyIterator();
+        while (it.next()) |k| try buf.appendSlice(try std.fmt.bufPrint(&line, "S {X:0>4} {X:0>6}\n", .{ k.* >> 24, k.* & 0xFF_FFFF }));
+    }
+    for (conv) |c| {
+        var it = c.set.keyIterator();
+        while (it.next()) |k| try buf.appendSlice(try std.fmt.bufPrint(&line, "C {X:0>4} {X:0>6}\n", .{ k.* >> 24, k.* & 0xFF_FFFF }));
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+}
+
+/// `--mmio-ref`: the pairs a generation saw (stock's and the conversion's),
+/// and the stock image's padding ranges (`P start end`, file offsets) —
+/// a write from padding is the generator's own code.
+const MmioRef = struct {
+    set: *core.bus.Bus.MmioWriters,
+    pad: std.array_list.Managed([2]u32),
+    fn inPadding(self: *const MmioRef, pc: u24) bool {
+        const bank: u32 = (pc >> 16) & 0x7F;
+        const a16: u32 = pc & 0xFFFF;
+        if (bank >= 0x40 or a16 < 0x8000) return false;
+        const file = bank * 0x8000 + (a16 - 0x8000);
+        for (self.pad.items) |r| if (file >= r[0] and file < r[1]) return true;
+        return false;
+    }
+};
+
+fn loadMmioRef(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !MmioRef {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    var ref: MmioRef = .{ .set = try core.bus.Bus.MmioWriters.create(gpa), .pad = .init(gpa) };
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, line, "\r "), ' ');
+        const kind = parts.next() orelse continue;
+        if (kind.len != 1) continue;
+        if (kind[0] == 'P') {
+            const a = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+            const b = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+            try ref.pad.append(.{ a, b });
+            continue;
+        }
+        const reg = std.fmt.parseInt(u16, parts.next() orelse continue, 16) catch continue;
+        const pc = std.fmt.parseInt(u24, parts.next() orelse continue, 16) catch continue;
+        ref.set.set.put(gpa, core.bus.Bus.MmioWriters.key(reg, pc), {}) catch {};
+    }
+    return ref;
+}
+
+/// The stock image's padding as `P start end` lines: runs of $FF at least
+/// 16 bytes long, the places the generator plants code.
+fn appendPaddingLines(buf: *std.array_list.Managed(u8), stock: []const u8) !void {
+    var line: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < stock.len) {
+        if (stock[i] != 0xFF) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < stock.len and stock[j] == 0xFF) j += 1;
+        if (j - i >= 16) try buf.appendSlice(try std.fmt.bufPrint(&line, "P {X:0>6} {X:0>6}\n", .{ i, j }));
+        i = j;
+    }
+}
+
 /// A take's `.start.srm` sidecar into a fresh console, before any anchor
 /// state: every surface replay the generator or the verifier makes must
 /// start from the save the take was recorded on. MEASURED without this:
@@ -2390,6 +2598,12 @@ fn runGenerate(
     const base_name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
 
     try out.print("wrote {s} ({} bytes)\n\n", .{ path, res.bps.len });
+    {
+        var mbuf: [512]u8 = undefined;
+        const mpath = std.fmt.bufPrint(&mbuf, "{s}.mmio", .{path}) catch path;
+        writeMmioRef(io, mpath, image, mmio_base_g[0..mmio_n_g], mmio_conv_g[0..mmio_n_g]) catch {};
+        try out.print("wrote {s} (the MMIO writer sets: stock's and the conversion's, for --mmio-ref)\n", .{mpath});
+    }
     try out.print("{s}\n", .{title});
     try out.print("  stub at $00:{x:0>4}, {} vector trampoline(s), {} MEMSEL store(s) neutralised\n", .{
         res.stub_addr, res.trampolines, res.memsel_stores_nopped,
@@ -2596,6 +2810,11 @@ fn runSa1Gen(
     con.init(cart);
     con.usage = &umap;
     applySidecar(con, movAt(movs, 0));
+    // The MMIO gate's reference: stock's writer set per surface.
+    for (0..n_surf) |ms| mmio_base_g[ms] = try core.bus.Bus.MmioWriters.create(gpa);
+    for (0..n_surf) |ms| mmio_conv_g[ms] = try core.bus.Bus.MmioWriters.create(gpa);
+    mmio_n_g = n_surf;
+    con.bus.mmio_writers = mmio_base_g[0];
     if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
         try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
         try out.flush();
@@ -2627,6 +2846,7 @@ fn runSa1Gen(
         con_s.init(cart_s);
         con_s.usage = &umap;
         applySidecar(con_s, movAt(movs, s));
+        con_s.bus.mmio_writers = mmio_base_g[s];
         if (surfaceAnchor(movs, s, verify_state)) |sb| try con_s.loadState(sb);
         var audio_s = core.console.audio_hash_init;
         var samples_s: std.array_list.Managed(profile.FrameSample) = .init(gpa);
@@ -3322,6 +3542,8 @@ fn runSa1Gen(
                 const con2 = try gpa.create(core.ProfilingConsole);
                 con2.init(cart2);
                 applySidecar(con2, movAt(movs, s));
+                mmio_conv_g[s].set.clearRetainingCapacity();
+                con2.bus.mmio_writers = mmio_conv_g[s];
                 if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
                 var feed2: util.movie.Feed = .init(movAt(movs, s));
                 for (0..s_total) |i| {
@@ -3379,6 +3601,18 @@ fn runSa1Gen(
             {
                 if (n_surf > 1) try out.print("  surface {} of {}:\n", .{ s + 1, n_surf });
                 s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), surfaceAnchor(movs, s, verify_state), args.window, s_total, &fail_why, &fail_frame);
+            }
+            // The MMIO gate, on top of whatever tier the pictures and the
+            // logic earned: a hardware register written from a site stock
+            // never wrote it from is a relocation that landed on hardware,
+            // whatever the pictures say (the sound driver's death was
+            // invisible to the pixels for 2,400 frames).
+            if (s_tier != null) {
+                const n_mmio = try mmioGate(out, image, res.image, mmio_base_g[0..n_surf], mmio_conv_g[s]);
+                if (n_mmio != 0) {
+                    fail_why = "a hardware register is written from a site stock never writes it from (the MMIO gate)";
+                    s_tier = null;
+                }
             }
             if (s_tier) |t| {
                 if (@intFromEnum(t) > @intFromEnum(passed.?)) passed = t;
@@ -5498,6 +5732,12 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
                 if (wi == core.sa1gen.dbg_walk_watch.len) break;
                 core.sa1gen.dbg_walk_watch[wi] = try std.fmt.parseInt(u24, one, 16);
             }
+        } else if (std.mem.eql(u8, a, "--mmio-stock")) {
+            out.mmio_stock = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--mmio-out")) {
+            out.mmio_out = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--mmio-ref")) {
+            out.mmio_ref = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--apu-port-trace")) {
             out.apu_port_trace = true;
         } else if (std.mem.eql(u8, a, "--conv-overclock")) {

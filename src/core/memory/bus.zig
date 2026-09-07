@@ -49,7 +49,7 @@ pub const Bus = struct {
     // configuration, set once at startup — it must survive a loadState
     // (skipped fields keep their in-memory value), so an old save does not
     // silently turn the option off.
-    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "tick_snap", "vector_pull", "coproc_irq_line", "auto_fastrom" };
+    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "tick_snap", "vector_pull", "coproc_irq_line", "auto_fastrom", "mmio_writers" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
@@ -61,6 +61,79 @@ pub const Bus = struct {
     /// before each frame; `captured` after the frame means the game
     /// completed a logic tick in it, and `wram` holds the state exactly as
     /// the tick began.
+    /// The MMIO WRITER SET: every (register, program counter) pair that
+    /// wrote a hardware register on this machine — the S-CPU's PPU, APU
+    /// mailbox, WRAM-port, CPU and DMA registers, each write folded to its
+    /// canonical register (the APU mailbox's 16 mirrors to one port each).
+    /// The verifier's MMIO gate compares a conversion's set against
+    /// stock's: a register written from a site stock never wrote it from
+    /// is a relocation that landed on hardware. Measured: every patch from
+    /// v66 to v68 wrote `STA $2177` — the mailbox mirror of port 3 — from
+    /// four sites whose stock instruction is `STA $2117`, and the sound
+    /// driver died on the VRAM address byte; the behavioral tier, which
+    /// compares game logic, never saw it. Null outside the verifier.
+    pub const MmioWriters = struct {
+        set: std.AutoHashMapUnmanaged(u64, void) = .{},
+        alloc: std.mem.Allocator,
+        /// Writes that arrived without a program counter (a DMA's B-bus
+        /// target) are folded under this pseudo-PC.
+        pub const pc_dma: u24 = 0xFF_FFFF;
+
+        pub fn create(alloc: std.mem.Allocator) !*MmioWriters {
+            const w = try alloc.create(MmioWriters);
+            w.* = .{ .alloc = alloc };
+            return w;
+        }
+
+        pub fn deinit(self: *MmioWriters) void {
+            self.set.deinit(self.alloc);
+        }
+
+        /// The canonical register a system-bank write lands on, or null
+        /// when the address is not one this gate covers (WRAM, ROM, the
+        /// SA-1's own registers at $2200-$23FF).
+        pub fn canonical(addr: u24) ?u16 {
+            const bank: u8 = @intCast(addr >> 16);
+            if ((bank & 0x7F) >= 0x40) return null;
+            const a16: u16 = @truncate(addr);
+            if (a16 >= 0x2100 and a16 <= 0x213F) return a16;
+            if (a16 >= 0x2140 and a16 <= 0x217F) return 0x2140 + (a16 & 3);
+            if (a16 >= 0x2180 and a16 <= 0x2183) return a16;
+            if (a16 == 0x4016 or a16 == 0x4017) return a16;
+            if (a16 >= 0x4200 and a16 <= 0x420D) return a16;
+            if (a16 >= 0x4300 and a16 <= 0x437F) return a16;
+            return null;
+        }
+
+        pub fn key(reg: u16, pc: u24) u64 {
+            return (@as(u64, reg) << 24) | pc;
+        }
+
+        /// The writer's program counter, its bank folded to the LoROM
+        /// mirror ($80+ and $00+ hold the same bytes; a conversion may
+        /// run a routine through either).
+        pub fn noteWrite(self: *MmioWriters, addr: u24, pbr: u8, pc16: u16) void {
+            const reg = canonical(addr) orelse return;
+            const pc: u24 = (@as(u24, pbr & 0x7F) << 16) | pc16;
+            self.set.put(self.alloc, key(reg, pc), {}) catch {};
+        }
+
+        pub fn has(self: *const MmioWriters, reg: u16, pc: u24) bool {
+            return self.set.contains(key(reg, pc));
+        }
+    };
+
+    test "MmioWriters.canonical folds the APU mailbox mirrors and ignores the SA-1's registers" {
+        try std.testing.expectEqual(@as(?u16, 0x2143), MmioWriters.canonical(0x822177));
+        try std.testing.expectEqual(@as(?u16, 0x2140), MmioWriters.canonical(0x002140));
+        try std.testing.expectEqual(@as(?u16, 0x2117), MmioWriters.canonical(0x822117));
+        try std.testing.expectEqual(@as(?u16, 0x420B), MmioWriters.canonical(0x80420B));
+        try std.testing.expectEqual(@as(?u16, 0x4311), MmioWriters.canonical(0x004311));
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x002220)); // SA-1 mapper
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x7E2143)); // WRAM bank
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x006998)); // BW-RAM window
+    }
+
     pub const TickSnap = struct {
         captured: bool = false,
         /// Read-before-write liveness over WRAM for the CURRENT tick
@@ -143,6 +216,9 @@ pub const Bus = struct {
     /// at the top of a logic tick. Null (always, outside the verifier)
     /// costs the poll paths one pointer test.
     tick_snap: ?*TickSnap,
+    /// The MMIO writer set this machine records into (see `MmioWriters`);
+    /// null costs the write path one pointer test.
+    mmio_writers: ?*MmioWriters,
     /// True only for the duration of a CPU vector pull (`Cpu.readVector16`
     /// calls `vectorRead8`). The SA-1's SNV/SIV substitution is gated on it:
     /// hardware swaps the SNES NMI/IRQ vectors during the pull, not when game
@@ -218,6 +294,7 @@ pub const Bus = struct {
         self.overclock = 1;
         self.oc_acc = 0;
         self.tick_snap = null;
+        self.mmio_writers = null;
         self.vector_pull = false;
         self.mdr = 0;
         self.fastrom = false;
