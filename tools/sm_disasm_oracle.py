@@ -202,6 +202,59 @@ MAP_M_KNOWN = 0x04   # this immediate's accumulator width is known: MAP_M8 says 
 MAP_X_KNOWN = 0x08   # this immediate's index width is known: MAP_X8 says 8-bit
 MAP_M8 = 0x02
 MAP_X8 = 0x01
+MAP_WRAM_POINTER = 0x40  # a 16-bit immediate naming a low-WRAM label that the next instruction stores: a pointer the window shift must move
+
+
+def load_labels(src_dir):
+    """Label -> address, from memory.asm's `Label: skip n ; $addr` lines and
+    the DiztinGUIsh label export beside the sources."""
+    lab = {}
+    root = os.path.dirname(os.path.abspath(src_dir))
+    csv_path = os.path.join(root, "diztinguish", "labels.csv")
+    if os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 2 and parts[0].strip():
+                    try:
+                        lab[parts[1].strip()] = int(parts[0].strip().lstrip("$"), 16)
+                    except ValueError:
+                        pass
+    mem = os.path.join(src_dir, "memory.asm")
+    if os.path.exists(mem):
+        with open(mem, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"\s*([A-Za-z_][\w.]*):\s*skip\s+\S+\s*;\s*\$([0-9A-Fa-f]+)", line)
+                if m:
+                    lab[m.group(1)] = int(m.group(2), 16)
+    return lab
+
+
+def wram_pointer_sites(inst, lab):
+    """Instruction starts whose 16-bit immediate names a low-WRAM label and
+    whose next instruction stores it (STA/STX/STY, any mode) — a pointer
+    into the window the relocation must shift. An immediate that is only
+    compared or decremented is a constant that happens to share the value."""
+    addrs = sorted(inst)
+    out = set()
+    for i, a in enumerate(addrs):
+        parts = inst[a].split(None, 1)
+        if len(parts) < 2:
+            continue
+        mn = parts[0].upper()
+        op = parts[1].strip()
+        if not op.startswith("#") or not mn.startswith(("LDA.W", "LDX.W", "LDY.W", "PEA")):
+            continue
+        m = re.match(r"#([A-Za-z_][\w.]*)(\s*[+-]\s*\$?[0-9A-Fa-f]+)?$", op)
+        if not m:
+            continue
+        v = lab.get(m.group(1))
+        if v is None or (v & 0xFFFF) >= 0x2000:
+            continue
+        nxt = inst.get(addrs[i + 1], "") if i + 1 < len(addrs) else ""
+        if nxt.split()[0].upper().startswith(("STA", "STX", "STY")) if nxt else False:
+            out.add(a)
+    return out
 
 
 def export_code_map(inst, data, path):
@@ -219,8 +272,9 @@ def export_code_map(inst, data, path):
             m[a] = MAP_DATA
     for a in data:
         m[a] |= MAP_DATA
+    pointers = wram_pointer_sites(inst, load_labels(export_code_map.src_dir))
     for a, line in inst.items():
-        m[a] = MAP_START
+        m[a] = MAP_START | (MAP_WRAM_POINTER if a in pointers else 0)
         body = line.split(";")[0].strip()
         while body and body.split(None, 1)[0].strip("+-") == "":
             body = body.split(None, 1)[1].strip() if " " in body else ""
@@ -241,12 +295,13 @@ def export_code_map(inst, data, path):
             m[a + k] = MAP_INTERIOR
     with open(path, "wb") as f:
         f.write(m)
-    print(f"wrote {path}: {len(inst)} starts, {len(data)} data bytes")
+    print(f"wrote {path}: {len(inst)} starts, {len(data)} data bytes, {len(pointers)} stored low-WRAM pointer immediates")
 
 
 def main():
     if len(sys.argv) == 4 and sys.argv[2] == "--export":
         inst, data = load_disassembly(sys.argv[1])
+        export_code_map.src_dir = sys.argv[1]
         export_code_map(inst, data, sys.argv[3])
         return
     if len(sys.argv) != 3:

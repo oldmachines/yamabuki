@@ -313,6 +313,8 @@ pub const Stats = struct {
     rewritten_long: u32 = 0,
     /// Sites skipped because their operand bytes carry an opcode flag (two decodes overlapping).
     skipped_overlap: u32 = 0,
+    /// Low-WRAM pointer immediates shifted on the code map's word.
+    rewritten_map_pointers: u32 = 0,
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
@@ -5222,6 +5224,15 @@ pub const cm_m_known: u8 = 0x04;
 pub const cm_x_known: u8 = 0x08;
 pub const cm_m8: u8 = 0x02;
 pub const cm_x8: u8 = 0x01;
+/// A 16-bit immediate the disassembly names with a low-WRAM label and the
+/// next instruction stores: a pointer into the window. The evidence-gated
+/// pointer-seed rule only reaches the seeds a profiled dereference proved;
+/// the label is proof for the rest. Measured: `LDA #CustomDrawInst_NumberOfBlocks`
+/// stored into the PLM draw-instruction pointers ($84:8B3B) was never shifted,
+/// the draw routine read its block word through the abandoned WRAM home, and
+/// every destructible block Samus revealed drew as a flipped tile $3FF —
+/// the crosses a session saw in green Brinstar.
+pub const cm_wram_pointer: u8 = 0x40;
 
 /// The map's flags for a CPU address (either mirror), 0 without a map.
 pub fn codeMapAt(a: u32) u8 {
@@ -5293,6 +5304,7 @@ fn extendCoverage(
             if (lo >> 16 >= 0x40) continue;
             try stack.append(.{ .addr = @intCast(lo), .m8 = true, .x8 = true, .from = 0xFFFF_FFFC });
         }
+        std.debug.print("[code-map] {} seeds from the map\n", .{stack.items.len});
     }
     var sbank: u32 = 0;
     while (sbank < 0x40) : (sbank += 1) {
@@ -8500,6 +8512,24 @@ pub fn convertWholeGame(
             if (codeMapForbids(cpu_addr)) {
                 res.stats.skipped_overlap += 1;
                 continue;
+            }
+            if (bwram and codeMapAt(cpu_addr) & cm_wram_pointer != 0) {
+                // A stored immediate the disassembly names with a WRAM label
+                // (see `cm_wram_pointer`): the value moves with the window.
+                const fl_p = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                const wide = switch (op) {
+                    0xA9 => fl_p & usage_map.flag_m == 0,
+                    0xA2, 0xA0 => fl_p & usage_map.flag_x == 0,
+                    0xF4 => true,
+                    else => false,
+                };
+                if (wide and file + 2 < out.len) {
+                    const pv = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (pv < 0x2000) {
+                        std.mem.writeInt(u16, out[file + 1 ..][0..2], pv + wg_bw_window, .little);
+                        res.stats.rewritten_map_pointers += 1;
+                    }
+                }
             }
             // Two opcodes cannot overlap. A site whose operand bytes carry
             // an opcode flag of their own is a decode that started inside
