@@ -4169,6 +4169,14 @@ fn reportSa1(
 
     try out.print("wrote {s} ({} bytes)\n", .{ path, bps.len });
     try out.print("wrote {s}\n\n", .{cmd_path});
+    if (mmio_n_g > 0) {
+        // The MMIO writer sets beside the patch: stock's and the verified
+        // conversion's, plus stock's padding — the reference `--mmio-ref`
+        // checks a human take against.
+        const mpath = try std.fmt.allocPrint(gpa, "{s}.mmio", .{path});
+        writeMmioRef(io, mpath, image, mmio_base_g[0..mmio_n_g], mmio_conv_g[0..mmio_n_g]) catch {};
+        try out.print("wrote {s} (the MMIO writer sets, for --mmio-ref)\n", .{mpath});
+    }
     if (args.window) {
         try out.print(
             \\uniform window relocation (v17's architecture):
