@@ -131,7 +131,7 @@ The patch applies to the stock ROM and produces an 8 MiB image: the lower
 4 MiB is v66's conversion with the split's anchor, the upper the same with
 the SA-1's shadows (`docs/SM_SA1_FINDINGS.md` §10).
 
-### The split ship, second cut (v68)
+### The split ship, second cut (v68) — hangs at a death, see v69
 
 `sm-sa1-v68.bps.cmd` is v67's recipe with two more takes and one more input
 file. The takes are `recordings/stock-gameover-quit.ymv` (with its
@@ -160,6 +160,23 @@ slowdown 626 of 10,000 frames on stock, 310 on v68; lag frames 863 to 610;
 S-CPU utilisation 67% to 21%. Door transitions keep stock's timing. The
 per-poll quit take `recordings/stock-gameover-quit-polls.ymv` replays on
 any build and walks the soft reset into a new game on v68.
+
+### The split ship, third cut (v69) — supersedes v68
+
+`sm-sa1-v69.bps.cmd` is v68's recipe plus one stock cover pair,
+`recordings/v68-take0001-polls.ymv` (the first human session on v68), and a
+generator fix that pair exposed. Every patch from v66 to v68 hangs at the
+first death (or loud room) a session reaches: the static extension's
+dispatcher scan had matched the immediates of `AND #$FC` / `LDA #$7C` before
+four `STA $2117` stores as `JSR/JMP ($178D,X)`, and the window shift of that
+fake operand turned each store into `STA $2177` — the APU mailbox mirror. The
+sound driver took the VRAM address byte as a request and died; the death
+jingle's engine upload then waited forever. The fix is four guards in the
+static extension and the relocation walk (`docs/SM_SA1_FINDINGS.md` §10,
+"v68 take 0001"). v69 is otherwise v68: the same gameplay gate, the same
+S-CPU set (`sm-sa1-v69.scpu.set` is byte-identical to v68's), the same
+numbers. Verified behaviorally equivalent over all eight surfaces; the
+session's take replays through its death to game over.
 
 ### What v25 does not include
 
