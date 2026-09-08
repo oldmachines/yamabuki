@@ -2297,6 +2297,27 @@ fn saveHarvestCache(
 /// in window mode, which is refused at load time instead.
 /// Conversion-side site evidence fills in only where stock evidence is
 /// absent (see the maps' declaration). Returns the stock map, now complete.
+/// The stock and conversion file offsets a covered CPU address reads from,
+/// for the cover harvest's byte-identity guard. Stock is plain LoROM. A dual
+/// conversion image (>= 4 MiB, larger than any plain Super Metroid LoROM)
+/// follows the shim's Super-MMC map, where $A0-$BF is MB2 at file $200000 —
+/// NOT the LoROM mirror of $20-$3F the plain formula would read. Using the
+/// plain formula for both silently compared MB1 bytes against the cover's
+/// MB2 code and mis-credited (in practice, rejected) every $A0-$BF harvest.
+/// Returns null for an address with no ROM code home in either image.
+fn harvestFiles(image_len: usize, ci_len: usize, pc: u24) ?struct { s: usize, c: usize } {
+    const bank: u32 = (pc >> 16) & 0x7F;
+    const a16: u32 = pc & 0xFFFF;
+    if (bank > 0x3F or a16 < 0x8000) return null;
+    const sfile: usize = bank * 0x8000 + (a16 - 0x8000);
+    const cfile: usize = if (ci_len >= 0x40_0000)
+        (core.sa1gen.loromFileOffset(ci_len, pc) orelse return null)
+    else
+        sfile;
+    if (sfile >= image_len or cfile >= ci_len) return null;
+    return .{ .s = sfile, .c = cfile };
+}
+
 fn foldConvEvidence(site_ev: []u8, conv: []const u8, out: *std.Io.Writer) []u8 {
     var folded: u32 = 0;
     var shadowed: u32 = 0;
@@ -3126,12 +3147,8 @@ fn runSa1Gen(
         var pc: u32 = 0;
         while (pc < core.usage_map.cpu_map_len) : (pc += 1) {
             if (tmp[pc] & core.usage_map.flag_opcode == 0) continue;
-            const bank = (pc >> 16) & 0x7F;
-            const a16 = pc & 0xFFFF;
-            if (bank > 0x3F or a16 < 0x8000) continue;
-            const file = bank * 0x8000 + (a16 - 0x8000);
-            if (file >= image.len or file >= ci.len) continue;
-            if (image[file] != ci[file]) continue; // scaffolding / rewritten opcode
+            const hf = harvestFiles(image.len, ci.len, @intCast(pc)) orelse continue;
+            if (image[hf.s] != ci[hf.c]) continue; // scaffolding / rewritten opcode
             // A cover's opcode inside an instruction the stock profile
             // proved (executed, not a start) is a harvest from an image
             // whose code lay elsewhere, not coverage. Measured: three such
@@ -3156,12 +3173,8 @@ fn runSa1Gen(
         // this conversion's own scaffolding and proves nothing about stock.
         var merged_pb: u32 = 0;
         for (cover_pb.proven[0..cover_pb.n_proven]) |ca| {
-            const bank = (ca >> 16) & 0x7F;
-            const a16 = ca & 0xFFFF;
-            if (bank > 0x3F or a16 < 0x8000) continue;
-            const file = bank * 0x8000 + (a16 - 0x8000);
-            if (file >= image.len or file >= ci.len) continue;
-            if (image[file] != ci[file]) continue;
+            const hf = harvestFiles(image.len, ci.len, @intCast(ca)) orelse continue;
+            if (image[hf.s] != ci[hf.c]) continue;
             const before = ptr_ev.n_proven;
             ptr_ev.addProven(ca);
             if (ptr_ev.n_proven != before) merged_pb += 1;
