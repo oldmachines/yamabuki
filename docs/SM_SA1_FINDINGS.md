@@ -1465,6 +1465,94 @@ the records off it are shown not to. And the minimap is drawn from the
 same table as the pause map: one net fixed both, but only the `--watch`
 on the game state said which screen the player had actually seen.
 
+## 4o. The area-map legend garble: a WRAM fill through the WMDATA port (v70-v73)
+
+A player opening the area map on v70-v72 sometimes saw the legend rows at
+the bottom of the map replaced by garbled tiles: fragments of the right
+glyphs mixed with graphics noise. The map itself was pixel-identical to
+stock; only the two legend rows were wrong, and the same session could
+render the map clean once and garbled the next time. The chase is worth
+recording in full, because the answer was a class none of the instruments
+could see, and because two wrong conclusions were reached and retracted on
+the way to it.
+
+**Narrowing.** The full player take verified behaviorally equivalent over
+its whole length, with zero `--stale` hits (the detector hooks the DMA
+engine as well as the CPU) and the MMIO writer gate silent. A whole-
+machine diff of stock against the conversion at the map screen, built by
+dumping both with `--dump-ram`, put the entire divergence in 125 bytes of
+the BG2 tilemap at VRAM `$3800-$3BFF`, the legend rows; CGRAM, OAM,
+character graphics and the rest of VRAM were identical. The legend reaches
+VRAM through a 128-byte DMA from a WRAM staging buffer, `$7E:3640` on
+stock and `$40:3640` on the conversion, which is the same address
+correctly relocated by the window fold. So the buffer's content was wrong,
+and the question became who fills it.
+
+**Two wrong turns.** The first theory was a producer/consumer split, a
+writer left at the abandoned `$7E` home while the DMA read the window,
+because the abandoned `$7E:3640` on the conversion did hold the legend
+while the window held garbage. The second, after a write-watch on the
+buffer returned nothing, was a buffer-reuse timing race: the graphics
+decompressor (`STA [DP_DecompDest],Y` at `$80:B191`) overwrites the buffer
+with its own output, and the conversion's altered timing was supposed to
+have inverted stock's order of build, upload, reuse. Both were retracted by
+one measurement: the legend-upload schedules and the decompressor's write
+are at the same master clocks on stock and on the conversion, and stock's
+buffer, after the decompressor writes garbage into it, is restored to the
+legend before the next upload, by something the CPU write-watch could not
+see. Bisecting the buffer by frame on both builds put stock's restore
+between clocks 1447M and 1472M and showed the conversion's window never
+restored at all.
+
+**The mechanism.** The restore is a fill through the S-CPU's WRAM data
+port. The pause code sets WMADD to `$7E:3400` with three immediates
+(`$82:8EFF`, `$8F04`, `$8F09`), then `JSL SetupHDMATransfer` with inline
+arguments — mode, B-bus `$80` which is WMDATA, a `dl` source of
+`Tilemap_BG2PauseScreen_BG2RoomSelectMap_1` at `$B6:E400`, a `dw` length of
+`$0400` — and triggers channel 1. A second site at `$82:8F1D` does the same
+for `$7E:3800` from `Tilemap_EquipmentScreen`, 2,048 bytes. The port
+writes real WRAM and nothing else; it cannot be pointed at BW-RAM. On the
+conversion the `dl` source folded correctly (`$B6` to `$36`), and the
+bank-immediate net had even re-banked the WMADD bank byte from `$7E` to
+`$40` — a rewrite that can never work, since `$2183` selects `$7E` or
+`$7F` by its low bit alone — so the fill landed in the abandoned
+`$7E:3400` while the legend DMA read `$40:3400`. That is why the abandoned
+home held the legend, why the window held the decompressor's leftovers,
+and why nothing reported it: the CPU's stores go to MMIO (`$2181-$2183`),
+the DMA's B-bus target is `$2180`, and the write into `$7E` happens inside
+the port, so neither the stale detector nor an address watch ever names a
+`$7E` access. The generator's own design note had said as much for the
+whole-game mode ("WRAM-port traffic lands in real WRAM"); no verification
+surface opens the pause map, so in window mode it shipped.
+
+**The fix (v73).** A signature net, `relocateWmdataFills`, matches the
+32-byte site — the three WMADD immediates, the JSL with its inline
+arguments, the trigger — and replaces it in place with a block move that
+reaches BW-RAM directly: `PHB / PHP / REP #$30 / LDX #src / LDY #dst /
+LDA #len-1 / MVN dst,src / PLP / PLB`, NOP-padded to the site's length. The
+MVN's source bank goes through the same de-mirror map as every other bank
+byte; its destination is `$40`/`$41` at the WMADD offset. MVN sets DBR for
+its duration, hence the PHB/PLB; PHP/PLP restores the caller's widths.
+Hand-patched first onto v72, the garbled take then rendered the legend
+byte-identical to stock — and its end-frame hash became stock's own hash on
+that take. Two sites in the whole game take the net; a third WMADD setup in
+bank `$88` never DMAs through the port and is left alone. The count is
+reported as "WMDATA-port fill(s) turned into MVN block moves".
+
+**Instrument lessons.** `--watch` takes one dashed argument, `lo-hi`, not
+two addresses; a space-separated range silently collapses to a single byte
+and returns false negatives, which produced the first two wrong turns until
+the tool was validated on a known-hot address. The write-watch caps at
+4,096 hits, so a wide range hides the late writer that matters; watching
+the exact word is what named `$80:B191`. Frame-bisecting a buffer with
+`--frames N --dump-ram` on both builds is the instrument that finally
+separated "who corrupts it" from "who restores it". And the DMA trace
+gained a from-clock (`--dma-trace <max>:<from-clock>`) because its fixed
+quota fills long before a one-time upload late in a long take. The class
+itself — a WRAM write the CPU never performs as an address — is now in
+the generator's vocabulary; a port read (`LDA $2180`) of relocated data
+would be the mirror-image bug, and no site in Super Metroid does one.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -1965,6 +2053,7 @@ enemy-load slowdown rather than transition lag.
 | **v70 take 0001 (2026-09-07)** | The player's first session on v70: green Brinstar, destructible blocks shot open, every revealed block drawn as a crossed tile. Root cause: `Instruction_PLM_DrawPLMBlock_Common` builds a one-block draw list in low WRAM (`CustomDrawInst_*`, `$1E67-$1E6C`) and stores its address as an immediate (`LDA #$1E67` at `$84:8B3B`) into the PLM's draw-instruction pointer; `DrawPLM` reads the count through a thunk that resolves the index at run time (fine either way), then `LDA (DP_Temp03)` at `$84:8F53` reads the block word through the un-shifted pointer — `$84:1E69`, an abandoned home, open bus on the SA-1 — so the block draws as tile `$3FF`. The evidence-gated pointer-seed rule never reached the site: the thunked dereference leaves no proof of a seed. Found by state + `--dump-ram` (the draw buffer `$7E:C6C8` held `C3FF` words where stock holds `22CE 22CF 22DE 22DF`), then the disassembly's label | a stored pointer the disassembly names is proof enough; and `--stale` had been blind to the FIRST read of this class — the exe in use that session never reported SA-1-side hits (a build-staleness accident, not a design gap; the fresh build names `$84:8F53`) | `tests/surfaces/sm-sa1/recordings/v70-take0001-polls.ymv` |
 | **v71, SHIPPED** | v70's recipe; the generator shifts every 16-bit immediate the disassembly labels with a low-WRAM address and the next instruction stores (code-map flag 0x40 from `wram_pointer_sites`; `cm_wram_pointer` in the generator). Three sites moved: `$84:8B3B` (the draw list), `$82:9EE5` (`MapTilesExplored`, the pause map's explored tiles) and `$88:AE05` (`HUDBG2XPositionScrollingSky`, an HDMA indirect address — the DMA engine would have read the abandoned home). Patch 158,478 bytes = v70 + six bytes + checksum; the S-CPU set is v70's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean (zero unexplained rewrites in either copy); patched stock equals the generated image. The v70 take replays with the blocks drawn as stock's, zero MMIO offenders. `--stale` on it still names `$86:8030`, `$86:8033` (`Enemy.palette,X` / `Enemy.GFXOffset,X` in the enemy-projectile spawn) and `$A0:A3B9` (`Enemy.AI,X` in `EnemyDeath`): executed sites whose evidence is not pure low-WRAM, because stock's own callers pass garbage in X (the disassembly says so of both) and the index carries the read into the next bank. Left as-is: shifting them would be correct (the window is mirrored in every system bank) but the evidence rule cannot yet say so; v72 material | the disassembly's labels are a fourth proof source next to profiles, covers and the room-graph walk. `--stale` now also hooks the DMA engine (GDMA sources, HDMA tables and transfer sources) | `tests/surfaces/sm-sa1/sm-sa1-v71.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v71.scpu.set` |
 | **v72, SHIPPED** | v71's recipe plus the wrapping index thunk (`idxThunkBodyWrap`): a real table base (`$100..$1F00`) with mixed low-WRAM-and-ROM evidence dispatches on where BASE+INDEX lands in 16 bits — below `$2000` is the window, a wrap past `$10000-base` is the next bank's window (the shifted operand's own carry), between them the operand is as written. The three sites it serves are the whole game's only `left_mixed` audit verdict (measured low WRAM, but not only): `$86:8030`/`$86:8033` (`Enemy.palette,X` / `Enemy.GFXOffset,X`, the enemy-projectile spawn) and `$A0:A3B9` (`Enemy.AI,X`, `EnemyDeath`). Stock's callers pass a non-index in X (the disassembly says so), so the read alternates between the enemy table and ROM/the next bank's low mirror. Patch 158,587 bytes = v71 + three thunks + `JSR` redirects; S-CPU set is v71's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the generated image. The v70 take's `--stale` list, which named these three on v71, is empty on v72; the v69 take syncs, MMIO gate silent | the wrapping-base index thunk closes the `left_mixed` class the audit isolates; the enemy-projectile palettes and `EnemyDeath`'s grapple check no longer read open bus | `tests/surfaces/sm-sa1/sm-sa1-v72.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v72.scpu.set` |
+| **v73, SHIPPED** | v72's recipe plus `relocateWmdataFills`, a signature net for WRAM fills through the WMDATA port (`$2180`, address in `$2181-$2183`). The port writes real WRAM only and cannot be aimed at BW-RAM, so on a window conversion every such fill lands in the abandoned home while every relocated reader looks in the window — and no instrument sees it (the CPU stores go to MMIO, the DMA's B-bus target is `$2180`, the `$7E` write happens inside the port). Super Metroid's pause menu loads its map tilemap into `$7E:3400`/`$7E:3800` this way; the graphics decompressor reuses `$7E:3400` and stock restores the legend rows by re-running the port fill before the legend's DMA re-uploads them. On v70-v72 that restore went to the dead home and the area map's bottom rows drew as decompressed graphics (§4o). The net replaces each 32-byte site with `PHB/PHP/REP #$30/LDX #src/LDY #dst/LDA #len-1/MVN dst,src/PLP/PLB` + NOPs; 2 sites take it. Patch 158,622 bytes = v72 + two sites in both copies + checksum; S-CPU set is v72's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the image; the garbled take renders the legend byte-identical to stock with stock's end-frame hash; the v69-v72 takes are stale-silent with a clean MMIO gate | a WRAM write with no CPU or DMA A-bus address is a class of its own; the generator's design note had named it for whole-game mode and it slipped the window mode because no surface opens the pause map. Frame-bisecting a buffer with `--frames N --dump-ram` on both builds is what separated 'who corrupts it' from 'who restores it' | `tests/surfaces/sm-sa1/sm-sa1-v73.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v73.scpu.set` |
 
 **Where the widened split stands (s19e, 2026-09-06).** With the gate at
 `$08-$0C` the SA-1 runs Super Metroid's door transitions as well as its

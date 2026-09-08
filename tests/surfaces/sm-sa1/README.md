@@ -263,7 +263,7 @@ palette loads at `$86:8030`/`$86:8033` and the enemy-death AI read at
 disassembly's note) — see `docs/SM_SA1_FINDINGS.md` §10 (v71) for what
 they read and why they are not this cut's.
 
-### The split ship, sixth cut (v72) — the wrapping index thunk
+### The split ship, sixth cut (v72) — the wrapping index thunk; see v73
 
 `sm-sa1-v72.bps.cmd` is v71's recipe unchanged; the generator gained one
 more thunk shape. v71 left three executed sites reading an abandoned home,
@@ -291,6 +291,45 @@ v70 take's `--stale` list, which named these three on v71, is empty on v72;
 the v69 take syncs with a silent MMIO gate. What a player now meets when an
 enemy projectile spawns or an enemy dies is the enemy's own palette and
 death animation, not open-bus garbage.
+
+### The split ship, seventh cut (v73) — the area map's legend, and a WRAM write no address names
+
+`sm-sa1-v73.bps.cmd` is v72's recipe unchanged; the generator gained one
+signature net. A player's area map on v70-v72 sometimes drew its bottom
+legend rows as garbled tiles while the map itself was pixel-identical to
+stock. Every gate was silent on the take: behaviorally equivalent over its
+whole length, zero `--stale` hits with the DMA engine hooked, the MMIO
+writer gate clean. The cause is a class no address-based instrument can
+see.
+
+The pause menu loads its map tilemap into `$7E:3400` and `$7E:3800` through
+the S-CPU's WRAM data port: WMADD from three immediates, `JSL
+SetupHDMATransfer` with inline arguments naming B-bus `$80` (WMDATA), a
+`dl` source in bank `$B6`, a `dw` length, then the `$420B` trigger. The
+port writes real WRAM and nothing else. On the conversion the source
+folded correctly and the bank-immediate net had even re-banked the WMADD
+bank byte to `$40` — which `$2183` ignores, selecting `$7E` or `$7F` by its
+low bit — so the fill landed in the abandoned `$7E:3400` while the legend's
+own DMA read the window `$40:3400`. The graphics decompressor reuses that
+buffer; stock restores the legend rows by running the same port fill again
+before the legend re-uploads, and on the conversion that restore went to
+the dead home. Findings §4o has the whole chase, including two wrong
+conclusions retracted on the way.
+
+The net (`relocateWmdataFills`) replaces each 32-byte site in place with a
+block move that reaches BW-RAM directly — `PHB / PHP / REP #$30 / LDX #src
+/ LDY #dst / LDA #len-1 / MVN dst,src / PLP / PLB`, NOP-padded — the
+source bank through the de-mirror map, the destination `$40`/`$41` at the
+WMADD offset. Two sites in the whole game take it; a third WMADD setup in
+bank `$88` never DMAs through the port and is left alone. Patch 158,622
+bytes = v72 plus those two sites in both copies and the checksum; the S-CPU
+set is v72's.
+
+Verified behaviorally equivalent over all eight surfaces; the oracle and the
+explainer are clean; the patched stock ROM equals the generated image. The
+garbled take (`recordings/v72-take0002-polls.ymv`) now renders the legend
+byte-identical to stock and ends on stock's own frame hash; the v69, v70,
+v71 and v72 takes replay with zero `--stale` sites and a silent MMIO gate.
 
 ### What v25 does not include
 
