@@ -315,6 +315,9 @@ pub const Stats = struct {
     skipped_overlap: u32 = 0,
     /// Low-WRAM pointer immediates shifted on the code map's word.
     rewritten_map_pointers: u32 = 0,
+    /// WMDATA-port fills (DMA into $2180 at a relocated WMADD) turned into
+    /// MVN block moves into BW-RAM. See `relocateWmdataFills`.
+    rewritten_wmdata_fills: u32 = 0,
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
@@ -3749,6 +3752,119 @@ fn demirrorQueueBankImms(out: []u8, wide: bool) u32 {
         }
     }
     return n;
+}
+
+/// WRAM fills through the WMDATA port, re-aimed at the window BY SIGNATURE.
+///
+/// The S-CPU's WRAM data port ($2180, address in $2181-$2183) writes REAL
+/// WRAM and nothing else: it cannot be pointed at BW-RAM. A window
+/// conversion moves the game's WRAM into BW-RAM, so every fill the game
+/// performs through the port lands in the abandoned home while every
+/// reader — CPU and DMA alike, correctly relocated — looks in the window.
+/// Nothing in the usual instruments sees it: the CPU's stores go to MMIO
+/// ($2181-$2183, $2180), the DMA's B-bus target is $2180, and the write
+/// into $7E happens inside the port, so neither the stale detector nor an
+/// address watch ever names a $7E access.
+///
+/// Measured: Super Metroid's pause menu loads its map tilemap into
+/// $7E:3400 and $7E:3800 this way — WMADD from three immediates, then
+/// `JSL SetupHDMATransfer` with inline arguments (mode, B=$80, a `dl`
+/// source, a `dw` length), then the $420B trigger. The graphics
+/// decompressor later reuses $7E:3400 for its own output; stock restores
+/// the map's legend rows by running the same port fill again before the
+/// legend's own DMA re-uploads them. On the conversion the restore went
+/// to the dead home, the legend DMA read the window, and the area map's
+/// bottom rows drew as decompressed graphics — the garble a player saw
+/// on v70-v72 (findings §4o). The bank-immediate net had even re-banked
+/// the WMADD bank byte $7E to $40, which the port ignores ($2183 selects
+/// $7E or $7F by its low bit alone): a rewrite that could never work.
+///
+/// The fix replaces the whole 32-byte site — WMADD setup, JSL with
+/// arguments, trigger — with a block move that reaches BW-RAM directly:
+///
+///     PHB / PHP / REP #$30
+///     LDX #src / LDY #dst / LDA #len-1
+///     MVN dst_bank, src_bank
+///     PLP / PLB / NOP x14
+///
+/// The MVN's source bank is the `dl` bank through the same de-mirror map
+/// as every other bank byte (already folded when the walk reached the
+/// site, raw when it did not); its destination is $40/$41 at the WMADD
+/// offset. MVN sets DBR to the destination for its duration, hence the
+/// PHB/PLB; PHP/PLP restores the caller's widths exactly. Five fixed
+/// opcode groups over 32 bytes keep the signature off data.
+fn relocateWmdataFills(out: []u8, wide: bool) u32 {
+    var n: u32 = 0;
+    var f: usize = 0;
+    while (f + 32 <= out.len) : (f += 1) {
+        const b = out[f..][0..32];
+        // LDA #lo / STA $2181 / LDA #mid / STA $2182 / LDA #bank / STA $2183
+        if (!(b[0] == 0xA9 and b[2] == 0x8D and b[3] == 0x81 and b[4] == 0x21 and
+            b[5] == 0xA9 and b[7] == 0x8D and b[8] == 0x82 and b[9] == 0x21 and
+            b[10] == 0xA9 and b[12] == 0x8D and b[13] == 0x83 and b[14] == 0x21)) continue;
+        // JSL callee / db mode,$00,$80 (B-bus = WMDATA) / dl src / dw len / LDA #$02 / STA $420B
+        if (!(b[15] == 0x22 and b[19] == 0x01 and b[20] == 0x00 and b[21] == 0x80 and
+            b[27] == 0xA9 and b[28] == 0x02 and b[29] == 0x8D and b[30] == 0x0B and b[31] == 0x42)) continue;
+        const dst_bank: u8 = switch (b[11]) {
+            0x7E, 0x40 => 0x40,
+            0x7F, 0x41 => 0x41,
+            else => continue, // not a relocated home
+        };
+        const dst: u16 = @as(u16, b[6]) << 8 | b[1];
+        const src: u16 = std.mem.readInt(u16, b[22..24], .little);
+        const sb = b[24];
+        const src_bank: u8 = if (sb == 0x7E or sb == 0x7F)
+            sb - 0x3E
+        else if (wide and sb >= 0xA0 and sb <= 0xBF)
+            sb - 0x80
+        else if (wide and sb >= 0xC0 and sb <= 0xDF)
+            sb - 0x20
+        else
+            sb;
+        const len: u16 = std.mem.readInt(u16, b[25..27], .little);
+        if (len == 0) continue;
+        const cnt: u16 = len - 1;
+        const body = [_]u8{
+            0x8B, 0x08, 0xC2, 0x30, // PHB / PHP / REP #$30
+            0xA2, @truncate(src), @truncate(src >> 8), // LDX #src
+            0xA0, @truncate(dst), @truncate(dst >> 8), // LDY #dst
+            0xA9, @truncate(cnt), @truncate(cnt >> 8), // LDA #len-1
+            0x54, dst_bank, src_bank, // MVN dst,src
+            0x28, 0xAB, // PLP / PLB
+        };
+        @memcpy(b[0..body.len], &body);
+        @memset(b[body.len..], 0xEA);
+        n += 1;
+        f += 31;
+    }
+    return n;
+}
+
+test "relocateWmdataFills: the pause-map port fill becomes an MVN into the window" {
+    // Super Metroid $82:8EFD: WMADD = $7E:3400, DMA $B6:E400 -> $2180, $0400 bytes.
+    var buf: [40]u8 = @splat(0xFF);
+    const site = [_]u8{
+        0xA9, 0x00, 0x8D, 0x81, 0x21, 0xA9, 0x34, 0x8D, 0x82, 0x21, 0xA9, 0x7E, 0x8D, 0x83, 0x21,
+        0x22, 0xA9, 0x91, 0x80, 0x01, 0x00, 0x80, 0x00, 0xE4, 0xB6, 0x00, 0x04, 0xA9, 0x02, 0x8D, 0x0B, 0x42,
+    };
+    @memcpy(buf[4..36], &site);
+    try testing.expectEqual(@as(u32, 1), relocateWmdataFills(&buf, true));
+    const want = [_]u8{ 0x8B, 0x08, 0xC2, 0x30, 0xA2, 0x00, 0xE4, 0xA0, 0x00, 0x34, 0xA9, 0xFF, 0x03, 0x54, 0x40, 0x36, 0x28, 0xAB };
+    try testing.expectEqualSlices(u8, &want, buf[4..22]);
+    for (buf[22..36]) |x| try testing.expectEqual(@as(u8, 0xEA), x);
+    try testing.expectEqual(@as(u8, 0xFF), buf[36]); // nothing past the site
+    // an already de-mirrored source ($36) and a re-banked WMADD ($40) give the same MVN
+    @memcpy(buf[4..36], &site);
+    buf[4 + 11] = 0x40;
+    buf[4 + 24] = 0x36;
+    try testing.expectEqual(@as(u32, 1), relocateWmdataFills(&buf, true));
+    try testing.expectEqualSlices(u8, &want, buf[4..22]);
+    // a port fill aimed at a bank the window does not move is left alone
+    var site_b0 = site;
+    site_b0[11] = 0x00;
+    @memcpy(buf[4..36], &site_b0);
+    try testing.expectEqual(@as(u32, 0), relocateWmdataFills(&buf, true));
+    try testing.expectEqualSlices(u8, &site_b0, buf[4..36]);
 }
 
 /// Mirror-bank `JSL`s in code no surface reached, re-banked on the evidence
@@ -9057,6 +9173,7 @@ pub fn convertWholeGame(
         }
     }
     if (bwram) res.stats.rewritten_queue_imms += demirrorQueueBankImms(out, out.len > 0x20_0000);
+    if (bwram) res.stats.rewritten_wmdata_fills += relocateWmdataFills(out, out.len > 0x20_0000);
     // Measured pointer-bank sources: table bytes (and immediate operands
     // the shape pass above didn't already reach) that carry $7E/$7F into
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is
