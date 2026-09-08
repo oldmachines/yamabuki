@@ -1553,6 +1553,63 @@ itself — a WRAM write the CPU never performs as an address — is now in
 the generator's vocabulary; a port read (`LDA $2180`) of relocated data
 would be the mirror-image bug, and no site in Super Metroid does one.
 
+## 4p. The item-pickup message box: a GDMA the SA-1 cannot drive (v74)
+
+Picking up a missile pack on v70-v73 froze the game for a second or two
+with no panel drawn, then resumed with the count increased. The player's
+hypothesis was exactly right: a panel was causing the freeze without
+appearing. It is the clearest instance yet of the split's defining
+constraint, that the SA-1 cannot reach the picture hardware.
+
+**The chain.** A short take ending on the frozen pickup made a full trace
+fit. The whole-machine diff put the box in one place: the message-box
+tilemap is built correctly in the window buffer at `$40:3800` and `$40:3200`,
+but the DMAs that upload it to VRAM `$5880`/`$59a0` never fire. Tracing the
+DMA setup, `$85:8212` sets channel 1 to source `$40:3800` (bank `$7E`
+relocated to `$40` correctly), destination VRAM `$5880`, and then triggers
+`$420B` — and the trigger runs as `[ww-sa1]`, on the SA-1. The message box
+is invoked from inside the gameplay loop, which the split runs on the SA-1,
+and the SA-1's `$420B` write does not drive the S-CPU's DMA engine or the
+main picture. The box's surrounding rows at `$5800` came out fine because
+they go through the S-CPU's NMI write queue; only the box's own panel is a
+direct DMA the SA-1 triggered, and that one was lost.
+
+**Not a relocation bug.** Every register the box sets is correct and every
+buffer is in the right window home. This is the same architectural class as
+the pause map's WRAM-port fills (§4o), the SA-1 performing an operation only
+the S-CPU can, but a GDMA to VRAM, which no MVN can replace because VRAM is
+not in the SA-1's reach.
+
+**The fix, via the IO-pump.** The split already pumps S-CPU-only IO
+routines: the SA-1 enqueues a call and the S-CPU replays it for real, which
+is exactly what a GDMA to VRAM needs. The five message-box draw routines —
+`Initialise_PPU_for_MessageBoxes` (`$85:8143`, the VRAM backup), the two
+`Clear_MessageBox_BG3Tilemap` calls (`$85:81F3`), `Initialise_MessageBox`
+(`$85:8241`, the text upload), `Open_MessageBox` (`$85:844C`), and the
+restore DMA inside `Restore_PPU` (entered at `$85:861F`, past its leading
+`JSR`) — become deferred pump entries. The SA-1 enqueues them and skips
+their bodies; the S-CPU pump runs each and performs the real VRAM DMA. They
+read the same BW-RAM buffers both CPUs already share, so nothing else moves.
+The IO-entry cap, 26 and already at 23 for this game, was raised to 40 (a
+one-line-per-array change, no layout constant depends on it).
+
+**Result.** The box draws byte-identical to stock, panel border, "MISSILE",
+the item icon and "press the Y button" all present. Verified behaviorally
+equivalent over all eight surfaces with 28 pumped IO routines; the pickup
+take is stale-silent with a clean MMIO gate. The `Restore_PPU` entry could
+not sit at the routine's start, whose second instruction is a `JSR`, so it
+enters at the restore DMA itself; the enqueue-skip runs from there to the
+routine's `RTS`.
+
+**A method note that mattered.** The chase kept coming up empty on the
+write-watch until two things were understood: the watch reports the writer's
+full bank, so `$80:4313` is a DMA-register write under DBR `$80`, not
+`$00:4313`; and the watch caps at 4,096 hits, so a whole-take watch drops a
+late event and must be bounded near the moment. And `[ww-sa1]` versus `[ww]`
+is what finally said the box code was running on the SA-1. `--audit` builds
+a converted image in six minutes instead of forty, which made iterating on
+the five routines' prefix shapes practical.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -2054,6 +2111,7 @@ enemy-load slowdown rather than transition lag.
 | **v71, SHIPPED** | v70's recipe; the generator shifts every 16-bit immediate the disassembly labels with a low-WRAM address and the next instruction stores (code-map flag 0x40 from `wram_pointer_sites`; `cm_wram_pointer` in the generator). Three sites moved: `$84:8B3B` (the draw list), `$82:9EE5` (`MapTilesExplored`, the pause map's explored tiles) and `$88:AE05` (`HUDBG2XPositionScrollingSky`, an HDMA indirect address — the DMA engine would have read the abandoned home). Patch 158,478 bytes = v70 + six bytes + checksum; the S-CPU set is v70's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean (zero unexplained rewrites in either copy); patched stock equals the generated image. The v70 take replays with the blocks drawn as stock's, zero MMIO offenders. `--stale` on it still names `$86:8030`, `$86:8033` (`Enemy.palette,X` / `Enemy.GFXOffset,X` in the enemy-projectile spawn) and `$A0:A3B9` (`Enemy.AI,X` in `EnemyDeath`): executed sites whose evidence is not pure low-WRAM, because stock's own callers pass garbage in X (the disassembly says so of both) and the index carries the read into the next bank. Left as-is: shifting them would be correct (the window is mirrored in every system bank) but the evidence rule cannot yet say so; v72 material | the disassembly's labels are a fourth proof source next to profiles, covers and the room-graph walk. `--stale` now also hooks the DMA engine (GDMA sources, HDMA tables and transfer sources) | `tests/surfaces/sm-sa1/sm-sa1-v71.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v71.scpu.set` |
 | **v72, SHIPPED** | v71's recipe plus the wrapping index thunk (`idxThunkBodyWrap`): a real table base (`$100..$1F00`) with mixed low-WRAM-and-ROM evidence dispatches on where BASE+INDEX lands in 16 bits — below `$2000` is the window, a wrap past `$10000-base` is the next bank's window (the shifted operand's own carry), between them the operand is as written. The three sites it serves are the whole game's only `left_mixed` audit verdict (measured low WRAM, but not only): `$86:8030`/`$86:8033` (`Enemy.palette,X` / `Enemy.GFXOffset,X`, the enemy-projectile spawn) and `$A0:A3B9` (`Enemy.AI,X`, `EnemyDeath`). Stock's callers pass a non-index in X (the disassembly says so), so the read alternates between the enemy table and ROM/the next bank's low mirror. Patch 158,587 bytes = v71 + three thunks + `JSR` redirects; S-CPU set is v71's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the generated image. The v70 take's `--stale` list, which named these three on v71, is empty on v72; the v69 take syncs, MMIO gate silent | the wrapping-base index thunk closes the `left_mixed` class the audit isolates; the enemy-projectile palettes and `EnemyDeath`'s grapple check no longer read open bus | `tests/surfaces/sm-sa1/sm-sa1-v72.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v72.scpu.set` |
 | **v73, SHIPPED** | v72's recipe plus `relocateWmdataFills`, a signature net for WRAM fills through the WMDATA port (`$2180`, address in `$2181-$2183`). The port writes real WRAM only and cannot be aimed at BW-RAM, so on a window conversion every such fill lands in the abandoned home while every relocated reader looks in the window — and no instrument sees it (the CPU stores go to MMIO, the DMA's B-bus target is `$2180`, the `$7E` write happens inside the port). Super Metroid's pause menu loads its map tilemap into `$7E:3400`/`$7E:3800` this way; the graphics decompressor reuses `$7E:3400` and stock restores the legend rows by re-running the port fill before the legend's DMA re-uploads them. On v70-v72 that restore went to the dead home and the area map's bottom rows drew as decompressed graphics (§4o). The net replaces each 32-byte site with `PHB/PHP/REP #$30/LDX #src/LDY #dst/LDA #len-1/MVN dst,src/PLP/PLB` + NOPs; 2 sites take it. Patch 158,622 bytes = v72 + two sites in both copies + checksum; S-CPU set is v72's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the image; the garbled take renders the legend byte-identical to stock with stock's end-frame hash; the v69-v72 takes are stale-silent with a clean MMIO gate | a WRAM write with no CPU or DMA A-bus address is a class of its own; the generator's design note had named it for whole-game mode and it slipped the window mode because no surface opens the pause map. Frame-bisecting a buffer with `--frames N --dump-ram` on both builds is what separated 'who corrupts it' from 'who restores it' | `tests/surfaces/sm-sa1/sm-sa1-v73.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v73.scpu.set` |
+| **v74, SHIPPED** | v73's recipe plus five deferred IO-pump entries for the item-pickup message box's draw routines (`$85:8143`, `$85:81F3`, `$85:8241`, `$85:844C`, and the restore DMA at `$85:861F`). The box is invoked from the offloaded gameplay loop, so its GDMA trigger to VRAM ran on the SA-1 and was inert; the box logic completed (freeze + pickup) but the panel never drew on v70-v73 (§4p). Pumping the draw routines lets the S-CPU replay them and perform the real upload; they read the shared BW-RAM buffers, so nothing else changes. The IO-entry cap was raised 26->40 (commit d3e28c4). Patch 159,447 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 28 pumped IO routines; oracle clean; explainer zero unexplained in both copies; patched stock equals the image. The pickup take draws the box byte-identical to stock, stale-silent, MMIO gate clean | a GDMA to VRAM is the one S-CPU-only class MVN cannot cover (VRAM is out of the SA-1's reach); the pump is the mechanism. `--audit` (six-minute converted image) made iterating on the five routines' prefix shapes practical | `tests/surfaces/sm-sa1/sm-sa1-v74.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v74.scpu.set` |
 
 **Where the widened split stands (s19e, 2026-09-06).** With the gate at
 `$08-$0C` the SA-1 runs Super Metroid's door transitions as well as its

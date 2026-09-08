@@ -292,7 +292,7 @@ the v69 take syncs with a silent MMIO gate. What a player now meets when an
 enemy projectile spawns or an enemy dies is the enemy's own palette and
 death animation, not open-bus garbage.
 
-### The split ship, seventh cut (v73) — the area map's legend, and a WRAM write no address names
+### The split ship, seventh cut (v73) — the area map's legend, and a WRAM write no address names; see v74
 
 `sm-sa1-v73.bps.cmd` is v72's recipe unchanged; the generator gained one
 signature net. A player's area map on v70-v72 sometimes drew its bottom
@@ -330,6 +330,33 @@ explainer are clean; the patched stock ROM equals the generated image. The
 garbled take (`recordings/v72-take0002-polls.ymv`) now renders the legend
 byte-identical to stock and ends on stock's own frame hash; the v69, v70,
 v71 and v72 takes replay with zero `--stale` sites and a silent MMIO gate.
+
+### The split ship, eighth cut (v74) — the item-pickup message box, drawn through the IO-pump
+
+`sm-sa1-v74.bps.cmd` is v73's recipe plus five `--wg-split-io` entries. On
+v70-v73 picking up an item froze the game for a moment with no panel drawn,
+then resumed with the count raised. The message box is invoked from the
+gameplay loop, which the split runs on the SA-1, and its draw routines set up
+a GDMA to VRAM and trigger `$420B` — but that trigger runs on the SA-1, which
+cannot drive the S-CPU's DMA or the picture, so the panel's upload was lost
+(findings §4p). The box's logic and its queue-driven surrounding rows worked;
+only its own direct DMA was inert.
+
+The five draw routines — `Initialise_PPU_for_MessageBoxes` (`$85:8143`),
+`Clear_MessageBox_BG3Tilemap` (`$85:81F3`), `Initialise_MessageBox`
+(`$85:8241`), `Open_MessageBox` (`$85:844C`), and the restore DMA at
+`$85:861F` — become deferred IO-pump entries: the SA-1 enqueues them and the
+S-CPU replays them for real, performing the actual VRAM upload from the
+shared BW-RAM buffers. This is the same pump the split already uses for every
+other hardware operation the SA-1 cannot do; a GDMA to VRAM is the one class
+the WMDATA MVN trick (v73) cannot cover, because VRAM is out of the SA-1's
+reach. The IO-entry cap, 26 and already at 23 for this game, was raised to 40.
+
+Patch 159,447 bytes; the S-CPU set is v73's. Verified behaviorally equivalent
+over all eight surfaces, now with 28 pumped IO routines; the oracle is clean
+and the explainer finds zero unexplained rewrites in both copies; the patched
+stock ROM equals the generated image. The pickup take draws the box
+byte-identical to stock, with zero `--stale` sites and a silent MMIO gate.
 
 ### What v25 does not include
 
