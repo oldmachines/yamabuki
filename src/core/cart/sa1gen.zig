@@ -5899,7 +5899,7 @@ fn emitSplit(
         if (splitPrefixSpan(out, usage, io.entry, 3) == 0)
             return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
     }
-    if (spec.io_entries.len > 26)
+    if (spec.io_entries.len > 40)
         return refuse(refusal, .{ .reason = .wg_split_shape, .detail = 0 });
 
     // Mirror swaps: absolute reads of $4212 -> $3792 and $4218-$421F ->
@@ -6784,8 +6784,8 @@ fn emitSplitIoBanked(
     res: *Result,
 ) Error!void {
     var cur = curp.*;
-    var tramp24: [26]u24 = undefined;
-    var stub16: [26]u16 = undefined;
+    var tramp24: [40]u24 = undefined;
+    var stub16: [40]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
         if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
@@ -7568,7 +7568,7 @@ fn emitSplitIo(
     // bridge's frame sat between them, the PLP ate the frame's PCL, and
     // the RTL flew into bank $34 padding (measured: an IRQ-storming
     // wild march at clk 70.37M).
-    var tramp_addrs: [26]u16 = undefined;
+    var tramp_addrs: [40]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
         const span = splitPrefixSpan(out, usage, io.entry, 3);
         if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
@@ -7590,7 +7590,7 @@ fn emitSplitIo(
     // Bank $00 keeps a 4-byte JML hop per entry; an RTS-shaped deferred
     // return needs its pop to happen with PBR=$00, so its hop carries
     // one RTS byte the far stub JMLs back to.
-    var enq_addrs: [26]u16 = undefined;
+    var enq_addrs: [40]u16 = undefined;
     for (spec.io_entries, 0..) |io, i| {
         enq_addrs[i] = base16 + @as(u16, @intCast(cur));
         const hop_jml_at = cur;
