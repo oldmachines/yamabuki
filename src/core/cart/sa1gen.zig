@@ -6898,6 +6898,20 @@ fn emitSplitIoBanked(
             put(&fb, &fc, &.{ 0xAF, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00, 0x29, 0xCF });
             put(&fb, &fc, &.{ 0x0F, @truncate(split_scr_pw), @truncate(split_scr_pw >> 8), 0x00, 0x83, 0x01 });
             put(&fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
+            // ...and now the body's WIDTHS too. A routine's exit M/X can be
+            // part of its contract: Super Metroid's `Open_MessageBox` opens
+            // with `REP #$30` and returns without a PLP, and its caller,
+            // arriving in 8-bit from the lag-frame player, goes straight
+            // into a 16-bit `LDA MessageBoxIndex / CMP #$001C`. With the
+            // caller's widths kept, that CMP ate one operand byte and the
+            // leftover $00 ran as BRK: the SA-1 sat in the crash handler on
+            // every item pickup with a message box (v74; findings §4q).
+            // The pops above had to happen under the caller's widths (the
+            // pushes were made in them); only after them is P free to become
+            // the body's, in full. PHP / SEP #$20 / PHA / LDA pret /
+            // STA $02,S / PLA / PLP: B is kept across the 8-bit hop, X/Y
+            // untouched, and the pulled P is exactly what the body left.
+            put(&fb, &fc, &.{ 0x08, 0xE2, 0x20, 0x48, 0xAF, @truncate(split_cell_pret), @truncate(split_cell_pret >> 8), 0x00, 0x83, 0x02, 0x68, 0x28 });
             if (args != 0) {
                 // skip the inline bytes, as the body would have
                 put(&fb, &fc, &.{ 0x08, 0xC2, 0x20, 0x48, 0xA3, 0x04, 0x18, 0x69, args, 0x00, 0x83, 0x04, 0x68, 0x28 });

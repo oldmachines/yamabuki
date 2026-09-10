@@ -1610,6 +1610,59 @@ is what finally said the box code was running on the SA-1. `--audit` builds
 a converted image in six minutes instead of forty, which made iterating on
 the five routines' prefix shapes practical.
 
+## 4q. The pickup crash: a pumped routine's exit widths are part of its contract (v74 → v76)
+
+A player on v74 collected the Super Missiles from the Chozo orb in Green
+Brinstar and the game locked: the box drew, "SUPER MISSILE, select and press
+the Y button", and never left. Reproduced headless from the player's own
+state, held in slot 2 just before the pickup, with a hand-written anchored
+take: a jump-shot opens the orb, walking in collects it, the box draws at
+frame 190, and the machine never leaves it — the same state at frame 420 as
+at 215, where v73 on the same take is back in gameplay by frame 650. The
+SA-1's program counter in the steady state was `$80:8573`, the game's own
+crash handler, entered through a BRK. (A note on instruments: the cell at
+`$05B6` is the frame counter, which legitimately stops during any message
+box, since the box runs on lag frames; the NMI counter is `$05B8` and kept
+ticking. The proof of the hang is the crash handler, not a counter.)
+
+**Where.** The SA-1 trace across the crash reads: Initialise_PPU (its
+enqueue stub at `$85:9706`), the lag-frame player, then the Open_MessageBox
+stub at `$85:9949` spinning on the pump's ack, returning to `$85:809C`, and
+three instructions later the BRK. Stock at `$85:809C` is `LDA MessageBoxIndex
+/ CMP #$001C / BEQ`, a 16-bit load and compare. The stub returned with the
+accumulator in 8-bit mode, so `CMP` consumed one operand byte and the
+leftover `$00` executed as BRK. The bytes were not the problem; the flags
+were.
+
+**Why.** `Play_2_Lag_Frames_of_Music_and_Sound_Effects` runs `SEP #$30` and
+returns 8-bit. `Open_MessageBox` opens with `REP #$30` and returns without a
+`PLP`. Its caller relies on that: the 16-bit compare after the call works
+only because the callee left 16-bit widths behind. The deferred stub's exit
+rebuilt P as "the body's flags, under the caller's widths" (the pushes it
+pops were made in the caller's widths, so the pops must be too), which is
+exactly right for a routine that preserves M and X and exactly wrong for
+one whose exit widths are a return value. Every item pickup with a message
+box went through this path, so v74 crashed on all of them; the missile take
+that verified v74 ended as the box drew, one frame short of the fault.
+
+**The fix (v76).** After the caller's pops, the stub adopts the body's P in
+full: `PHP / SEP #$20 / PHA / LDA pret / STA $02,S / PLA / PLP`, twelve
+bytes, where `pret` is the cell the S-CPU pump fills with the body's P at
+its return (captured by `PHP; SEP #$20; PLA` before anything else moves).
+The pump enters bodies with the caller's widths, so the body's exit widths
+are the contract's own. B survives the 8-bit hop, X and Y are untouched,
+and the pulled P is exactly what stock's caller would have seen. No layout
+constant depends on the stub's length; the free-space placer absorbs the
+growth.
+
+**The hole.** No take in the verification corpus displays a message box:
+the box index is zero at the end of every per-poll take. The tier could not
+see this class. The regression gate for v76 is the anchored pickup take
+replayed on the new image; a per-poll take through a pickup, recorded by a
+player, is the durable one and is owed. For scale: stock's item box is 360
+lag frames plus the open and close animations, so the six-second panel v73
+showed on the same take is stock's own length, not a stall.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -2112,6 +2165,7 @@ enemy-load slowdown rather than transition lag.
 | **v72, SHIPPED** | v71's recipe plus the wrapping index thunk (`idxThunkBodyWrap`): a real table base (`$100..$1F00`) with mixed low-WRAM-and-ROM evidence dispatches on where BASE+INDEX lands in 16 bits — below `$2000` is the window, a wrap past `$10000-base` is the next bank's window (the shifted operand's own carry), between them the operand is as written. The three sites it serves are the whole game's only `left_mixed` audit verdict (measured low WRAM, but not only): `$86:8030`/`$86:8033` (`Enemy.palette,X` / `Enemy.GFXOffset,X`, the enemy-projectile spawn) and `$A0:A3B9` (`Enemy.AI,X`, `EnemyDeath`). Stock's callers pass a non-index in X (the disassembly says so), so the read alternates between the enemy table and ROM/the next bank's low mirror. Patch 158,587 bytes = v71 + three thunks + `JSR` redirects; S-CPU set is v71's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the generated image. The v70 take's `--stale` list, which named these three on v71, is empty on v72; the v69 take syncs, MMIO gate silent | the wrapping-base index thunk closes the `left_mixed` class the audit isolates; the enemy-projectile palettes and `EnemyDeath`'s grapple check no longer read open bus | `tests/surfaces/sm-sa1/sm-sa1-v72.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v72.scpu.set` |
 | **v73, SHIPPED** | v72's recipe plus `relocateWmdataFills`, a signature net for WRAM fills through the WMDATA port (`$2180`, address in `$2181-$2183`). The port writes real WRAM only and cannot be aimed at BW-RAM, so on a window conversion every such fill lands in the abandoned home while every relocated reader looks in the window — and no instrument sees it (the CPU stores go to MMIO, the DMA's B-bus target is `$2180`, the `$7E` write happens inside the port). Super Metroid's pause menu loads its map tilemap into `$7E:3400`/`$7E:3800` this way; the graphics decompressor reuses `$7E:3400` and stock restores the legend rows by re-running the port fill before the legend's DMA re-uploads them. On v70-v72 that restore went to the dead home and the area map's bottom rows drew as decompressed graphics (§4o). The net replaces each 32-byte site with `PHB/PHP/REP #$30/LDX #src/LDY #dst/LDA #len-1/MVN dst,src/PLP/PLB` + NOPs; 2 sites take it. Patch 158,622 bytes = v72 + two sites in both copies + checksum; S-CPU set is v72's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the image; the garbled take renders the legend byte-identical to stock with stock's end-frame hash; the v69-v72 takes are stale-silent with a clean MMIO gate | a WRAM write with no CPU or DMA A-bus address is a class of its own; the generator's design note had named it for whole-game mode and it slipped the window mode because no surface opens the pause map. Frame-bisecting a buffer with `--frames N --dump-ram` on both builds is what separated 'who corrupts it' from 'who restores it' | `tests/surfaces/sm-sa1/sm-sa1-v73.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v73.scpu.set` |
 | **v74, SHIPPED** | v73's recipe plus five deferred IO-pump entries for the item-pickup message box's draw routines (`$85:8143`, `$85:81F3`, `$85:8241`, `$85:844C`, and the restore DMA at `$85:861F`). The box is invoked from the offloaded gameplay loop, so its GDMA trigger to VRAM ran on the SA-1 and was inert; the box logic completed (freeze + pickup) but the panel never drew on v70-v73 (§4p). Pumping the draw routines lets the S-CPU replay them and perform the real upload; they read the shared BW-RAM buffers, so nothing else changes. The IO-entry cap was raised 26->40 (commit d3e28c4). Patch 159,447 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 28 pumped IO routines; oracle clean; explainer zero unexplained in both copies; patched stock equals the image. The pickup take draws the box byte-identical to stock, stale-silent, MMIO gate clean | a GDMA to VRAM is the one S-CPU-only class MVN cannot cover (VRAM is out of the SA-1's reach); the pump is the mechanism. `--audit` (six-minute converted image) made iterating on the five routines' prefix shapes practical | `tests/surfaces/sm-sa1/sm-sa1-v74.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v74.scpu.set` |
+| **v76, SHIPPED** | v74's recipe unchanged; the generator's deferred enqueue stub changed. On v74 every item pickup that shows a message box crashed the SA-1: the stub returned to the game with the caller's M/X widths, and `Open_MessageBox` ($85:844C) opens `REP #$30` and returns without a `PLP`; its caller's 16-bit `CMP #$001C` under 8-bit widths ate one operand byte and the leftover `$00` ran as BRK into the game's crash handler at `$80:8573` (§4q). The stub now adopts the body's full P from the pump's return cell after the caller-width pops (12 bytes). Patch 159,783 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 28 pumped IO routines; the player's own pickup state, driven by an anchored take through the orb, the tank and the panel, resumes gameplay with the count raised, stale-silent | a pumped routine's exit widths can be a return value; no take in the corpus displays a message box, so the tier was blind to the class — a per-poll pickup take is owed | `tests/surfaces/sm-sa1/sm-sa1-v76.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v76.scpu.set` |
 
 **Where the widened split stands (s19e, 2026-09-06).** With the gate at
 `$08-$0C` the SA-1 runs Super Metroid's door transitions as well as its

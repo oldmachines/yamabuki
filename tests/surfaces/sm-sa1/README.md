@@ -331,7 +331,7 @@ garbled take (`recordings/v72-take0002-polls.ymv`) now renders the legend
 byte-identical to stock and ends on stock's own frame hash; the v69, v70,
 v71 and v72 takes replay with zero `--stale` sites and a silent MMIO gate.
 
-### The split ship, eighth cut (v74) — the item-pickup message box, drawn through the IO-pump
+### The split ship, eighth cut (v74) — the item-pickup message box, drawn through the IO-pump; see v76
 
 `sm-sa1-v74.bps.cmd` is v73's recipe plus five `--wg-split-io` entries. On
 v70-v73 picking up an item froze the game for a moment with no panel drawn,
@@ -357,6 +357,30 @@ over all eight surfaces, now with 28 pumped IO routines; the oracle is clean
 and the explainer finds zero unexplained rewrites in both copies; the patched
 stock ROM equals the generated image. The pickup take draws the box
 byte-identical to stock, with zero `--stale` sites and a silent MMIO gate.
+
+### The split ship, ninth cut (v76) — the pumped routine's exit widths
+
+`sm-sa1-v76.bps.cmd` is v74's recipe unchanged; the generator changed. On
+v74 every item pickup that shows a message box crashed the SA-1: the box
+drew and the game never left it (findings §4q). The deferred enqueue stub
+returned to the game with the caller's M/X widths, and `Open_MessageBox`
+is a routine whose exit widths are part of its contract — it opens with
+`REP #$30`, returns without a `PLP`, and its caller goes straight into a
+16-bit `CMP #$001C`. Under 8-bit widths that compare ate one operand byte
+and the leftover `$00` ran as BRK.
+
+The stub now adopts the body's full P after the caller's pops, from the
+cell the S-CPU pump fills with the body's P at its return. The take that
+verified v74's box ended as the box drew, one frame before the fault; the
+gate for v76 is the player's own pickup state, driven by a hand-written
+anchored take through the orb, the tank, the box, and out: on v76 the panel
+draws and gameplay resumes with the count raised, stale-silent.
+
+Patch 159,783 bytes; the S-CPU set is v73's. Verified behaviorally
+equivalent over all eight surfaces with 28 pumped IO routines. No take in
+this directory displays a message box (the box index is zero at the end of
+every per-poll take), which is how v74 shipped with the crash; a per-poll
+take through an item pickup is the fixture this class still lacks.
 
 ### What v25 does not include
 
