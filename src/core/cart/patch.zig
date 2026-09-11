@@ -222,15 +222,29 @@ fn eqRun(source: []const u8, target: []const u8, at: usize) usize {
 /// of varint either side).
 const source_run_min = 4;
 
+/// A run copyable from earlier target output shorter than this is cheaper
+/// carried inline (a TargetCopy costs two varints).
+const target_copy_min = 8;
+
+/// The longest run at `at` that repeats the target from `from` (`from < at`;
+/// overlap allowed, which is how a fill run encodes as one copy).
+fn selfRun(target: []const u8, at: usize, from: usize) usize {
+    var n: usize = 0;
+    while (at + n < target.len and target[at + n] == target[from + n]) n += 1;
+    return n;
+}
+
 /// Encode `target` against `source` as a BPS patch, with all three CRC32s.
 ///
-/// Emits SourceRead for unchanged spans and TargetRead for everything else —
-/// no delta search. That is the optimal encoding for what the patch generator
-/// produces (a handful of in-place edits to a ROM image) and valid BPS for
-/// any input pair; a general delta encoder would only shrink patches this
-/// tool never writes. The result round-trips through `apply`, which verifies
-/// every checksum — the generator's gate does exactly that before shipping
-/// a file.
+/// Emits SourceRead for unchanged spans, TargetCopy for two shapes the
+/// generator produces in bulk — a fill run (the expansion's padding, copied
+/// from one byte behind) and the DUAL IMAGE's upper half (a copy of the
+/// lower half half an image behind, with the split's edits on top) — and
+/// TargetRead for everything else. No general delta search: that is the
+/// optimal encoding for what this tool writes (in-place edits to a ROM
+/// image, plus those two), and valid BPS for any input pair. The result
+/// round-trips through `apply`, which verifies every checksum — the
+/// generator's gate does exactly that before shipping a file.
 pub fn writeBps(
     gpa: std.mem.Allocator,
     source: []const u8,
@@ -243,23 +257,56 @@ pub fn writeBps(
     try putVarint(&p, target.len);
     try putVarint(&p, 0); // no metadata
 
+    const half = target.len / 2;
+    const Copy = struct { len: usize, from: usize };
+    const best = struct {
+        fn f(t: []const u8, at: usize, h: usize) Copy {
+            var c: Copy = .{ .len = 0, .from = 0 };
+            if (at >= h and h >= 0x10000) {
+                const n = selfRun(t, at, at - h);
+                if (n > c.len) c = .{ .len = n, .from = at - h };
+            }
+            if (at >= 1) {
+                const n = selfRun(t, at, at - 1);
+                if (n > c.len) c = .{ .len = n, .from = at - 1 };
+            }
+            return c;
+        }
+    }.f;
+    const worth = struct {
+        fn f(eq: usize, c: Copy, at: usize, end: usize) bool {
+            return (eq > 0 and (eq >= source_run_min or at + eq == end)) or c.len >= target_copy_min;
+        }
+    }.f;
+
+    var tgt_rel: usize = 0; // the TargetCopy read cursor, mirrored from the decoder
     var i: usize = 0;
     while (i < target.len) {
         const eq = eqRun(source, target, i);
-        if (eq > 0 and (eq >= source_run_min or i + eq == target.len)) {
+        const cp = best(target, i, half);
+        if (eq > 0 and (eq >= source_run_min or i + eq == target.len) and eq >= cp.len) {
             // SourceRead reads the source at the output offset — no operand.
             try putVarint(&p, ((@as(u64, eq) - 1) << 2) |
                 @intFromEnum(BpsAction.source_read));
             i += eq;
             continue;
         }
+        if (cp.len >= target_copy_min) {
+            try putVarint(&p, ((@as(u64, cp.len) - 1) << 2) |
+                @intFromEnum(BpsAction.target_copy));
+            const neg = cp.from < tgt_rel;
+            const mag: u64 = if (neg) tgt_rel - cp.from else cp.from - tgt_rel;
+            try putVarint(&p, (mag << 1) | @intFromBool(neg));
+            tgt_rel = cp.from + cp.len;
+            i += cp.len;
+            continue;
+        }
         // Changed span: swallow differing bytes and any unchanged islands too
         // small to be worth an action switch, until a real run (or the end).
-        var j = i;
+        var j = i + 1;
         while (j < target.len) {
-            const e = eqRun(source, target, j);
-            if (e > 0 and (e >= source_run_min or j + e == target.len)) break;
-            j += e + 1;
+            if (worth(eqRun(source, target, j), best(target, j, half), j, target.len)) break;
+            j += 1;
         }
         try putVarint(&p, ((@as(u64, j - i) - 1) << 2) |
             @intFromEnum(BpsAction.target_read));
@@ -506,6 +553,35 @@ test "writeBps round-trips through apply, fully verified" {
     defer gpa.free(got.image);
     try testing.expectEqualSlices(u8, &target, got.image);
     try testing.expect(got.verified);
+}
+
+test "writeBps: a doubled image and a fill run encode as copies" {
+    const gpa = testing.allocator;
+    // 128 KiB source; target = source with two edits, 64 KiB of $FF padding,
+    // then a copy of that whole lower half with three more edits.
+    const src = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(src);
+    for (src, 0..) |*b, k| b.* = @truncate(k *% 31 + (k >> 9));
+    const lower = 192 * 1024;
+    const tgt = try gpa.alloc(u8, 2 * lower);
+    defer gpa.free(tgt);
+    @memcpy(tgt[0..src.len], src);
+    @memset(tgt[src.len..lower], 0xFF);
+    tgt[0x1000] +%= 1;
+    tgt[0x1FFFF] +%= 1;
+    @memcpy(tgt[lower..], tgt[0..lower]);
+    tgt[lower + 0x2000] +%= 1;
+    tgt[lower + 0x28000] = 0x42; // inside the copied padding
+    tgt[2 * lower - 1] = 0x24;
+    const patch = try writeBps(gpa, src, tgt);
+    defer gpa.free(patch);
+    // Not the 256 KiB a raw encoding would carry: a few dozen bytes of actions.
+    try testing.expect(patch.len < 256);
+    var mm: CrcMismatch = undefined;
+    const back = try apply(gpa, src, patch, &mm);
+    defer gpa.free(back.image);
+    try testing.expect(back.verified);
+    try testing.expectEqualSlices(u8, tgt, back.image);
 }
 
 test "writeBps: identical images encode as one SourceRead" {

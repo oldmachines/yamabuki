@@ -13,6 +13,7 @@
 //! overriding the per-access charge the bus accessors would otherwise add.
 
 const std = @import("std");
+const wdc65816 = @import("../cpu/wdc65816.zig");
 
 /// GDMA timing: a fixed per-DMA setup, a per-active-channel overhead, and a
 /// per-byte transfer cost, all in master cycles. These replace the bus
@@ -53,6 +54,11 @@ pub const Channel = struct {
 /// memory the window conversion abandoned is invisible to the stale-access
 /// detector. It shows up only as graphics that never arrive.
 pub var dbg_dma: usize = 0;
+/// Only log GDMA at or after this master clock. The trace has a fixed
+/// quota that fills early in a long take, so an event near the end (a
+/// pause-menu draw after a full session) is never reached without a
+/// lower bound. Pairs with the CPU `--watch-from`.
+pub var dbg_dma_from: u64 = 0;
 var dbg_dma_seen: [4096]u64 = @splat(0);
 var dbg_dma_n: usize = 0;
 
@@ -64,6 +70,7 @@ fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: 
     // Dedup within a ~370-frame bucket only: the same (src, reg) upload
     // recurring in a LATER scene (the Ceres re-upload after the intro) must
     // print again, or the trace claims a region was never written twice.
+    if (clk < dbg_dma_from) return;
     const key: u64 = (clk / (357366 * 370)) << 40 | @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
     for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
     if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;
@@ -273,6 +280,8 @@ pub const Dma = struct {
         // the chip has no path back into the cartridge.
         const decompress = bus.cart.chip == .sdd1 and !b_to_a and bus.sdd1.channelArmed(i);
         if (decompress) bus.sdd1.beginTransfer(i, (@as(u24, ch.a_bank) << 16) | ch.a_addr);
+        if (a_guarded or ch.a_bank == 0x7E or ch.a_bank == 0x7F)
+            wdc65816.noteStaleDma(if (b_to_a) "D<" else "D>", (@as(u24, ch.a_bank) << 16) | ch.a_addr, bus.clock);
 
         var remaining = total;
         var p: usize = 0;
@@ -347,6 +356,7 @@ pub const Dma = struct {
                 (@as(u24, ch.indirect_bank) << 16) | ch.count
             else
                 (@as(u24, ch.a_bank) << 16) | ch.table_addr;
+            wdc65816.noteStaleDma(if (indirect) "H*" else "H>", a, bus.clock);
             if (b_to_a) {
                 aWrite(bus, a, bus.read8(b));
             } else {
@@ -361,6 +371,7 @@ pub const Dma = struct {
         _ = self;
         const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.table_addr;
         ch.table_addr +%= 1;
+        wdc65816.noteStaleDma("HT", a, bus.clock);
         return aRead(bus, a);
     }
 

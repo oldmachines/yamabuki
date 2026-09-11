@@ -7,6 +7,7 @@
 //! traffic for free.
 
 const std = @import("std");
+const wdc65816 = @import("../cpu/wdc65816.zig");
 const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
 const MathUnit = @import("math_unit.zig").MathUnit;
@@ -48,7 +49,7 @@ pub const Bus = struct {
     // configuration, set once at startup — it must survive a loadState
     // (skipped fields keep their in-memory value), so an old save does not
     // silently turn the option off.
-    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "tick_snap", "vector_pull", "coproc_irq_line", "auto_fastrom" };
+    pub const serialize_skip = .{ "page_read", "page_write", "page_speed", "cart", "last_data_read", "last_data_write", "input_polled", "tick_snap", "vector_pull", "coproc_irq_line", "auto_fastrom", "mmio_writers" };
 
     /// `last_data_read`/`last_data_write` when there has been none since they
     /// were cleared. Out of u24 range, so it cannot collide with a real address.
@@ -60,6 +61,79 @@ pub const Bus = struct {
     /// before each frame; `captured` after the frame means the game
     /// completed a logic tick in it, and `wram` holds the state exactly as
     /// the tick began.
+    /// The MMIO WRITER SET: every (register, program counter) pair that
+    /// wrote a hardware register on this machine — the S-CPU's PPU, APU
+    /// mailbox, WRAM-port, CPU and DMA registers, each write folded to its
+    /// canonical register (the APU mailbox's 16 mirrors to one port each).
+    /// The verifier's MMIO gate compares a conversion's set against
+    /// stock's: a register written from a site stock never wrote it from
+    /// is a relocation that landed on hardware. Measured: every patch from
+    /// v66 to v68 wrote `STA $2177` — the mailbox mirror of port 3 — from
+    /// four sites whose stock instruction is `STA $2117`, and the sound
+    /// driver died on the VRAM address byte; the behavioral tier, which
+    /// compares game logic, never saw it. Null outside the verifier.
+    pub const MmioWriters = struct {
+        set: std.AutoHashMapUnmanaged(u64, void) = .{},
+        alloc: std.mem.Allocator,
+        /// Writes that arrived without a program counter (a DMA's B-bus
+        /// target) are folded under this pseudo-PC.
+        pub const pc_dma: u24 = 0xFF_FFFF;
+
+        pub fn create(alloc: std.mem.Allocator) !*MmioWriters {
+            const w = try alloc.create(MmioWriters);
+            w.* = .{ .alloc = alloc };
+            return w;
+        }
+
+        pub fn deinit(self: *MmioWriters) void {
+            self.set.deinit(self.alloc);
+        }
+
+        /// The canonical register a system-bank write lands on, or null
+        /// when the address is not one this gate covers (WRAM, ROM, the
+        /// SA-1's own registers at $2200-$23FF).
+        pub fn canonical(addr: u24) ?u16 {
+            const bank: u8 = @intCast(addr >> 16);
+            if ((bank & 0x7F) >= 0x40) return null;
+            const a16: u16 = @truncate(addr);
+            if (a16 >= 0x2100 and a16 <= 0x213F) return a16;
+            if (a16 >= 0x2140 and a16 <= 0x217F) return 0x2140 + (a16 & 3);
+            if (a16 >= 0x2180 and a16 <= 0x2183) return a16;
+            if (a16 == 0x4016 or a16 == 0x4017) return a16;
+            if (a16 >= 0x4200 and a16 <= 0x420D) return a16;
+            if (a16 >= 0x4300 and a16 <= 0x437F) return a16;
+            return null;
+        }
+
+        pub fn key(reg: u16, pc: u24) u64 {
+            return (@as(u64, reg) << 24) | pc;
+        }
+
+        /// The writer's program counter, its bank folded to the LoROM
+        /// mirror ($80+ and $00+ hold the same bytes; a conversion may
+        /// run a routine through either).
+        pub fn noteWrite(self: *MmioWriters, addr: u24, pbr: u8, pc16: u16) void {
+            const reg = canonical(addr) orelse return;
+            const pc: u24 = (@as(u24, pbr & 0x7F) << 16) | pc16;
+            self.set.put(self.alloc, key(reg, pc), {}) catch {};
+        }
+
+        pub fn has(self: *const MmioWriters, reg: u16, pc: u24) bool {
+            return self.set.contains(key(reg, pc));
+        }
+    };
+
+    test "MmioWriters.canonical folds the APU mailbox mirrors and ignores the SA-1's registers" {
+        try std.testing.expectEqual(@as(?u16, 0x2143), MmioWriters.canonical(0x822177));
+        try std.testing.expectEqual(@as(?u16, 0x2140), MmioWriters.canonical(0x002140));
+        try std.testing.expectEqual(@as(?u16, 0x2117), MmioWriters.canonical(0x822117));
+        try std.testing.expectEqual(@as(?u16, 0x420B), MmioWriters.canonical(0x80420B));
+        try std.testing.expectEqual(@as(?u16, 0x4311), MmioWriters.canonical(0x004311));
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x002220)); // SA-1 mapper
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x7E2143)); // WRAM bank
+        try std.testing.expectEqual(@as(?u16, null), MmioWriters.canonical(0x006998)); // BW-RAM window
+    }
+
     pub const TickSnap = struct {
         captured: bool = false,
         /// Read-before-write liveness over WRAM for the CURRENT tick
@@ -95,6 +169,13 @@ pub const Bus = struct {
     cart: *Cartridge,
     /// Master clock in master cycles since power-on.
     clock: u64,
+    /// S-CPU overclock divisor (1 = real). The CPU's own bus and internal
+    /// cycles advance the master clock 1/n as fast; DMA, PPU and APU keep
+    /// their timing. A verification REFERENCE, not a game mode: a stock
+    /// image that never lags pairs per poll with a slowdown-removing
+    /// conversion, where the real one forks on every lag difference.
+    overclock: u8 = 1,
+    oc_acc: u32 = 0,
     /// Address of the most recent *data* read / write (`Cpu.read8`/`Cpu.write8`),
     /// or `no_data_access`. Set by the CPU — never by an instruction fetch, and
     /// never by a stack push or pull, both of which go straight to the bus.
@@ -111,6 +192,22 @@ pub const Bus = struct {
     /// frame in which it stays false is a frame the main loop never came around:
     /// a dropped frame. Diagnostic only; nothing in the core reads it.
     input_polled: bool,
+    /// The LAP tick: set when the game's own lap counter (`lap_cell`, a
+    /// low-WRAM address at any of its homes) is written. A game that polls
+    /// the pad every NMI, lag frames included, ticks per FRAME on its
+    /// polls — and a slowdown-removing conversion runs a different number
+    /// of laps per frame wherever stock lagged, so per-poll pairing forks
+    /// on every lag difference. Per lap, the logic pairs by construction.
+    lap_polled: bool,
+    /// Per-lap input delivery (a version-4 take): the entries the feed
+    /// staged for the coming laps, applied to the joypad AT each lap edge
+    /// (inside the frame — a two-lap frame consumes two), and the pads
+    /// seen at the edges, for a per-lap recording.
+    lap_feed: [16][2]u16,
+    lap_feed_n: u8,
+    lap_feed_i: u8,
+    lap_rec: [16][2]u16,
+    lap_rec_n: u8,
     /// Behavioral-verification hook (same optional-diagnostic pattern as the
     /// coverage map): when set, the FIRST controller poll after the harness
     /// clears `input_polled` snapshots WRAM into it. The poll is the one
@@ -119,6 +216,9 @@ pub const Bus = struct {
     /// at the top of a logic tick. Null (always, outside the verifier)
     /// costs the poll paths one pointer test.
     tick_snap: ?*TickSnap,
+    /// The MMIO writer set this machine records into (see `MmioWriters`);
+    /// null costs the write path one pointer test.
+    mmio_writers: ?*MmioWriters,
     /// True only for the duration of a CPU vector pull (`Cpu.readVector16`
     /// calls `vectorRead8`). The SA-1's SNV/SIV substitution is gated on it:
     /// hardware swaps the SNES NMI/IRQ vectors during the pull, not when game
@@ -187,7 +287,14 @@ pub const Bus = struct {
         self.last_data_read = no_data_access;
         self.last_data_write = no_data_access;
         self.input_polled = false;
+        self.lap_polled = false;
+        self.lap_feed_n = 0;
+        self.lap_feed_i = 0;
+        self.lap_rec_n = 0;
+        self.overclock = 1;
+        self.oc_acc = 0;
         self.tick_snap = null;
+        self.mmio_writers = null;
         self.vector_pull = false;
         self.mdr = 0;
         self.fastrom = false;
@@ -316,7 +423,18 @@ pub const Bus = struct {
 
     /// One CPU internal cycle (no bus access).
     pub inline fn idle(self: *Bus) void {
-        self.clock += timing.speed_fast;
+        self.cpuCycles(timing.speed_fast);
+    }
+
+    /// The S-CPU's own cycles, under the overclock divisor.
+    pub inline fn cpuCycles(self: *Bus, n: u32) void {
+        if (self.overclock <= 1) {
+            self.clock += n;
+            return;
+        }
+        self.oc_acc += n;
+        self.clock += self.oc_acc / self.overclock;
+        self.oc_acc %= self.overclock;
     }
 
     /// Side-effect-free read for diagnostics (the profiler's opcode peek):
@@ -356,7 +474,7 @@ pub const Bus = struct {
     pub inline fn read8(self: *Bus, addr: u24) u8 {
         const idx = addr >> 13;
         if (self.page_read[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             const v = p[addr & (page_size - 1)];
             self.mdr = v;
             return v;
@@ -409,7 +527,7 @@ pub const Bus = struct {
         self.mdr = value;
         const idx = addr >> 13;
         if (self.page_write[idx]) |p| {
-            self.clock += self.page_speed[idx];
+            self.cpuCycles(self.page_speed[idx]);
             p[addr & (page_size - 1)] = value;
             return;
         }
@@ -430,7 +548,28 @@ pub const Bus = struct {
     /// a data READ of a WRAM byte not yet written this tick marks it live —
     /// it was consumed as input state. Called from the CPU's data-access
     /// wrappers, never from fetches.
+    /// The lap tick, raised by either CPU's write hook (`wdc65816.lap_pending`:
+    /// the lap cell went from zero to nonzero — the main loop's own
+    /// once-per-lap mark) and taken here on the S-CPU's next data access,
+    /// where the verifier's snapshot lives.
+    inline fn noteLapEdge(self: *Bus) void {
+        if (wdc65816.lap_pending) {
+            wdc65816.lap_pending = false;
+            self.lap_polled = true;
+            if (self.lap_rec_n < self.lap_rec.len) {
+                self.lap_rec[self.lap_rec_n] = self.joy.buttons;
+                self.lap_rec_n += 1;
+            }
+            if (self.lap_feed_i < self.lap_feed_n) {
+                self.joy.buttons = self.lap_feed[self.lap_feed_i];
+                self.lap_feed_i += 1;
+            }
+            self.tickSnap();
+        }
+    }
+
     pub fn noteTickRead(self: *Bus, addr: u24) void {
+        self.noteLapEdge();
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
         if (t.written[off >> 3] & (@as(u8, 1) << @intCast(off & 7)) != 0) return;
@@ -438,6 +577,7 @@ pub const Bus = struct {
     }
 
     pub fn noteTickWrite(self: *Bus, addr: u24) void {
+        self.noteLapEdge();
         const t = self.tick_snap orelse return;
         const off = wramOffset(addr) orelse return;
         const bit = @as(u8, 1) << @intCast(off & 7);
@@ -449,6 +589,11 @@ pub const Bus = struct {
     /// behavioral verifier only — the once-per-frame tick snapshot.
     inline fn notePoll(self: *Bus) void {
         self.input_polled = true;
+        if (wdc65816.lap_cell == 0) self.tickSnap();
+    }
+
+    /// The behavioral verifier's once-per-tick snapshot.
+    inline fn tickSnap(self: *Bus) void {
         if (self.tick_snap) |t| {
             if (!t.captured) {
                 t.captured = true;
@@ -483,7 +628,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         // MMIO exists only in the system area (banks $00-$3F / $80-$BF),
         // except the large-LoROM DSP-1 ports in banks $60-$6F.
@@ -605,7 +750,7 @@ pub const Bus = struct {
         defer if (self.coprocIrqGuard()) self.syncCoprocIrq();
         const bank: u8 = @intCast(addr >> 16);
         const a16: u16 = @truncate(addr);
-        self.clock += speedOfParts(bank, a16, self.fastrom);
+        self.cpuCycles(speedOfParts(bank, a16, self.fastrom));
 
         if (!isSystemBank(bank)) {
             if (self.dsp1Port(bank, a16)) |sr| {

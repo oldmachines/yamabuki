@@ -713,6 +713,18 @@ program counter names it. That check needs no baseline, no movie
 pairing, no lag reasoning: it is a property of the converted image
 alone. `--stale <max-sites>` reports each offending (PBR,PC) once.
 
+The detector hooks the CPU's data reads and writes, and since the
+draw-pointer bug of Super Metroid's destructible blocks it also hooks
+the DMA engine: a general-purpose channel's A-bus start (`D>` reading,
+`D<` writing), an HDMA table read (`HT`) and each HDMA transfer's
+source (`H>` direct, `H*` indirect) into an abandoned home are reported
+once per address. That class never passes through a CPU access — the
+game hands a pointer to a channel and the channel does the reading —
+and it stayed invisible until the hook existed. (The block-word bug
+itself turned out to be a CPU read through a stale pointer; the DMA
+hook was built while proving that, and it stays because the next one
+may not be.)
+
 Run against the laser recording, the shipped conversion produced
 twelve sites. Eight were tiny-base indexed absolutes — four loads and,
 critically, **four stores**, including `STA $0030,Y` at `$02:8C8B`
@@ -1661,3 +1673,24 @@ screen is PPU-identical to stock in free-run with correct defaults; the
 suite is 463/463. What remains is not a slowdown gap but the standing costs
 the gate discloses — transitions run stock-shape by design, and any surface
 must be confirmed to reach its screen before its green is believed.
+
+## Build time: where it goes, and the two caches
+
+A generation stamps its phases (`[time]` lines). Measured on the eight-surface
+Super Metroid corpus, idle machine: evidence pass + baselines ~820 s, coverage
+pad ~840 s (it replays each surface to its end before padding past it),
+harvest 1.5 s from `--harvest-cache`, verification 883 s serial or 494 s with
+the surfaces on threads (bounded by the longest surface's own tier). The
+stock replays dominate, not the verification.
+
+`--baseline-cache <dir>` snapshots the whole stock phase — the evidence union,
+the profiler state, every surface's baseline outputs — keyed on every input
+that phase consumes, and a hit skips it: 2,156 s -> 504 s on a repeat recipe,
+patch byte-identical. It is a snapshot of one serially-built union, never a
+merge: the pointer-bank evidence carries first-writer records that no
+order-free merge reproduces, which is why the baselines are cached rather
+than threaded. Raw structs in the file are guarded by a comptime layout hash
+(field names, sizes, offsets), so a struct edit invalidates old snapshots
+instead of misreading them. `--verify-jobs N` sets the verifier's thread
+count (1 = the serial loop, for timing). Both cache flags and `--verify-jobs`
+are machine-local and are stripped from shipped `.bps.cmd` recipes.

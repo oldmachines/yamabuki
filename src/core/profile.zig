@@ -379,6 +379,12 @@ pub const FrameSample = struct {
     /// complete an iteration: a dropped frame, which the player sees as
     /// slowdown.
     lag: bool,
+    /// `work` split by context: cycles credited while an interrupt frame was
+    /// on the call stack (the NMI/IRQ handlers and everything they call),
+    /// and the rest — the main loop's own work, the share an SA-1 offload
+    /// of the game loop could take off the S-CPU. Sums to `work`.
+    int_work: u64 = 0,
+    main_work: u64 = 0,
 
     /// Fraction of the frame spent working, 0..1. The headline number: a game
     /// that never approaches 1.0 is not a candidate for a faster CPU.
@@ -457,6 +463,13 @@ pub const Routine = struct {
     kind: RoutineKind,
     /// Times it was entered (calls + interrupt dispatches).
     calls: u64,
+    /// Of the calls, those made with a 3-byte frame (JSL): the routine's
+    /// return shape, which a split's replay stub has to match.
+    rtl_calls: u64,
+    /// It wrote WRAM while on top of the stack. A split IO routine that
+    /// does cannot be replayed on top of an SA-1 run of the same body (the
+    /// state would advance twice); it must be deferred.
+    writes_wram: bool,
     /// Entries made while an interrupt frame was on the stack (the handler's
     /// own dispatch included). `int_entries * 2 > calls` reads as "this
     /// routine lives in interrupt context" — the offload machinery's single
@@ -654,6 +667,13 @@ pub const Profiler = struct {
     depth: u16,
     /// Interrupt frames currently on the stack (nonzero = interrupt context).
     int_depth: u16,
+    /// Per-frame `work` by context (see FrameSample.int_work).
+    int_work_frame: u64,
+    main_work_frame: u64,
+    /// The offload census: MMIO touches by context, register and site.
+    /// Off by default (the report turns it on); see `Census`.
+    census_on: bool,
+    census: Census,
     stack_resets: u64,
     /// Every cycle the profiler has seen, work or idle — the wall clock that
     /// inclusive time is measured on.
@@ -738,6 +758,8 @@ pub const Profiler = struct {
             .entry = Routine.empty,
             .kind = .code,
             .calls = 0,
+        .rtl_calls = 0,
+        .writes_wram = false,
             .int_entries = 0,
             .self_cycles = 0,
             .incl_cycles = 0,
@@ -763,6 +785,10 @@ pub const Profiler = struct {
         .stack = @splat(.{ .slot = 0, .sp_pre = 0, .observed_at = 0, .is_int = false }),
         .depth = 0,
         .int_depth = 0,
+        .int_work_frame = 0,
+        .main_work_frame = 0,
+        .census_on = false,
+        .census = .{},
         .stack_resets = 0,
         .observed = 0,
         .ledger = @splat(.{ .slot = 0, .pure = 0, .iter = 0 }),
@@ -866,8 +892,13 @@ pub const Profiler = struct {
         // moved routine would still have to reach, idle or not — so this runs
         // for every access, not just ones the wait classifier calls work.
         if (self.depth != 0) {
-            if (read) |addr| self.noteAccess(addr);
-            if (write) |addr| self.noteAccess(addr);
+            if (read) |addr| self.noteAccess(addr, false);
+            if (write) |addr| self.noteAccess(addr, true);
+        }
+        if (self.census_on) {
+            const top: u24 = if (self.depth != 0) @intCast(self.routines[self.topSlot()].entry & 0xFF_FFFF) else 0;
+            if (read) |addr| self.census.note(addr, pc, self.int_depth > 0, top, false);
+            if (write) |addr| self.census.note(addr, pc, self.int_depth > 0, top, true);
         }
 
         self.applyEvent(ev);
@@ -926,10 +957,13 @@ pub const Profiler = struct {
     }
 
     /// Sort one data access into the routine on top of the stack's footprint.
-    fn noteAccess(self: *Profiler, addr: u24) void {
+    fn noteAccess(self: *Profiler, addr: u24, is_write: bool) void {
         const r = &self.routines[self.topSlot()];
         switch (classify(addr)) {
-            .wram => if (wramOffset(addr)) |off| r.noteWram(off),
+            .wram => if (wramOffset(addr)) |off| {
+                r.noteWram(off);
+                if (is_write) r.writes_wram = true;
+            },
             .mmio => r.noteMmio(@truncate(addr)),
             .sram => r.touches_sram = true,
             .rom => {},
@@ -947,6 +981,10 @@ pub const Profiler = struct {
 
     fn creditSelf(self: *Profiler, slot: u16, cycles: u64) void {
         if (cycles == 0) return;
+        // Context at settlement: staged loop cycles settle a few
+        // instructions after they ran, so a loop that straddles an
+        // interrupt boundary smears a little; the totals stay exact.
+        if (self.int_depth > 0) self.int_work_frame += cycles else self.main_work_frame += cycles;
         if (slot == slot_main) {
             self.main_self += cycles;
             self.main_frame += cycles;
@@ -988,9 +1026,9 @@ pub const Profiler = struct {
     fn applyEvent(self: *Profiler, ev: Event) void {
         switch (ev.kind) {
             .none => {},
-            .call => self.pushFrame(ev.target, ev.sp_before, ev.d, false),
+            .call => self.pushFrame(ev.target, ev.sp_before, ev.d, false, ev.sp_after),
             .nmi, .irq => {
-                self.pushFrame(ev.target, ev.sp_before, ev.d, true);
+                self.pushFrame(ev.target, ev.sp_before, ev.d, true, ev.sp_after);
                 // Tag the handler. First insert wins; a routine both called
                 // and interrupted into keeps whichever it was seen as first.
                 if (self.depth > 0) {
@@ -1012,7 +1050,7 @@ pub const Profiler = struct {
         }
     }
 
-    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16, is_int: bool) void {
+    fn pushFrame(self: *Profiler, entry: u24, sp_pre: u16, d: u16, is_int: bool, sp_after: u16) void {
         if (self.depth == call_stack_max) {
             // Deeper than the model follows — recursion, or a game using the
             // stack in ways no model survives. Start over and count it rather
@@ -1033,6 +1071,7 @@ pub const Profiler = struct {
         if (is_int) self.int_depth += 1;
         const r = &self.routines[slot];
         r.calls += 1;
+        if (!is_int and sp_pre -% sp_after == 3) r.rtl_calls += 1;
         if (self.int_depth > 0) r.int_entries += 1;
         r.on_stack += 1;
         self.stack[self.depth] = .{ .slot = slot, .sp_pre = sp_pre, .observed_at = self.observed, .is_int = is_int };
@@ -1258,7 +1297,11 @@ pub const Profiler = struct {
             .work = self.work,
             .idle = self.idle,
             .lag = !polled,
+            .int_work = self.int_work_frame,
+            .main_work = self.main_work_frame,
         };
+        self.int_work_frame = 0;
+        self.main_work_frame = 0;
         self.total_work += self.work;
         self.total_idle += self.idle;
         self.work = 0;
@@ -1283,6 +1326,89 @@ pub const Profiler = struct {
         return self.pending;
     }
 };
+/// The offload census. Moving the game loop to the SA-1 leaves the S-CPU
+/// with the interrupt handlers and with every hardware register the loop
+/// touches — the SA-1 cannot reach the PPU, the DMA unit, the APU ports or
+/// the joypad, so each of those touches becomes a marshalled request. This
+/// counts them: by context (main loop vs interrupt), by register, with the
+/// first few sites that make them. Registers are bucketed: $2100-$21FF ->
+/// 0..$FF, $4200-$43FF -> $100..$2FF, $4016/$4017 (the manual joypad
+/// ports, outside `isMmio`) -> $300/$301.
+pub const Census = struct {
+    pub const buckets: usize = 0x302;
+    pub const pcs_cap: usize = 6;
+    /// [context][bucket]: 0 = main loop, 1 = interrupt.
+    count: [2][buckets]u64 = @splat(@splat(0)),
+    /// Of `count`, the writes.
+    writes: [2][buckets]u64 = @splat(@splat(0)),
+    pcs: [2][buckets][pcs_cap]u24 = @splat(@splat(@splat(0))),
+    /// The routine (entry) each site ran under, parallel to `pcs`.
+    entries: [2][buckets][pcs_cap]u24 = @splat(@splat(@splat(0))),
+    n_pcs: [2][buckets]u8 = @splat(@splat(0)),
+
+    pub fn bucketOf(addr: u24) ?u16 {
+        const bank: u8 = @intCast((addr >> 16) & 0x7F);
+        const a16: u16 = @truncate(addr);
+        if (bank > 0x3F) return null;
+        if (a16 >= 0x2100 and a16 <= 0x21FF) return a16 - 0x2100;
+        if (a16 >= 0x4200 and a16 <= 0x43FF) return 0x100 + (a16 - 0x4200);
+        if (a16 == 0x4016 or a16 == 0x4017) return 0x300 + (a16 - 0x4016);
+        return null;
+    }
+
+    pub fn regOf(bucket: usize) u16 {
+        if (bucket < 0x100) return 0x2100 + @as(u16, @intCast(bucket));
+        if (bucket < 0x300) return 0x4200 + @as(u16, @intCast(bucket - 0x100));
+        return 0x4016 + @as(u16, @intCast(bucket - 0x300));
+    }
+
+    /// What a register is to an offload: the class decides the cost.
+    pub const Class = enum { ppu, apu, wram_port, dma, cpu, joypad, math };
+    pub fn classOf(reg: u16) Class {
+        if (reg >= 0x2140 and reg <= 0x2143) return .apu;
+        if (reg >= 0x2180 and reg <= 0x2183) return .wram_port;
+        if (reg < 0x2200) return .ppu;
+        if (reg == 0x4016 or reg == 0x4017 or (reg >= 0x4218 and reg <= 0x421F)) return .joypad;
+        if (reg == 0x420B or reg == 0x420C or reg >= 0x4300) return .dma;
+        if ((reg >= 0x4202 and reg <= 0x4206) or (reg >= 0x4214 and reg <= 0x4217)) return .math;
+        return .cpu;
+    }
+
+    pub fn note(self: *Census, addr: u24, pc: u24, in_int: bool, entry: u24, is_write: bool) void {
+        const b = bucketOf(addr) orelse return;
+        const c: usize = if (in_int) 1 else 0;
+        self.count[c][b] += 1;
+        if (is_write) self.writes[c][b] += 1;
+        const n = self.n_pcs[c][b];
+        for (self.pcs[c][b][0..n]) |q| if (q == pc) return;
+        if (n == pcs_cap) return;
+        self.pcs[c][b][n] = pc;
+        self.entries[c][b][n] = entry;
+        self.n_pcs[c][b] = n + 1;
+    }
+};
+
+test "census: registers bucket by context with their sites, and classify for the offload" {
+    var c: Census = .{};
+    c.note(0x002118, 0x808000, false, 0x807000, true);
+    c.note(0x802118, 0x808010, false, 0x807000, true);
+    c.note(0x002118, 0x808000, false, 0x807000, true);
+    c.note(0x00420B, 0x809000, true, 0x808F00, true);
+    c.note(0x004016, 0x80A000, false, 0, false);
+    c.note(0x7E2118, 0x80B000, false, 0, false); // WRAM, not a register
+    try std.testing.expectEqual(@as(u64, 3), c.writes[0][0x18]);
+    try std.testing.expectEqual(@as(u24, 0x807000), c.entries[0][0x18][0]);
+    try std.testing.expectEqual(@as(u64, 3), c.count[0][0x18]);
+    try std.testing.expectEqual(@as(u8, 2), c.n_pcs[0][0x18]);
+    try std.testing.expectEqual(@as(u64, 1), c.count[1][0x10B]);
+    try std.testing.expectEqual(@as(u64, 1), c.count[0][0x300]);
+    try std.testing.expectEqual(@as(u16, 0x420B), Census.regOf(0x10B));
+    try std.testing.expectEqual(Census.Class.dma, Census.classOf(0x420B));
+    try std.testing.expectEqual(Census.Class.math, Census.classOf(0x4216));
+    try std.testing.expectEqual(Census.Class.apu, Census.classOf(0x2140));
+    try std.testing.expectEqual(Census.Class.ppu, Census.classOf(0x2118));
+}
+
 /// The answer to "is this game CPU-bound?", which is the only question step one
 /// of the analyser is entitled to answer.
 pub const Verdict = enum {
@@ -1338,7 +1464,7 @@ pub const Summary = struct {
     /// Where the slowdown was: the first few short lag runs (frame of the
     /// first dropped frame, run length), so a 0.1% verdict can be placed
     /// in the take — a boss burst and a transition are different findings.
-    slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8,
+    slow_runs: [768]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 768,
     n_slow_runs: u8 = 0,
     /// Lag in short runs: genuine frame-rate slowdown. This is the number the
     /// verdict is based on. See `stall_run_max`.
@@ -1907,7 +2033,7 @@ pub fn summarise(samples: []const FrameSample, util_scratch: []f64) Summary {
     const p95 = percentile(utils, 95);
 
     // Second pass: place the short runs.
-    var slow_runs: [8]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 8;
+    var slow_runs: [768]SlowRun = [_]SlowRun{.{ .start = 0, .len = 0 }} ** 768;
     var n_slow_runs: u8 = 0;
     {
         var r: u32 = 0;

@@ -1,0 +1,1 @@
+"$STOCK" --gen-sa1-patch --window --wg-static --verify-behavioral --movie tests/surfaces/sm-sa1/scripted/sm-attract36k.ymv --movie tests/surfaces/sm-sa1/scripted/sm-play-death.ymv --movie tests/surfaces/sm-sa1/scripted/sm-titleskip.ymv --out tests/surfaces/sm-sa1/sm-sa1-v25.bps

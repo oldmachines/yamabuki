@@ -85,7 +85,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         // The cart value is owned here so the whole system is one allocation;
         // the bus/cpu hold pointers into this struct and must not be moved.
         // `steps` and `prof` are diagnostics, not machine state.
-        pub const serialize_skip = .{ "steps", "prof", "usage", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
+        pub const serialize_skip = .{ "steps", "prof", "usage", "skip_render", "polled_latch", "polled_consumed", "lap_latch", "prev_load_end", "prev_load_w", "x_src", "x_w", "pushed_src", "dbr_src", "dma_a1t_src", "prev_load_hi_src", "pushed_hi_src", "plb_pc", "pei_stage", "pei_dp", "a_lo_src", "a_hi_src" };
 
         cart: Cartridge,
         bus: Bus,
@@ -165,6 +165,26 @@ pub fn Console(comptime cfg: CoreConfig) type {
         line_start: u64,
         /// Completed-frame counter.
         frame: u64,
+        /// Skip the fast core's per-scanline pixel rendering. Nothing the
+        /// game can observe lives in the framebuffer, so a run that never
+        /// looks at frames — a coverage harvest — can leave it unpainted and
+        /// keep every register, DMA, timing and audio step exactly as it was.
+        /// Run configuration, not machine state: listed in `serialize_skip`,
+        /// or it would shift the save-state layout by a byte and every
+        /// anchored recording would load a machine one byte off.
+        skip_render: bool,
+        /// The game read the controller since a frontend last took this
+        /// (`takeInputPolled`). Latched here because the profiler clears the
+        /// bus's own flag at frame end; a per-poll input feed advances on it.
+        /// Diagnostic, not machine state: in `serialize_skip`.
+        polled_latch: bool,
+        lap_latch: bool,
+        /// A poll the frontend already took (`takeInputPolled`) since the
+        /// profiler's last frame boundary — the boundary sits at vblank start,
+        /// the game's own poll comes after it, and a per-poll feed takes the
+        /// flag between frames; without this the profiler saw every frame as
+        /// dropped. Diagnostic, in `serialize_skip`.
+        polled_consumed: bool,
         /// CPU instructions/interrupts retired since reset. A deterministic
         /// work proxy for perf-regression baselines (paired with bus.clock).
         steps: u64,
@@ -178,6 +198,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
             self.cpu = Cpu(Bus).init(&self.bus);
             self.region = timing.regionFromHeaderByte(self.cart.header.region);
             self.bus.ppu.pal = self.region == .pal;
+            self.skip_render = false;
+            self.polled_latch = false;
+            self.lap_latch = false;
+            self.polled_consumed = false;
             self.reset();
         }
 
@@ -246,6 +270,54 @@ pub fn Console(comptime cfg: CoreConfig) type {
             }
             self.scanline = 0;
             self.frame +%= 1;
+            self.polled_latch = self.polled_latch or self.bus.input_polled;
+            self.lap_latch = self.lap_latch or self.bus.lap_polled;
+        }
+
+        /// Whether the game has read the controller since the last `take`.
+        pub fn inputPolled(self: *const Self) bool {
+            return self.polled_latch or self.bus.input_polled;
+        }
+
+        /// Read-and-clear form, for a feed that advances one entry per poll.
+        pub fn takeInputPolled(self: *Self) bool {
+            const p = self.inputPolled();
+            if (p) self.polled_consumed = true;
+            self.polled_latch = false;
+            self.bus.input_polled = false;
+            return p;
+        }
+
+        /// Whether the game's lap counter (`bus.lap_cell`) was written since
+        /// the last `takeLapPassed` — the lap tick of a per-lap take.
+        pub fn lapPassed(self: *const Self) bool {
+            return self.lap_latch or self.bus.lap_polled;
+        }
+
+        pub fn takeLapPassed(self: *Self) bool {
+            const p = self.lapPassed();
+            self.lap_latch = false;
+            self.bus.lap_polled = false;
+            return p;
+        }
+
+        /// Stage up to 16 per-lap entries for the coming frame's lap edges;
+        /// returns how many the previous staging consumed.
+        pub fn lapFeedStage(self: *Self, entries: []const [2]u16) u8 {
+            const consumed = self.bus.lap_feed_i;
+            const n: u8 = @intCast(@min(entries.len, self.bus.lap_feed.len));
+            @memcpy(self.bus.lap_feed[0..n], entries[0..n]);
+            self.bus.lap_feed_n = n;
+            self.bus.lap_feed_i = 0;
+            return consumed;
+        }
+
+        /// The pads recorded at the frame's lap edges; cleared.
+        pub fn lapRecTake(self: *Self, buf: *[16][2]u16) u8 {
+            const n = self.bus.lap_rec_n;
+            @memcpy(buf[0..n], self.bus.lap_rec[0..n]);
+            self.bus.lap_rec_n = 0;
+            return n;
         }
 
         fn stepScanline(self: *Self) void {
@@ -271,7 +343,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
                 // scanline 0, so the window matches the NMI-to-NMI period the
                 // game's logic actually runs in.
                 if (cfg.profile) {
-                    self.prof.endFrame(self.frame, self.bus.input_polled);
+                    self.polled_latch = self.polled_latch or self.bus.input_polled;
+                    self.prof.endFrame(self.frame, self.bus.input_polled or self.polled_consumed);
+                    self.polled_consumed = false;
                     self.bus.input_polled = false;
                 }
                 // Entering vblank: latch the NMI flag and deliver if enabled.
@@ -316,7 +390,9 @@ pub fn Console(comptime cfg: CoreConfig) type {
             // Fast mode renders the whole visible scanline at line end; the
             // accurate core renders whatever the beam didn't already emit.
             if (line < self.vblankLine()) {
-                if (cfg.accuracy == .fast) self.renderScanline(line) else self.bus.ppu.finishScanline(line);
+                if (cfg.accuracy == .fast) {
+                    if (!self.skip_render) self.renderScanline(line);
+                } else self.bus.ppu.finishScanline(line);
             }
 
             // Between lines the beam is in blanking: HDMA's per-line $21xx
@@ -1250,6 +1326,42 @@ pub const AnyConsole = union(Accuracy) {
     pub fn runFrame(self: *AnyConsole) void {
         switch (self.*) {
             inline else => |*c| c.runFrame(),
+        }
+    }
+
+    pub fn inputPolled(self: *const AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.inputPolled(),
+        }
+    }
+
+    pub fn takeInputPolled(self: *AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.takeInputPolled(),
+        }
+    }
+
+    pub fn lapPassed(self: *const AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.lapPassed(),
+        }
+    }
+
+    pub fn takeLapPassed(self: *AnyConsole) bool {
+        switch (self.*) {
+            inline else => |*c| return c.takeLapPassed(),
+        }
+    }
+
+    pub fn lapFeedStage(self: *AnyConsole, entries: []const [2]u16) u8 {
+        switch (self.*) {
+            inline else => |*c| return c.lapFeedStage(entries),
+        }
+    }
+
+    pub fn lapRecTake(self: *AnyConsole, buf: *[16][2]u16) u8 {
+        switch (self.*) {
+            inline else => |*c| return c.lapRecTake(buf),
         }
     }
 
