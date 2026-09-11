@@ -268,11 +268,19 @@ const Args = struct {
     /// 785k frames replayed per generation, 24 of them unchanged since the
     /// last. Bump the version whenever the profiler's semantics change.
     harvest_cache: ?[]const u8 = null,
+    /// `--baseline-cache <dir>`: snapshot of the stock side of a generation
+    /// (evidence pass, per-surface baselines, coverage pad) keyed on every
+    /// input it has; a hit skips ~27 minutes of stock replays. See
+    /// `saveBaselineSnapshot`.
+    baseline_cache: ?[]const u8 = null,
     /// --harvest-jobs N: cover pairs that still need a replay run on N
     /// threads (default: the machine's core count, at most 12). Each replay
     /// owns its console and products; the merges stay on the main thread, in
     /// recipe order, so the union and the log are the same at any N.
     harvest_jobs: usize = 0,
+    /// `--verify-jobs N`: surfaces verified concurrently (0 = one per core,
+    /// capped at the surface count; 1 = the serial loop, for timing it).
+    verify_jobs: usize = 0,
     /// --harvest-render: paint frames during harvest replays (the default
     /// skips the pixel work; the harvest never looks at a frame).
     harvest_render: bool = false,
@@ -2246,6 +2254,198 @@ fn loadHarvestCache(
 /// Write the pair's products sparsely: only map cells that are non-zero.
 /// Best-effort — a cache that cannot be written just means a replay next
 /// time.
+/// The baseline snapshot: everything the stock side of a generation
+/// produces before the harvest, so a repeat build with the same inputs
+/// skips it. MEASURED (v78, idle machine): the evidence pass, the eight
+/// baselines and the coverage pad are ~27 of a build's 36 minutes, and
+/// none of their inputs change between versions of the same recipe — the
+/// generator's own code and the split flags act after this point.
+///
+/// Exact by construction: the phase is replayed serially into ONE union in
+/// a fixed order and the snapshot is that union's bytes, not a merge. The
+/// profiler and evidence structs are plain data (fixed arrays, no
+/// pointers) and are stored raw, guarded by a layout hash of their fields
+/// (names, sizes, offsets) so a struct change invalidates every snapshot.
+const baseline_cache_magic = "YBSC";
+const baseline_cache_version: u32 = 1;
+
+fn layoutHash(comptime T: type) u32 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var h: u32 = 2166136261;
+        const info = @typeInfo(T).@"struct";
+        for (info.fields) |f| {
+            for (f.name) |c| h = (h ^ c) *% 16777619;
+            h = (h ^ @as(u32, @intCast(@sizeOf(f.type) & 0xFFFF_FFFF))) *% 16777619;
+            h = (h ^ @as(u32, @intCast(@offsetOf(T, f.name) & 0xFFFF_FFFF))) *% 16777619;
+        }
+        h = (h ^ @as(u32, @intCast(@sizeOf(T) & 0xFFFF_FFFF))) *% 16777619;
+        return h;
+    }
+}
+
+const baseline_layout: u32 = layoutHash(profile.Profiler) ^ (layoutHash(profile.Summary) *% 3) ^
+    (layoutHash(profile.Conversion) *% 5) ^ (layoutHash(core.usage_map.PtrBankEvidence) *% 7);
+
+/// Every input the stock phase consumes: the image, each surface's inputs
+/// and mode, the anchored states, the skip, and the flags that steer the
+/// phase (window/whole-game select the pad and the evidence pass).
+fn baselineKey(
+    image: []const u8,
+    movs: []const util.movie.Movie,
+    n_surf: usize,
+    totals: []const u32,
+    evidence_state: ?[]const u8,
+    verify_state: ?[]const u8,
+    skip: u32,
+    whole_game: bool,
+    window: bool,
+) u64 {
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.asBytes(&baseline_cache_version));
+    h.update(std.mem.asBytes(&baseline_layout));
+    const crc = util.movie.imageCrc(image);
+    h.update(std.mem.asBytes(&crc));
+    const ns: u32 = @intCast(n_surf);
+    h.update(std.mem.asBytes(&ns));
+    for (0..n_surf) |i| {
+        h.update(std.mem.asBytes(&totals[i]));
+        if (i < movs.len) {
+            const m = movs[i];
+            h.update(std.mem.sliceAsBytes(m.frames));
+            if (m.anchor) |a| h.update(a);
+            if (m.start_srm) |b| h.update(b);
+            h.update(std.mem.asBytes(&m.per_poll));
+            h.update(std.mem.asBytes(&m.tail_frames));
+            h.update(std.mem.asBytes(&m.lap_cell));
+        }
+    }
+    if (evidence_state) |b| h.update(b);
+    if (verify_state) |b| h.update(b);
+    h.update(std.mem.asBytes(&skip));
+    h.update(std.mem.asBytes(&whole_game));
+    h.update(std.mem.asBytes(&window));
+    return h.final();
+}
+
+/// What the snapshot carries, as views into the generator's own storage.
+const BaselineSnap = struct {
+    n_surf: usize,
+    totals: []const u32,
+    hashes: []const []u64,
+    env: []const []u64,
+    audio: []u64,
+    sums: []profile.Summary,
+    mmio: []const *core.bus.Bus.MmioWriters,
+    cov_early: *u32,
+    prof: *profile.Profiler,
+    evidence: *?profile.Conversion,
+    ub: []u8,
+    site_ev: []u8,
+    ptr_ev: *core.usage_map.PtrBankEvidence,
+};
+
+fn baselineCachePath(gpa: std.mem.Allocator, dir: []const u8, key: u64) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "{s}/base-{x:0>16}.ybs", .{ dir, key });
+}
+
+/// Read and validate a snapshot for `key`; the bytes past the header, or
+/// null (missing, foreign, stale).
+fn loadBaselineSnapshot(io: std.Io, gpa: std.mem.Allocator, path: []const u8, key: u64) ?[]const u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 * 1024)) catch return null;
+    if (data.len < 24 or !std.mem.eql(u8, data[0..4], baseline_cache_magic)) return null;
+    if (std.mem.readInt(u32, data[4..8], .little) != baseline_cache_version) return null;
+    if (std.mem.readInt(u32, data[8..12], .little) != baseline_layout) return null;
+    if (std.mem.readInt(u64, data[12..20], .little) != key) return null;
+    return data[20..];
+}
+
+const SnapReader = struct {
+    d: []const u8,
+    o: usize = 0,
+    fn bytes(r: *SnapReader, n: usize) ![]const u8 {
+        if (r.o + n > r.d.len) return error.Truncated;
+        const b = r.d[r.o .. r.o + n];
+        r.o += n;
+        return b;
+    }
+    fn u32v(r: *SnapReader) !u32 {
+        return std.mem.readInt(u32, (try r.bytes(4))[0..4], .little);
+    }
+    fn u64v(r: *SnapReader) !u64 {
+        return std.mem.readInt(u64, (try r.bytes(8))[0..8], .little);
+    }
+};
+
+fn applyBaselineSnapshot(data: []const u8, snap: BaselineSnap) !void {
+    var r: SnapReader = .{ .d = data };
+    if (try r.u32v() != snap.n_surf) return error.SurfaceCount;
+    for (0..snap.n_surf) |s| {
+        if (try r.u32v() != snap.totals[s]) return error.SurfaceLength;
+        const n: usize = snap.totals[s];
+        @memcpy(std.mem.sliceAsBytes(snap.hashes[s][0..n]), try r.bytes(n * 8));
+        @memcpy(std.mem.sliceAsBytes(snap.env[s][0..n]), try r.bytes(n * 8));
+        snap.audio[s] = try r.u64v();
+        @memcpy(std.mem.asBytes(&snap.sums[s]), try r.bytes(@sizeOf(profile.Summary)));
+        const nm = try r.u32v();
+        const m = snap.mmio[s];
+        m.set.clearRetainingCapacity();
+        for (0..nm) |_| try m.set.put(m.alloc, try r.u64v(), {});
+    }
+    snap.cov_early.* = try r.u32v();
+    @memcpy(std.mem.asBytes(snap.prof), try r.bytes(@sizeOf(profile.Profiler)));
+    const has_ev = try r.u32v();
+    if (has_ev != 0) {
+        var c: profile.Conversion = undefined;
+        @memcpy(std.mem.asBytes(&c), try r.bytes(@sizeOf(profile.Conversion)));
+        snap.evidence.* = c;
+    } else snap.evidence.* = null;
+    @memcpy(snap.ub, try r.bytes(snap.ub.len));
+    @memcpy(snap.site_ev, try r.bytes(snap.site_ev.len));
+    @memcpy(std.mem.asBytes(snap.ptr_ev), try r.bytes(@sizeOf(core.usage_map.PtrBankEvidence)));
+    if (r.o != data.len) return error.TrailingBytes;
+}
+
+fn saveBaselineSnapshot(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, path: []const u8, key: u64, snap: BaselineSnap) !void {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll(baseline_cache_magic);
+    try w.writeInt(u32, baseline_cache_version, .little);
+    try w.writeInt(u32, baseline_layout, .little);
+    try w.writeInt(u64, key, .little);
+    try w.writeInt(u32, @intCast(snap.n_surf), .little);
+    for (0..snap.n_surf) |s| {
+        const n: usize = snap.totals[s];
+        try w.writeInt(u32, snap.totals[s], .little);
+        try w.writeAll(std.mem.sliceAsBytes(snap.hashes[s][0..n]));
+        try w.writeAll(std.mem.sliceAsBytes(snap.env[s][0..n]));
+        try w.writeInt(u64, snap.audio[s], .little);
+        try w.writeAll(std.mem.asBytes(&snap.sums[s]));
+        const m = snap.mmio[s];
+        // sorted, so the file is a function of the set and nothing else
+        const keys = try gpa.alloc(u64, m.set.count());
+        defer gpa.free(keys);
+        var it = m.set.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) keys[i] = k.*;
+        std.mem.sort(u64, keys, {}, std.sort.asc(u64));
+        try w.writeInt(u32, @intCast(keys.len), .little);
+        for (keys) |k| try w.writeInt(u64, k, .little);
+    }
+    try w.writeInt(u32, snap.cov_early.*, .little);
+    try w.writeAll(std.mem.asBytes(snap.prof));
+    if (snap.evidence.*) |c| {
+        try w.writeInt(u32, 1, .little);
+        try w.writeAll(std.mem.asBytes(&c));
+    } else try w.writeInt(u32, 0, .little);
+    try w.writeAll(snap.ub);
+    try w.writeAll(snap.site_ev);
+    try w.writeAll(std.mem.asBytes(snap.ptr_ev));
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
+}
+
 fn saveHarvestCache(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -2855,7 +3055,23 @@ fn runSa1Gen(
     // from the gameplay scene, into the same usage map the rewriter and
     // the walks consume. Candidates come from THIS profile.
     var evidence_conv: ?profile.Conversion = null;
-    if (evidence_state) |sb| {
+    var sum: profile.Summary = undefined;
+    var sum_s: [max_movies]profile.Summary = undefined;
+    // The baseline snapshot: a hit here skips the evidence pass, every
+    // baseline and the coverage pad, and fills their outputs below once the
+    // surface-0 console exists (its profiler state is part of the snapshot).
+    var base_key: u64 = 0;
+    var base_path: []const u8 = "";
+    var base_data: ?[]const u8 = null;
+    if (args.baseline_cache) |dir| {
+        base_key = baselineKey(image, movs, n_surf, totals[0..n_surf], evidence_state, verify_state, args.skip, args.whole_game, args.window);
+        base_path = try baselineCachePath(gpa, dir, base_key);
+        base_data = loadBaselineSnapshot(io, gpa, base_path, base_key);
+        try out.print("  baseline cache: {s} ({s})\n", .{ if (base_data != null) @as([]const u8, "HIT — stock phase skipped") else "miss — will be written", base_path });
+        try out.flush();
+    }
+    const base_restored = base_data != null;
+    if (!base_restored) if (evidence_state) |sb| {
         const ecart = try core.Cartridge.load(gpa, image);
         const econ = try gpa.create(core.ProfilingConsole);
         econ.init(ecart);
@@ -2887,7 +3103,7 @@ fn runSa1Gen(
         gpa.destroy(econ);
         try out.print("  (evidence pass: profile + coverage anchored at the state; verification stays power-on)\n", .{});
         try out.flush();
-    }
+    };
     try phaseMark(io, out, "baselines: start (harvest + evidence pass done)");
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.ProfilingConsole);
@@ -2899,14 +3115,37 @@ fn runSa1Gen(
     for (0..n_surf) |ms| mmio_conv_g[ms] = try core.bus.Bus.MmioWriters.create(gpa);
     mmio_n_g = n_surf;
     con.bus.mmio_writers = mmio_base_g[0];
-    if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
+    const base_snap: BaselineSnap = .{
+        .n_surf = n_surf,
+        .totals = totals[0..n_surf],
+        .hashes = hashes_s[0..n_surf],
+        .env = env_base_s[0..n_surf],
+        .audio = base_audio_s[0..n_surf],
+        .sums = sum_s[0..n_surf],
+        .mmio = mmio_base_g[0..n_surf],
+        .cov_early = &cov_early,
+        .prof = &con.prof,
+        .evidence = &evidence_conv,
+        .ub = ub,
+        .site_ev = site_ev,
+        .ptr_ev = ptr_ev,
+    };
+    if (base_data) |bd| {
+        applyBaselineSnapshot(bd, base_snap) catch |e| {
+            try out.print("error: baseline snapshot {s} does not apply: {s} (delete it)\n", .{ base_path, @errorName(e) });
+            try out.flush();
+            std.process.exit(1);
+        };
+        sum = sum_s[0];
+    }
+    if (!base_restored) if (surfaceAnchor(movs, 0, verify_state)) |sb| con.loadState(sb) catch |e| {
         try out.print("error: the state does not load into this console: {s}\n", .{@errorName(e)});
         try out.flush();
         std.process.exit(1);
     };
     var base_audio = core.console.audio_hash_init;
     var feed0: util.movie.Feed = .init(movAt(movs, 0));
-    for (0..total) |i| {
+    if (!base_restored) for (0..total) |i| {
         if (i == cov_mark) cov_early = core.usage_map.countOpcodes(ub);
         feed0.step(con, i);
         con.runFrame();
@@ -2915,16 +3154,17 @@ fn runSa1Gen(
         if (con.takeProfile()) |smp| {
             if (i >= args.skip) samples.appendAssumeCapacity(smp);
         }
+    };
+    if (!base_restored) {
+        base_audio_s[0] = base_audio;
+        const scratch = try gpa.alloc(f64, samples.items.len);
+        sum = profile.summarise(samples.items, scratch);
     }
-    base_audio_s[0] = base_audio;
-    const scratch = try gpa.alloc(f64, samples.items.len);
-    const sum = profile.summarise(samples.items, scratch);
     // Surfaces beyond the first: fresh consoles into the SAME coverage
     // and evidence union, their own hashes/audio and their own profile
     // summary (the lag comparison is per surface).
-    var sum_s: [max_movies]@TypeOf(sum) = undefined;
-    sum_s[0] = sum;
-    for (1..n_surf) |s| {
+    if (!base_restored) sum_s[0] = sum;
+    if (!base_restored) for (1..n_surf) |s| {
         const cart_s = try core.Cartridge.load(gpa, image);
         const con_s = try gpa.create(core.ProfilingConsole);
         con_s.init(cart_s);
@@ -2950,7 +3190,7 @@ fn runSa1Gen(
         sum_s[s] = profile.summarise(samples_s.items, scratch_s);
         con_s.cart.deinit(gpa);
         gpa.destroy(con_s);
-    }
+    };
     try phaseMark(io, out, "baselines: done");
     // COVERAGE PAD: replay every surface PAST its movie end on throwaway
     // consoles, coverage/evidence union only — no samples, no baselines,
@@ -2963,7 +3203,7 @@ fn runSa1Gen(
     // the pointer operand unshifted — dead-WRAM pointer, BRK storm,
     // permanent park behind a blank screen; latent in EVERY shipped
     // window build, exposed only by post-movie soak probes).
-    if (args.whole_game and args.window and movs.len != 0) {
+    if (!base_restored and args.whole_game and args.window and movs.len != 0) {
         const cov_pad: u32 = 1500;
         for (0..n_surf) |s| {
             const cart_p = try core.Cartridge.load(gpa, image);
@@ -3002,6 +3242,13 @@ fn runSa1Gen(
     // merges pair i only after joining it, in recipe order, so the union
     // and the log come out the same at any thread count. Memory is bounded
     // by the in-flight window: two 16 MiB maps and a console per job.
+    if (args.baseline_cache) |dir| if (!base_restored) {
+        saveBaselineSnapshot(io, gpa, dir, base_path, base_key, base_snap) catch |e| {
+            try out.print("  baseline cache: NOT written ({s})\n", .{@errorName(e)});
+        };
+        try out.print("  baseline cache: written {s}\n", .{base_path});
+        try out.flush();
+    };
     const HarvestJob = struct {
         ci_raw: []u8 = &.{},
         ci: []const u8 = &.{},
@@ -3771,7 +4018,8 @@ fn runSa1Gen(
             j.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             j.out = std.Io.Writer.Allocating.init(j.arena.allocator());
         }
-        const surf_jobs_max: usize = @max(1, @min(std.Thread.getCpuCount() catch 4, n_surf));
+        const surf_jobs_max: usize = @max(1, @min(if (args.verify_jobs != 0) args.verify_jobs else (std.Thread.getCpuCount() catch 4), n_surf));
+        try out.print("  verify: {} surface(s) at a time\n", .{surf_jobs_max});
         var surf_next: usize = 0;
         var surf_inflight: usize = 0;
         for (0..n_surf) |s| {
@@ -5987,10 +6235,15 @@ fn parseArgs(init: std.process.Init, gpa: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--harvest-jobs")) {
             const v = it.next() orelse return error.MissingValue;
             out.harvest_jobs = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--verify-jobs")) {
+            const v = it.next() orelse return error.MissingValue;
+            out.verify_jobs = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, a, "--harvest-render")) {
             out.harvest_render = true;
         } else if (std.mem.eql(u8, a, "--harvest-cache")) {
             out.harvest_cache = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--baseline-cache")) {
+            out.baseline_cache = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--cover-movie")) {
             // Fills the pair the last --cover-image opened.
             if (out.n_cover == 0) return error.MissingValue;

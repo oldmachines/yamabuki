@@ -1673,3 +1673,24 @@ screen is PPU-identical to stock in free-run with correct defaults; the
 suite is 463/463. What remains is not a slowdown gap but the standing costs
 the gate discloses — transitions run stock-shape by design, and any surface
 must be confirmed to reach its screen before its green is believed.
+
+## Build time: where it goes, and the two caches
+
+A generation stamps its phases (`[time]` lines). Measured on the eight-surface
+Super Metroid corpus, idle machine: evidence pass + baselines ~820 s, coverage
+pad ~840 s (it replays each surface to its end before padding past it),
+harvest 1.5 s from `--harvest-cache`, verification 883 s serial or 494 s with
+the surfaces on threads (bounded by the longest surface's own tier). The
+stock replays dominate, not the verification.
+
+`--baseline-cache <dir>` snapshots the whole stock phase — the evidence union,
+the profiler state, every surface's baseline outputs — keyed on every input
+that phase consumes, and a hit skips it: 2,156 s -> 504 s on a repeat recipe,
+patch byte-identical. It is a snapshot of one serially-built union, never a
+merge: the pointer-bank evidence carries first-writer records that no
+order-free merge reproduces, which is why the baselines are cached rather
+than threaded. Raw structs in the file are guarded by a comptime layout hash
+(field names, sizes, offsets), so a struct edit invalidates old snapshots
+instead of misreading them. `--verify-jobs N` sets the verifier's thread
+count (1 = the serial loop, for timing). Both cache flags and `--verify-jobs`
+are machine-local and are stripped from shipped `.bps.cmd` recipes.
