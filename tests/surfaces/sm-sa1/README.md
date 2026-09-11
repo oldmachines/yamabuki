@@ -358,7 +358,7 @@ and the explainer finds zero unexplained rewrites in both copies; the patched
 stock ROM equals the generated image. The pickup take draws the box
 byte-identical to stock, with zero `--stale` sites and a silent MMIO gate.
 
-### The split ship, ninth cut (v76) — the pumped routine's exit widths
+### The split ship, ninth cut (v76) — the pumped routine's exit widths; see v78
 
 `sm-sa1-v76.bps.cmd` is v74's recipe unchanged; the generator changed. On
 v74 every item pickup that shows a message box crashed the SA-1: the box
@@ -381,6 +381,23 @@ equivalent over all eight surfaces with 28 pumped IO routines. No take in
 this directory displays a message box (the box index is zero at the end of
 every per-poll take), which is how v74 shipped with the crash; a per-poll
 take through an item pickup is the fixture this class still lacks.
+
+### The split ship, tenth cut (v78) - the save pod's input loop, on the S-CPU
+
+`sm-sa1-v78.bps.cmd` is v76's recipe plus two `--wg-split-io` entries. On v76
+saving at a pod stopped at "WOULD YOU LIKE TO SAVE?": the message box's
+interaction routine reads the controller itself, through
+`ReadControllerInput` and inline from `$4212/$4218/$4219`, and those reads
+are inert on the SA-1 (findings 4r). Pumping `ReadControllerInput` alone
+took the YES and wrote the save, then left "SAVE COMPLETED" waiting for a
+dismiss press it reads inline. `Handle_MessageBox_Interaction` (`$85:846D`)
+is now a deferred entry: the S-CPU runs the box's waits, reads and the
+YES/NO redraw while the SA-1 waits in its stub.
+
+Patch 160,127 bytes; the S-CPU set is v73's. Verified behaviorally
+equivalent over all eight surfaces with 30 pumped IO routines. The gate is
+the player's own save-pod take with a confirm and a dismiss press appended:
+slot B written, the box dismissed, gameplay resumed, stale-silent.
 
 ### What v25 does not include
 

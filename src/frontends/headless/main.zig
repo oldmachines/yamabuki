@@ -387,6 +387,18 @@ pub fn main(init: std.process.Init) !void {
 /// Debug frame's growth deserves — it is virtual address space, not memory.
 const debug_stack_size = 64 * 1024 * 1024;
 
+/// Phase clock for the generator's log: wall seconds since the first mark.
+/// MEASUREMENT, not a caveat — every "why is a build 17 minutes" question
+/// gets answered by these lines instead of guessed at.
+var phase_t0: i96 = 0;
+fn phaseMark(io: std.Io, out: *std.Io.Writer, name: []const u8) !void {
+    const now = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    if (phase_t0 == 0) phase_t0 = now;
+    const dt: u64 = @intCast(@divTrunc(now - phase_t0, 1_000_000));
+    try out.print("  [time] {s}: +{d}.{d:0>1}s\n", .{ name, dt / 1000, (dt % 1000) / 100 });
+    try out.flush();
+}
+
 fn runOnThread(init: std.process.Init, status: *anyerror!void) void {
     status.* = run(init);
 }
@@ -2876,6 +2888,7 @@ fn runSa1Gen(
         try out.print("  (evidence pass: profile + coverage anchored at the state; verification stays power-on)\n", .{});
         try out.flush();
     }
+    try phaseMark(io, out, "baselines: start (harvest + evidence pass done)");
     const cart = try core.Cartridge.load(gpa, image);
     const con = try gpa.create(core.ProfilingConsole);
     con.init(cart);
@@ -2938,6 +2951,7 @@ fn runSa1Gen(
         con_s.cart.deinit(gpa);
         gpa.destroy(con_s);
     }
+    try phaseMark(io, out, "baselines: done");
     // COVERAGE PAD: replay every surface PAST its movie end on throwaway
     // consoles, coverage/evidence union only — no samples, no baselines,
     // no verdict influence. The conversion runs AHEAD of stock by the
@@ -3025,6 +3039,7 @@ fn runSa1Gen(
             }
         }
     };
+    try phaseMark(io, out, "harvest: start");
     var jobs: [max_cover_pairs]HarvestJob = @splat(.{});
     const jobs_max: usize = if (args.harvest_jobs != 0) args.harvest_jobs else @min(12, std.Thread.getCpuCount() catch 4);
     // Phase 1: load every pair, decide cache hit or replay, and prepare the
@@ -3595,108 +3610,209 @@ fn runSa1Gen(
         var fail_mov: ?util.movie.Movie = null;
         var fail_s: usize = 0;
         var conv_sum: @TypeOf(sum) = undefined;
+        // The surfaces verify IN PARALLEL, one thread each (capped at the
+        // core count): each has its own consoles, arena and output buffer,
+        // and touches nothing shared but its own per-surface slots. The
+        // results fold in surface order, so the verdict, the first failure
+        // reported and the printed order are exactly the serial loop's.
+        // MEASURED before this: eight surfaces, ~275k frames, replayed
+        // serially on one thread were the bulk of a 17-minute build.
+        const SurfaceJob = struct {
+            s: usize = 0,
+            n_surf: usize = 0,
+            total: u32 = 0,
+            hashes: []u64 = &.{},
+            conv_hashes: []u64 = &.{},
+            env_base: []u64 = &.{},
+            env_conv: []u64 = &.{},
+            base_audio: u64 = 0,
+            base_sum: profile.Summary = undefined,
+            mmio_base: []const *core.bus.Bus.MmioWriters = &.{},
+            mmio_conv: *core.bus.Bus.MmioWriters = undefined,
+            mov: ?util.movie.Movie = null,
+            anchor: ?[]const u8 = null,
+            plan: *const profile.Plan = undefined,
+            res: *const core.sa1gen.Result = undefined,
+            image: []const u8 = &.{},
+            skip: u32 = 0,
+            verify_behavioral: bool = false,
+            behavioral_ok: bool = false,
+            window: bool = false,
+            arena: std.heap.ArenaAllocator = undefined,
+            out: std.Io.Writer.Allocating = undefined,
+            // results
+            tier: ?SaTier = null,
+            equiv: util.Equivalence = .identical,
+            fail_why: []const u8 = "",
+            fail_frame: u32 = 0,
+            conv_sum: profile.Summary = undefined,
+            err: ?anyerror = null,
+            thread: ?std.Thread = null,
+
+            fn run(job: *@This()) void {
+                job.runInner() catch |e| {
+                    job.err = e;
+                };
+            }
+
+            fn runInner(job: *@This()) !void {
+                const a = job.arena.allocator();
+                const w = &job.out.writer;
+                const s = job.s;
+                @memset(job.env_conv, 0);
+                var fast_audio = core.console.audio_hash_init;
+                var job_samples: std.array_list.Managed(profile.FrameSample) = .init(a);
+                try job_samples.ensureTotalCapacity(job.total);
+                {
+                    const cart2 = try core.Cartridge.load(a, job.res.image);
+                    const con2 = try a.create(core.ProfilingConsole);
+                    con2.init(cart2);
+                    applySidecar(con2, job.mov);
+                    job.mmio_conv.set.clearRetainingCapacity();
+                    con2.bus.mmio_writers = job.mmio_conv;
+                    if (job.anchor) |sb| try seedConverted(con2, sb, job.plan, job.res);
+                    var feed2: util.movie.Feed = .init(job.mov);
+                    for (0..job.total) |i| {
+                        feed2.step(con2, i);
+                        con2.runFrame();
+                        try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &job.env_conv[i] }, EnergySink.add);
+                        job.conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
+                        if (con2.takeProfile()) |smp| {
+                            if (i >= job.skip) job_samples.appendAssumeCapacity(smp);
+                        }
+                    }
+                    con2.cart.deinit(a);
+                }
+                const job_scratch = try a.alloc(f64, job_samples.items.len);
+                job.conv_sum = profile.summarise(job_samples.items, job_scratch);
+
+                // Stage-S4 gate, three tiers: strict identity; frames
+                // identical with envelope-equivalent audio; equivalent modulo
+                // timing with a non-negative lag improvement.
+                job.equiv = util.framesEquivalent(job.hashes, job.conv_hashes);
+                var why: []const u8 = "";
+                var at: u32 = 0;
+                var s_tier: ?SaTier = switch (job.equiv) {
+                    .identical => blk: {
+                        if (fast_audio == job.base_audio) break :blk .strict;
+                        if (util.audioEnvelopeMismatch(job.env_base, job.env_conv)) |bad| {
+                            why = "audio envelope diverged (a sound moved, silenced, or invented)";
+                            at = bad;
+                            break :blk null;
+                        }
+                        break :blk .envelope;
+                    },
+                    .equivalent => blk: {
+                        if (job.conv_sum.lag_frames > job.base_sum.lag_frames) {
+                            why = "same pictures but MORE dropped frames — a regression";
+                            break :blk null;
+                        }
+                        break :blk .equivalent;
+                    },
+                    .divergent => blk: {
+                        why = "renders pictures the original never showed";
+                        at = firstDiff(job.hashes, job.conv_hashes);
+                        break :blk null;
+                    },
+                };
+
+                // The behavioral tier: a slowdown-removing conversion cannot
+                // be frame-identical to a slowed-down baseline, so
+                // `divergent` from the pixel gate is where working offloads
+                // go to die. Opt-in. Whole-game (SA-1-execution) images stay
+                // excluded — their state relocation is not modelled — but
+                // WINDOW images are in.
+                if (s_tier == null and job.equiv == .divergent and job.verify_behavioral and job.behavioral_ok) {
+                    if (job.n_surf > 1) try w.print("  surface {} of {}:\n", .{ s + 1, job.n_surf });
+                    s_tier = try runBehavioralTier(a, w, job.image, job.res.image, job.plan, job.res, job.mov, job.anchor, job.window, job.total, &why, &at);
+                }
+                // The MMIO gate, on top of whatever tier the pictures and the
+                // logic earned: a hardware register written from a site stock
+                // never wrote it from is a relocation that landed on hardware,
+                // whatever the pictures say (the sound driver's death was
+                // invisible to the pixels for 2,400 frames).
+                if (s_tier != null) {
+                    const n_mmio = try mmioGate(w, job.image, job.res.image, job.mmio_base, job.mmio_conv);
+                    if (n_mmio != 0) {
+                        why = "a hardware register is written from a site stock never writes it from (the MMIO gate)";
+                        s_tier = null;
+                    }
+                }
+                job.tier = s_tier;
+                job.fail_why = why;
+                job.fail_frame = at;
+            }
+        };
+        try phaseMark(io, out, "verify: start (rewrite done)");
+        var sjobs: [max_movies]SurfaceJob = @splat(.{});
+        for (0..n_surf) |s| {
+            if (!args.movie_verify[s]) continue;
+            const j = &sjobs[s];
+            j.s = s;
+            j.n_surf = n_surf;
+            j.total = totals[s];
+            j.hashes = hashes_s[s];
+            j.conv_hashes = conv_hashes_s[s];
+            j.env_base = env_base_s[s];
+            j.env_conv = env_conv_s[s];
+            j.base_audio = base_audio_s[s];
+            j.base_sum = sum_s[s];
+            j.mmio_base = mmio_base_g[0..n_surf];
+            j.mmio_conv = mmio_conv_g[s];
+            j.mov = movAt(movs, s);
+            j.anchor = surfaceAnchor(movs, s, verify_state);
+            j.plan = &plan;
+            j.res = &res;
+            j.image = image;
+            j.skip = args.skip;
+            j.verify_behavioral = args.verify_behavioral;
+            j.behavioral_ok = !args.whole_game or args.window;
+            j.window = args.window;
+            j.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            j.out = std.Io.Writer.Allocating.init(j.arena.allocator());
+        }
+        const surf_jobs_max: usize = @max(1, @min(std.Thread.getCpuCount() catch 4, n_surf));
+        var surf_next: usize = 0;
+        var surf_inflight: usize = 0;
         for (0..n_surf) |s| {
             // Evidence-only movie: it profiled into the union above; its
             // gameplay forks at the first RNG-divergent event, so a
             // tick-locked verdict over it compares two different games.
             if (!args.movie_verify[s]) continue;
-            const s_total = totals[s];
-            const s_hashes = hashes_s[s];
-            const s_conv_hashes = conv_hashes_s[s];
-            const s_env_base = env_base_s[s];
-            const s_env_conv = env_conv_s[s];
-            @memset(s_env_conv, 0);
-            var fast_audio = core.console.audio_hash_init;
-            conv_samples.clearRetainingCapacity();
-            {
-                const cart2 = try core.Cartridge.load(gpa, res.image);
-                const con2 = try gpa.create(core.ProfilingConsole);
-                con2.init(cart2);
-                applySidecar(con2, movAt(movs, s));
-                mmio_conv_g[s].set.clearRetainingCapacity();
-                con2.bus.mmio_writers = mmio_conv_g[s];
-                if (surfaceAnchor(movs, s, verify_state)) |sb| try seedConverted(con2, sb, &plan, &res);
-                var feed2: util.movie.Feed = .init(movAt(movs, s));
-                for (0..s_total) |i| {
-                    feed2.step(con2, i);
-                    con2.runFrame();
-                    try util.drainAudio(con2, &fast_audio, EnergySink{ .cell = &s_env_conv[i] }, EnergySink.add);
-                    s_conv_hashes[i] = core.console.hashFrame(con2.framebuffer());
-                    if (con2.takeProfile()) |smp| {
-                        if (i >= args.skip) conv_samples.appendAssumeCapacity(smp);
-                    }
-                }
-                con2.cart.deinit(gpa);
-                gpa.destroy(con2);
+            while (surf_next < n_surf and surf_inflight < surf_jobs_max) : (surf_next += 1) {
+                if (!args.movie_verify[surf_next]) continue;
+                sjobs[surf_next].thread = try std.Thread.spawn(.{ .stack_size = debug_stack_size }, SurfaceJob.run, .{&sjobs[surf_next]});
+                surf_inflight += 1;
             }
-            const conv_scratch = try gpa.alloc(f64, conv_samples.items.len);
-            const s_conv_sum = profile.summarise(conv_samples.items, conv_scratch);
-            if (s == 0) conv_sum = s_conv_sum;
-
-            // Stage-S4 gate, three tiers: strict identity; frames
-            // identical with envelope-equivalent audio; equivalent modulo
-            // timing with a non-negative lag improvement.
-            const s_equiv = util.framesEquivalent(s_hashes, s_conv_hashes);
-            var s_tier: ?SaTier = switch (s_equiv) {
-                .identical => blk: {
-                    if (fast_audio == base_audio_s[s]) break :blk .strict;
-                    if (util.audioEnvelopeMismatch(s_env_base, s_env_conv)) |bad| {
-                        fail_why = "audio envelope diverged (a sound moved, silenced, or invented)";
-                        fail_frame = bad;
-                        break :blk null;
-                    }
-                    break :blk .envelope;
-                },
-                .equivalent => blk: {
-                    if (s_conv_sum.lag_frames > sum_s[s].lag_frames) {
-                        fail_why = "same pictures but MORE dropped frames — a regression";
-                        break :blk null;
-                    }
-                    break :blk .equivalent;
-                },
-                .divergent => blk: {
-                    fail_why = "renders pictures the original never showed";
-                    fail_frame = firstDiff(s_hashes, s_conv_hashes);
-                    break :blk null;
-                },
-            };
-
-            // The behavioral tier: a slowdown-removing conversion cannot
-            // be frame-identical to a slowed-down baseline, so
-            // `divergent` from the pixel gate is where working offloads
-            // go to die. Opt-in. Whole-game (SA-1-execution) images stay
-            // excluded — their state relocation is not modelled — but
-            // WINDOW images are in.
-            if (s_tier == null and s_equiv == .divergent and args.verify_behavioral and
-                (!args.whole_game or args.window))
-            {
-                if (n_surf > 1) try out.print("  surface {} of {}:\n", .{ s + 1, n_surf });
-                s_tier = try runBehavioralTier(gpa, out, image, res.image, &plan, &res, movAt(movs, s), surfaceAnchor(movs, s, verify_state), args.window, s_total, &fail_why, &fail_frame);
+            const job = &sjobs[s];
+            if (job.thread) |t| {
+                t.join();
+                job.thread = null;
+                surf_inflight -= 1;
             }
-            // The MMIO gate, on top of whatever tier the pictures and the
-            // logic earned: a hardware register written from a site stock
-            // never wrote it from is a relocation that landed on hardware,
-            // whatever the pictures say (the sound driver's death was
-            // invisible to the pixels for 2,400 frames).
-            if (s_tier != null) {
-                const n_mmio = try mmioGate(out, image, res.image, mmio_base_g[0..n_surf], mmio_conv_g[s]);
-                if (n_mmio != 0) {
-                    fail_why = "a hardware register is written from a site stock never writes it from (the MMIO gate)";
-                    s_tier = null;
-                }
-            }
-            if (s_tier) |t| {
+            try out.writeAll(job.out.written());
+            try out.flush();
+            if (job.err) |e| return e;
+            if (s == 0) conv_sum = job.conv_sum;
+            if (job.tier) |t| {
                 if (@intFromEnum(t) > @intFromEnum(passed.?)) passed = t;
             } else {
                 passed = null;
-                equiv = s_equiv;
+                equiv = job.equiv;
+                fail_why = job.fail_why;
+                fail_frame = job.fail_frame;
                 fail_mov = movAt(movs, s);
                 fail_s = s;
                 if (n_surf > 1) try out.print("  surface {} of {} FAILED: {s}\n", .{ s + 1, n_surf, fail_why });
                 break;
             }
         }
-
+        for (0..n_surf) |s| if (sjobs[s].thread) |t| {
+            t.join();
+            sjobs[s].thread = null;
+        };
+        for (0..n_surf) |s| if (args.movie_verify[s]) sjobs[s].arena.deinit();
+        try phaseMark(io, out, "verify: done");
         if (passed) |tier| {
             if (!phase_async) {
                 // The sync ladder's maximal passing configuration. Try

@@ -1663,6 +1663,39 @@ player, is the durable one and is owed. For scale: stock's item box is 360
 lag frames plus the open and close animations, so the six-second panel v73
 showed on the same take is stock's own length, not a stall.
 
+## 4r. The save pod: a box that reads the pads itself (v76 -> v78)
+
+Saving at a pod on v76 stopped at "WOULD YOU LIKE TO SAVE?": YES was never
+taken. The player's take, 13,588 polls from the two-slot save, ends with the
+SA-1 inside the box's lag-frame wait and the save-confirmation index active.
+The box's save path in `Handle_MessageBox_Interaction` ($85:846D) reads the
+controller on its own: `JSL ReadControllerInput` ($80:9459), which polls
+`$4212` and reads `$4218/$4219`. Run on the SA-1 those reads are inert, so
+no press ever arrives. Pumping `ReadControllerInput` as a deferred entry
+(v77, not shipped) took the YES: slot B was written and "SAVE COMPLETED"
+drew, and then the game sat there. That box, like every item box after its
+360 lag frames, dismisses on a press it reads INLINE (`.loopInput` at
+$85:84A3, `$4212/$4218/$4219` again), not through the routine, so the pump
+one level down was not enough. The item boxes had closed on v74-v76 only
+because the SA-1's reads of those registers returned nonzero garbage.
+
+**The fix (v78).** The whole interaction routine becomes a deferred pump
+entry (`$85:846D`, `SEP #$20 / LDA MessageBoxIndex` as its prefix): the S-CPU
+runs the wait loops, the controller reads and the YES/NO redraw, all native,
+while the SA-1 spins in its stub; `ReadControllerInput` stays pumped for any
+other SA-1 caller. Verified behaviorally equivalent with 30 pumped routines.
+Gate: the player's take extended with a confirm press and a dismiss press:
+slot B written, "SAVE COMPLETED" drawn and dismissed, the SA-1 back in bank
+$90 gameplay, stale-silent. On v76 the same take ends inside the box with no
+slot written.
+
+**A measurement, from this build.** The generator now stamps its phases:
+baselines 858 s, the coverage pad 843 s, harvest 1 s (cached),
+verification 583 s with the eight surfaces on threads. The stock replays
+are the bulk, not the verification; the baseline snapshot cache is next.
+This run was not a controlled comparison: the machine was not idle, and no
+serial run has been timed with the same marks yet.
+
 ## 5. Instruments and technique notes
 
 `--dump-ppu` grew several times this campaign; it now prints, per frame:
@@ -2166,6 +2199,7 @@ enemy-load slowdown rather than transition lag.
 | **v73, SHIPPED** | v72's recipe plus `relocateWmdataFills`, a signature net for WRAM fills through the WMDATA port (`$2180`, address in `$2181-$2183`). The port writes real WRAM only and cannot be aimed at BW-RAM, so on a window conversion every such fill lands in the abandoned home while every relocated reader looks in the window — and no instrument sees it (the CPU stores go to MMIO, the DMA's B-bus target is `$2180`, the `$7E` write happens inside the port). Super Metroid's pause menu loads its map tilemap into `$7E:3400`/`$7E:3800` this way; the graphics decompressor reuses `$7E:3400` and stock restores the legend rows by re-running the port fill before the legend's DMA re-uploads them. On v70-v72 that restore went to the dead home and the area map's bottom rows drew as decompressed graphics (§4o). The net replaces each 32-byte site with `PHB/PHP/REP #$30/LDX #src/LDY #dst/LDA #len-1/MVN dst,src/PLP/PLB` + NOPs; 2 sites take it. Patch 158,622 bytes = v72 + two sites in both copies + checksum; S-CPU set is v72's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces; oracle and explainer clean; patched stock equals the image; the garbled take renders the legend byte-identical to stock with stock's end-frame hash; the v69-v72 takes are stale-silent with a clean MMIO gate | a WRAM write with no CPU or DMA A-bus address is a class of its own; the generator's design note had named it for whole-game mode and it slipped the window mode because no surface opens the pause map. Frame-bisecting a buffer with `--frames N --dump-ram` on both builds is what separated 'who corrupts it' from 'who restores it' | `tests/surfaces/sm-sa1/sm-sa1-v73.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v73.scpu.set` |
 | **v74, SHIPPED** | v73's recipe plus five deferred IO-pump entries for the item-pickup message box's draw routines (`$85:8143`, `$85:81F3`, `$85:8241`, `$85:844C`, and the restore DMA at `$85:861F`). The box is invoked from the offloaded gameplay loop, so its GDMA trigger to VRAM ran on the SA-1 and was inert; the box logic completed (freeze + pickup) but the panel never drew on v70-v73 (§4p). Pumping the draw routines lets the S-CPU replay them and perform the real upload; they read the shared BW-RAM buffers, so nothing else changes. The IO-entry cap was raised 26->40 (commit d3e28c4). Patch 159,447 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 28 pumped IO routines; oracle clean; explainer zero unexplained in both copies; patched stock equals the image. The pickup take draws the box byte-identical to stock, stale-silent, MMIO gate clean | a GDMA to VRAM is the one S-CPU-only class MVN cannot cover (VRAM is out of the SA-1's reach); the pump is the mechanism. `--audit` (six-minute converted image) made iterating on the five routines' prefix shapes practical | `tests/surfaces/sm-sa1/sm-sa1-v74.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v74.scpu.set` |
 | **v76, SHIPPED** | v74's recipe unchanged; the generator's deferred enqueue stub changed. On v74 every item pickup that shows a message box crashed the SA-1: the stub returned to the game with the caller's M/X widths, and `Open_MessageBox` ($85:844C) opens `REP #$30` and returns without a `PLP`; its caller's 16-bit `CMP #$001C` under 8-bit widths ate one operand byte and the leftover `$00` ran as BRK into the game's crash handler at `$80:8573` (§4q). The stub now adopts the body's full P from the pump's return cell after the caller-width pops (12 bytes). Patch 159,783 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 28 pumped IO routines; the player's own pickup state, driven by an anchored take through the orb, the tank and the panel, resumes gameplay with the count raised, stale-silent | a pumped routine's exit widths can be a return value; no take in the corpus displays a message box, so the tier was blind to the class — a per-poll pickup take is owed | `tests/surfaces/sm-sa1/sm-sa1-v76.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v76.scpu.set` |
+| **v78, SHIPPED** | v76's recipe plus two deferred IO-pump entries: `Handle_MessageBox_Interaction` ($85:846D) and `ReadControllerInput` ($80:9459). Saving at a pod on v76 stopped at the YES/NO prompt: the box reads the pads itself, inline and through `ReadControllerInput`, and those joypad-register reads are inert on the SA-1 (section 4r). Pumping only `ReadControllerInput` (v77) took the YES but left "SAVE COMPLETED" waiting for a dismiss press read inline; the whole interaction routine now runs on the S-CPU. Patch 160,127 bytes; S-CPU set is v73's. VERIFIED BEHAVIORALLY EQUIVALENT over all eight surfaces with 30 pumped IO routines; the player's save-pod take with confirm and dismiss presses writes slot B and returns to gameplay, stale-silent. First timed build: baselines 858 s, coverage pad 843 s, harvest 1 s, parallel verification 583 s | a message box's input loop is S-CPU work end to end, not one routine; the stock replays dominate a build, not verification | `tests/surfaces/sm-sa1/sm-sa1-v78.bps` + `.bps.cmd` (needs `$CODEMAP`) + `.bps.mmio` + `sm-sa1-v78.scpu.set` |
 
 **Where the widened split stands (s19e, 2026-09-06).** With the gate at
 `$08-$0C` the SA-1 runs Super Metroid's door transitions as well as its
