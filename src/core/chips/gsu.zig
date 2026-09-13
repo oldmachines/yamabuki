@@ -215,9 +215,26 @@ pub const Gsu = struct {
             if (!self.cache_valid[line]) {
                 const dp: u16 = off & 0x1F0;
                 const base: u16 = (self.cbr +% dp) & 0xFFF0;
-                for (0..16) |i| {
-                    self.chargeMem();
-                    self.cache[dp + i] = self.readProgByte(base +% @as(u16, @intCast(i)));
+                // PBR cannot change during a line fill, so classify the
+                // bank once instead of per byte (readProgByte re-tests it
+                // on every one of the sixteen).
+                const bank = self.pbr;
+                if (bank <= 0x5F) {
+                    for (0..16) |i| {
+                        self.chargeMem();
+                        self.cache[dp + i] = self.readRom(bank, base +% @as(u16, @intCast(i)));
+                    }
+                } else if (bank & 0x7E == 0x70) {
+                    const hi: u32 = @as(u32, bank & 1) << 16;
+                    for (0..16) |i| {
+                        self.chargeMem();
+                        self.cache[dp + i] = self.ram[self.ramIndex(hi | (base +% @as(u16, @intCast(i))))];
+                    }
+                } else {
+                    for (0..16) |i| {
+                        self.chargeMem();
+                        self.cache[dp + i] = 0;
+                    }
                 }
                 self.cache_valid[line] = true;
             } else {

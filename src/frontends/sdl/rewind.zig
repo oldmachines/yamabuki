@@ -88,7 +88,17 @@ pub const Rewind = struct {
         // new state. (`state` may alias `scratch` — read before write.)
         // An identical state still pushes its (empty) delta: every capture
         // is one step of history, whatever happened during it.
-        for (0..state.len) |i| {
+        // 32 bytes at a time: a state is ~450 KiB and this runs thirty
+        // times a second, so the scalar loop was ~13 MB/s of byte XORs.
+        const V = @Vector(32, u8);
+        var i: usize = 0;
+        while (i + 32 <= state.len) : (i += 32) {
+            const s: V = state[i..][0..32].*;
+            const l: V = self.latest[i..][0..32].*;
+            self.scratch[i..][0..32].* = s ^ l;
+            self.latest[i..][0..32].* = s;
+        }
+        while (i < state.len) : (i += 1) {
             const x = state[i] ^ self.latest[i];
             self.latest[i] = state[i];
             self.scratch[i] = x;

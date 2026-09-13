@@ -297,6 +297,27 @@ pub const Sa1 = struct {
     /// Advance the H/V (or linear) counters by consumed master clocks and
     /// fire the timer IRQ when a target is crossed inside the window.
     fn advanceTimer(self: *Sa1, mcycles: u32) void {
+        // Runs after EVERY SA-1 instruction. With both timer enables off —
+        // the common case; the counters are then observable only through
+        // $2312/$2313 — nothing can fire, so the counters just advance:
+        // the same arithmetic as the chunked loops below with every
+        // trigger test removed, and no loop when the line does not wrap.
+        if (!self.hen and !self.ven) {
+            self.hcounter += mcycles;
+            if (!self.hvselb) {
+                while (self.hcounter >= 1364) {
+                    self.hcounter -= 1364;
+                    self.vcounter += 1;
+                    if (self.vcounter >= 262) self.vcounter = 0;
+                }
+            } else {
+                while (self.hcounter >= 0x800) {
+                    self.hcounter -= 0x800;
+                    self.vcounter = (self.vcounter + 1) & 0x1ff;
+                }
+            }
+            return;
+        }
         if (!self.hvselb) {
             // HV mode: 1364 master clocks per line, 262 lines (NTSC frame).
             var left = mcycles;
