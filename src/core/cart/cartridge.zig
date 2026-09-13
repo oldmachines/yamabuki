@@ -29,7 +29,14 @@ pub const max_sram = 0x2_0000; // 128 KiB covers all base-console carts
 /// version-sized cart-RAM tail instead.
 pub const max_sram_hi = 0x2_0000;
 
-pub const Error = error{ NoHeader, RomTooSmall, OutOfMemory };
+/// The largest image `load` accepts (after the copier header is stripped).
+/// The biggest licensed cart is 6 MiB (48 Mbit, ExHiROM); 16 MiB leaves
+/// room for expanded hacks and every SA-1 conversion this tree writes,
+/// and bounds the power-of-two padding below at 32 MiB instead of letting
+/// a stray file ask for gigabytes.
+pub const max_rom_bytes: usize = 16 * 1024 * 1024;
+
+pub const Error = error{ NoHeader, RomTooSmall, RomTooLarge, OutOfMemory };
 
 pub const Cartridge = struct {
     // Derived/immutable data is rebuilt or re-supplied at load; only SRAM is
@@ -58,10 +65,13 @@ pub const Cartridge = struct {
     pub fn load(allocator: std.mem.Allocator, raw_image: []const u8) Error!Cartridge {
         const image = header_mod.stripCopierHeader(raw_image);
         if (image.len < 0x8000) return error.RomTooSmall;
+        if (image.len > max_rom_bytes) return error.RomTooLarge;
         const header = try header_mod.detect(image);
 
         const rom_crc = std.hash.Crc32.hash(image);
-        const padded_len = std.math.ceilPowerOfTwoAssert(usize, image.len);
+        // Cannot fail below `max_rom_bytes`; the bound above is what keeps
+        // this from asserting on a pathological file.
+        const padded_len = std.math.ceilPowerOfTwo(usize, image.len) catch return error.RomTooLarge;
         const rom = try allocator.alloc(u8, padded_len);
         // Cyclic mirror by doubling: each pass copies the (whole multiple of
         // the image already laid down) forward, so the result is identical to
@@ -165,4 +175,40 @@ test "load pads rom and sizes sram" {
     try std.testing.expectEqual(ChipKind.none, cart.chip);
     // cyclic padding mirrors the image
     try std.testing.expectEqual(raw[0], cart.rom[384 * 1024]);
+}
+
+test "load refuses images outside the size bounds instead of trapping" {
+    const alloc = std.testing.allocator;
+    // Too small: below the smallest mappable bank half.
+    var tiny: [0x7FFF]u8 = @splat(0);
+    try std.testing.expectError(error.RomTooSmall, Cartridge.load(alloc, &tiny));
+    // Too large: one byte over the cap. Before the bound existed this
+    // reached `ceilPowerOfTwoAssert` and a 32 MiB allocation for a file
+    // no SNES cart shape can explain.
+    const big = try alloc.alloc(u8, max_rom_bytes + 1);
+    defer alloc.free(big);
+    try std.testing.expectError(error.RomTooLarge, Cartridge.load(alloc, big));
+}
+
+test "load sizes SRAM above 128 KiB into the high bank and identifies chips" {
+    const alloc = std.testing.allocator;
+    const raw = try alloc.alloc(u8, 512 * 1024);
+    defer alloc.free(raw);
+    @memset(raw, 0x22);
+    const h = raw[0x7FC0..][0..64];
+    @memcpy(h[0..21], "SRAM HI TEST         ");
+    h[0x15] = 0x20;
+    h[0x16] = 0x35; // SA-1 with battery
+    h[0x17] = 9;
+    h[0x18] = 8; // 256 KiB SRAM: 128 KiB in `sram`, the rest in `sram_hi`
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+    std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+
+    var cart = try Cartridge.load(alloc, raw);
+    defer cart.deinit(alloc);
+    try std.testing.expectEqual(ChipKind.sa1, cart.chip);
+    try std.testing.expect(cart.hasBattery());
+    try std.testing.expectEqual(@as(u32, max_sram - 1), cart.sram_mask);
+    try std.testing.expectEqual(@as(u32, 0x2_0000 - 1), cart.sram_hi_mask);
 }

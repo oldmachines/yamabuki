@@ -288,7 +288,11 @@ pub fn smallSramPtr(bus: *Bus, addr: u24) ?*u8 {
     const a16: u16 = @truncate(addr);
     switch (cart.header.mapping) {
         .lorom => {
-            if ((bank & 0x7F) >= 0x70 and (bank & 0x7F) <= 0x7D and a16 < 0x8000) {
+            // The same banks `mapLoRom` gives a page-table SRAM window:
+            // $70-$7D and their $F0-$FF mirrors — every one of $F0-$FF,
+            // because only $7E/$7F are WRAM; $FE/$FF are SRAM on the board.
+            const sram_bank = (bank >= 0x70 and bank <= 0x7D) or bank >= 0xF0;
+            if (sram_bank and a16 < 0x8000) {
                 const offset = ((@as(u32, bank & 0x0F) << 15) | a16) & cart.sram_mask;
                 return &cart.sram[offset];
             }

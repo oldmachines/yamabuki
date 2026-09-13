@@ -66,23 +66,31 @@ pub const Picker = struct {
                 if (id.len <= title.len or !std.mem.endsWith(u8, id, title)) continue;
             }
             const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ movies_dir, n }) catch continue;
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch {
+            // Only the header is needed to list a take, and a long take is
+            // megabytes of entries: read the first `header_len_v2` bytes,
+            // never the file.
+            const head = readHeader(io, dir, n) orelse {
                 gpa.free(path);
                 continue;
             };
-            defer gpa.free(bytes);
+            const bytes = head.buf[0..head.len];
             if (bytes.len < util.movie.header_len or !std.mem.eql(u8, bytes[0..4], util.movie.magic)) {
                 gpa.free(path);
                 continue;
             }
             const version = std.mem.readInt(u16, bytes[4..6], .little);
             const frames = std.mem.readInt(u32, bytes[12..16], .little);
-            const per_poll = version == util.movie.version_polls;
+            // Formats 3 and 4 are both per poll (4 adds the lap cell) —
+            // the same rule `movie.parse` applies.
+            const per_poll = version == util.movie.version_polls or version == util.movie.version_laps;
             const anchored = (version == util.movie.version or per_poll) and bytes.len >= util.movie.header_len_v2 and
                 std.mem.readInt(u32, bytes[32..36], .little) != 0;
-            var es_buf: [512]u8 = undefined;
-            const es_name = std.fmt.bufPrint(&es_buf, "{s}.end.state", .{stem}) catch "";
-            const has_end = if (es_name.len == 0) false else (if (dir.access(io, es_name, .{})) true else |_| false);
+            const es_name = std.fmt.allocPrint(gpa, "{s}.end.state", .{stem}) catch {
+                gpa.free(path);
+                continue;
+            };
+            defer gpa.free(es_name);
+            const has_end = if (dir.access(io, es_name, .{})) true else |_| false;
             const num = gpa.dupe(u8, number) catch {
                 gpa.free(path);
                 continue;
@@ -103,6 +111,21 @@ pub const Picker = struct {
         }.lt);
         if (self.takes.items.len == 0 and self.err_msg == null) self.err_msg = "NO TAKES OF THIS GAME YET";
         return self;
+    }
+
+    const Header = struct {
+        buf: [util.movie.header_len_v2]u8,
+        len: usize,
+    };
+
+    /// The first header's worth of `name` inside `dir`, or null when the
+    /// file cannot be opened or read. Short files return what they have.
+    fn readHeader(io: std.Io, dir: std.Io.Dir, name: []const u8) ?Header {
+        var f = dir.openFile(io, name, .{}) catch return null;
+        defer f.close(io);
+        var h: Header = .{ .buf = undefined, .len = 0 };
+        h.len = f.readPositionalAll(io, &h.buf, 0) catch return null;
+        return h;
     }
 
     pub fn deinit(self: *Picker) void {
@@ -202,3 +225,121 @@ pub const Picker = struct {
         ui.drawText(s, 8, 200, if (self.stage == .list) "ENTER  CHOOSE    ESC  BACK" else "ENTER  GO    ESC  BACK", ui.color.text_dim);
     }
 };
+
+// --- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Write a minimal take of `version` named `<stem>.ymv` into `dir`,
+/// optionally with a (dummy) end state beside it.
+fn writeTestTake(io: std.Io, dir: std.Io.Dir, stem: []const u8, version: u16, anchor_len: u32, with_end: bool) !void {
+    var buf: [util.movie.header_len_v4]u8 = @splat(0);
+    @memcpy(buf[0..4], util.movie.magic);
+    std.mem.writeInt(u16, buf[4..6], version, .little);
+    std.mem.writeInt(u32, buf[12..16], 7, .little);
+    if (version != util.movie.version_plain) std.mem.writeInt(u32, buf[32..36], anchor_len, .little);
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ stem, util.movie.file_ext });
+    try dir.writeFile(io, .{ .sub_path = name, .data = &buf });
+    if (with_end) {
+        const es = try std.fmt.bufPrint(&name_buf, "{s}.end.state", .{stem});
+        try dir.writeFile(io, .{ .sub_path = es, .data = "x" });
+    }
+}
+
+fn tmpPath(buf: []u8, tmp: *const testing.TmpDir) []const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path}) catch unreachable;
+}
+
+test "takes: the picker lists this game's takes newest first, other builds last, and reads only headers" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const game = "abcd1234-SUPER GAME";
+    try writeTestTake(io, tmp.dir, game ++ "-0002", util.movie.version_plain, 0, false);
+    try writeTestTake(io, tmp.dir, game ++ "-0010", util.movie.version, 64, true);
+    try writeTestTake(io, tmp.dir, game ++ "-0001", util.movie.version_laps, 0, false);
+    // Same title, another image: listed after this build's takes.
+    try writeTestTake(io, tmp.dir, "ffff0000-SUPER GAME-0005", util.movie.version_polls, 0, false);
+    // Not takes at all: wrong extension, no number, a five-digit number,
+    // another title entirely, a directory that happens to end in .ymv.
+    try tmp.dir.writeFile(io, .{ .sub_path = game ++ "-0003.txt", .data = "no" });
+    try tmp.dir.writeFile(io, .{ .sub_path = game ++ ".ymv", .data = "no" });
+    try tmp.dir.writeFile(io, .{ .sub_path = game ++ "-12345.ymv", .data = "no" });
+    try writeTestTake(io, tmp.dir, "abcd1234-OTHER-0001", util.movie.version_plain, 0, false);
+    try tmp.dir.createDirPath(io, game ++ "-0004.ymv");
+
+    var pbuf: [128]u8 = undefined;
+    var picker = Picker.init(testing.allocator, io, tmpPath(&pbuf, &tmp), game);
+    defer picker.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), picker.err_msg);
+    try testing.expectEqual(@as(usize, 4), picker.takes.items.len);
+    const t = picker.takes.items;
+    try testing.expectEqualStrings("0010", t[0].number);
+    try testing.expectEqualStrings("0002", t[1].number);
+    try testing.expectEqualStrings("0001", t[2].number);
+    try testing.expectEqualStrings("0005", t[3].number);
+    try testing.expect(t[3].other_build);
+    try testing.expectEqual(@as(u32, 7), t[0].frames);
+    // Format 2 with an anchor: anchored, and it has an end state.
+    try testing.expect(t[0].anchored and t[0].has_end and !t[0].per_poll);
+    // Format 4 (per lap) is per poll too — it used to read as POWER-ON
+    // and be refused cross-build.
+    try testing.expect(t[2].per_poll and !t[2].anchored);
+    // Another build's per-poll power-on take is usable; its anchored or
+    // per-frame takes would not be.
+    try testing.expect(Picker.usable(t[3]));
+    try testing.expect(!Picker.usable(.{ .path = "", .number = "", .frames = 0, .anchored = true, .per_poll = true, .other_build = true, .has_end = false }));
+}
+
+test "takes: an empty or missing folder reports why" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    var empty = Picker.init(testing.allocator, io, tmpPath(&pbuf, &tmp), "x-Y");
+    defer empty.deinit();
+    try testing.expectEqualStrings("NO TAKES OF THIS GAME YET", empty.err_msg.?);
+    var missing = Picker.init(testing.allocator, io, ".zig-cache/tmp/no-such-dir-yamabuki", "x-Y");
+    defer missing.deinit();
+    try testing.expectEqualStrings("NO TAKES FOLDER YET", missing.err_msg.?);
+}
+
+test "takes: navigation — confirm needs a usable take, the how-stage only flips with an end state" {
+    var picker: Picker = .{ .gpa = testing.allocator };
+    defer picker.takes.deinit(testing.allocator);
+    const mk = struct {
+        fn take(has_end: bool, other: bool) Take {
+            return .{ .path = "", .number = "", .frames = 1, .anchored = false, .per_poll = true, .other_build = other, .has_end = has_end };
+        }
+    };
+    try picker.takes.append(testing.allocator, mk.take(false, false)); // 0: no end state
+    try picker.takes.append(testing.allocator, mk.take(true, false)); // 1: end state
+    for (0..20) |_| try picker.takes.append(testing.allocator, mk.take(false, false));
+
+    // Confirm on a take without an end state goes straight to replay.
+    try testing.expectEqual(Request.none, picker.handleNav(.confirm));
+    try testing.expect(picker.stage == .how);
+    try testing.expectEqual(@as(u8, 1), picker.how);
+    _ = picker.handleNav(.down); // must not flip: nothing to flip to
+    try testing.expectEqual(@as(u8, 1), picker.how);
+    try testing.expectEqual(Request.start_replay, picker.handleNav(.confirm));
+    try testing.expectEqual(Request.none, picker.handleNav(.back));
+    try testing.expect(picker.stage == .list);
+
+    // With an end state the default is the end state, and up/down toggles.
+    _ = picker.handleNav(.down);
+    _ = picker.handleNav(.confirm);
+    try testing.expectEqual(@as(u8, 0), picker.how);
+    _ = picker.handleNav(.down);
+    try testing.expectEqual(@as(u8, 1), picker.how);
+    _ = picker.handleNav(.up);
+    try testing.expectEqual(Request.start_end_state, picker.handleNav(.confirm));
+    _ = picker.handleNav(.back);
+
+    // Scrolling follows the cursor past the visible rows.
+    for (0..20) |_| _ = picker.handleNav(.down);
+    try testing.expectEqual(@as(usize, 21), picker.cursor);
+    try testing.expectEqual(@as(usize, 21 + 1 - visible_rows), picker.scroll);
+    try testing.expectEqual(Request.close, picker.handleNav(.close));
+}

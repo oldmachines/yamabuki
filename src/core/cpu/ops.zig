@@ -76,7 +76,9 @@ inline fn indexY(cpu: anytype, comptime x8: bool) u16 {
 
 fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: AccessKind) u24 {
     switch (mode) {
-        .imm => unreachable,
+        // `mode` is comptime: an immediate operand has no effective
+        // address, and asking for one is a compile error, not a trap.
+        .imm => comptime unreachable,
         .abs => {
             return @as(u24, cpu.regs.dbr) << 16 | cpu.fetch16();
         },

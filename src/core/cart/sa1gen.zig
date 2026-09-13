@@ -166,6 +166,16 @@ fn splitFile(a: u24) usize {
     return @as(usize, (a >> 16) & 0x7F) * 0x8000 + (@as(usize, a & 0xFFFF) - 0x8000);
 }
 
+/// Whether `a` names `span` bytes the split can read as LoROM code: the
+/// upper half of a bank that exists in the image. The split's addresses
+/// come straight from the command line (`--wg-split*`), so a mistyped one
+/// has to be a refusal — `splitFile` on a low-half address underflows, and
+/// on a bank past the image it indexes past `out`.
+fn splitAddrInImage(image_len: usize, a: u24, span: usize) bool {
+    if ((a & 0xFFFF) < 0x8000) return false;
+    return splitFile(a) + span <= image_len;
+}
+
 /// Coverage flags of a site, whichever mirror the game ran it in.
 fn splitUsage(usage: []const u8, a: u24) u8 {
     return usage[a] | usage[a ^ 0x80_0000];
@@ -5888,6 +5898,25 @@ fn emitSplit(
     refusal: *?Refusal,
     res: *Result,
 ) Error!void {
+    // Every declared address must lie inside the image before anything
+    // reads through it. `spec.tail` is a bank-$00 address and is indexed
+    // as `out[tail - 0x8000]` below, so it gets the same bound.
+    if (spec.tail == 0) {
+        if (!splitAddrInImage(out.len, spec.mainloop, 16))
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
+    } else if (!splitAddrInImage(out.len, spec.tail, 16) or !splitAddrInImage(out.len, spec.tail_epilogue, 1)) {
+        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail });
+    }
+    for (spec.io_entries) |io| {
+        if (!splitAddrInImage(out.len, io.entry, 16))
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
+    }
+    for (spec.vbl_ranges) |r| {
+        // `r[1]` is exclusive, so the last byte the walk reads is `r[1]-1`.
+        if (r[1] <= r[0] or !splitAddrInImage(out.len, r[0], 1) or !splitAddrInImage(out.len, r[1] - 1, 1))
+            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = r[0] });
+    }
+
     // Anchor shapes first: nothing is written until every check holds.
     if (spec.tail == 0) {
         if (splitPrefixSpan(out, usage, spec.mainloop, 4) < 4)

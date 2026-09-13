@@ -168,6 +168,7 @@ fn sramSlice(con: *core.AnyConsole) []u8 {
 
 /// The .srm file for one game, wired to the console's live SRAM.
 pub const Sram = struct {
+    gpa: std.mem.Allocator,
     dir: []const u8,
     path: []const u8,
     debounce: Debounce = .{ .last_persisted = 0 },
@@ -175,6 +176,7 @@ pub const Sram = struct {
 
     pub fn init(gpa: std.mem.Allocator, saves_dir: []const u8, game_id: []const u8) !Sram {
         return .{
+            .gpa = gpa,
             .dir = saves_dir,
             .path = try std.fmt.allocPrint(gpa, "{s}/{s}.srm", .{ saves_dir, game_id }),
         };
@@ -230,9 +232,15 @@ pub const Sram = struct {
     fn write(self: *Sram, io: std.Io, sram: []const u8, err: *std.Io.Writer) void {
         std.Io.Dir.cwd().createDirPath(io, self.dir) catch {};
         // Temp + rename: a crash mid-write must never tear the only copy
-        // of someone's save file.
-        var tmp_buf: [512]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{self.path}) catch return;
+        // of someone's save file. The temp name is allocated, not sized
+        // into a fixed buffer: a long per-user data path plus a long game
+        // id must not silently skip the save.
+        const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{self.path}) catch |e| {
+            err.print("warning: cannot write {s}: {s}\n", .{ self.path, @errorName(e) }) catch {};
+            err.flush() catch {};
+            return;
+        };
+        defer self.gpa.free(tmp);
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = sram }) catch |e| {
             err.print("warning: cannot write {s}: {s}\n", .{ self.path, @errorName(e) }) catch {};
             err.flush() catch {};

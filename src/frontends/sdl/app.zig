@@ -134,6 +134,9 @@ const GlVideo = struct {
     active: u1,
     /// The baked profile directory the ladder resolved to, e.g. `shaders/essl300`.
     profile_dir: []const u8,
+    /// The GLSL dialect of the rung that won — what the OSD is compiled in,
+    /// kept so a chain rebuild can recompile it.
+    dialect: osd.Dialect,
     /// Every preset in that directory, sorted — the cycle order.
     names: [][]const u8,
     index: usize,
@@ -282,7 +285,11 @@ pub fn run(
         if (g.osd) |*o| o.deinit();
         g.chain().deinit();
         _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
+        destroyGlVideo(gpa, g);
     };
+    // Set by a window/device event or by a failed swap: the shader chain
+    // is rebuilt on the next present (see `rebuildChain`).
+    var gl_rebuild = false;
 
     // The software path is what runs when there is no shader chain — including
     // under CI's dummy video driver, which is why --frames still prints hashes.
@@ -615,6 +622,20 @@ pub fn run(
                     }
                     continue;
                 },
+                // Anything that can leave the GL context or the chain's
+                // objects stale (a minimize/restore round trip, a display
+                // change, a driver reset): rebuild the chain before the
+                // next frame rather than draw with dead names — the
+                // "picture goes blank after a long pause" failure.
+                sdl3.event_window_restored,
+                sdl3.event_window_display_changed,
+                sdl3.event_render_targets_reset,
+                sdl3.event_render_device_reset,
+                sdl3.event_render_device_lost,
+                => {
+                    gl_rebuild = true;
+                    continue;
+                },
                 else => continue,
             };
 
@@ -883,6 +904,9 @@ pub fn run(
                             inp.clearTransient();
                         } else toast.set("NO TAKES FOLDER", .{});
                     }
+                    // Consumed: the key must not also reach the bindings
+                    // (it used to toggle the cheat switch on the way past).
+                    continue;
                 } else if (false) {
                     // (the direct end-state load F11 used to do; the takes screen's
                     // END STATE option on the current take is the same action) — the machine the
@@ -1245,6 +1269,27 @@ pub fn run(
         };
 
         if (glv) |g| gl_path: {
+            if (gl_rebuild) {
+                gl_rebuild = false;
+                rebuildChain(io, gpa, g, window, err) catch |e| {
+                    // Same fallback as a failed render below: the picture
+                    // moves to the software blit, the game keeps running.
+                    try err.print("shader chain could not be rebuilt ({s}); falling back to the software renderer\n", .{@errorName(e)});
+                    try err.flush();
+                    if (g.osd) |*o| o.deinit();
+                    g.chain().deinit();
+                    _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
+                    destroyGlVideo(gpa, g);
+                    glv = null;
+                    renderer = sdl.SDL_CreateRenderer(window, null) orelse {
+                        try err.print("error: SDL_CreateRenderer after shader failure: {s}\n", .{sdl.SDL_GetError()});
+                        try err.flush();
+                        std.process.exit(1);
+                    };
+                    _ = sdl.SDL_SetRenderVSync(renderer.?, 0);
+                    break :gl_path;
+                };
+            }
             g.chain().upload(final_px, width, height);
             var win_w: c_int = 0;
             var win_h: c_int = 0;
@@ -1260,6 +1305,7 @@ pub fn run(
                 if (g.osd) |*o| o.deinit();
                 g.chain().deinit();
                 _ = g.sdl_gl.SDL_GL_DestroyContext(g.ctx);
+                destroyGlVideo(gpa, g);
                 glv = null;
                 renderer = sdl.SDL_CreateRenderer(window, null) orelse {
                     // No GL and no renderer: nothing left can put pixels on
@@ -1304,7 +1350,15 @@ pub fn run(
                 const lb = shader.Chain.letterbox(window_size, g.chain().source_size);
                 o.draw(window_size, .{ .x = lb.x, .y = lb.y, .w = lb.w, .h = lb.h });
             }
-            _ = g.sdl_gl.SDL_GL_SwapWindow(window);
+            // A failed swap, or a context-loss error left on the queue, is
+            // the cheapest signal that every object the chain holds is
+            // dead. Rebuild next frame instead of drawing black forever.
+            if (!g.sdl_gl.SDL_GL_SwapWindow(window)) gl_rebuild = true;
+            switch (g.api.glGetError()) {
+                gl.NO_ERROR => {},
+                gl.CONTEXT_LOST, gl.INVALID_FRAMEBUFFER_OPERATION, gl.OUT_OF_MEMORY => gl_rebuild = true,
+                else => {},
+            }
         } else {
             const r = renderer.?;
             if (texture == null or width != tex_w or height != tex_h) {
@@ -1433,10 +1487,7 @@ pub fn run(
         if (fast_forward or opts.frames != 0) {
             next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
         } else {
-            const now = sdl.SDL_GetTicksNS();
-            if (now < next_deadline) sdl.SDL_DelayNS(next_deadline - now);
-            next_deadline += frame_ns;
-            if (now > next_deadline + max_lag_ns) next_deadline = now + frame_ns;
+            next_deadline = paceFrame(sdl.SDL_GetTicksNS(), next_deadline, frame_ns, max_lag_ns, &sdl);
         }
     }
 
@@ -2619,12 +2670,12 @@ fn writeMovie(
 ) void {
     const dir = opts.movies_dir orelse return;
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    var path_buf: [512]u8 = undefined;
-    var n: u32 = 1;
-    const path = while (n <= 9999) : (n += 1) {
-        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}-{d:0>4}{s}", .{ dir, opts.game_id, n, util.movie.file_ext }) catch return;
-        std.Io.Dir.cwd().access(io, p, .{}) catch break p;
-    } else return;
+    const path = nextNumberedPath(io, gpa, dir, opts.game_id, util.movie.file_ext) orelse {
+        err.print("movie: no free take number under {s}; take not written\n", .{dir}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    defer gpa.free(path);
     const m: util.movie.Movie = .{
         .accuracy = if (opts.accuracy == .accurate) 1 else 0,
         .region = if (con.region() == .pal) 1 else 0,
@@ -2652,15 +2703,18 @@ fn writeMovie(
     // the take would be lost with the window. `--record --srm <this file>`
     // continues from it.
     if (con.cartridge().hasBattery() or saves.liftedSram(con) != null) {
-        var srm_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&srm_buf, "{s}.srm", .{path[0 .. path.len - util.movie.file_ext.len]})) |srm_path| {
+        if (std.fmt.allocPrint(gpa, "{s}.srm", .{path[0 .. path.len - util.movie.file_ext.len]})) |srm_path| {
+            defer gpa.free(srm_path);
             std.Io.Dir.cwd().writeFile(io, .{ .sub_path = srm_path, .data = saves.liveSram(con) }) catch |e| {
                 err.print("movie: battery save of this take not written: {s}\n", .{@errorName(e)}) catch {};
                 err.flush() catch {};
             };
             err.print("movie: battery save of this take: {s} (continue with --record --srm)\n", .{srm_path}) catch {};
             err.flush() catch {};
-        } else |_| {}
+        } else |e| {
+            err.print("movie: battery save of this take not written: {s}\n", .{@errorName(e)}) catch {};
+            err.flush() catch {};
+        }
     }
     // The save the take began from, beside it: with it, a power-on take
     // replays from the same save on any build (the takes screen and
@@ -2678,8 +2732,8 @@ fn writeMovie(
     // instead of replaying. Bound to this exact file by the file's hash, and
     // to this build by the state's own header; the running audio hash rides
     // along because the take's end hashes include it.
-    var es_buf: [512]u8 = undefined;
-    if (std.fmt.bufPrint(&es_buf, "{s}.end.state", .{path[0 .. path.len - util.movie.file_ext.len]})) |es_path| {
+    if (std.fmt.allocPrint(gpa, "{s}.end.state", .{path[0 .. path.len - util.movie.file_ext.len]})) |es_path| {
+        defer gpa.free(es_path);
         const head = end_state_header_len + EndMarks.encoded_len;
         if (gpa.alloc(u8, head + core.AnyConsole.state_size)) |buf| {
             defer gpa.free(buf);
@@ -2708,6 +2762,20 @@ fn writeMovie(
     err.flush() catch {};
 }
 
+/// The first `<dir>/<stem>-NNNN<ext>` (NNNN from 0001) that does not exist
+/// yet, allocated into `gpa`; null when every number up to 9999 is taken or
+/// the name cannot be built. Shared by takes and screenshots so both
+/// number the same way.
+fn nextNumberedPath(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, stem: []const u8, ext: []const u8) ?[]u8 {
+    var n: u32 = 1;
+    while (n <= 9999) : (n += 1) {
+        const p = std.fmt.allocPrint(gpa, "{s}/{s}-{d:0>4}{s}", .{ dir, stem, n, ext }) catch return null;
+        std.Io.Dir.cwd().access(io, p, .{}) catch return p;
+        gpa.free(p);
+    }
+    return null;
+}
+
 fn writeScreenshot(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -2719,12 +2787,12 @@ fn writeScreenshot(
     err: *std.Io.Writer,
 ) void {
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    var path_buf: [512]u8 = undefined;
-    var n: u32 = 1;
-    const path = while (n <= 9999) : (n += 1) {
-        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}-{d:0>4}.png", .{ dir, game_id, n }) catch return;
-        std.Io.Dir.cwd().access(io, p, .{}) catch break p;
-    } else return;
+    const path = nextNumberedPath(io, gpa, dir, game_id, ".png") orelse {
+        err.print("screenshot: no free number under {s}; not written\n", .{dir}) catch {};
+        err.flush() catch {};
+        return;
+    };
+    defer gpa.free(path);
     const data = png.encode(gpa, rgb, w, h) catch |e| {
         err.print("screenshot failed: {s}\n", .{@errorName(e)}) catch {};
         err.flush() catch {};
@@ -2777,9 +2845,19 @@ fn initGl(
         // Which presets exist for this profile is the gate: no point holding a
         // context we cannot use. The listing doubles as the `,`/`.` cycle order.
         const profile_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ shader_root, prof.dir });
-        const names = listPresets(io, gpa, profile_dir) catch continue;
+        const names = listPresets(io, gpa, profile_dir) catch {
+            gpa.free(profile_dir);
+            continue;
+        };
         any_dir_listed = true;
-        const start = indexOfName(names, name) orelse continue;
+        // Every rung that falls through frees what it listed: a machine
+        // that fails all three used to leak three preset listings.
+        const start = indexOfName(names, name) orelse {
+            for (names) |n| gpa.free(n);
+            gpa.free(names);
+            gpa.free(profile_dir);
+            continue;
+        };
         name_seen = true;
 
         _ = sdl_gl.SDL_GL_SetAttribute(sdl3.gl_attr.context_profile_mask, prof.profile_mask);
@@ -2794,6 +2872,9 @@ fn initGl(
                 prof.dir, prof.major, prof.minor, base.SDL_GetError(),
             }) catch {};
             err.flush() catch {};
+            for (names) |n| gpa.free(n);
+            gpa.free(names);
+            gpa.free(profile_dir);
             continue;
         };
         _ = sdl_gl.SDL_GL_MakeCurrent(window, ctx);
@@ -2803,6 +2884,9 @@ fn initGl(
 
         const api = gl.load(sdl_gl.SDL_GL_GetProcAddress) catch {
             _ = sdl_gl.SDL_GL_DestroyContext(ctx);
+            for (names) |n| gpa.free(n);
+            gpa.free(names);
+            gpa.free(profile_dir);
             continue;
         };
 
@@ -2820,12 +2904,14 @@ fn initGl(
             .chains = undefined,
             .active = 0,
             .profile_dir = profile_dir,
+            .dialect = prof.dialect,
             .names = names,
             .index = start,
             .osd = null,
         };
         buildChain(io, gpa, g, start, g.chain(), err) catch |e| {
             _ = sdl_gl.SDL_GL_DestroyContext(ctx);
+            destroyGlVideo(gpa, g); // frees names + profile_dir + g
             return e;
         };
         g.osd = osd.Osd.init(api, prof.dialect) catch |e| blk: {
@@ -2911,6 +2997,60 @@ fn buildChain(
     const p = try a.create(preset.Preset);
     try preset.parse(p, manifest);
     try out.init(io, a, g.api, g.gles_major, p.*, dir, err);
+}
+
+/// Rebuild the current preset in place after the GL context may have
+/// been lost or its objects reset (window restored, display changed, GPU
+/// reset, a failed swap). Re-asserts the context, compiles the same preset
+/// into the spare slot — the path `cycleShader` already takes — and swaps
+/// it in; the OSD's objects are rebuilt the same way. On failure the
+/// incumbent is left as it was and the caller decides what to do.
+fn rebuildChain(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    g: *GlVideo,
+    window: *sdl3.Window,
+    err: *std.Io.Writer,
+) !void {
+    if (!g.sdl_gl.SDL_GL_MakeCurrent(window, g.ctx)) return error.GlMakeCurrentFailed;
+    // Drain any stale error so the post-swap check reads this frame's.
+    while (g.api.glGetError() != gl.NO_ERROR) {}
+    const spare: u1 = 1 - g.active;
+    try buildChain(io, gpa, g, g.index, &g.chains[spare], err);
+    g.chain().deinit();
+    g.active = spare;
+    if (g.osd) |*o| {
+        o.deinit();
+        g.osd = osd.Osd.init(g.api, g.dialect) catch null;
+    }
+    err.print("shader: chain rebuilt after a context change\n", .{}) catch {};
+    err.flush() catch {};
+}
+
+/// Free everything `initGl` allocated for a `GlVideo` besides the GL
+/// objects (those are the chain's and the context's to release).
+fn destroyGlVideo(gpa: std.mem.Allocator, g: *GlVideo) void {
+    for (g.names) |n| gpa.free(n);
+    gpa.free(g.names);
+    gpa.free(g.profile_dir);
+    gpa.destroy(g);
+}
+
+/// Sleep to the next frame boundary and return the following one.
+///
+/// The clock is read again AFTER the sleep: the catch-up test has to see
+/// where the frame actually ended, not where it began. The earlier form
+/// compared the pre-sleep time against an already-advanced deadline, which
+/// could never be more than a frame behind, so a real stall (a paused
+/// window, a long disk write) was followed by a burst of frames run
+/// back-to-back until the deadline caught up on its own.
+fn paceFrame(now_before: u64, deadline: u64, frame_ns: u64, max_lag_ns: u64, sdl: *const sdl3.Api) u64 {
+    if (now_before < deadline) sdl.SDL_DelayNS(deadline - now_before);
+    const now = sdl.SDL_GetTicksNS();
+    const next = deadline + frame_ns;
+    // Fell more than `max_lag_ns` behind: resync rather than sprint.
+    if (now > next + max_lag_ns) return now + frame_ns;
+    return next;
 }
 
 /// Step `delta` presets and swap the chain in.

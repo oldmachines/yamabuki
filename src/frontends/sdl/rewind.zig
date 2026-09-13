@@ -155,9 +155,15 @@ fn rleApply(delta: []const u8, buf: []u8) void {
     var di: usize = 0;
     var bi: usize = 0;
     while (di < delta.len) {
+        // Every delta applied here came out of `rleEncode` over a buffer of
+        // this exact size, so the records always fit. The guards make that
+        // an invariant of the codec rather than of every caller: a
+        // malformed delta stops early instead of slicing past either end.
+        if (di + 8 > delta.len) return;
         const zeros = std.mem.readInt(u32, delta[di..][0..4], .little);
         const lits = std.mem.readInt(u32, delta[di + 4 ..][0..4], .little);
         di += 8;
+        if (di + lits > delta.len or bi + zeros + lits > buf.len) return;
         bi += zeros;
         for (delta[di..][0..lits], 0..) |b, k| buf[bi + k] ^= b;
         di += lits;

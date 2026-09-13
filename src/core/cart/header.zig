@@ -83,7 +83,7 @@ fn score(rom: []const u8, offset: u32, mapping: Mapping) i32 {
         .hirom => 0x1,
         .exhirom => 0x5,
     };
-    if ((h.map_mode & 0xEF) == 0x20 | expected_mode) s += 3;
+    if ((h.map_mode & 0xEF) == (0x20 | expected_mode)) s += 3;
 
     // Reset vector must point into the upper half of bank $00 (ROM area).
     if (h.reset_vector >= 0x8000) s += 2 else s -= 4;

@@ -25,7 +25,7 @@ fn isSkipped(comptime T: type, comptime field_name: []const u8) bool {
 
 /// Widest-alignment byte count needed to store T's bit size.
 fn intByteSize(comptime T: type) usize {
-    return comptime std.math.divCeil(usize, @bitSizeOf(T), 8) catch unreachable;
+    return comptime (@bitSizeOf(T) + 7) / 8;
 }
 
 fn IntBacking(comptime T: type) type {

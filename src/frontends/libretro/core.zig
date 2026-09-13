@@ -171,6 +171,10 @@ pub export fn retro_serialize(data: ?*anyopaque, size: usize) bool {
 
 pub export fn retro_unserialize(data: ?*const anyopaque, size: usize) bool {
     const con = console orelse return false;
+    // Mirror of retro_serialize's check: a frontend handing over a
+    // truncated state (an older core's file, a netplay desync) gets a
+    // clean refusal instead of whatever a short buffer does to loadState.
+    if (size < core.AnyConsole.state_size) return false;
     const in: [*]const u8 = @ptrCast(data orelse return false);
     con.loadState(in[0..size]) catch return false;
     return true;

@@ -685,4 +685,5 @@ test {
     _ = @import("osd.zig");
     _ = @import("preset.zig");
     _ = @import("gl.zig");
+    _ = @import("takes.zig");
 }

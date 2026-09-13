@@ -199,7 +199,10 @@ pub const Apu = struct {
                 }
                 self.cpu_out[0] = value; // echo = acknowledge
             },
-            .done => unreachable,
+            // The caller gates on `boot != .done`, but both `boot` and
+            // `boot_pending` are serialized: a state that carries the
+            // pair inconsistently must be a no-op here, not a trap.
+            .done => {},
         }
     }
 

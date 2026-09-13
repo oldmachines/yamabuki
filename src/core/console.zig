@@ -1158,7 +1158,10 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// behind a versioned header. The ROM image is not saved; loading
         /// requires a console built from the same ROM.
         pub fn saveState(self: *const Self, out: []u8) usize {
-            std.debug.assert(out.len >= state_size);
+            // An unconditional check, not a debug assert: `serialize.write`
+            // does no bounds checking of its own, so a short buffer in a
+            // ReleaseFast build would be silent heap corruption.
+            if (out.len < state_size) @panic("saveState: buffer smaller than state_size");
             @memcpy(out[0..4], &state_magic);
             std.mem.writeInt(u32, out[4..8], state_version, .little);
             std.mem.writeInt(u32, out[8..12], @intCast(state_payload_size), .little);

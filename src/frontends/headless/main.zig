@@ -1268,7 +1268,13 @@ fn writeScpuSet(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
 
 fn dumpRam(io: std.Io, gpa: std.mem.Allocator, con: *core.AnyConsole, path: []const u8) void {
     const fc = &con.fast;
-    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800 + 0x10000 + 0x200 + 0x220) catch unreachable;
+    // Layout of the dump (offsets): WRAM $0000, BW-RAM $20000, VRAM $40000,
+    // I-RAM $50000, ARAM $50800, CGRAM $60800, OAM $60A00.
+    const buf = gpa.alloc(u8, 0x20000 + 0x20000 + 0x10000 + 0x800 + 0x10000 + 0x200 + 0x220) catch {
+        std.debug.print("[dump] out of memory, {s} not written\n", .{path});
+        return;
+    };
+    defer gpa.free(buf);
     @memset(buf, 0);
     @memcpy(buf[0..0x20000], &fc.bus.wram.data);
     if (fc.bus.cart.chip == .sa1) @memcpy(buf[0x20000..][0..0x20000], fc.bus.sa1.bwram[0..0x20000]);

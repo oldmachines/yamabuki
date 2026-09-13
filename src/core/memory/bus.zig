@@ -288,8 +288,14 @@ pub const Bus = struct {
         self.last_data_write = no_data_access;
         self.input_polled = false;
         self.lap_polled = false;
+        // Both arrays are serialized (they are not in `serialize_skip`), so
+        // they must start defined: a Console is `undefined` heap memory
+        // before `init`, and unset entries would otherwise be written into
+        // every save state as whatever the allocator handed out.
+        self.lap_feed = @splat(.{ 0, 0 });
         self.lap_feed_n = 0;
         self.lap_feed_i = 0;
+        self.lap_rec = @splat(.{ 0, 0 });
         self.lap_rec_n = 0;
         self.overclock = 1;
         self.oc_acc = 0;
@@ -1004,6 +1010,39 @@ test "lorom sram direct-mapped rw" {
     try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x70_0000));
     try std.testing.expectEqual(@as(u8, 0xA5), tc.bus.read8(0x70_7FFF));
     try std.testing.expectEqual(@as(u8, 0x5A), tc.cart.sram[0]);
+}
+
+test "small sram is reachable in the same banks as page-mapped sram" {
+    // 2 KiB SRAM goes through `smallSramPtr`; 32 KiB through the page
+    // table. The two must agree on WHICH banks are SRAM: $70-$7D and every
+    // one of $F0-$FF ($FE/$FF included — only $7E/$7F are WRAM).
+    var small = try TestConsole.create(0x20, 1);
+    defer small.destroy();
+    var big = try TestConsole.create(0x20, 5);
+    defer big.destroy();
+    for ([_]u24{ 0x70_0000, 0x7D_0100, 0xF0_0200, 0xFE_0300, 0xFF_07FF }) |addr| {
+        small.bus.write8(addr, 0x5A);
+        big.bus.write8(addr, 0x5A);
+        try std.testing.expectEqual(@as(u8, 0x5A), small.bus.read8(addr));
+        try std.testing.expectEqual(@as(u8, 0x5A), big.bus.read8(addr));
+    }
+    // $7E/$7F are WRAM on both, never SRAM.
+    small.bus.write8(0x7E_0100, 0x11);
+    try std.testing.expectEqual(@as(u8, 0x11), small.bus.wram.data[0x100]);
+    try std.testing.expect(mappers.smallSramPtr(&small.bus, 0x7E_0100) == null);
+    try std.testing.expect(mappers.smallSramPtr(&small.bus, 0x7F_0100) == null);
+    // The upper half of an SRAM bank is ROM, not SRAM.
+    try std.testing.expect(mappers.smallSramPtr(&small.bus, 0xFE_8000) == null);
+}
+
+test "init defines every serialized field, lap arrays included" {
+    // The Console is `undefined` memory before `init`; the lap feed and
+    // record arrays are serialized, so they must come out of init defined
+    // or every save state carries whatever the allocator handed over.
+    var tc = try TestConsole.create(0x20, 1);
+    defer tc.destroy();
+    for (tc.bus.lap_feed) |e| try std.testing.expectEqual([2]u16{ 0, 0 }, e);
+    for (tc.bus.lap_rec) |e| try std.testing.expectEqual([2]u16{ 0, 0 }, e);
 }
 
 test "small sram mirrors through slow path" {

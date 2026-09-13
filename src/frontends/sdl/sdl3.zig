@@ -124,6 +124,15 @@ pub const audio_device_default_playback: u32 = 0xFFFF_FFFF;
 
 // SDL_events.h
 pub const event_quit: u32 = 0x100;
+/// Window lifecycle events that can leave the GL context or its objects
+/// stale: a minimize/restore round trip, a display hot-swap, or a GPU
+/// driver reset. The player re-validates the shader chain on any of them.
+pub const event_window_exposed: u32 = 0x204;
+pub const event_window_restored: u32 = 0x20B;
+pub const event_window_display_changed: u32 = 0x213;
+pub const event_render_targets_reset: u32 = 0x2000;
+pub const event_render_device_reset: u32 = 0x2001;
+pub const event_render_device_lost: u32 = 0x2002;
 pub const event_key_down: u32 = 0x300;
 pub const event_key_up: u32 = 0x301;
 pub const event_gamepad_axis_motion: u32 = 0x650;

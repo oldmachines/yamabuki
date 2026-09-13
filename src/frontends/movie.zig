@@ -145,6 +145,10 @@ pub const Movie = struct {
 /// Serialize to caller-owned bytes. An anchored movie is written as version 2;
 /// a power-on one stays version 1 so older builds keep reading it.
 pub fn encode(gpa: std.mem.Allocator, m: Movie) ![]u8 {
+    // `parse` refuses a count above `frames_max`; the writer holds the same
+    // line so the u32 count field can never be asked to hold more.
+    if (m.frames.len > frames_max) return error.TooLong;
+    if (m.anchor) |a| if (a.len > anchor_max) return error.TooLong;
     const head: usize = if (m.per_poll and m.lap_cell != 0) header_len_v4 else if (m.per_poll) header_len_v3 else if (m.anchor != null) header_len_v2 else header_len;
     const alen: usize = if (m.anchor) |a| a.len else 0;
     const out = try gpa.alloc(u8, head + alen + m.frames.len * 4);
@@ -477,4 +481,64 @@ test "movie: a per-poll take round-trips with its tail and anchor, and feeds per
     feed2.step(&pad, 2);
     try testing.expectEqual(@as(u16, 0x20), pad.fed[0]);
     pf.frames = &.{};
+}
+
+test "movie: a per-lap take (format 4) round-trips its lap cell" {
+    const gpa = testing.allocator;
+    const frames = try gpa.dupe([2]u16, &[_][2]u16{ .{ 0x0080, 0 }, .{ 0x0040, 0 } });
+    var m: Movie = .{
+        .accuracy = 0,
+        .region = 0,
+        .rom_crc = 0xCAFE_F00D,
+        .end_frame_hash = 1,
+        .end_audio_hash = 2,
+        .frames = frames,
+        .anchor = null,
+        .per_poll = true,
+        .lap_cell = 0x0080,
+        .tail_frames = 3,
+    };
+    defer m.deinit(gpa);
+    const bytes = try encode(gpa, m);
+    defer gpa.free(bytes);
+    try testing.expectEqual(version_laps, std.mem.readInt(u16, bytes[4..6], .little));
+    try testing.expectEqual(header_len_v4 + 2 * 4, bytes.len);
+    var back = try parse(gpa, bytes);
+    defer back.deinit(gpa);
+    try testing.expect(back.per_poll);
+    try testing.expectEqual(@as(u16, 0x0080), back.lap_cell);
+    try testing.expectEqual(@as(u32, 3), back.tail_frames);
+    try testing.expectEqualSlices([2]u16, frames, back.frames);
+    // A format-4 header cut before its lap cell is truncated, not a v3.
+    try testing.expectError(error.Truncated, parse(gpa, bytes[0 .. header_len_v4 - 1]));
+}
+
+test "movie: encode holds the same length line as parse" {
+    // The count field is a u32 and parse refuses anything above
+    // `frames_max`; the writer must refuse the same input rather than
+    // emit a file its own reader rejects.
+    const gpa = testing.allocator;
+    const too_many = try gpa.alloc([2]u16, frames_max + 1);
+    defer gpa.free(too_many);
+    @memset(too_many, .{ 0, 0 });
+    const m: Movie = .{
+        .accuracy = 0,
+        .region = 0,
+        .rom_crc = 0,
+        .end_frame_hash = 0,
+        .end_audio_hash = 0,
+        .frames = too_many,
+        .anchor = null,
+    };
+    try testing.expectError(error.TooLong, encode(gpa, m));
+}
+
+test "movie: startSrmPath edge cases" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("a.start.srm", startSrmPath(&buf, "a.ymv").?);
+    try testing.expectEqual(@as(?[]const u8, null), startSrmPath(&buf, ".ymv"));
+    try testing.expectEqual(@as(?[]const u8, null), startSrmPath(&buf, "x.YMV"));
+    // A path the caller's buffer cannot hold is null, never a truncated name.
+    var tiny: [4]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), startSrmPath(&tiny, "take.ymv"));
 }
