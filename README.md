@@ -1,9 +1,9 @@
 # Yamabuki
 
 A fast, cross-platform SNES emulator written in Zig, built to run full speed
-on underpowered ARM handhelds.
-
-## Design goals
+on underpowered ARM handhelds — and, lately, an emulator that writes
+patches: it profiles a game, tells you whether a faster CPU would help, and
+generates verified FastROM and SA-1 conversions.
 
 - **Speed first**: scanline-based fast core by default, engineered for weak
   ARM chips (Cortex-A53-class and below). Zero heap allocation per frame,
@@ -14,530 +14,230 @@ on underpowered ARM handhelds.
   per game.
 - **Portable**: pure-Zig core with no external dependencies; cross-compiles
   to x86_64 and aarch64 (glibc and musl) with `zig build` alone.
-- **Deployable**: libretro core for RetroArch-based handheld firmware, an
-  SDL3 desktop app that plays standalone — overlay menu, gamepads with
-  remapping, battery saves, save-state slots, rewind, a scanned ROM library,
-  per-game settings — and a headless runner for CI.
+- **Deployable**: a libretro core for RetroArch-based handheld firmware, an
+  SDL3 desktop app that plays standalone (overlay menu, gamepads with
+  remapping, battery saves, save-state slots, rewind, CRT shaders, a scanned
+  ROM library, input-movie recording), and a headless runner for CI and
+  analysis.
+
+Contents: [Status](#status) · [Building](#building) · [Playing](#playing) ·
+[Shaders](#shaders) · [Patches and SA-1 conversion](#patches-and-sa-1-conversion) ·
+[Repository layout](#repository-layout) · [Testing](#testing) ·
+[Documentation](#documentation) · [Contributing](#contributing)
+
+## Status
+
+Early development, but a complete machine: the console boots ROMs, renders
+every BG mode (2/4/8bpp planar, affine Mode 7 + EXTBG, hi-res modes 5/6,
+pseudo-hires) with sprites, windows and colour math, and plays sound through
+a full SPC700 + S-DSP (8 BRR voices, gaussian interpolation, ADSR/GAIN,
+noise, pitch modulation, echo) with signed, phase-exact mixing. Five
+enhancement chips are emulated: Super FX (low level, locked against all 58
+krom GSU goldens), SA-1, DSP-1, Cx4 and S-DD1. The 65816 holds full cycle
+parity against 5.12 M SingleStepTests cases; 102 homebrew ROMs are locked
+against golden framebuffer and audio hashes on both cores and through the
+libretro entry points. NTSC and PAL, region auto-detected.
+
+Of the twenty canonical commercial games first surveyed, sixteen play; the
+survey and what it found are in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). The CRT shader pipeline is
+compile-verified for three GL profiles and runs on desktop GPUs; it has not
+yet been run on a handheld's GPU.
+
+| Milestone | Status |
+|---|---|
+| M0-M9 skeleton, cart/bus, 65816, scheduler + DMA, full fast PPU, APU, save states + libretro, SDL3 frontend, accurate core, five enhancement chips | done |
+| M10 ARM performance tuning | in progress: tile-row decode cache (+18-39% on 8bpp ROMs), SA-1 ROM-read fast path, deterministic VRAM-traffic perf gate, static-musl handheld packaging with a CI linkage assertion |
+| M11 CRT shaders | in progress: GL ES 3 / GL 3.3 / GL ES 2 chain with software fallback, 12 libretro presets baked ahead of time (see [Shaders](#shaders)); not yet run on a handheld GPU |
+| M12 ROM patch layer + SA-1 candidacy analyser + patch generation | in progress: soft-patching, the patch registry, the `--sa1-report` analyser, the FastROM generator (CI-gated), and the SA-1 conversion generator through its mainline split — see [Patches and SA-1 conversion](#patches-and-sa-1-conversion) |
+| M13 commercial-boot golden gate | done: opt-in, your own ROMs, hash-keyed (`test-commercial`) |
+| M14 end-user UI | in progress: the SDL app is a standalone player; deferred: `.zip` ROMs, box art, handheld-class rewind |
+
+The full milestone table with every deliverable and its verification is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Building
 
-Requires Zig 0.16.0 (pinned in `.zigversion`; `tools/install_zig.sh`
-installs it from PyPI if ziglang.org is unreachable).
+Requires Zig 0.16.0 (pinned in `.zigversion` and `build.zig.zon`;
+`tools/install_zig.sh` installs it from PyPI if ziglang.org is unreachable).
+There are no other build-time dependencies: SDL3 is loaded at runtime, and
+the shader tools run on the build host only.
 
 ```sh
-zig build                        # headless runner + libretro core + SDL3 desktop app
-zig build test                   # unit tests
-tools/fetch_test_data.sh         # fetch CPU test vectors + test ROMs (gitignored)
-zig build test-sst               # run 65816 SingleStepTests vectors
-zig build test-sst-spc700        # run SPC700 SingleStepTests vectors
-zig build test-roms              # render PeterLemon ROMs, check golden hashes
-zig build test-roms -Drom-accurate  # same goldens on the accurate core
-zig build test-libretro          # drive the libretro core against the same goldens
-zig build fuzz                   # deterministic fuzz: random PPU/bus traffic + save/load roundtrip
-zig build bench -- <rom.sfc>     # headless FPS benchmark (JSON)
-zig build bench-check            # gate the deterministic perf baseline (steps/cycles/vram_reads)
+zig build                        # headless runner + libretro core + SDL3 desktop app, in zig-out/bin
+zig build test                   # unit tests (needs nothing else)
+tools/fetch_test_data.sh         # CPU test vectors + test ROMs, into test-data/ (gitignored, ~3 GB)
+zig build test-roms              # 102 homebrew ROMs against golden hashes (add -Drom-accurate for the accurate core)
+zig build test-sst               # 65816 SingleStepTests   (zig build test-sst-spc700 for the SPC700)
+zig build test-libretro          # the libretro core against the same goldens
+zig build test-patchgen          # FastROM patch generator end to end
+zig build fuzz                   # deterministic fuzz + save/load round trip
+zig build bench-check            # deterministic perf gate; zig build bench -- <rom.sfc> for FPS
 zig build test-commercial -Dcommercial-roms=<dir>  # boot YOUR OWN commercial ROMs against pinned hashes
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl  # handheld build
 tools/package_handheld.sh        # static musl handheld package (asserts no dynamic deps)
 ```
 
-`test-commercial` is the one gate that needs ROMs you supply yourself —
-commercial ROMs are never fetched or vendored. It identifies dumps by content
-hash (`tests/commercial_goldens.zon`), skips pinned games you don't have, and
-exists because all the committed goldens are homebrew: a launch title that
-never booted (F-Zero) passed every one of them.
+Every gate, what it proves, and where its data comes from:
+[`docs/TESTING.md`](docs/TESTING.md). Cloning the repository pulls about
+70 MB of committed recordings under `tests/surfaces/`; they are the
+verification corpus of the SA-1 conversion work and are treated as code.
 
-CRT shaders are baked ahead of time, once:
-
-```sh
-tools/fetch_shaders.sh           # libretro slang-shaders (pinned, gitignored)
-tools/build_shader_tools.sh      # glslang + SPIRV-Cross, built with zig as the C++ compiler
-zig build shaders                # transpile the presets in shaders/presets.conf to GLSL
-```
-
-Run a ROM headless and dump a frame (and its audio) to inspect:
+Run a ROM headless and dump a frame and its audio:
 
 ```sh
-zig build && ./zig-out/bin/yamabuki-headless <rom.sfc> --frames 60 --ppm out.ppm --wav out.wav
+./zig-out/bin/yamabuki-headless <rom.sfc> --frames 60 --ppm out.ppm --wav out.wav
 ```
 
-Or play it in a window (needs the SDL3 runtime library, `libSDL3.so.0` —
-the build has no SDL dependency, the library is dlopen'd):
+## Playing
 
 ```sh
 ./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N] [--shader crt-lottes]
 ./zig-out/bin/yamabuki-sdl           # no argument: open the ROM library
 ```
 
-The desktop app is a complete player, no RetroArch required. `Esc` (or a
-pad's guide button) opens an overlay menu over the paused game — settings,
-input remapping for two players (keyboard and gamepads, hotplugged), state
-slots, per-game overrides, quit. Battery saves persist as `.srm` files,
-`F12` takes a PNG screenshot, holding `Backspace` rewinds, and launching
-with no ROM argument opens a library scanned from the directories in
-`config.zon`'s `library.rom_dirs` — added from the library screen's own
-"+ ADD ROM FOLDER" row (an in-app folder browser), or by hand-editing
-`config.zon`. Everything lives in the OS's per-user
-data directory (`SDL_GetPrefPath`: `%APPDATA%\yamabuki\yamabuki` on
-Windows, `~/.local/share/yamabuki/yamabuki` on Linux), and every binding
-and setting is editable both in-menu and in `config.zon`.
+The desktop app needs the SDL3 runtime library (`libSDL3.so.0`, `SDL3.dll`)
+next to the binary or on the loader path; the build never links it. It is a
+complete player: `Esc` (or a pad's guide button) opens an overlay menu over
+the paused game — settings, input remapping for two players (keyboard and
+gamepads, hotplugged), state slots, per-game overrides, quit. Battery saves
+persist as `.srm` files, `F12` takes a PNG screenshot, holding `Backspace`
+rewinds, `F10` records an input movie, `F11` opens the takes screen, and
+launching with no ROM opens a library scanned from the directories in
+`config.zon`'s `library.rom_dirs` (added from the library screen's own
+"+ ADD ROM FOLDER" row, or by hand). Everything lives in the OS's per-user
+data directory (`%APPDATA%\yamabuki\yamabuki` on Windows,
+`~/.local/share/yamabuki/yamabuki` on Linux), and every binding and setting
+is editable both in-menu and in `config.zon`.
 
-Keyboard defaults follow RetroArch — arrows = d-pad, `Z`=B, `X`=A,
-`A`=Y, `S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
+Keyboard defaults follow RetroArch — arrows = d-pad, `Z`=B, `X`=A, `A`=Y,
+`S`=X, `Q`=L, `W`=R, `Enter`=Start, `RShift`=Select — plus `F5`/`F9`
 save/load state, `F6`/`F7` state slot, `F1` reset, `P` pause, hold `Tab`
-(or the right trigger) to fast-forward, and `,` / `.` to cycle shaders.
-Gamepads use the positional map every controller era agrees on: south=B,
-east=A, west=Y, north=X.
+(or the right trigger) to fast-forward, `,` / `.` to cycle shaders, `F8` to
+toggle cheats. Gamepads use the positional map every controller era agrees
+on: south=B, east=A, west=Y, north=X. Every flag of both binaries and every
+hotkey: [`docs/CLI.md`](docs/CLI.md).
 
 ## Shaders
 
 `--shader <name>` runs the frame through a libretro CRT shader chain, and
-`,` / `.` cycle through the rest of them without restarting. The cycle only
-walks presets baked for the GPU profile you actually got, so it can never land
-on a shader this device cannot compile; the replacement chain is built before
-the incumbent is torn down, so a preset that fails costs a printed line and not
-the picture. The shipped set is listed in
-[`shaders/presets.conf`](shaders/presets.conf) — the
-cheap single-pass ones (`zfast-crt`, `crt-pi`, `crt-lottes-fast`,
-`crt-easymode`, `sharp-bilinear`) and the heavyweights (`crt-royale`,
-`crt-guest-advanced`, `crt-lottes`, `crt-easymode-halation`, `gtu-v050`,
-`crt-geom`, `crt-hyllian`). Each is tagged `handheld` or `desktop`, and the tag
-is printed at startup: it is a claim about a Cortex-A53-class device, not a
-rating. crt-royale on a Mali-G31 is a slideshow, and the package says so rather
-than letting you find out.
+`,` / `.` cycle through the rest without restarting. The shipped set is in
+[`shaders/presets.conf`](shaders/presets.conf): the cheap single-pass ones
+(`zfast-crt`, `crt-pi`, `crt-lottes-fast`, `crt-easymode`, `sharp-bilinear`)
+and the heavyweights (`crt-royale`, `crt-guest-advanced`, `crt-lottes`,
+`crt-easymode-halation`, `gtu-v050`, `crt-geom`, `crt-hyllian`), each tagged
+`handheld` or `desktop`.
 
-### The shaders are transpiled offline
+The presets are libretro *slang* shaders, and the emulator contains no
+shader compiler: they are transpiled once on the build host by glslang and
+SPIRV-Cross (themselves built with `zig c++`) into plain GLSL for three
+profiles, GL ES 3, GL 3.3 and GL ES 2, plus a manifest of reflected uniform
+offsets. A preset that cannot work on a profile is absent from it, not
+broken; if no profile works the frontend prints why and falls back to the
+software blit.
 
-These are libretro *slang* presets — Vulkan GLSL. Running them the way RetroArch
-does means linking glslang and SPIRV-Cross (two C++ libraries, ~150k lines) into
-the binary and compiling shaders on the device at load. Yamabuki does the
-compile on the build host instead and ships the result:
-
-```
-  .slangp preset ──┐
-  .slang shaders ──┤  tools/transpile_shaders.py   (build host, never shipped)
-  .png LUTs      ──┘
-        │
-        ├─ glslang ──────► SPIR-V
-        ├─ SPIRV-Cross ──► GLSL ES 300 / GLSL 330 / GLSL ES 100
-        ├─ reflection ───► uniform offsets, types, sampler names
-        └─ zlib ─────────► raw RGBA LUTs
-        │
-        ▼
-  shaders/<profile>/<preset>/{preset.conf, pass*.vert, pass*.frag, *.bin}
-        │
-        ▼
-  yamabuki-sdl  ── reads bytes, plumbs them into offsets
+```sh
+tools/fetch_shaders.sh           # libretro slang-shaders (pinned, gitignored)
+tools/build_shader_tools.sh      # glslang + SPIRV-Cross, built with zig as the C++ compiler
+zig build shaders                # transpile the presets in shaders/presets.conf to GLSL
+zig build validate-shaders       # parse every baked manifest and stat the files it references
 ```
 
-What that buys:
+Why it is done this way, and what it buys: [`docs/SHADERS.md`](docs/SHADERS.md).
 
-- **The emulator contains no shader compiler.** No glslang, no SPIRV-Cross, no
-  SPIR-V, no C++ — and no PNG decoder either, since crt-royale's phosphor masks
-  are decoded to raw RGBA at bake time. The runtime never parses a format it can
-  avoid parsing.
-- **The design goals survive.** The core stays pure Zig, `zig build` still needs
-  nothing installed, and the handheld package is still a static musl binary that
-  passes its own no-dynamic-deps assertion. A runtime shader compiler would have
-  cost all three.
-- **Nothing is compiled on the device.** A Cortex-A53 does not spend its startup
-  budget parsing GLSL, and a driver bug in a vendor's shader compiler surfaces on
-  the build machine rather than in someone's hands.
-- **Every ambiguity is resolved once, where it can fail loudly.** Uniform
-  offsets, sampler bindings, pass aliases, feedback targets, LUT dimensions — all
-  settled at bake time. The runtime's job is reduced to memcpy-into-offset, which
-  is why it can be allocation-free after `init`.
-- **A shader that cannot work is absent, not broken.** A preset is written for a
-  profile only if it transpiled *and* every uniform in it mapped to a semantic
-  the runtime supplies. Failures are printed at bake, not discovered on a
-  handheld.
-
-The one cost is that adding a shader is a build step, not a drop-in file. Given
-the target device, that trade is not close.
-
-**glslang and SPIRV-Cross are built by `zig c++`.** Zig ships clang, so
-`tools/build_shader_tools.sh` compiles both from pinned upstream source with the
-toolchain this repo already requires — no system g++, no Vulkan SDK, no package
-manager. The prerequisites for the whole shader pipeline are the pinned Zig,
-cmake, and ninja. This is also the honest reason the *offline* route was chosen
-over linking them in: it was never that Zig couldn't build them (it can, and
-does), but that shipping a 150k-line C++ compiler to a handheld to do work that
-can be done once on a laptop is the wrong shape.
-
-Three GLSL profiles are baked and the frontend picks one at startup: **GL ES 3**
-(the handheld primary), **GL 3.3** (desktop), and **GL ES 2** (for Mali-400-class
-parts). A preset is only written for a profile if it actually transpiled *and*
-every uniform in it mapped to a semantic the runtime supplies — so a preset
-appearing in the directory and a preset running on your GPU are the same
-statement. Five of the thirty-six (preset, profile) pairs are honestly skipped:
-crt-geom and crt-hyllian build their sampling kernels with multidimensional
-array constructors, which no ESSL below 310 has, and crt-guest-advanced needs
-`textureSize`, which ESSL 100 lacks. If no profile works — an old GLES2 chip, no
-GL driver at all, CI's dummy video driver — the frontend prints why and falls
-back to the software blit. A missing shader never costs you the emulator.
-
-## Games
+## Patches and SA-1 conversion
 
 ![Twenty SNES games running in Yamabuki with the crt-royale shader](site/shots/gallery.png)
 
-*Super Metroid · Turtles in Time · Super Street Fighter II · Kirby Super Star ·
-Donkey Kong Country · Super Mario World · EarthBound · Super Castlevania IV ·
-Mega Man X · Contra III · Super Mario Kart · Final Fantasy VI — captured with
-`--shot`, rendered through crt-royale on an RTX 2070.*
+The emulator applies patches, finds them, and writes them.
 
-These are the first commercial games Yamabuki has ever run. Every golden test in
-this repo is homebrew (PeterLemon, krom), and it turns out that proves less than
-it looks like it does.
+- **Soft-patching.** `--patch` applies a BPS or IPS at load (BPS
+  hash-verified both ways); `--auto-patch` finds the right patch for your
+  cart through a hash-keyed registry (`patches/registry.zon` — an index,
+  never a payload); `--save-patched` writes the result. The SDL player
+  discovers patches on its own and asks PLAY PATCHED / PLAY ORIGINAL,
+  remembered per game with separate saves per identity.
+- **Is this game CPU-bound?** `yamabuki-headless <rom> --sa1-report`
+  profiles a game and tells you whether an SA-1 conversion would help,
+  measuring the time the CPU spends *waiting* rather than the time it
+  spends working, and counting slowdown apart from load stalls. Run across
+  a library of seventy-six carts it independently ranked the two games
+  Vitor Vilela actually converted among the most CPU-starved. How it
+  works, and every plausible rule that turned out wrong:
+  [`docs/CPU_BOUND_ANALYSER.md`](docs/CPU_BOUND_ANALYSER.md).
+- **FastROM generation.** `--gen-fastrom-patch` derives a FastROM
+  conversion mechanically, verifies it in-emulator (every frame pixel- and
+  audio-identical to the unpatched run, MEMSEL held), and only then emits
+  a BPS. CI runs the whole loop (`zig build test-patchgen`).
+- **SA-1 generation.** `--gen-sa1-patch` converts a cart to an SA-1 board
+  and, in its `--window` form, relocates the game's low WRAM into BW-RAM and
+  splits the per-frame logic onto the SA-1 while the S-CPU keeps the
+  hardware-facing work. Every conversion is verified against recorded
+  playthroughs before a patch is written: strict pixel-and-audio identity
+  when timing did not change, behavioural equivalence (the game's logic
+  state at every tick) when it did, and a refusal by name otherwise. The
+  Super Metroid conversion has shipped through 78 verified versions; its
+  patches, exact command lines and recorded verification takes live in
+  [`tests/surfaces/sm-sa1/`](tests/surfaces/sm-sa1/README.md).
 
-**Twenty of the canonical SNES library, run for 3,700 frames each:**
+The methodology is in
+[`docs/SA1_CONVERSION_LEARNINGS.md`](docs/SA1_CONVERSION_LEARNINGS.md), the
+Super Metroid campaign in [`docs/SM_SA1_FINDINGS.md`](docs/SM_SA1_FINDINGS.md),
+and the flags in [`docs/CLI.md`](docs/CLI.md).
 
-| | |
-|---|---|
-| **16 / 20** | boot and render |
-| **2 / 20** | Donkey Kong Country 2 (E) and Secret of Mana (E) are PAL ROMs; on the NTSC-hardcoded core they used to correctly print *"THIS GAME PAK IS NOT DESIGNED FOR YOUR SUPER NES"*. PAL support (region auto-detected from the cart header, `--region` to override; 312 lines/frame, 50 Hz pacing, STAT78's PAL bit) now lets them play with `--region auto`. |
-| **4 / 20** | **never render a frame** — Chrono Trigger, F-Zero, Super Mario RPG, Yoshi's Island. Three sit on a forced-blank screen with an identical static framebuffer hash from frame 300 to frame 6,000: the CPU is stuck before it ever enables the display. |
-
-F-Zero was the one that stung. LoROM, no coprocessor, a launch title — if that
-does not boot, this is not an exotic edge case.
-
-**F-Zero now boots**, and the thing that found the bug was the frame-budget
-profiler below, which was built for something else entirely. It reported F-Zero
-sitting at **0% CPU utilisation** — the CPU was not crashed or lost, it was
-*waiting*, in a loop, forever. `--hot` gave the address, and the two instructions
-there gave the answer:
-
-```
-$8616:  BIT $4212      ; HVBJOY
-$8619:  BVC $8616      ; loop until V is set
-```
-
-`BIT` drops bit 6 of the operand straight into the V flag, and **bit 6 of HVBJOY
-is the H-blank flag**. Yamabuki's `in_hblank` was declared, initialised to false,
-read by `readHvbjoy` — and *assigned by nobody*. The flag was permanently zero, so
-`BVC` looped until the heat death of the universe. Deriving it from the beam is
-four lines, and F-Zero renders its title screen, plays its music, and runs its
-Mode 7 attract demo. All 100 goldens and the perf baselines are unchanged.
-
-Twelve more carts still sit at 0% utilisation and never poll the pad — the same
-signature, a different cause each. That is a much better place to start than "it
-renders a black screen", and it is what M13 now has to work with. The same fix
-also revived **Super Mario Kart's Mode 7 attract demo** — the "flat yellow
-field" from the first survey was the game parked on `BIT $4212 / BEQ` at
-`$80:8B19`, waiting for the same H-blank flag; with the bit real, the demo runs
-its full split-screen Mode 7 race.
-
-None of this was visible from 100 passing golden ROMs, because all 100 are
-homebrew.
-
-## Is this game CPU-bound?
+## Repository layout
 
 ```
-$ yamabuki-headless "Super Mario World.sfc" --sa1-report
-
-SUPER MARIOWORLD
-  lorom, no coprocessor, SlowROM
-  profiled 1800 frames (30s) after 300 boot frames
-
-  CPU utilisation   mean 44%   median 43%   p95 62%   max 100%
-  slowdown          0 of 1800 frames (0.0%)
-  stalls            1 (57 frames) — loads or transitions, not slowdown
-
-  verdict: NOT CPU-BOUND
-    The CPU idles through 56% of an average frame and never falls behind.
-    A faster CPU has nothing to do here.
+src/core/        the emulator: cpu/ memory/ ppu/ apu/ cart/ chips/, console.zig, serialize.zig, profile.zig
+src/frontends/   headless/ (CLI + analysis + generators), sdl/ (desktop player), libretro/, movie.zig
+tests/           the runners behind zig build test-*, golden hashes, the SA-1 verification surfaces
+bench/           headless FPS benchmark and the deterministic perf baseline
+tools/           host-side scripts: fetch test data, bake shaders, package handhelds (tools/README.md)
+patches/         the patch registry index and the auto-FastROM compatibility list
+shaders/         presets.conf (what ships) and the baked GLSL (gitignored)
+docs/            documentation; docs/README.md is the index
 ```
 
-This is step one of the SA-1 candidacy analyser (M12). The community around
-[Vitor Vilela](https://github.com/VitorVilela7) has spent years hand-converting
-SNES games to run on the SA-1 — Gradius III, Contra III, Super R-Type, and the
-SMW SA-1 Pack under a large share of modern hacks. Each one is weeks of reverse
-engineering, and the first thing you want to know is whether a game is worth it
-at all. **A game that always finishes its logic with time to spare gains nothing
-from a faster CPU**, however attractive it looks from the outside.
+The module map, the core's design and the decisions behind it:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**You cannot measure that the obvious way.** On a SNES the CPU burns *exactly*
-the same number of master cycles every frame — the scheduler runs it to the
-scanline's clock target, always. It never "overruns its budget"; it never gets the
-chance. When a game is too slow, what happens is that its main loop fails to come
-round before the next vblank and a frame is dropped.
+## Testing
 
-So the budget is measured by its complement: not the time the CPU spent working,
-but the time it spent **waiting**. Idle time is headroom, and headroom is exactly
-what an SA-1 buys back.
+Correctness is externally anchored and nothing is vendored: the 65816 and
+SPC700 are held to the SingleStepTests vectors, 102 homebrew ROMs to golden
+hashes on both cores and through libretro, commercial games to boot hashes
+of dumps you supply, and performance to deterministic instruction, cycle
+and VRAM-traffic counts rather than wall-clock time. A deterministic fuzz
+harness covers the renderer, the bus and the save/load round trip. CI runs
+all of it on Linux plus a native Windows unit-test job, a five-target
+cross-compile matrix with a static-linkage assertion, an SDL smoke test,
+and the shader bake. Details, the build options, and how to mint a golden:
+[`docs/TESTING.md`](docs/TESTING.md).
 
-### A loop is a wait if it goes nowhere
+## Documentation
 
-It touches a fixed handful of addresses over and over, instead of reading and
-writing its way *through* memory. That distinction is the whole difficulty:
+[`docs/README.md`](docs/README.md) is the index. In short:
+[architecture](docs/ARCHITECTURE.md) · [testing](docs/TESTING.md) ·
+[command line](docs/CLI.md) · [shaders](docs/SHADERS.md) ·
+[compatibility](docs/COMPATIBILITY.md) ·
+[the CPU-bound analyser](docs/CPU_BOUND_ANALYSER.md) ·
+[surround audio](docs/AUDIO_SURROUND.md) · [roadmap](docs/ROADMAP.md) ·
+[SA-1 conversion learnings](docs/SA1_CONVERSION_LEARNINGS.md) ·
+[Super Metroid findings](docs/SM_SA1_FINDINGS.md) ·
+[the September 2026 audit](docs/AUDIT_2026-09.md).
 
-```
-wait:  LDA $10        wait:  LDA $4212      sum:  LDA $2000,y
-       BEQ wait              BPL wait             ADC $04
-                                                  INY
-$8166: JSL check                                  CPY #$1000
-$816A: BRA $8166                                  BNE sum
-```
+## Contributing
 
-The first three are waits. The fourth is a checksum — tight, repetitive, and it
-writes nothing for four thousand iterations — and it is *working*. Its tell is
-that it **walks**: a different address every pass. A wait watches the same one or
-two forever, because watching one spot for something else to change it is what
-waiting *is*.
-
-Every one of the following was a bug, and a real game found each of them. None of
-them were visible from reasoning about it.
-
-- **A loop is found by return, not by proximity.** The commonest SNES main loop is
-  a *call* in a loop — that `JSL check` / `BRA` above is Contra III's — and its
-  seven addresses are spread over 6 KiB. Bounding the *span* of the program
-  counter rejects it outright, along with every other subroutine-shaped wait ever
-  written. **Contra III came out at 100% utilisation on every frame, title screen
-  included**, which is what gave it away.
-- **Stack traffic is not a side effect.** That `JSL` pushes three bytes every pass,
-  so a naive "writes nothing" test throws the loop out again. A JSL/RTL pair leaves
-  the machine exactly as it found it, so pushes and pulls bypass the profiler's
-  data path entirely.
-- **A wait is allowed to write.** The classic SNES idiom stirs a random seed while
-  it spins — that is how a game seeds randomness from how long you took to press
-  Start. Tetris & Dr. Mario's wait is exactly that, and it read **100% busy on
-  every frame** until writes were allowed:
-
-  ```
-  $86ED:  JSR $8DAD      ; $9E = $9E * 5 + $7113   — advance the RNG
-  $86F0:  LDA $0BA6      ; check the flag
-  $86F3:  BPL $86ED
-  ```
-
-  Writing one fixed word changes nothing that matters; writing your way through a
-  buffer does. The one thing a wait may never do is poke a **hardware register** —
-  that is what stops a loop kicking off DMA (`STA $420B`, the same address every
-  pass) from slipping through the same test.
-- **The unit of judgement is one pass, not one window.** Judge a whole window of
-  instructions at once and working code that merely *precedes* a wait — a memory
-  clear, say — condemns the wait that follows it, because the window saw a write.
-  Super Mario World's idle time vanished completely.
-
-One rule is worth recording as a dead end, because it is plausible and wrong:
-*"a wait cannot exit on its own, so a loop ended by an interrupt was waiting."*
-Both halves fail. A loop polling `$4212` exits under its own power the moment the
-hardware sets the bit — no interrupt needed — and *any* long-running loop is
-eventually interrupted by the vblank NMI, checksums included. It did not even
-exclude the case it existed to exclude.
-
-### Slowdown is not a stall
-
-The independent check on all of the above is the **lag frame**: a game polls the
-controller once per main-loop iteration, so a frame in which it never read the pad
-is a frame its logic did not come round. That is what a player actually sees, and
-it comes from a completely different signal than the idle accounting, so agreement
-between the two is real corroboration.
-
-But dropped frames come in two kinds. Slowdown is a game failing to keep up *while
-it is still playing* — it drops one frame in two or three, so its runs are short.
-An unbroken fifth of a second with no input poll is a game doing something else:
-decompressing a level, running a fade. Both pin the CPU; only one is a reason to
-reach for an SA-1. Super Mario World's attract demo drops 66 frames in 1800 —
-3.7%, comfortably over any "CPU-bound" threshold — but **57 of them are one
-unbroken run**, which is a level transition. Conflating those is how you talk
-yourself into a conversion nobody needs, so the report counts them apart.
-
-### What it still gets wrong
-
-A wait the profiler fails to recognise reads as work, so **utilisation is an upper
-bound** — real idle is at least what is reported. And a game that polls the pad
-inside its **NMI handler** polls every frame whatever its main loop is doing, so it
-can never register a dropped frame at all: **slowdown is a lower bound.** The two
-errors point in opposite directions, so they bracket the truth rather than
-compounding — which is the main reason for keeping both signals.
-
-The upper bound on utilisation is the direction that *flatters* a conversion,
-which is exactly why the tool prints the caveat every run instead of rounding in
-its own favour. And on its own the profiler presses no buttons: what gets
-profiled is the attract loop, which for most carts is real gameplay and for some
-is a title screen idling at 12%.
-
-**`--movie` is the answer to that**, and deliberately the only one: a recorded
-playthrough, replayed from power-on and verified against the hashes it carries,
-so the profile is measured over real gameplay rather than whatever the demo
-happened to exercise. Cruder substitutes were tried and removed. A held button
-mask is not a player — it never taps, aims, or reacts, so on a game that
-edge-detects presses it does nothing at all — and resuming a save state fixes
-where a run begins without supplying anyone to play it, so the scene winds down
-within seconds. Both invite a number that reads like gameplay and is not. The
-report says which of the two modes drove it, so it is never mistaken for the
-other.
-
-The profiler is a third comptime instantiation of the core (`ProfilingConsole`),
-so the shipped emulator carries no branch for it — the same trick as `accuracy`.
-Emulation under it is bit-identical: 5,120,000 SingleStepTests cases, 100 golden
-ROMs, and the deterministic bench baselines all unchanged.
-
-### Seventy-six carts, ranked
-
-Run across a whole library, 1,800 frames each. The interesting result is how few
-games are candidates:
-
-| | |
-|---|---|
-| **7** | **CPU-bound** — lose ≥2% of their frames to slowdown, spread through the capture rather than bunched into loads |
-| **25** | drop frames occasionally |
-| **13** | at the limit — never late, but nothing to spare |
-| **14** | not CPU-bound — a faster CPU has nothing to do |
-| **13** | **0% utilisation, never poll the pad** — not slow, *stuck* (see F-Zero, above) |
-
-The top of the list:
-
-```
-game                    map    chip  FastROM  mean  med  p95  slowdown
-JUNGLE STRIKE           lorom  -     yes       12%   2%  77%    50.1%
-FINAL FANTASY VI        hirom  -     yes       17%  15% 100%     6.8%
-PALADIN'S QUEST         lorom  -     -         12%   2% 100%     3.3%
-KIRBY SUPER STAR        lorom  sa1   -         20%  12% 100%     2.3%
-LIVE A LIVE             hirom  -     -         22%  17% 100%     2.1%
-SUPER R-TYPE            lorom  -     -         53%  54%  82%     2.1%
-TURTLES IN TIME         lorom  -     -         30%  22% 100%     2.0%
-```
-
-Two of those are corroboration rather than discovery, and that is the point:
-**Super R-Type and Contra III are both games Vitor Vilela actually converted** —
-he chose them by playing them, years ago, and the profiler independently ranks
-them among the most CPU-starved carts in the library. Kirby Super Star is the
-joke: it *already has* an SA-1 and still drops frames.
-
-Jungle Strike loses **half its frames**, which is a scale of slowdown nobody
-should have to discover by feel.
-
-## Status
-
-Early development. The console boots ROMs, renders, and plays sound: scheduler
-with NMI/IRQ, DMA/HDMA, a fast scanline renderer covering all 8 BG modes
-(2/4/8bpp planar, affine Mode 7 + EXTBG, hi-res 512-wide modes 5/6 and
-pseudo-hires) with sprites, windows, and color math, and the full APU — SPC700
-plus the S-DSP (8 BRR voices, gaussian interpolation, ADSR/GAIN envelopes,
-noise, pitch modulation, echo) emitting 32 kHz stereo with signed, phase-exact
-mixing, so Dolby Surround games decode correctly
-([`docs/AUDIO_SURROUND.md`](docs/AUDIO_SURROUND.md)).
-PeterLemon BG/text/sprite ROMs render and are locked against golden framebuffer
-hashes, music demo ROMs against golden audio-stream hashes; the 65816 and
-SPC700 cores are validated against
-[SingleStepTests](https://github.com/SingleStepTests) vectors — the 65816 at
-full cycle parity (count and per-cycle bus position over all 5.12M cases) —
-and the SPC700 CPU-test ROMs run end-to-end on the audio CPU through an HLE
-boot handshake. An opt-in accurate core (`--accurate`, or the
-`yamabuki_accuracy` libretro option) renders piecewise at the beam position,
-so mid-scanline register writes split the line the way hardware does.
-Super FX (GSU) cartridges work: the full RISC instruction set with the
-hardware's prefetch pipeline, code cache, and PLOT bitplane pipeline, locked
-against all 31 krom GSUTest opcode screens and 27 plot demos (which match
-krom's reference captures pixel-for-pixel). The DSP-1 math coprocessor
-(Super Mario Kart, Pilotwings) is emulated at the command level, with its
-lookup tables regenerated from closed-form math and every command family
-locked by exact unit-test vectors. The SA-1 (Super Mario RPG, Kirby Super
-Star) runs as a second instance of the same 65816 core on its own bus, with
-the Super MMC, BW-RAM projections, DMA with character conversion, and the
-arithmetic unit. The Cx4 (Mega Man X2/X3) is emulated at the command level:
-the wireframe transform/rasterizer, sprite scale/rotate, OAM builder, and the
-scalar math commands, driven synchronously through its $6000-$7FFF register
-window. The S-DD1 (Star Ocean, Street Fighter Alpha 2) is two things at once:
-the memory-map controller that windows banks $C0-$FF over a 4 MiB ROM, and the
-entropy decompressor a DMA channel can be armed to read through, expanding
-graphics straight into VRAM — completing M9's enhancement-chip set. Performance work (M10) is
-underway: the fast renderer now decodes each tile row in a single pass — a run
-of same-tile background pixels reuses one decode (memoized by char-data
-address) and each sprite tile column decodes once, instead of re-reading every
-plane word per pixel — bit-identical output, with noticeably less VRAM traffic
-on decode-bound backgrounds and sprites.
-
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture and roadmap.
-
-| Milestone | Status |
-|---|---|
-| M0 skeleton, build system, CI | done |
-| M1 cartridge/mappers/bus | done |
-| M2 65816 CPU + test vectors | done |
-| M3 scheduler, DMA/HDMA, first pixels (BG modes 0/1) | done |
-| M4 full fast PPU | done (all BG modes, mosaic, offset-per-tile, windows, color math, Mode 7 + EXTBG, hi-res/pseudo-hires) |
-| M5 APU (SPC700 + S-DSP) | done (BRR voices, gaussian, ADSR/GAIN, noise, pitch mod, echo; 32 kHz stereo + audio-hash goldens) |
-| M6 save states + libretro core | done (joypad input, versioned save states, full libretro core + parity harness) |
-| M7 SDL3 desktop frontend | done (dlopen'd SDL3, no build-time deps; keyboard input, save-state hotkeys, fast-forward, region-aware (NTSC/PAL) pacing; CI golden-hash smoke test) |
-| M8 accurate mode (dot renderer, cycle timing) | done (beam-position piecewise rendering, dot-placed H-IRQs, full SST cycle parity — count and position; `--accurate` / `yamabuki_accuracy` selection) |
-| M9 enhancement chips (Super FX, DSP-1, SA-1, Cx4, S-DD1) | done (Super FX: 58 golden ROMs; DSP-1 HLE; SA-1: second 65816 + MMC/DMA/math; Cx4 HLE wireframe/sprite math; S-DD1 bank window + entropy decompressor, gated by Star Ocean's boot — all unit-test gated) |
-| M10 ARM performance tuning | in progress (tile-row decode cache for BG + sprites, ~+18–39% on 8bpp ROMs; SA-1 ROM-read fast path precomputes the MMC map, −15% total instructions / +15% FPS on Super Mario RPG, bit-identical; deterministic VRAM-traffic bench gate + static-musl handheld packaging with a CI static-linkage assertion) |
-| M11 CRT shaders | in progress (GL ES 3 pipeline with GL 3.3, GL ES 2, and software fallbacks: multi-pass FBO chain, pass aliases, feedback targets, frame history, LUTs; 12 libretro presets transpiled ahead of time by glslang + SPIRV-Cross on the build host — 31 of 36 (preset, profile) pairs bake, the 5 skips are printed and CI-gated. **Not yet run on a GPU.**) |
-| M12 ROM patch layer + SA-1 candidacy analyser + patch generation | in progress — soft-patching (BPS/IPS, hash-verified), the `--auto-patch` registry, opt-in auto-FastROM, `--wide`, the analyser through its unified verdict, and the first patch *generator* have all landed. **`--sa1-report`**: run the game and Yamabuki tells you whether it would convert well to the SA-1, and what it would cost. The whole problem is one hardware fact — **the SA-1 cannot see the SNES's WRAM** ($7E-$7F); its world is ROM, cartridge BW-RAM, and 2 KiB of I-RAM. So a conversion is never "move this routine to the fast CPU", it is "move this routine *and every byte of state it touches* out of WRAM" — which is why the SMW SA-1 Pack's headline feat is relocating the game's logic memory. The analyser measures exactly that: is the game even CPU-bound (which frames overran, and by how much), which routines cost the frame, the WRAM working set of each one (the number that decides the project), the blockers (WRAM shared with code that must stay put, DMA sources, unreachable MMIO), and a verdict with its reasoning shown. All of that is built: per-routine cycle attribution, WRAM working sets, MMIO and shared-page blockers, DMA/HDMA arms with WRAM-sourced transfers tagged, and a graded `conversion:` verdict in every report. The same instrumentation dumped rather than summarised gives execution coverage, hot-routine profiles and RAM access maps — the artefacts Vilela's "SA-1 Collection" was built from. Also: soft-patching (BPS/IPS at load, source hash-verified, `--save-patched` to write the result) and a hash-keyed registry so `--auto-patch` finds the right SA-1 / FastROM patch for your cart — Yamabuki already emulates the SA-1, so a converted ROM boots today. Plus opt-in auto-FastROM (mechanically derivable, but it breaks cycle-timed code, so it is a flag and a compat list, never a default) and a wider framebuffer for widescreen hacks. And the emulator now *writes* patches, not just applies them: **`--gen-fastrom-patch`** derives a FastROM conversion mechanically (header speed bit, MEMSEL reset stub in discovered free space, interrupt trampolines into the fast mirror, observed `STZ $420D` init stores NOPed only when provably safe), verifies it in-emulator — every frame pixel- and audio-identical to the unpatched run, MEMSEL held — and only then emits a BPS, with the whole loop gated in CI (`zig build test-patchgen`). The SDL player discovers patches by itself (same-basename softpatch, a patches folder matched by BPS source CRC32, the registry) and asks PLAY PATCHED / PLAY ORIGINAL, remembered per game, with separate saves per identity — and generates them too: picking a SlowROM game with no patch offers GENERATE FASTROM PATCH, runs the generate-and-verify session incrementally on the UI loop with a progress bar (no thread, the library scanner's pattern), and lands in the PLAY PATCHED prompt with the measured effect shown; refusals name their reason on screen and the game is not re-offered. SA-1 conversion generation is staged as a refusal-first ladder in the ROADMAP (coverage maps → relocation plan → mechanical rewrite → differential verification), and its first two-and-a-half stages are built: `--sa1-report --usage-map out.bin` exports execution/access coverage from real play in bsnes-plus's `-usage.bin` format, DiztinGUIsh-importable — the artefact Vilela's SA-1 Collection disassemblies were reconstructed from — and `--sa1-report --plan` prints the relocation plan, the WRAM → I-RAM/BW-RAM allocation map for the hot set (dp window pinned for a D=$3000 boot, DMA-fed state forced to BW-RAM, hottest-first fill, sharing flagged as re-pointing work). Stage S3's first half executes that plan: `--gen-sa1-patch` converts the cart to a real SA-1 board (S-CPU shim opens the write gates, boots the SA-1 through CRV/$2200 into a park stub) and statically rewrites every covered access to the moved state — which both CPUs can reach, so the game still runs on the S-CPU and the differential gate proves frame-for-frame identity before the BPS is written. Stage S3b executes on the SA-1 for real: up to seven eligible hot leaf routines move across, their call sites re-pointed through message-port stubs that marshal registers over an I-RAM mailbox to an emitted SA-1 dispatcher. Stage S4 is the gate that decides what ships: strict pixel-and-audio identity when timing did not change, EQUIVALENCE MODULO TIMING (same distinct pictures in the same order, plus a measured non-negative lag improvement) when it did — anything else refuses. And the far rung has a first vertical slice: `--gen-sa1-patch --whole-game` migrates the *entire* game onto the SA-1 (Vilela's SA-1 Root architecture) when its measured WRAM working set fits the identity-mapped I-RAM window — the S-CPU becomes an MMIO service loop fed by a mailbox, NMI is forwarded across the wall with a per-transaction mask so interrupt-context MMIO cannot corrupt a request in flight, and everything it cannot prove refuses by name; `zig build wg-demo` writes a playable demo game that goes through the whole path end to end — animated, migrated, verified strict-tier identical, patch written — and CI holds it there. And the pipeline no longer has to profile whatever the attract loop happens to do: the SDL player records **input movies** (F10 — a TAS-style `.ymv` of per-frame pad masks from power-on, carrying the played image's CRC and end-of-run frame/audio hashes), and `--movie` replays them verified in either frontend or feeds them to `--sa1-report` and the generators, so coverage and verification come from a real playthrough. Per-game authorship stays human, but the mechanical fraction and the verification are the emulator's job. The repo carries the patch index, never the payload, and never a ROM |
-| M13 game compatibility | planned. The first run against commercial games found what 100 passing homebrew goldens could not: **4 of the canonical 20 never render a frame** (Chrono Trigger, F-Zero, Super Mario RPG, Yoshi's Island — three of them stuck on a forced-blank screen with a static framebuffer hash from frame 300 to 6,000, i.e. the CPU never reaches the point of enabling the display), F-Zero is the tell — LoROM, no coprocessor, a launch title. The fix for the test suite is the same as the fix for the emulator: goldens minted from *commercial* boot sequences, not just homebrew, so a regression here fails CI instead of being discovered by eye. PAL support (deferred since M0, region constants already parameterized) closed the other two: DKC2 (E) and Secret of Mana (E), which used to refuse to run on an NTSC-hardcoded core, now boot with `--region auto` |
-
-## Design notes
-
-The decisions below are the ones that shape everything else in the tree.
-
-**Performance is gated deterministically, not by wall clock.** Timing a
-frame in CI is flaky, so the perf baseline (`bench/baseline.zon`) pins three
-counters per ROM instead: `steps` (instructions retired), `cycles` (master
-clock), and `vram_reads` (renderer word fetches). All three are identical
-across Debug/ReleaseFast and across target architectures, so `zig build
-bench-check` fails on drift rather than on noise. `vram_reads` is chosen to
-stand in for the optimization it protects: deleting the M10 tile-row decode
-cache multiplies the count ~8x and turns the gate red. An optimization that
-CI cannot see is an optimization that will be reverted by accident.
-
-**Accuracy is a `comptime` parameter, spent at frame granularity.**
-`Console(cfg)` is instantiated twice — fast and accurate — and only a handful
-of sites in the core branch on `cfg.accuracy`, all of them at scanline or
-frame level. The hot loops are fully monomorphized: no branch, no function
-pointer. Runtime selection (`--accurate`, `yamabuki_accuracy`) is a tagged
-union over the two instantiations (`AnyConsole`), so choosing a core costs one
-switch per frame, not one per pixel.
-
-**Save states are `comptime` reflection over plain data, and a pointer is a
-compile error.** `src/core/serialize.zig` walks the state tree and refuses to
-serialize pointers. That is the design, not a limitation: it forces derived
-state (bus page tables, decode caches, chip-to-ROM wiring) to be *rebuilt* by
-`postLoad()` hooks instead of persisted, so it cannot silently rot. It also
-makes `byteSize(T)` comptime-known, which is what lets libretro's
-`retro_serialize_size` stay fixed for a whole session; a `comptime` assert
-keeps the fast and accurate cores at the same state size.
-
-**A `Console` is self-referential: heap-allocate it and never move it.** The
-bus page table holds pointers into `self.cart` and `self.bus.wram`, and the
-CPU holds `&self.bus`. Construct in place with `init` and do not copy the
-value afterwards — a moved Console has a page table pointing at its own
-corpse.
-
-**Test data is fetched and revision-pinned, never vendored.** CI resolves the
-upstream SingleStepTests and PeterLemon repos with `git ls-remote` at run
-time; no ROMs or vectors are committed. Correctness is externally anchored:
-the 65816 is held to full cycle parity (count *and* per-cycle bus position
-over all 5.12M cases), and the golden framebuffer/audio hashes in
-`tests/golden_hashes.zon` are replayed through three drivers — the fast core,
-the accurate core (`-Drom-accurate`), and the libretro core.
-
-**Zero build-time dependencies is a hard constraint.** SDL3 is not linked: the
-frontend hand-ports the ABI subset it needs and `dlopen`s the library, so
-`zig build` alone cross-compiles to `aarch64-linux-musl` on a machine with no
-SDL installed. `tools/package_handheld.sh` then *asserts* the result is
-statically linked (no interpreter, no `NEEDED`), because a handheld firmware
-will not supply the shared objects a stray dynamic dep would demand.
-
-**Work that can happen on the build host does not happen on the device.** The
-CRT shaders are libretro slang presets, which normally require glslang and
-SPIRV-Cross — ~150k lines of C++ — linked into the emulator and run at load.
-Instead `tools/transpile_shaders.py` compiles them ahead of time and ships plain
-GLSL plus a manifest of reflected uniform offsets, and the phosphor-mask PNGs are
-decoded to raw RGBA the same way. The binary therefore holds no shader compiler,
-no SPIR-V, and no image decoder: it reads bytes and writes them at offsets. That
-is what keeps the pure-Zig core, the dependency-free `zig build`, and the static
-musl package all intact at once — and it means a preset that cannot work is
-*absent* from the package rather than failing on someone's handheld. The tools
-themselves are built by `zig c++`, so even the bake step needs no toolchain the
-repo does not already pin. See [Shaders](#shaders).
-
-**Enhancement chips are emulated at the level their games actually observe.**
-Super FX is low-level (real prefetch pipeline, code cache, PLOT bitplane
-pipeline) because games depend on its behaviour cycle by cycle; DSP-1 and Cx4
-are command-level HLE because they do not. SA-1 gets the cheapest treatment of
-all: it *is* the 65816 core, instantiated a second time on its own bus. The
-S-DD1 splits the question: its *data* has to be exact to the bit — one wrong
-bit in the entropy decoder turns Star Ocean's title screen into noise, which
-no unit test would notice — while its *timing* is unobservable, so a
-decompressing DMA simply expands as the transfer runs.
+- `zig fmt --check .` is the first CI job; `zig build test` must pass with
+  nothing fetched. The other gates need `tools/fetch_test_data.sh` once.
+- Emulation changes that alter a golden hash re-mint the golden in the same
+  commit and say why the picture changed. Performance changes re-baseline
+  `bench/baseline.zon` only after the goldens are shown unchanged.
+- The core stays pure Zig with no allocation after construction; frontends
+  hand-port the ABIs they need rather than adding a build-time dependency.
+- Test data and ROMs are never committed. Patches are indexed, never
+  vendored. The recordings under `tests/surfaces/` are the exception, and
+  deleting one is a code change.
+- The repository has no LICENSE file yet; until it does, the project's own
+  licence is unstated (the fetched test data and shaders belong to their
+  upstreams).
