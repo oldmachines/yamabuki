@@ -1025,7 +1025,7 @@ fn loadCodeMap(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, args: Ar
             std.process.exit(1);
         }
         core.sa1gen.dbg_code_map = data;
-}
+    }
 }
 
 /// Is `pc` inside the stock image's padding — the $FF runs where the

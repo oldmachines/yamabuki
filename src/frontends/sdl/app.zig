@@ -716,7 +716,7 @@ pub fn run(
                                             rec_marks = em.frames;
                                             rec_audio = em.audio;
                                             rec_mark_hash = em.hash;
-                rec_mark_tail = em.tail;
+                                            rec_mark_tail = em.tail;
                                             at_power_on = false;
                                             try err.print("movie: continuing take {s} from its end state, frame {d}\n", .{ p, m.frames.len });
                                             try err.flush();

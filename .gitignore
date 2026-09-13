@@ -29,6 +29,7 @@ _site/
 # never the patches themselves. Fetch them from the registry's URLs.
 patches/*.bps
 patches/*.ips
-zig-out-cli/
-zig-out-gen/
+# Side-by-side install prefixes used during SA-1 generation work
+# (zig build --prefix zig-out-<tag>): every one of them is a build output.
+zig-out-*/
 *.log
