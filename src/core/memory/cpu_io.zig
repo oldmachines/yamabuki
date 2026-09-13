@@ -94,7 +94,6 @@ pub const CpuIo = struct {
 };
 
 test {
-    const std = @import("std");
     var io: CpuIo = .init;
     // htime/vtime are 9-bit split across two ports.
     io.setHtimeLow(0x34);
@@ -119,4 +118,67 @@ test {
     io.nmitimen = nmi_enable | 0x20; // NMI on, V-IRQ
     try std.testing.expect(io.nmiEnabled());
     try std.testing.expectEqual(@as(u2, 2), io.irqMode());
+}
+
+// --- tests ---------------------------------------------------------------
+
+const std = @import("std");
+
+test "HVBJOY drives bits 7, 6 and 0 and passes bits 5-1 through from open bus" {
+    var io: CpuIo = .init;
+    // Nothing asserted: the driven bits read 0 whatever the MDR holds.
+    try std.testing.expectEqual(@as(u8, 0x3E), io.readHvbjoy(0xFF));
+    try std.testing.expectEqual(@as(u8, 0x00), io.readHvbjoy(0x00));
+    // Everything asserted: the driven bits read 1 and open bus fills the rest.
+    io.in_vblank = true;
+    io.in_hblank = true;
+    io.auto_joypad_busy = true;
+    try std.testing.expectEqual(@as(u8, 0xC1), io.readHvbjoy(0x00));
+    try std.testing.expectEqual(@as(u8, 0xFF), io.readHvbjoy(0xFF));
+    try std.testing.expectEqual(@as(u8, 0xC1 | 0x2A), io.readHvbjoy(0x2A));
+}
+
+test "RDNMI blends the version nibble with open-bus bits 6-4 only" {
+    var io: CpuIo = .init;
+    try std.testing.expectEqual(@as(u8, 0x72), io.readRdnmi(0xFF)); // bits 6-4 + version 2
+    try std.testing.expectEqual(@as(u8, 0x02), io.readRdnmi(0x0F)); // bits 3-0 never leak
+    try std.testing.expectEqual(@as(u8, 0x02), io.readRdnmi(0x80)); // nor bit 7
+    io.nmi_flag = true;
+    try std.testing.expectEqual(@as(u8, 0xF2), io.readRdnmi(0xFF));
+}
+
+test "HTIME/VTIME high bytes keep only bit 0" {
+    var io: CpuIo = .init;
+    io.setHtimeLow(0x34);
+    io.setHtimeHigh(0xFE);
+    try std.testing.expectEqual(@as(u16, 0x034), io.htime);
+    io.setHtimeHigh(0xFF);
+    try std.testing.expectEqual(@as(u16, 0x134), io.htime);
+
+    io.setVtimeLow(0xE0);
+    io.setVtimeHigh(0xFE);
+    try std.testing.expectEqual(@as(u16, 0x0E0), io.vtime);
+    io.setVtimeHigh(0x01);
+    try std.testing.expectEqual(@as(u16, 0x1E0), io.vtime);
+    // The high write leaves the low byte alone and vice versa.
+    io.setVtimeLow(0x00);
+    try std.testing.expectEqual(@as(u16, 0x100), io.vtime);
+}
+
+test "irqMode decodes NMITIMEN bits 5-4 and ignores the rest" {
+    var io: CpuIo = .init;
+    const modes = [_]struct { reg: u8, mode: u2 }{
+        .{ .reg = 0x00, .mode = 0 },
+        .{ .reg = 0x10, .mode = 1 },
+        .{ .reg = 0x20, .mode = 2 },
+        .{ .reg = 0x30, .mode = 3 },
+        .{ .reg = 0x81, .mode = 0 }, // NMI + auto-joypad, no IRQ
+        .{ .reg = 0xB1, .mode = 3 },
+        .{ .reg = 0x4F, .mode = 0 }, // bit 6 and the low nibble do not count
+        .{ .reg = 0xDF, .mode = 1 },
+    };
+    for (modes) |m| {
+        io.nmitimen = m.reg;
+        try std.testing.expectEqual(m.mode, io.irqMode());
+    }
 }

@@ -434,11 +434,23 @@ const ArmTestBus = struct {
             return 0;
         }
     } = .{},
+    /// Every write8, counted; the first few also logged in order so a test
+    /// can check WHICH B-bus register each transferred byte went to.
+    writes: u64 = 0,
+    log_addr: [16]u16 = @splat(0),
+    log_val: [16]u8 = @splat(0),
+    log_n: usize = 0,
 
     fn read8(self: *ArmTestBus, addr: u24) u8 {
         return self.mem[@as(u16, @truncate(addr))];
     }
     fn write8(self: *ArmTestBus, addr: u24, value: u8) void {
+        self.writes += 1;
+        if (self.log_n < self.log_addr.len) {
+            self.log_addr[self.log_n] = @truncate(addr);
+            self.log_val[self.log_n] = value;
+            self.log_n += 1;
+        }
         self.mem[@as(u16, @truncate(addr))] = value;
     }
 };
@@ -501,4 +513,119 @@ test "hdma arming reads live registers, indirect bank only in indirect mode" {
     try std.testing.expectEqual(@as(u24, 0x00_8D00), arms[0].src);
     try std.testing.expect(arms[0].indirect_bank == null);
     try std.testing.expectEqual(@as(?u8, 0x7E), arms[1].indirect_bank);
+}
+
+fn armChannel0(dma: *Dma, control: u8, b_addr: u8, a_bank: u8, a_addr: u16, count: u16) void {
+    dma.writeReg(0x4300, control);
+    dma.writeReg(0x4301, b_addr);
+    dma.writeReg(0x4302, @truncate(a_addr));
+    dma.writeReg(0x4303, @truncate(a_addr >> 8));
+    dma.writeReg(0x4304, a_bank);
+    dma.writeReg(0x4305, @truncate(count));
+    dma.writeReg(0x4306, @truncate(count >> 8));
+}
+
+test "gdma with count 0 moves the full 64 KiB" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+    armChannel0(&dma, 0x00, 0x80, 0x7E, 0x0000, 0);
+    dma.startGpDma(&bus, 0x01);
+    try std.testing.expectEqual(@as(u64, 0x10000), bus.writes);
+    try std.testing.expectEqual(@as(u16, 0), dma.channels[0].count);
+    try std.testing.expectEqual(@as(u16, 0), dma.channels[0].a_addr); // wrapped once round
+    // Fixed cost: setup + one channel + 8 per byte.
+    try std.testing.expectEqual(@as(u64, 8 + 8 + 8 * 0x10000), bus.clock);
+}
+
+test "gdma decrement mode walks the source address downward through zero" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+    bus.mem[0x0001] = 0x11;
+    bus.mem[0x0000] = 0x22;
+    bus.mem[0xFFFF] = 0x33;
+    armChannel0(&dma, 0x10, 0x80, 0x7E, 0x0001, 3); // bits 4-3 = 10: decrement
+    dma.startGpDma(&bus, 0x01);
+    try std.testing.expectEqual(@as(usize, 3), bus.log_n);
+    try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33 }, bus.log_val[0..3]);
+    try std.testing.expectEqual(@as(u16, 0xFFFE), dma.channels[0].a_addr);
+    for (bus.log_addr[0..3]) |a| try std.testing.expectEqual(@as(u16, 0x2180), a);
+}
+
+test "gdma mode 3 repeats its 4-byte pattern across the count" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+    armChannel0(&dma, 0x03, 0x18, 0x7E, 0x1000, 6);
+    dma.startGpDma(&bus, 0x01);
+    try std.testing.expectEqual(@as(usize, 6), bus.log_n);
+    try std.testing.expectEqualSlices(u16, &.{ 0x2118, 0x2118, 0x2119, 0x2119, 0x2118, 0x2118 }, bus.log_addr[0..6]);
+}
+
+test "aBusValid guards the B-bus window and the DMA registers in system banks only" {
+    try std.testing.expect(!Dma.aBusValid(0x00_2100));
+    try std.testing.expect(!Dma.aBusValid(0x00_21FF));
+    try std.testing.expect(!Dma.aBusValid(0x00_4310));
+    try std.testing.expect(!Dma.aBusValid(0x00_420B));
+    try std.testing.expect(!Dma.aBusValid(0x00_420C));
+    try std.testing.expect(!Dma.aBusValid(0x80_2100)); // the upper mirror too
+    try std.testing.expect(!Dma.aBusValid(0x3F_4300));
+    try std.testing.expect(Dma.aBusValid(0x00_2200));
+    try std.testing.expect(Dma.aBusValid(0x00_20FF));
+    try std.testing.expect(Dma.aBusValid(0x00_4380));
+    try std.testing.expect(Dma.aBusValid(0x00_420A));
+    try std.testing.expect(Dma.aBusValid(0x7E_2100)); // WRAM, not the B-bus
+    try std.testing.expect(Dma.aBusValid(0x40_4310));
+}
+
+test "hdma repeat entry transfers every line, a plain entry once, then the table reloads" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+    // Table at $7E:3000: [$83: 3 lines, repeat] AA BB CC, [$02: 2 lines] DD, [end].
+    bus.mem[0x3000..0x3007].* = .{ 0x83, 0xAA, 0xBB, 0xCC, 0x02, 0xDD, 0x00 };
+    armChannel0(&dma, 0x00, 0x00, 0x7E, 0x3000, 0); // mode 0 -> $2100
+    dma.hdmaen = 0x01;
+    dma.hdmaInit(&bus);
+    try std.testing.expectEqual(@as(u8, 0x83), dma.channels[0].line_counter);
+    try std.testing.expectEqual(@as(u16, 0x3001), dma.channels[0].table_addr);
+
+    for (0..3) |_| dma.hdmaRunLine(&bus);
+    try std.testing.expectEqual(@as(usize, 3), bus.log_n);
+    try std.testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC }, bus.log_val[0..3]);
+    for (bus.log_addr[0..3]) |a| try std.testing.expectEqual(@as(u16, 0x2100), a);
+    // Reloaded from the next entry after the third line.
+    try std.testing.expectEqual(@as(u8, 0x02), dma.channels[0].line_counter);
+    try std.testing.expectEqual(@as(u16, 0x3005), dma.channels[0].table_addr);
+    try std.testing.expect(dma.channels[0].hdma_do_transfer);
+
+    dma.hdmaRunLine(&bus); // line 4: the plain entry's single transfer
+    try std.testing.expectEqual(@as(usize, 4), bus.log_n);
+    try std.testing.expectEqual(@as(u8, 0xDD), bus.log_val[3]);
+    try std.testing.expect(!dma.channels[0].hdma_do_transfer);
+    dma.hdmaRunLine(&bus); // line 5: held, then the $00 terminator is read
+    try std.testing.expectEqual(@as(usize, 4), bus.log_n);
+    try std.testing.expectEqual(@as(u8, 0x00), dma.channels[0].line_counter);
+    dma.hdmaRunLine(&bus); // line 6: the channel is finished for this frame
+    try std.testing.expectEqual(@as(usize, 4), bus.log_n);
+    try std.testing.expectEqual(@as(u16, 0x3007), dma.channels[0].table_addr);
+}
+
+test "loadIndirect reads the address low byte first and advances the table by two" {
+    var dma: Dma = .init;
+    var bus: ArmTestBus = .{};
+    bus.mem[0x3000] = 0x34;
+    bus.mem[0x3001] = 0x12;
+    const ch = &dma.channels[0];
+    ch.a_bank = 0x7E;
+    ch.table_addr = 0x3000;
+    dma.loadIndirect(&bus, ch);
+    try std.testing.expectEqual(@as(u16, 0x1234), ch.count);
+    try std.testing.expectEqual(@as(u16, 0x3002), ch.table_addr);
+
+    // hdmaInit does the same after the line-count byte in indirect mode.
+    bus.mem[0x4000..0x4003].* = .{ 0x05, 0x78, 0x56 };
+    armChannel0(&dma, 0x40, 0x00, 0x7E, 0x4000, 0);
+    dma.hdmaen = 0x01;
+    dma.hdmaInit(&bus);
+    try std.testing.expectEqual(@as(u8, 0x05), ch.line_counter);
+    try std.testing.expectEqual(@as(u16, 0x5678), ch.count);
+    try std.testing.expectEqual(@as(u16, 0x4003), ch.table_addr);
 }

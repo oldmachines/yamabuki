@@ -902,3 +902,69 @@ test "ppu serialize skips derived palette, postLoad rebuilds it" {
     ppu2.postLoad();
     try std.testing.expectEqual(ppu.palette[5], ppu2.palette[5]);
 }
+
+test "VMAIN address remap rotates the low bits per the documented modes" {
+    var ppu: Ppu = .init;
+    // Mode 1: aaaaaaaaYYYxxxxx -> aaaaaaaaxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (1 << 2));
+    ppu.vram_addr = 0x1234;
+    try std.testing.expectEqual(@as(u16, 0x12A1), ppu.vramTranslate());
+    // Mode 2: aaaaaaaYYYxxxxxx -> aaaaaaaxxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (2 << 2));
+    ppu.vram_addr = 0x1AB5;
+    try std.testing.expectEqual(@as(u16, 0x1BAA), ppu.vramTranslate());
+    // Mode 3: aaaaaaYYYxxxxxxx -> aaaaaaxxxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (3 << 2));
+    ppu.vram_addr = 0x1AB5;
+    try std.testing.expectEqual(@as(u16, 0x19AD), ppu.vramTranslate());
+    // Mode 0 is the identity.
+    ppu.writeReg(0x2115, 0x80);
+    try std.testing.expectEqual(@as(u16, 0x1AB5), ppu.vramTranslate());
+
+    // And a data write lands at the translated word, not the raw one.
+    ppu.writeReg(0x2115, 0x80 | (1 << 2));
+    ppu.writeReg(0x2116, 0x34);
+    ppu.writeReg(0x2117, 0x12);
+    ppu.writeReg(0x2118, 0xCD);
+    ppu.writeReg(0x2119, 0xAB);
+    try std.testing.expectEqual(@as(u16, 0xABCD), ppu.vram[0x12A1]);
+    try std.testing.expectEqual(@as(u16, 0), ppu.vram[0x1234]);
+}
+
+test "the non-designated VRAM read port returns its latch byte with no side effects" {
+    var ppu: Ppu = .init;
+    ppu.vram[0] = 0x1234;
+    ppu.vram[1] = 0x5678;
+    ppu.writeReg(0x2115, 0x80); // increment on the HIGH port
+    ppu.writeReg(0x2116, 0x00);
+    ppu.writeReg(0x2117, 0x00); // prefetches word 0 into the latch
+
+    // $2139 (low) is not the designated port: same byte every time, no step.
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+        try std.testing.expectEqual(@as(u16, 0), ppu.vram_addr);
+        try std.testing.expectEqual(@as(u16, 0x1234), ppu.vram_read_latch);
+    }
+    // $213A (high) is: it returns the latch high byte, reloads the latch from
+    // the CURRENT address, then steps — so the word just set up is served
+    // twice (the "dummy read" idiom) and the next word only on the read after.
+    try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+    try std.testing.expectEqual(@as(u16, 1), ppu.vram_addr);
+    try std.testing.expectEqual(@as(u16, 0x1234), ppu.vram_read_latch);
+    try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+    try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+    try std.testing.expectEqual(@as(u16, 2), ppu.vram_addr);
+    try std.testing.expectEqual(@as(u16, 0x5678), ppu.vram_read_latch);
+    try std.testing.expectEqual(@as(u8, 0x78), ppu.readReg(0x2139, 0));
+
+    // With the low port designated instead, the roles swap.
+    ppu.writeReg(0x2115, 0x00);
+    ppu.writeReg(0x2116, 0x00);
+    ppu.writeReg(0x2117, 0x00);
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+        try std.testing.expectEqual(@as(u16, 0), ppu.vram_addr);
+    }
+    try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+    try std.testing.expectEqual(@as(u16, 1), ppu.vram_addr);
+}

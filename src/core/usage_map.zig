@@ -790,3 +790,39 @@ test "flag semantics: latest M/X win, operands exec, writes demote code" {
     map.noteRead(0x00_0000, 2);
     try testing.expect(bytes[0xFF_FFFF] & flag_read != 0);
 }
+
+test "instruction lengths: every opcode is 1-4 bytes and only immediates depend on M/X" {
+    // The accumulator immediates (column 9, low row): M-width.
+    const m_imm = [_]u8{ 0x09, 0x29, 0x49, 0x69, 0x89, 0xA9, 0xC9, 0xE9 };
+    // The index immediates: X-width.
+    const x_imm = [_]u8{ 0xA0, 0xA2, 0xC0, 0xE0 };
+    for (0..256) |i| {
+        const op: u8 = @intCast(i);
+        const l_88 = instrLen(op, true, true);
+        const l_816 = instrLen(op, true, false);
+        const l_168 = instrLen(op, false, true);
+        const l_1616 = instrLen(op, false, false);
+        for ([_]u3{ l_88, l_816, l_168, l_1616 }) |l| {
+            try testing.expect(l >= 1);
+            try testing.expect(l <= 4);
+        }
+        if (std.mem.indexOfScalar(u8, &m_imm, op) != null) {
+            // 2 bytes with M set, 3 with M clear; X is irrelevant.
+            try testing.expectEqual(@as(u3, 2), l_88);
+            try testing.expectEqual(@as(u3, 2), l_816);
+            try testing.expectEqual(@as(u3, 3), l_168);
+            try testing.expectEqual(@as(u3, 3), l_1616);
+        } else if (std.mem.indexOfScalar(u8, &x_imm, op) != null) {
+            // 2 bytes with X set, 3 with X clear; M is irrelevant.
+            try testing.expectEqual(@as(u3, 2), l_88);
+            try testing.expectEqual(@as(u3, 3), l_816);
+            try testing.expectEqual(@as(u3, 2), l_168);
+            try testing.expectEqual(@as(u3, 3), l_1616);
+        } else {
+            // Everything else is width-independent.
+            try testing.expectEqual(l_88, l_816);
+            try testing.expectEqual(l_88, l_168);
+            try testing.expectEqual(l_88, l_1616);
+        }
+    }
+}

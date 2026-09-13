@@ -607,7 +607,7 @@ test {
 // A tiny flat-memory bus so the CPU can be unit-tested without the SST
 // vectors (which are multi-GB and gitignored). The full opcode matrix is
 // validated by `zig build test-sst`.
-const FlatBus = struct {
+pub const FlatBus = struct {
     mem: [0x1_0000]u8 = @splat(0),
     clock: u64 = 0,
 

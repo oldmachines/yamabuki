@@ -73,3 +73,22 @@ test "regionFromHeaderByte: PAL codes" {
         try std.testing.expectEqual(Region.pal, regionFromHeaderByte(b));
     }
 }
+
+test "regionFromHeaderByte: exactly the five NTSC codes over the whole byte" {
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const want: Region = switch (b) {
+            0x00, 0x01, 0x0D, 0x0F, 0x10 => .ntsc,
+            else => .pal,
+        };
+        try std.testing.expectEqual(want, regionFromHeaderByte(b));
+    }
+}
+
+test "beam arithmetic: dots x cycles per dot is the scanline, vblank follows the last visible line" {
+    try std.testing.expectEqual(cycles_per_line, @as(u64, dots_per_line) * cycles_per_dot);
+    try std.testing.expectEqual(visible_lines_224 + 1, vblank_line_224);
+    try std.testing.expectEqual(visible_lines_239 + 1, vblank_line_239);
+    try std.testing.expect(vblank_line_239 < ntsc_lines_per_frame);
+    try std.testing.expect(render_start_dot < dots_per_line);
+}

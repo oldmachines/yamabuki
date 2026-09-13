@@ -896,3 +896,123 @@ pub fn dispatch(smp: anytype) void {
         },
     }
 }
+
+// --- tests ---------------------------------------------------------------
+
+const FlatBus = spc700.FlatBus;
+const TestSmp = spc700.Smp(FlatBus);
+
+/// A core at power-on with `prog` at $0200.
+fn loadProg(bus: *FlatBus, prog: []const u8) TestSmp {
+    @memcpy(bus.mem[0x200 .. 0x200 + prog.len], prog);
+    var smp = TestSmp.init(bus);
+    smp.regs.pc = 0x200;
+    return smp;
+}
+
+test "DIV YA,X by zero takes the overflow path instead of trapping" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{0x9E}); // DIV YA,X
+    smp.setYa(0x1234);
+    smp.regs.x = 0;
+    smp.step();
+    // Y >= X and (Y & 15) >= (X & 15) both hold for X = 0.
+    try std.testing.expect(smp.getFlag(Flags.v));
+    try std.testing.expect(smp.getFlag(Flags.h));
+    // The documented overflow formula: A = 255 - (YA - (X<<9)) / (256 - X),
+    // Y = X + (YA - (X<<9)) % (256 - X).
+    try std.testing.expectEqual(@as(u8, 0xED), smp.regs.a);
+    try std.testing.expectEqual(@as(u8, 0x34), smp.regs.y);
+    try std.testing.expect(smp.getFlag(Flags.n)); // N/Z from A
+    try std.testing.expect(!smp.getFlag(Flags.z));
+}
+
+test "DIV YA,X in range: quotient in A, remainder in Y, V clear" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{0x9E});
+    smp.setYa(0x0100);
+    smp.regs.x = 0x10;
+    smp.step();
+    try std.testing.expectEqual(@as(u8, 0x10), smp.regs.a);
+    try std.testing.expectEqual(@as(u8, 0x00), smp.regs.y);
+    try std.testing.expect(!smp.getFlag(Flags.v));
+    // NOTE: H on DIV is the hardware's odd nibble compare (Y & 15) >= (X & 15),
+    // which is 1 >= 0 here — set even though the divide is exact.
+    try std.testing.expect(smp.getFlag(Flags.h));
+    try std.testing.expect(!smp.getFlag(Flags.n));
+    try std.testing.expect(!smp.getFlag(Flags.z));
+}
+
+test "MUL YA takes N and Z from Y, not from the full product" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{ 0xCF, 0xCF }); // MUL YA; MUL YA
+    smp.regs.y = 0x10;
+    smp.regs.a = 0x10;
+    smp.step();
+    try std.testing.expectEqual(@as(u16, 0x0100), smp.ya());
+    try std.testing.expect(!smp.getFlag(Flags.n));
+    try std.testing.expect(!smp.getFlag(Flags.z));
+
+    // $10 * $08 = $0080: Y is zero, so Z is set although A is not.
+    smp.regs.y = 0x10;
+    smp.regs.a = 0x08;
+    smp.step();
+    try std.testing.expectEqual(@as(u16, 0x0080), smp.ya());
+    try std.testing.expect(smp.getFlag(Flags.z));
+    try std.testing.expect(!smp.getFlag(Flags.n));
+}
+
+test "DAA and DAS decimal adjust with the carry as the tens overflow" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{ 0xDF, 0xBE }); // DAA; DAS
+    smp.regs.psw = 0; // C = 0, H = 0
+    smp.regs.a = 0x9A;
+    smp.step(); // $9A is not BCD: +$60 (carry) then +$06 -> $00
+    try std.testing.expectEqual(@as(u8, 0x00), smp.regs.a);
+    try std.testing.expect(smp.getFlag(Flags.c));
+    try std.testing.expect(smp.getFlag(Flags.z));
+
+    smp.regs.psw = 0;
+    smp.regs.a = 0x00;
+    smp.step(); // borrow (C clear) and no half carry: -$60 -$06 -> $9A
+    try std.testing.expectEqual(@as(u8, 0x9A), smp.regs.a);
+    try std.testing.expect(!smp.getFlag(Flags.c));
+    try std.testing.expect(smp.getFlag(Flags.n));
+}
+
+test "TCALL n reads its vector from $FFDE - 2n and pushes the return address" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{0x01}); // TCALL 0
+    bus.mem[0xFFDE] = 0x00;
+    bus.mem[0xFFDF] = 0x30;
+    smp.step();
+    try std.testing.expectEqual(@as(u16, 0x3000), smp.regs.pc);
+    try std.testing.expectEqual(@as(u8, 0xED), smp.regs.sp);
+    try std.testing.expectEqual(@as(u8, 0x02), bus.mem[0x1EF]); // return hi
+    try std.testing.expectEqual(@as(u8, 0x01), bus.mem[0x1EE]); // return lo
+
+    var bus15: FlatBus = .{};
+    var smp15 = loadProg(&bus15, &.{0xF1}); // TCALL 15
+    bus15.mem[0xFFC0] = 0x00;
+    bus15.mem[0xFFC1] = 0x40;
+    smp15.step();
+    try std.testing.expectEqual(@as(u16, 0x4000), smp15.regs.pc);
+}
+
+test "SET1/CLR1 decode the bit index from the opcode's top three bits" {
+    var bus: FlatBus = .{};
+    var smp = loadProg(&bus, &.{
+        0xE2, 0x50, // SET1 $50.7
+        0x02, 0x50, // SET1 $50.0
+        0x12, 0x50, // CLR1 $50.0
+        0xF2, 0x50, // CLR1 $50.7
+    });
+    smp.step();
+    try std.testing.expectEqual(@as(u8, 0x80), bus.mem[0x50]);
+    smp.step();
+    try std.testing.expectEqual(@as(u8, 0x81), bus.mem[0x50]);
+    smp.step();
+    try std.testing.expectEqual(@as(u8, 0x80), bus.mem[0x50]);
+    smp.step();
+    try std.testing.expectEqual(@as(u8, 0x00), bus.mem[0x50]);
+}

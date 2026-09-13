@@ -306,3 +306,114 @@ pub fn smallSramPtr(bus: *Bus, addr: u24) ?*u8 {
     }
     return null;
 }
+
+// --- tests ---------------------------------------------------------------
+
+const Cartridge = @import("../cart/cartridge.zig").Cartridge;
+
+/// A synthetic console: a 512 KiB image whose every byte is its own bank
+/// offset's high byte, with a header at $7FC0 (LoROM) or $FFC0 (HiROM).
+/// Mirrors bus.zig's private TestConsole.
+const TestConsole = struct {
+    cart: Cartridge,
+    bus: Bus,
+
+    fn create(mapping_mode: u8, sram_log2kb: u8) !*TestConsole {
+        const alloc = std.testing.allocator;
+        const raw = try alloc.alloc(u8, 512 * 1024);
+        defer alloc.free(raw);
+        for (raw, 0..) |*b, i| b.* = @truncate(i >> 8);
+        const hoff: u32 = if (mapping_mode & 0x01 != 0) 0xFFC0 else 0x7FC0;
+        const h = raw[hoff..][0..64];
+        @memcpy(h[0..21], "MAPPER TEST          ");
+        h[0x15] = mapping_mode;
+        h[0x16] = 0x02; // ROM + RAM + battery, no coprocessor
+        h[0x17] = 9;
+        h[0x18] = sram_log2kb;
+        std.mem.writeInt(u16, h[0x1C..0x1E], 0x0F0F, .little);
+        std.mem.writeInt(u16, h[0x1E..0x20], 0xF0F0, .little);
+        std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+
+        const tc = try alloc.create(TestConsole);
+        errdefer alloc.destroy(tc);
+        tc.cart = try Cartridge.load(alloc, raw);
+        tc.bus.init(&tc.cart);
+        return tc;
+    }
+
+    fn destroy(self: *TestConsole) void {
+        self.cart.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(self);
+    }
+};
+
+test "hirom sram window: 8 KiB chunks from bank $20 up, nothing below it" {
+    var tc = try TestConsole.create(0x21, 5); // HiROM, 32 KiB SRAM
+    defer tc.destroy();
+    const sram_base = @intFromPtr(&tc.cart.sram);
+
+    // Page 3 ($6000-$7FFF) of banks $20/$21 points at SRAM offsets 0 / $2000.
+    try std.testing.expectEqual(sram_base, @intFromPtr(tc.bus.page_read[pageIndex(0x20, 3)].?));
+    try std.testing.expectEqual(sram_base + 0x2000, @intFromPtr(tc.bus.page_read[pageIndex(0x21, 3)].?));
+    // The $A0-$BF mirror sees the same chunks.
+    try std.testing.expectEqual(sram_base, @intFromPtr(tc.bus.page_read[pageIndex(0xA0, 3)].?));
+    // Bank $1F has no SRAM page; it is left to the slow path.
+    try std.testing.expect(tc.bus.page_read[pageIndex(0x1F, 3)] == null);
+    try std.testing.expect(tc.bus.page_write[pageIndex(0x1F, 3)] == null);
+
+    // And through the bus: writes land at the expected SRAM offsets...
+    tc.bus.write8(0x20_6000, 0x5A);
+    tc.bus.write8(0x21_6000, 0xA5);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.cart.sram[0]);
+    try std.testing.expectEqual(@as(u8, 0xA5), tc.cart.sram[0x2000]);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x20_6000));
+    try std.testing.expectEqual(@as(u8, 0xA5), tc.bus.read8(0x21_6000));
+    // ...while $1F:6000 reaches nothing (open bus, SRAM untouched).
+    tc.bus.write8(0x1F_6000, 0x77);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.cart.sram[0]);
+    _ = tc.bus.read8(0x20_6000); // mdr = $5A
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x1F_6000));
+}
+
+test "smallSramPtr: a 2 KiB hirom sram mirrors through the whole $6000-$7FFF window" {
+    var tc = try TestConsole.create(0x21, 1); // HiROM, 2 KiB SRAM
+    defer tc.destroy();
+    // Too small for a page-table entry, so the slow path asks smallSramPtr.
+    try std.testing.expect(tc.bus.page_read[pageIndex(0x20, 3)] == null);
+
+    tc.bus.write8(0x20_6000, 0x5A);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.cart.sram[0]);
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x20_6800));
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x20_7000));
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0x21_6000)); // next bank wraps too
+    try std.testing.expectEqual(@as(u8, 0x5A), tc.bus.read8(0xA0_6000)); // upper mirror
+
+    try std.testing.expectEqual(@as(?*u8, &tc.cart.sram[0]), smallSramPtr(&tc.bus, 0x20_6000));
+    try std.testing.expectEqual(@as(?*u8, &tc.cart.sram[0x7FF]), smallSramPtr(&tc.bus, 0x20_67FF));
+    try std.testing.expectEqual(@as(?*u8, &tc.cart.sram[0]), smallSramPtr(&tc.bus, 0x20_6800));
+    // Outside the window: not SRAM.
+    try std.testing.expect(smallSramPtr(&tc.bus, 0x1F_6000) == null);
+    try std.testing.expect(smallSramPtr(&tc.bus, 0x20_5FFF) == null);
+    try std.testing.expect(smallSramPtr(&tc.bus, 0x20_8000) == null);
+}
+
+test "romSpeed: FastROM only speeds up the upper banks" {
+    try std.testing.expectEqual(timing.speed_slow, romSpeed(0x00, false));
+    try std.testing.expectEqual(timing.speed_slow, romSpeed(0x40, true));
+    try std.testing.expectEqual(timing.speed_slow, romSpeed(0x7F, true));
+    try std.testing.expectEqual(timing.speed_fast, romSpeed(0x80, true));
+    try std.testing.expectEqual(timing.speed_fast, romSpeed(0xC0, true));
+    try std.testing.expectEqual(timing.speed_slow, romSpeed(0xC0, false));
+
+    // The page table records the same verdict per page.
+    var tc = try TestConsole.create(0x21, 0); // HiROM: banks $40/$C0 are full ROM
+    defer tc.destroy();
+    tc.bus.fastrom = true;
+    buildPages(&tc.bus);
+    try std.testing.expectEqual(timing.speed_slow, tc.bus.page_speed[pageIndex(0x40, 0)]);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.page_speed[pageIndex(0xC0, 0)]);
+    try std.testing.expectEqual(timing.speed_slow, tc.bus.page_speed[pageIndex(0x00, 4)]);
+    try std.testing.expectEqual(timing.speed_fast, tc.bus.page_speed[pageIndex(0x80, 4)]);
+    // Both pages read the same ROM byte; only the charge differs.
+    try std.testing.expectEqual(tc.bus.read8(0x40_0000), tc.bus.read8(0xC0_0000));
+}

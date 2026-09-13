@@ -49,3 +49,35 @@ test "multiply and divide" {
     try std.testing.expectEqual(@as(u16, 0xFFFF), mu.rddiv);
     try std.testing.expectEqual(@as(u16, 1000), mu.rdmpy);
 }
+
+// --- tests ---------------------------------------------------------------
+
+test "RDDIV holds the multiplicand after a multiply" {
+    var mu: MathUnit = .init;
+    mu.wrmpya = 200;
+    mu.writeMultiplicand(100);
+    try std.testing.expectEqual(@as(u16, 100), mu.rddiv);
+    try std.testing.expectEqual(@as(u16, 20000), mu.rdmpy);
+}
+
+test "multiply saturates the 8x8 range: $FF x $FF = $FE01" {
+    var mu: MathUnit = .init;
+    mu.wrmpya = 0xFF;
+    mu.writeMultiplicand(0xFF);
+    try std.testing.expectEqual(@as(u16, 0xFE01), mu.rdmpy);
+    mu.writeMultiplicand(0x00);
+    try std.testing.expectEqual(@as(u16, 0), mu.rdmpy);
+}
+
+test "divide: $FFFF / 1 fills the quotient, and / 0 returns $FFFF with the dividend as remainder" {
+    var mu: MathUnit = .init;
+    mu.dividend = 0xFFFF;
+    mu.writeDivisor(1);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), mu.rddiv);
+    try std.testing.expectEqual(@as(u16, 0), mu.rdmpy);
+
+    mu.dividend = 0x1234;
+    mu.writeDivisor(0);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), mu.rddiv);
+    try std.testing.expectEqual(@as(u16, 0x1234), mu.rdmpy);
+}

@@ -170,3 +170,67 @@ test "garbage rom rejected" {
     junk[0xFFFD] = 0;
     try std.testing.expectError(error.NoHeader, detect(&junk));
 }
+
+/// Write a plausible header block at `off` (title, map mode, sizes, valid
+/// checksum pair, reset vector into ROM).
+fn stampHeader(rom: []u8, off: u32, map_mode: u8) void {
+    const h = rom[off..][0..64];
+    @memcpy(h[0..21], "YAMABUKI TEST        ");
+    h[0x15] = map_mode;
+    h[0x17] = 8;
+    h[0x18] = 3;
+    std.mem.writeInt(u16, h[0x1C..0x1E], 0x5AA5, .little);
+    std.mem.writeInt(u16, h[0x1E..0x20], 0xA55A, .little);
+    std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+}
+
+test "two plausible headers: the higher score wins, ties go to the first candidate" {
+    const rom = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+    stampHeader(rom, 0x7FC0, 0x20);
+    stampHeader(rom, 0xFFC0, 0x21);
+
+    // Both perfect: same score, LoROM is scanned first and keeps the lead.
+    try std.testing.expectEqual(Mapping.lorom, (try detect(rom)).mapping);
+    try std.testing.expectEqual(Mapping.lorom, (try detect(rom)).mapping);
+
+    // Break the LoROM checksum pair: HiROM now scores higher.
+    rom[0x7FC0 + 0x1E] = 0x00;
+    try std.testing.expectEqual(Mapping.hirom, (try detect(rom)).mapping);
+    try std.testing.expectEqual(@as(u32, 0xFFC0), (try detect(rom)).offset);
+
+    // Restore it and break the HiROM reset vector instead: back to LoROM.
+    rom[0x7FC0 + 0x1E] = 0x5A;
+    rom[0xFFC0 + 0x3D] = 0x00;
+    try std.testing.expectEqual(Mapping.lorom, (try detect(rom)).mapping);
+}
+
+test "a rom exactly one bank long detects hirom without reading past its end" {
+    const rom = try std.testing.allocator.alloc(u8, 0xFFC0 + 64);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+    stampHeader(rom, 0xFFC0, 0x21);
+    const h = try detect(rom);
+    try std.testing.expectEqual(Mapping.hirom, h.mapping);
+    try std.testing.expectEqual(@as(u32, 0xFFC0), h.offset);
+    try std.testing.expectEqual(@as(u16, 0x8000), h.reset_vector);
+    // One byte shorter and the HiROM candidate no longer fits.
+    try std.testing.expectError(error.NoHeader, detect(rom[0 .. rom.len - 1]));
+}
+
+test "sramBytes: zero means none, and the size code clamps at 4 MiB" {
+    var h: Header = undefined;
+    h.sram_size_log2kb = 0;
+    try std.testing.expectEqual(@as(u32, 0), h.sramBytes());
+    h.sram_size_log2kb = 1;
+    try std.testing.expectEqual(@as(u32, 2048), h.sramBytes());
+    h.sram_size_log2kb = 5;
+    try std.testing.expectEqual(@as(u32, 32 * 1024), h.sramBytes());
+    h.sram_size_log2kb = 12;
+    try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), h.sramBytes());
+    h.sram_size_log2kb = 13;
+    try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), h.sramBytes());
+    h.sram_size_log2kb = 255;
+    try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), h.sramBytes());
+}
