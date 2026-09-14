@@ -124,6 +124,15 @@ pub const audio_device_default_playback: u32 = 0xFFFF_FFFF;
 
 // SDL_events.h
 pub const event_quit: u32 = 0x100;
+/// Window lifecycle events that can leave the GL context or its objects
+/// stale: a minimize/restore round trip, a display hot-swap, or a GPU
+/// driver reset. The player re-validates the shader chain on any of them.
+pub const event_window_exposed: u32 = 0x204;
+pub const event_window_restored: u32 = 0x20B;
+pub const event_window_display_changed: u32 = 0x213;
+pub const event_render_targets_reset: u32 = 0x2000;
+pub const event_render_device_reset: u32 = 0x2001;
+pub const event_render_device_lost: u32 = 0x2002;
 pub const event_key_down: u32 = 0x300;
 pub const event_key_up: u32 = 0x301;
 pub const event_gamepad_axis_motion: u32 = 0x650;
@@ -146,6 +155,7 @@ pub const scancode = struct {
     pub const x: u32 = 27;
     pub const z: u32 = 29;
     pub const ret: u32 = 40;
+    pub const f: u32 = 9;
     pub const comma: u32 = 54;
     pub const period: u32 = 55;
     pub const escape: u32 = 41;
@@ -153,6 +163,7 @@ pub const scancode = struct {
     pub const f1: u32 = 58;
     pub const f5: u32 = 62;
     pub const f9: u32 = 66;
+    pub const f11: u32 = 68;
     pub const right: u32 = 79;
     pub const left: u32 = 80;
     pub const down: u32 = 81;
@@ -168,6 +179,7 @@ pub const Api = struct {
     SDL_GetError: *const fn () callconv(.c) [*:0]const u8,
 
     SDL_CreateWindow: *const fn (title: [*:0]const u8, w: c_int, h: c_int, flags: u64) callconv(.c) ?*Window,
+    SDL_SetWindowFullscreen: *const fn (win: *Window, fullscreen: bool) callconv(.c) bool,
     SDL_DestroyWindow: *const fn (win: *Window) callconv(.c) void,
 
     SDL_CreateRenderer: *const fn (win: *Window, name: ?[*:0]const u8) callconv(.c) ?*Renderer,

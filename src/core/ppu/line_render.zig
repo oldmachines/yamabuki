@@ -23,6 +23,7 @@ const fb_width_max = ppu_mod.fb_width_max;
 /// Compiled in only for the bench (see the `perf_counters` build option); false
 /// everywhere else, so `vread`'s increment folds away in shipping builds.
 const perf_counters = @import("perf_options").enabled;
+const diag = @import("perf_options").diagnostics;
 
 /// Read one VRAM word through the renderer's deterministic traffic counter.
 /// Every render-path VRAM fetch goes through here; the count is what
@@ -194,9 +195,11 @@ const mode_table = [8]ModeDesc{
 /// TM/TS as the renderer sees them, with any `--bg-disable` layers masked out
 /// (diagnostic only; zero when unset, so this is the register value).
 inline fn tmOf(ppu: *const Ppu) u8 {
+    if (!diag) return ppu.main_screen;
     return ppu.main_screen & ~ppu_mod.dbg_layer_disable;
 }
 inline fn tsOf(ppu: *const Ppu) u8 {
+    if (!diag) return ppu.sub_screen;
     return ppu.sub_screen & ~ppu_mod.dbg_layer_disable;
 }
 
@@ -317,23 +320,30 @@ fn fillLayers(ppu: *Ppu, line: u32, comptime md: ModeDesc, margin: u32, bgbuf: *
     fillObj(ppu, line, margin, objbuf);
 }
 
-/// The mode's priority order, honoring the mode-1 BG3-priority alternate and
-/// mode 7's EXTBG alternate.
-inline fn selectOrder(ppu: *const Ppu, comptime md: ModeDesc) []const Entry {
-    if (md.order_extbg) |ext| {
-        if (ppu.setini & 0x40 != 0) return ext;
-    }
-    return if (md.order_bg3_front) |alt|
-        (if (ppu.bg3_priority) alt else md.order)
-    else
-        md.order;
+/// Which of the mode's priority orders applies right now: 0 the mode's own,
+/// 1 the mode-1 BG3-priority alternate, 2 mode 7's EXTBG alternate. The
+/// orders themselves are comptime tables (`orderOf`), so the compositor is
+/// instantiated per order and walks it unrolled — see `resolvePixel`.
+inline fn orderSel(ppu: *const Ppu, comptime md: ModeDesc) u2 {
+    if (md.order_extbg != null and ppu.setini & 0x40 != 0) return 2;
+    if (md.order_bg3_front != null and ppu.bg3_priority) return 1;
+    return 0;
+}
+
+fn orderOf(comptime md: ModeDesc, comptime sel: u2) ?[]const Entry {
+    return switch (sel) {
+        0 => md.order,
+        1 => md.order_bg3_front,
+        2 => md.order_extbg,
+        3 => null,
+    };
 }
 
 /// Color math runs when any layer has its CGADSUB enable bit set or CGWSEL
 /// clips the main screen to black; otherwise the direct lpal path is taken
 /// and none of the math state is read.
 inline fn mathActive(ppu: *const Ppu) bool {
-    if (ppu_mod.dbg_no_color_math) return false;
+    if (diag and ppu_mod.dbg_no_color_math) return false;
     return ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
 }
 
@@ -355,7 +365,6 @@ fn renderMode(
         return;
     }
     fillLayers(ppu, line, md, margin, bgbuf, objbuf);
-    const order = selectOrder(ppu, md);
     const math = mathActive(ppu);
 
     // Windows matter when a layer is masked on the main screen ($212E TMW) or
@@ -364,10 +373,17 @@ fn renderMode(
     var winmask: [6][fb_width_max]bool = undefined;
     if (ppu.tmw != 0 or math) computeWindows(ppu, &winmask, margin, @intCast(row.len));
 
-    if (math) {
-        compositeMath(ppu, order, bgbuf, objbuf, row, &winmask, .full, .full);
-    } else {
-        composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, tmOf(ppu), .full);
+    // One compositor instantiation per priority order (at most three per
+    // mode); the order's walk is unrolled inside.
+    switch (orderSel(ppu, md)) {
+        inline 0, 1, 2 => |sel| if (comptime orderOf(md, sel)) |order| {
+            if (math) {
+                compositeMath(ppu, order, bgbuf, objbuf, row, &winmask, .full, .full);
+            } else {
+                composite(order, bgbuf, objbuf, lpal, row, &winmask, ppu.tmw, tmOf(ppu), .full);
+            }
+        } else unreachable,
+        3 => unreachable,
     }
 }
 
@@ -393,7 +409,6 @@ fn renderModeHires(
     }
     // A hi-res line never has a margin (`--wide` and hi-res don't combine).
     fillLayers(ppu, line, md, 0, bgbuf, objbuf);
-    const order = selectOrder(ppu, md);
     const math = mathActive(ppu);
 
     var winmask: [6][fb_width_max]bool = undefined;
@@ -404,12 +419,17 @@ fn renderModeHires(
 
     var main_row: [fb_width]u16 = undefined;
     var sub_row: [fb_width]u16 = undefined;
-    if (math) {
-        compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask, main_hd, sub_hd);
-    } else {
-        composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, tmOf(ppu), main_hd);
+    switch (orderSel(ppu, md)) {
+        inline 0, 1, 2 => |sel| if (comptime orderOf(md, sel)) |order| {
+            if (math) {
+                compositeMath(ppu, order, bgbuf, objbuf, &main_row, &winmask, main_hd, sub_hd);
+            } else {
+                composite(order, bgbuf, objbuf, lpal, &main_row, &winmask, ppu.tmw, tmOf(ppu), main_hd);
+            }
+            composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, tsOf(ppu), sub_hd);
+        } else unreachable,
+        3 => unreachable,
     }
-    composite(order, bgbuf, objbuf, lpal, &sub_row, &winmask, ppu.tsw, tsOf(ppu), sub_hd);
 
     for (0..fb_width) |x| {
         row[2 * x] = sub_row[x];
@@ -500,8 +520,12 @@ inline fn bgX(comptime hd: HalfDot, x: usize) usize {
 /// TS enable mask, so the same walk resolves the main and the sub screen; `tw`
 /// is the matching window mask register (TMW/TSW). `x` is the 256-basis screen
 /// pixel (windows and sprites live there); `hd` picks the BG sample column.
+///
+/// `order` is comptime: the walk is unrolled, so each entry's layer, its
+/// enable bit and its window bit are constants and the per-pixel work is a
+/// chain of predicated tests instead of a loop over a runtime slice.
 inline fn resolvePixel(
-    order: []const Entry,
+    comptime order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width_max]Cell,
     comptime hd: HalfDot,
@@ -510,15 +534,18 @@ inline fn resolvePixel(
     winmask: *const [6][fb_width_max]bool,
     tw: u8,
 ) Resolved {
-    for (order) |e| {
-        const layer: u3 = if (e.src == .bg) e.idx else 4;
-        if (screens & (@as(u8, 1) << layer) == 0) continue;
-        // A layer masked by its window is skipped here, so a lower-priority
-        // layer or the backdrop shows through. `tw` short-circuits, so
-        // `winmask` is untouched when windows are off.
-        if (tw & (@as(u8, 1) << layer) != 0 and winmask[layer][x]) continue;
-        const cell = if (e.src == .bg) bgbuf[e.idx][bgX(hd, x)] else objbuf[x];
-        if (cell.solid and cell.prio == e.prio) return .{ .abs = cell.abs, .layer = layer };
+    inline for (order) |e| {
+        const layer: u3 = comptime if (e.src == .bg) e.idx else 4;
+        const bit: u8 = comptime @as(u8, 1) << layer;
+        // A layer masked by its window is skipped, so a lower-priority layer
+        // or the backdrop shows through. `tw` short-circuits, so `winmask`
+        // is untouched when windows are off. (No `continue`: inside an
+        // unrolled loop that would be comptime control flow in a runtime
+        // branch, so the entry's whole test nests instead.)
+        if (screens & bit != 0 and !(tw & bit != 0 and winmask[layer][x])) {
+            const cell = if (e.src == .bg) bgbuf[e.idx][bgX(hd, x)] else objbuf[x];
+            if (cell.solid and cell.prio == e.prio) return .{ .abs = cell.abs, .layer = layer };
+        }
     }
     return .{ .abs = 0, .layer = 5 };
 }
@@ -527,7 +554,7 @@ inline fn resolvePixel(
 /// brightness-scaled palette entry. This is the hot path for the common
 /// no-math case; `compositeMath` below is the slower blending variant.
 fn composite(
-    order: []const Entry,
+    comptime order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width_max]Cell,
     lpal: *const [256]u16,
@@ -578,7 +605,7 @@ fn colorMath(main: u16, addend: u16, subtract: bool, half: bool) u16 {
 /// on raw 15-bit BGR, so master brightness is applied after blending.
 fn compositeMath(
     ppu: *const Ppu,
-    order: []const Entry,
+    comptime order: []const Entry,
     bgbuf: *const [4][fb_width_max]Cell,
     objbuf: *const [fb_width_max]Cell,
     row: []u16,

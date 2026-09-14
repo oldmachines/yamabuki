@@ -4,13 +4,30 @@
     .fingerprint = 0x9ab6ae596b74ea3f, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
+    // Everything build.zig reaches, and nothing it does not: the core module
+    // imports patches/*.zon, tools/wgdemo.zig is a compiled module, and the
+    // test runners live in tests/ (its surfaces/ corpus is 68 MB of
+    // recordings no build reads, so the runner files are listed one by one).
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "src",
-        "tests",
-        "bench",
-        "docs",
         "README.md",
+        "src",
+        "bench",
+        "patches/registry.zon",
+        "patches/fastrom-compat.zon",
+        "shaders/presets.conf",
+        "tools/wgdemo.zig",
+        "tools/transpile_shaders.py",
+        "tests/commercial_goldens.zon",
+        "tests/commercial_runner.zig",
+        "tests/fuzz.zig",
+        "tests/golden_hashes.zon",
+        "tests/libretro_runner.zig",
+        "tests/patchgen_runner.zig",
+        "tests/rom_runner.zig",
+        "tests/shader_validate.zig",
+        "tests/sst_65816.zig",
+        "tests/sst_spc700.zig",
     },
 }

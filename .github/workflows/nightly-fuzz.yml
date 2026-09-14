@@ -1,0 +1,28 @@
+name: Nightly fuzz
+
+# CI runs the deterministic fuzz harness with one fixed seed so a failure is
+# reproducible. That means the same random traffic every day; this sweep runs
+# fresh seeds (the run number, so they never repeat and any failure names its
+# seed in the log) with more iterations, on the Debug build where every safety
+# check is armed. A failure here is reproduced locally with
+#   zig build fuzz -Dfuzz-seed=<seed> -Dfuzz-iters=512
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+      - name: Fuzz with a fresh seed
+        run: |
+          seed=$(( ${{ github.run_number }} * 4 + ${{ matrix.lane }} ))
+          echo "seed=$seed"
+          zig build fuzz -Dfuzz-seed=$seed -Dfuzz-iters=512

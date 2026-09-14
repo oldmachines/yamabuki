@@ -97,7 +97,10 @@ const BpsAction = enum(u2) { source_read, target_read, source_copy, target_copy 
 fn bpsVarint(patch: []const u8, pos: *usize) Error!u64 {
     var data: u64 = 0;
     var shift: u64 = 1;
-    while (true) {
+    // Ten 7-bit groups cover a u64; an eleventh byte would wrap the
+    // accumulator silently, and no real patch encodes a number that wide.
+    var n: u8 = 0;
+    while (n < 10) : (n += 1) {
         if (pos.* >= patch.len) return Error.Corrupt;
         const x = patch[pos.*];
         pos.* += 1;
@@ -106,7 +109,13 @@ fn bpsVarint(patch: []const u8, pos: *usize) Error!u64 {
         shift <<= 7;
         data +%= shift;
     }
+    return Error.Corrupt;
 }
+
+/// The largest output a BPS may declare. Real SNES images top out at a few
+/// MiB; the cap exists so a corrupt or hostile size field is a `Corrupt`
+/// refusal rather than a multi-gigabyte allocation.
+pub const max_target_bytes: u64 = 64 * 1024 * 1024;
 
 fn applyBps(
     gpa: std.mem.Allocator,
@@ -138,6 +147,7 @@ fn applyBps(
     const metadata_size = try bpsVarint(patch, &pos);
     if (source_size != source.len) return Error.Corrupt;
     if (metadata_size > patch.len) return Error.Corrupt;
+    if (target_size > max_target_bytes) return Error.Corrupt;
     pos += @intCast(metadata_size);
 
     const target = try gpa.alloc(u8, @intCast(target_size));
@@ -151,7 +161,7 @@ fn applyBps(
     while (pos < actions_end) {
         const data = try bpsVarint(patch, &pos);
         const action: BpsAction = @enumFromInt(@as(u2, @truncate(data)));
-        const length: usize = @intCast((data >> 2) + 1);
+        const length = std.math.cast(usize, (data >> 2) + 1) orelse return Error.Corrupt;
         if (out + length > target.len) return Error.Corrupt;
 
         switch (action) {
@@ -167,7 +177,7 @@ fn applyBps(
             },
             .source_copy, .target_copy => {
                 const raw = try bpsVarint(patch, &pos);
-                const mag: usize = @intCast(raw >> 1);
+                const mag = std.math.cast(usize, raw >> 1) orelse return Error.Corrupt;
                 const neg = raw & 1 != 0;
                 if (action == .source_copy) {
                     src_rel = if (neg) std.math.sub(usize, src_rel, mag) catch return Error.Corrupt else src_rel + mag;
@@ -222,15 +232,29 @@ fn eqRun(source: []const u8, target: []const u8, at: usize) usize {
 /// of varint either side).
 const source_run_min = 4;
 
+/// A run copyable from earlier target output shorter than this is cheaper
+/// carried inline (a TargetCopy costs two varints).
+const target_copy_min = 8;
+
+/// The longest run at `at` that repeats the target from `from` (`from < at`;
+/// overlap allowed, which is how a fill run encodes as one copy).
+fn selfRun(target: []const u8, at: usize, from: usize) usize {
+    var n: usize = 0;
+    while (at + n < target.len and target[at + n] == target[from + n]) n += 1;
+    return n;
+}
+
 /// Encode `target` against `source` as a BPS patch, with all three CRC32s.
 ///
-/// Emits SourceRead for unchanged spans and TargetRead for everything else —
-/// no delta search. That is the optimal encoding for what the patch generator
-/// produces (a handful of in-place edits to a ROM image) and valid BPS for
-/// any input pair; a general delta encoder would only shrink patches this
-/// tool never writes. The result round-trips through `apply`, which verifies
-/// every checksum — the generator's gate does exactly that before shipping
-/// a file.
+/// Emits SourceRead for unchanged spans, TargetCopy for two shapes the
+/// generator produces in bulk — a fill run (the expansion's padding, copied
+/// from one byte behind) and the DUAL IMAGE's upper half (a copy of the
+/// lower half half an image behind, with the split's edits on top) — and
+/// TargetRead for everything else. No general delta search: that is the
+/// optimal encoding for what this tool writes (in-place edits to a ROM
+/// image, plus those two), and valid BPS for any input pair. The result
+/// round-trips through `apply`, which verifies every checksum — the
+/// generator's gate does exactly that before shipping a file.
 pub fn writeBps(
     gpa: std.mem.Allocator,
     source: []const u8,
@@ -243,23 +267,56 @@ pub fn writeBps(
     try putVarint(&p, target.len);
     try putVarint(&p, 0); // no metadata
 
+    const half = target.len / 2;
+    const Copy = struct { len: usize, from: usize };
+    const best = struct {
+        fn f(t: []const u8, at: usize, h: usize) Copy {
+            var c: Copy = .{ .len = 0, .from = 0 };
+            if (at >= h and h >= 0x10000) {
+                const n = selfRun(t, at, at - h);
+                if (n > c.len) c = .{ .len = n, .from = at - h };
+            }
+            if (at >= 1) {
+                const n = selfRun(t, at, at - 1);
+                if (n > c.len) c = .{ .len = n, .from = at - 1 };
+            }
+            return c;
+        }
+    }.f;
+    const worth = struct {
+        fn f(eq: usize, c: Copy, at: usize, end: usize) bool {
+            return (eq > 0 and (eq >= source_run_min or at + eq == end)) or c.len >= target_copy_min;
+        }
+    }.f;
+
+    var tgt_rel: usize = 0; // the TargetCopy read cursor, mirrored from the decoder
     var i: usize = 0;
     while (i < target.len) {
         const eq = eqRun(source, target, i);
-        if (eq > 0 and (eq >= source_run_min or i + eq == target.len)) {
+        const cp = best(target, i, half);
+        if (eq > 0 and (eq >= source_run_min or i + eq == target.len) and eq >= cp.len) {
             // SourceRead reads the source at the output offset — no operand.
             try putVarint(&p, ((@as(u64, eq) - 1) << 2) |
                 @intFromEnum(BpsAction.source_read));
             i += eq;
             continue;
         }
+        if (cp.len >= target_copy_min) {
+            try putVarint(&p, ((@as(u64, cp.len) - 1) << 2) |
+                @intFromEnum(BpsAction.target_copy));
+            const neg = cp.from < tgt_rel;
+            const mag: u64 = if (neg) tgt_rel - cp.from else cp.from - tgt_rel;
+            try putVarint(&p, (mag << 1) | @intFromBool(neg));
+            tgt_rel = cp.from + cp.len;
+            i += cp.len;
+            continue;
+        }
         // Changed span: swallow differing bytes and any unchanged islands too
         // small to be worth an action switch, until a real run (or the end).
-        var j = i;
+        var j = i + 1;
         while (j < target.len) {
-            const e = eqRun(source, target, j);
-            if (e > 0 and (e >= source_run_min or j + e == target.len)) break;
-            j += e + 1;
+            if (worth(eqRun(source, target, j), best(target, j, half), j, target.len)) break;
+            j += 1;
         }
         try putVarint(&p, ((@as(u64, j - i) - 1) << 2) |
             @intFromEnum(BpsAction.target_read));
@@ -330,14 +387,19 @@ fn applyIps(gpa: std.mem.Allocator, source: []const u8, patch: []const u8) Error
         pos += 3;
         const size = (@as(usize, patch[pos]) << 8) | patch[pos + 1];
         pos += 2;
+        // A record may start at or past the output end only when the
+        // truncation extension shrank the output below it (pass 1 sized the
+        // output to cover every record otherwise). Such a record is clipped
+        // — both kinds alike — never sliced from past the end.
         if (size == 0) {
             const run = (@as(usize, patch[pos]) << 8) | patch[pos + 1];
             const fill = patch[pos + 2];
             pos += 3;
-            if (off + run <= target.len) @memset(target[off..][0..run], fill);
+            const n = @min(run, target.len -| off);
+            if (n != 0) @memset(target[off..][0..n], fill);
         } else {
             const n = @min(size, target.len -| off);
-            @memcpy(target[off..][0..n], patch[pos..][0..n]);
+            if (n != 0) @memcpy(target[off..][0..n], patch[pos..][0..n]);
             pos += size;
         }
     }
@@ -484,6 +546,75 @@ test "ips: records, RLE, extension past the source, and truncation" {
     try testing.expectEqual(@as(usize, 13), got2.image.len);
 }
 
+test "ips: truncation below a record's offset clips it instead of slicing past the end" {
+    const gpa = testing.allocator;
+    const source = "AAAABBBBCCCC";
+    var mm: CrcMismatch = .{};
+
+    // Record at offset 8 and an RLE run from offset 3 to 9, then truncate
+    // the output to 5: the record starts past the end (previously a slice
+    // panic), the run straddles it (previously dropped whole).
+    var p: std.array_list.Managed(u8) = .init(gpa);
+    defer p.deinit();
+    try p.appendSlice("PATCH");
+    try p.appendSlice(&.{ 0, 0, 8, 0, 2 });
+    try p.appendSlice("XY");
+    try p.appendSlice(&.{ 0, 0, 3, 0, 0, 0, 6, '!' });
+    try p.appendSlice("EOF");
+    try p.appendSlice(&.{ 0, 0, 5 });
+
+    const got = try apply(gpa, source, p.items, &mm);
+    defer gpa.free(got.image);
+    try testing.expectEqualStrings("AAA!!", got.image);
+}
+
+test "bps: a declared target size beyond the cap is a refusal, not an allocation" {
+    const gpa = testing.allocator;
+    const source = "0123456789ABCDEF";
+    var mm: CrcMismatch = .{};
+
+    // Encode a varint the way byuu specifies (7 data bits per byte, the
+    // terminator bit on the last byte, each continuation implying +1 step).
+    const Enc = struct {
+        fn varint(list: *std.array_list.Managed(u8), v_in: u64) !void {
+            var v = v_in;
+            while (true) {
+                const x: u8 = @truncate(v & 0x7F);
+                v >>= 7;
+                if (v == 0) {
+                    try list.append(x | 0x80);
+                    return;
+                }
+                try list.append(x);
+                v -= 1;
+            }
+        }
+    };
+
+    var p: std.array_list.Managed(u8) = .init(gpa);
+    defer p.deinit();
+    try p.appendSlice("BPS1");
+    try Enc.varint(&p, source.len);
+    try Enc.varint(&p, max_target_bytes + 1); // the poison field
+    try Enc.varint(&p, 0); // no metadata
+    // Footer: source CRC (must match, it is checked before the sizes),
+    // a target CRC (never reached), and the patch CRC over the rest.
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc32(source), .little);
+    try p.appendSlice(&crc_buf);
+    try p.appendSlice(&.{ 0, 0, 0, 0 });
+    std.mem.writeInt(u32, &crc_buf, crc32(p.items), .little);
+    try p.appendSlice(&crc_buf);
+
+    try testing.expectError(Error.Corrupt, apply(gpa, source, p.items, &mm));
+
+    // An over-long varint (eleven continuation bytes) is Corrupt too, not a
+    // silently wrapped number.
+    var pos: usize = 0;
+    const eleven: [11]u8 = @splat(0x00);
+    try testing.expectError(Error.Corrupt, bpsVarint(&eleven, &pos));
+}
+
 test "writeBps round-trips through apply, fully verified" {
     const gpa = testing.allocator;
     // A ROM-like source with edits the generator would make: a changed byte
@@ -506,6 +637,35 @@ test "writeBps round-trips through apply, fully verified" {
     defer gpa.free(got.image);
     try testing.expectEqualSlices(u8, &target, got.image);
     try testing.expect(got.verified);
+}
+
+test "writeBps: a doubled image and a fill run encode as copies" {
+    const gpa = testing.allocator;
+    // 128 KiB source; target = source with two edits, 64 KiB of $FF padding,
+    // then a copy of that whole lower half with three more edits.
+    const src = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(src);
+    for (src, 0..) |*b, k| b.* = @truncate(k *% 31 + (k >> 9));
+    const lower = 192 * 1024;
+    const tgt = try gpa.alloc(u8, 2 * lower);
+    defer gpa.free(tgt);
+    @memcpy(tgt[0..src.len], src);
+    @memset(tgt[src.len..lower], 0xFF);
+    tgt[0x1000] +%= 1;
+    tgt[0x1FFFF] +%= 1;
+    @memcpy(tgt[lower..], tgt[0..lower]);
+    tgt[lower + 0x2000] +%= 1;
+    tgt[lower + 0x28000] = 0x42; // inside the copied padding
+    tgt[2 * lower - 1] = 0x24;
+    const patch = try writeBps(gpa, src, tgt);
+    defer gpa.free(patch);
+    // Not the 256 KiB a raw encoding would carry: a few dozen bytes of actions.
+    try testing.expect(patch.len < 256);
+    var mm: CrcMismatch = undefined;
+    const back = try apply(gpa, src, patch, &mm);
+    defer gpa.free(back.image);
+    try testing.expect(back.verified);
+    try testing.expectEqualSlices(u8, tgt, back.image);
 }
 
 test "writeBps: identical images encode as one SourceRead" {

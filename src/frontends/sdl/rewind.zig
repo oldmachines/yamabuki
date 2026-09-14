@@ -72,6 +72,16 @@ pub const Rewind = struct {
         self.counter = 0;
     }
 
+    /// Release the history and the two state buffers. The ring is not
+    /// usable afterwards.
+    pub fn deinit(self: *Rewind) void {
+        self.clear();
+        self.deltas.deinit(self.gpa);
+        self.gpa.free(self.latest);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
     pub fn depth(self: *const Rewind) usize {
         return self.deltas.items.len - self.head;
     }
@@ -88,7 +98,17 @@ pub const Rewind = struct {
         // new state. (`state` may alias `scratch` — read before write.)
         // An identical state still pushes its (empty) delta: every capture
         // is one step of history, whatever happened during it.
-        for (0..state.len) |i| {
+        // 32 bytes at a time: a state is ~450 KiB and this runs thirty
+        // times a second, so the scalar loop was ~13 MB/s of byte XORs.
+        const V = @Vector(32, u8);
+        var i: usize = 0;
+        while (i + 32 <= state.len) : (i += 32) {
+            const s: V = state[i..][0..32].*;
+            const l: V = self.latest[i..][0..32].*;
+            self.scratch[i..][0..32].* = s ^ l;
+            self.latest[i..][0..32].* = s;
+        }
+        while (i < state.len) : (i += 1) {
             const x = state[i] ^ self.latest[i];
             self.latest[i] = state[i];
             self.scratch[i] = x;
@@ -155,9 +175,15 @@ fn rleApply(delta: []const u8, buf: []u8) void {
     var di: usize = 0;
     var bi: usize = 0;
     while (di < delta.len) {
+        // Every delta applied here came out of `rleEncode` over a buffer of
+        // this exact size, so the records always fit. The guards make that
+        // an invariant of the codec rather than of every caller: a
+        // malformed delta stops early instead of slicing past either end.
+        if (di + 8 > delta.len) return;
         const zeros = std.mem.readInt(u32, delta[di..][0..4], .little);
         const lits = std.mem.readInt(u32, delta[di + 4 ..][0..4], .little);
         di += 8;
+        if (di + lits > delta.len or bi + zeros + lits > buf.len) return;
         bi += zeros;
         for (delta[di..][0..lits], 0..) |b, k| buf[bi + k] ^= b;
         di += lits;
@@ -203,12 +229,7 @@ test "rewind: history walks back through every pushed state" {
         .scratch = try a.alloc(u8, 64),
         .budget = 1 << 20,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var prng = std.Random.DefaultPrng.init(99);
     const rand = prng.random();
@@ -240,12 +261,7 @@ test "rewind: the budget evicts oldest history but never the newest" {
         // Small enough that a few dense deltas overflow it.
         .budget = 600,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var prng = std.Random.DefaultPrng.init(3);
     const rand = prng.random();
@@ -285,12 +301,7 @@ test "rewind: a rewound console is byte-identical to a straight run" {
     con.init(.fast, cart);
 
     var rw = try Rewind.init(a, 8 << 20);
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
     for (0..30) |_| {
         con.runFrame();
         rw.onFrame(con);
@@ -325,12 +336,7 @@ test "rewind: clear forgets history and re-anchors" {
         .scratch = try a.alloc(u8, 32),
         .budget = 1 << 16,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var s1: [32]u8 = @splat(1);
     var s2: [32]u8 = @splat(2);

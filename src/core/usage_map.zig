@@ -249,9 +249,20 @@ pub const PtrBankEvidence = struct {
     /// and rendered the room as a full-screen tile-sheet).
     hdma_tables: [max_hdma_tables]u24,
     n_hdma_tables: usize,
+    /// FIFO cursor for `addHdmaTable` once the list is full. A scrolling
+    /// HDMA effect re-arms with a SHIFTED table base every frame, so the
+    /// distinct-address family is unbounded and fills any fixed list; a
+    /// silent drop at capacity then starves every later surface (measured:
+    /// Super Metroid's Ceres-ARRIVAL $2105 table, armed 14,680 times by
+    /// the gameplay surface, lost to the attract surface's scroll-effect
+    /// churn). Overwriting the oldest instead keeps whatever still arms:
+    /// a table re-armed every frame re-enters at worst one eviction later,
+    /// and the relocation walk is idempotent, so a shifted base costs a
+    /// slot but never a wrong byte.
+    ht_cursor: usize,
 
     pub const none: u32 = 0xFFFF_FFFF;
-    pub const max_hdma_tables = 32;
+    pub const max_hdma_tables = 128;
     pub const max_proven = 256;
     pub const max_unres = 48;
     pub const max_xl = 32;
@@ -277,13 +288,18 @@ pub const PtrBankEvidence = struct {
         .n_xl = 0,
         .hdma_tables = undefined,
         .n_hdma_tables = 0,
+        .ht_cursor = 0,
     };
 
     pub fn addHdmaTable(self: *PtrBankEvidence, table: u24) void {
         for (self.hdma_tables[0..self.n_hdma_tables]) |t| if (t == table) return;
-        if (self.n_hdma_tables == max_hdma_tables) return;
-        self.hdma_tables[self.n_hdma_tables] = table;
-        self.n_hdma_tables += 1;
+        if (self.n_hdma_tables < max_hdma_tables) {
+            self.hdma_tables[self.n_hdma_tables] = table;
+            self.n_hdma_tables += 1;
+        } else {
+            self.hdma_tables[self.ht_cursor] = table;
+            self.ht_cursor = (self.ht_cursor + 1) % max_hdma_tables;
+        }
     }
 
     pub fn noteUnresolved(self: *PtrBankEvidence, pc: u24, slot: u16) void {
@@ -773,4 +789,40 @@ test "flag semantics: latest M/X win, operands exec, writes demote code" {
     // And a wrapped 16-bit read at the bottom back-marks to the top.
     map.noteRead(0x00_0000, 2);
     try testing.expect(bytes[0xFF_FFFF] & flag_read != 0);
+}
+
+test "instruction lengths: every opcode is 1-4 bytes and only immediates depend on M/X" {
+    // The accumulator immediates (column 9, low row): M-width.
+    const m_imm = [_]u8{ 0x09, 0x29, 0x49, 0x69, 0x89, 0xA9, 0xC9, 0xE9 };
+    // The index immediates: X-width.
+    const x_imm = [_]u8{ 0xA0, 0xA2, 0xC0, 0xE0 };
+    for (0..256) |i| {
+        const op: u8 = @intCast(i);
+        const l_88 = instrLen(op, true, true);
+        const l_816 = instrLen(op, true, false);
+        const l_168 = instrLen(op, false, true);
+        const l_1616 = instrLen(op, false, false);
+        for ([_]u3{ l_88, l_816, l_168, l_1616 }) |l| {
+            try testing.expect(l >= 1);
+            try testing.expect(l <= 4);
+        }
+        if (std.mem.indexOfScalar(u8, &m_imm, op) != null) {
+            // 2 bytes with M set, 3 with M clear; X is irrelevant.
+            try testing.expectEqual(@as(u3, 2), l_88);
+            try testing.expectEqual(@as(u3, 2), l_816);
+            try testing.expectEqual(@as(u3, 3), l_168);
+            try testing.expectEqual(@as(u3, 3), l_1616);
+        } else if (std.mem.indexOfScalar(u8, &x_imm, op) != null) {
+            // 2 bytes with X set, 3 with X clear; M is irrelevant.
+            try testing.expectEqual(@as(u3, 2), l_88);
+            try testing.expectEqual(@as(u3, 3), l_816);
+            try testing.expectEqual(@as(u3, 2), l_168);
+            try testing.expectEqual(@as(u3, 3), l_1616);
+        } else {
+            // Everything else is width-independent.
+            try testing.expectEqual(l_88, l_816);
+            try testing.expectEqual(l_88, l_168);
+            try testing.expectEqual(l_88, l_1616);
+        }
+    }
 }

@@ -98,7 +98,7 @@ fn fuzzPpu(gpa: std.mem.Allocator, iters: u32) !u64 {
 
         const lines: u32 = if (p.overscan()) core.timing.visible_lines_239 else core.timing.visible_lines_224;
         for (0..lines) |line| p.renderScanline(@intCast(line));
-        hash = mix(hash, core.console.hashFrame(p.frame(lines)));
+        hash = mix(hash, core.console.hashFrame(p.frameRows(lines)));
     }
     return hash;
 }

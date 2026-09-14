@@ -25,6 +25,12 @@ pub const fb_height: u32 = 239;
 /// two apart by "is it exactly 512" without carrying a separate flag.
 pub const wide_margin_max: u32 = 64;
 
+/// VRAM is 32768 words; a translated word address wraps into it.
+pub const vram_word_mask: u16 = 0x7FFF;
+/// OAM: the 512-byte low table, then the 32-byte high table.
+pub const oam_low_bytes: u16 = 0x200;
+pub const oam_last_byte: u16 = 0x21F;
+
 /// Per-background-layer configuration latched from the register file.
 pub const BgLayer = struct {
     /// Tilemap base, in VRAM words.
@@ -362,11 +368,11 @@ pub const Ppu = struct {
             },
             0x16 => { // VMADDL — hardware prefetches the read latch on VMADD writes
                 self.vram_addr = (self.vram_addr & 0xFF00) | value;
-                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+                self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             },
             0x17 => { // VMADDH — same prefetch
                 self.vram_addr = (self.vram_addr & 0x00FF) | (@as(u16, value) << 8);
-                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+                self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             },
             0x18 => self.writeVramLow(value), // VMDATAL
             0x19 => self.writeVramHigh(value), // VMDATAH
@@ -508,13 +514,13 @@ pub const Ppu = struct {
     }
 
     fn writeVramLow(self: *Ppu, value: u8) void {
-        const a = self.vramTranslate() & 0x7FFF;
+        const a = self.vramTranslate() & vram_word_mask;
         self.vram[a] = (self.vram[a] & 0xFF00) | value;
         self.vramStep(false);
     }
 
     fn writeVramHigh(self: *Ppu, value: u8) void {
-        const a = self.vramTranslate() & 0x7FFF;
+        const a = self.vramTranslate() & vram_word_mask;
         self.vram[a] = (self.vram[a] & 0x00FF) | (@as(u16, value) << 8);
         self.vramStep(true);
     }
@@ -529,7 +535,7 @@ pub const Ppu = struct {
         // fetch odd source bytes through exactly that idiom, and the Ceres
         // station tiles rendered as speckle).
         if (!self.vram_inc_high) {
-            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             self.vramStep(false);
         }
         return v;
@@ -538,7 +544,7 @@ pub const Ppu = struct {
     fn readVramHigh(self: *Ppu) u8 {
         const v: u8 = @truncate(self.vram_read_latch >> 8);
         if (self.vram_inc_high) {
-            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             self.vramStep(true);
         }
         return v;
@@ -578,7 +584,7 @@ pub const Ppu = struct {
 
     fn writeOam(self: *Ppu, value: u8) void {
         const a = self.oam_addr;
-        if (a < 0x200) {
+        if (a < oam_low_bytes) {
             // Low table: even byte is buffered, odd byte commits the pair.
             if (a & 1 == 0) {
                 self.oam_latch = value;
@@ -588,15 +594,15 @@ pub const Ppu = struct {
             }
         } else {
             // High table: written directly.
-            self.oam[a & 0x21F] = value;
+            self.oam[a & oam_last_byte] = value;
         }
-        self.oam_addr = if (a >= 0x21F) 0 else a + 1;
+        self.oam_addr = if (a >= oam_last_byte) 0 else a + 1;
     }
 
     fn readOam(self: *Ppu) u8 {
         const a = self.oam_addr;
-        const v = self.oam[a & 0x21F];
-        self.oam_addr = if (a >= 0x21F) 0 else a + 1;
+        const v = self.oam[a & oam_last_byte];
+        self.oam_addr = if (a >= oam_last_byte) 0 else a + 1;
         return v;
     }
 
@@ -677,7 +683,7 @@ pub const Ppu = struct {
     }
 
     /// Visible framebuffer for the current display height and frame width.
-    pub fn frame(self: *const Ppu, height: u32) []const u16 {
+    pub fn frameRows(self: *const Ppu, height: u32) []const u16 {
         return self.fb[0 .. self.fb_line_width * height];
     }
 };
@@ -901,4 +907,70 @@ test "ppu serialize skips derived palette, postLoad rebuilds it" {
     try std.testing.expectEqual(@as(u16, 0), ppu2.palette[5]);
     ppu2.postLoad();
     try std.testing.expectEqual(ppu.palette[5], ppu2.palette[5]);
+}
+
+test "VMAIN address remap rotates the low bits per the documented modes" {
+    var ppu: Ppu = .init;
+    // Mode 1: aaaaaaaaYYYxxxxx -> aaaaaaaaxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (1 << 2));
+    ppu.vram_addr = 0x1234;
+    try std.testing.expectEqual(@as(u16, 0x12A1), ppu.vramTranslate());
+    // Mode 2: aaaaaaaYYYxxxxxx -> aaaaaaaxxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (2 << 2));
+    ppu.vram_addr = 0x1AB5;
+    try std.testing.expectEqual(@as(u16, 0x1BAA), ppu.vramTranslate());
+    // Mode 3: aaaaaaYYYxxxxxxx -> aaaaaaxxxxxxxYYY
+    ppu.writeReg(0x2115, 0x80 | (3 << 2));
+    ppu.vram_addr = 0x1AB5;
+    try std.testing.expectEqual(@as(u16, 0x19AD), ppu.vramTranslate());
+    // Mode 0 is the identity.
+    ppu.writeReg(0x2115, 0x80);
+    try std.testing.expectEqual(@as(u16, 0x1AB5), ppu.vramTranslate());
+
+    // And a data write lands at the translated word, not the raw one.
+    ppu.writeReg(0x2115, 0x80 | (1 << 2));
+    ppu.writeReg(0x2116, 0x34);
+    ppu.writeReg(0x2117, 0x12);
+    ppu.writeReg(0x2118, 0xCD);
+    ppu.writeReg(0x2119, 0xAB);
+    try std.testing.expectEqual(@as(u16, 0xABCD), ppu.vram[0x12A1]);
+    try std.testing.expectEqual(@as(u16, 0), ppu.vram[0x1234]);
+}
+
+test "the non-designated VRAM read port returns its latch byte with no side effects" {
+    var ppu: Ppu = .init;
+    ppu.vram[0] = 0x1234;
+    ppu.vram[1] = 0x5678;
+    ppu.writeReg(0x2115, 0x80); // increment on the HIGH port
+    ppu.writeReg(0x2116, 0x00);
+    ppu.writeReg(0x2117, 0x00); // prefetches word 0 into the latch
+
+    // $2139 (low) is not the designated port: same byte every time, no step.
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+        try std.testing.expectEqual(@as(u16, 0), ppu.vram_addr);
+        try std.testing.expectEqual(@as(u16, 0x1234), ppu.vram_read_latch);
+    }
+    // $213A (high) is: it returns the latch high byte, reloads the latch from
+    // the CURRENT address, then steps — so the word just set up is served
+    // twice (the "dummy read" idiom) and the next word only on the read after.
+    try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+    try std.testing.expectEqual(@as(u16, 1), ppu.vram_addr);
+    try std.testing.expectEqual(@as(u16, 0x1234), ppu.vram_read_latch);
+    try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+    try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+    try std.testing.expectEqual(@as(u16, 2), ppu.vram_addr);
+    try std.testing.expectEqual(@as(u16, 0x5678), ppu.vram_read_latch);
+    try std.testing.expectEqual(@as(u8, 0x78), ppu.readReg(0x2139, 0));
+
+    // With the low port designated instead, the roles swap.
+    ppu.writeReg(0x2115, 0x00);
+    ppu.writeReg(0x2116, 0x00);
+    ppu.writeReg(0x2117, 0x00);
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(u8, 0x12), ppu.readReg(0x213A, 0));
+        try std.testing.expectEqual(@as(u16, 0), ppu.vram_addr);
+    }
+    try std.testing.expectEqual(@as(u8, 0x34), ppu.readReg(0x2139, 0));
+    try std.testing.expectEqual(@as(u16, 1), ppu.vram_addr);
 }

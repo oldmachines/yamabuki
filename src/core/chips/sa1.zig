@@ -27,12 +27,15 @@
 //!    count, not the exact cycle.
 
 const std = @import("std");
+/// The conversion tooling's per-access hooks, compiled in only for the
+/// headless runner and the core tests (see build.zig).
+const diag = @import("perf_options").diagnostics;
 const wdc65816 = @import("../cpu/wdc65816.zig");
 const sa1_trace = @import("../sa1_trace.zig");
 const usage_map = @import("../usage_map.zig");
 
 pub const Sa1 = struct {
-    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "bwram_hi", "bwram_hi_mask", "mmc_base", "mmc_flat", "trace", "usage" };
+    pub const serialize_skip = .{ "rom", "rom_mask", "bwram", "bwram_mask", "bwram_hi", "bwram_hi_mask", "mmc_base", "mmc_flat", "trace", "usage", "overclock" };
 
     const CpuT = wdc65816.Cpu(Sa1);
 
@@ -65,6 +68,12 @@ pub const Sa1 = struct {
     // Catch-up scheduling (master cycles banked, 2 per SA-1 cycle).
     last_sync: u64,
     budget: i64,
+    /// SA-1 overclock multiplier (1 = real): the master cycles banked per
+    /// sync are multiplied, so the SA-1 runs n times faster. A
+    /// verification REFERENCE, paired with Bus.overclock on the S-CPU: a
+    /// conversion whose CPUs are both lag-free pairs per poll with a
+    /// lag-free stock, where real timing forks on every lag difference.
+    overclock: u8,
 
     // $2200 CCNT (SNES → SA-1 control)
     sa1_irq: bool,
@@ -180,6 +189,7 @@ pub const Sa1 = struct {
         // Zero everything bytewise (the struct holds pointers, which
         // std.mem.zeroes refuses); attach() wires the pointers before use.
         @memset(std.mem.asBytes(self), 0);
+        self.overclock = 1;
         self.cpu = CpuT.init(self);
         self.sa1_resb = true; // held in reset until the SNES releases it
         self.db = 1;
@@ -227,7 +237,7 @@ pub const Sa1 = struct {
             self.last_sync = master_clock;
             return;
         }
-        self.budget += @intCast(master_clock - self.last_sync);
+        self.budget += @as(i64, @intCast(master_clock - self.last_sync)) * @as(i64, self.overclock);
         self.last_sync = master_clock;
         if (!self.running()) {
             self.budget = 0;
@@ -239,11 +249,14 @@ pub const Sa1 = struct {
                 break;
             }
             self.pollInterrupts();
-            if (self.trace) |t| {
+            // Both donors are conversion tooling (the trace and the usage
+            // map); without the diagnostics knob the two optional tests per
+            // SA-1 instruction fold away.
+            if (diag) if (self.trace) |t| {
                 const r = &self.cpu.regs;
                 t.note(@as(u24, r.pbr) << 16 | r.pc, r.c, r.x, r.y, r.d, r.dbr, r.p);
-            }
-            if (self.usage) |u| {
+            };
+            if (diag) if (self.usage) |u| {
                 const r = &self.cpu.regs;
                 // ROM-window pcs only, folded through the fast mirrors —
                 // and peeked without touching budget or MDR.
@@ -264,7 +277,7 @@ pub const Sa1 = struct {
                         self.usage = null;
                     } else u.noteInstr(pc, op, m8, x8);
                 }
-            }
+            };
             const before = self.budget;
             self.cpu.step();
             self.advanceTimer(@intCast(before - self.budget));
@@ -290,6 +303,27 @@ pub const Sa1 = struct {
     /// Advance the H/V (or linear) counters by consumed master clocks and
     /// fire the timer IRQ when a target is crossed inside the window.
     fn advanceTimer(self: *Sa1, mcycles: u32) void {
+        // Runs after EVERY SA-1 instruction. With both timer enables off —
+        // the common case; the counters are then observable only through
+        // $2312/$2313 — nothing can fire, so the counters just advance:
+        // the same arithmetic as the chunked loops below with every
+        // trigger test removed, and no loop when the line does not wrap.
+        if (!self.hen and !self.ven) {
+            self.hcounter += mcycles;
+            if (!self.hvselb) {
+                while (self.hcounter >= 1364) {
+                    self.hcounter -= 1364;
+                    self.vcounter += 1;
+                    if (self.vcounter >= 262) self.vcounter = 0;
+                }
+            } else {
+                while (self.hcounter >= 0x800) {
+                    self.hcounter -= 0x800;
+                    self.vcounter = (self.vcounter + 1) & 0x1ff;
+                }
+            }
+            return;
+        }
         if (!self.hvselb) {
             // HV mode: 1364 master clocks per line, 262 lines (NTSC frame).
             var left = mcycles;
@@ -647,6 +681,7 @@ pub const Sa1 = struct {
             0x2208 => self.civ = (self.civ & 0x00FF) | (@as(u16, value) << 8),
             0x2220 => {
                 self.cb = @truncate(value);
+                wdc65816.dbg_upper_mapped = (value & 0x07) == 4; // the split's dual image: megabyte 4 = the SA-1's copy
                 self.cbmode = value & 0x80 != 0;
                 self.mmc_dirty = true;
                 self.refreshMmc();

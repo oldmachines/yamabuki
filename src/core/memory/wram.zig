@@ -53,3 +53,30 @@ test "wram port autoincrement and wrap" {
     try std.testing.expectEqual(@as(u8, 0xBB), wram.portRead());
     try std.testing.expectEqual(@as(u17, 1), wram.port_addr);
 }
+
+// --- tests ---------------------------------------------------------------
+
+test "WMADDH keeps only bit 0 of the written byte" {
+    var wram: Wram = .init;
+    wram.setPortAddrLow(0x34);
+    wram.setPortAddrMid(0x12);
+    wram.setPortAddrHigh(0xFE);
+    try std.testing.expectEqual(@as(u17, 0x0_1234), wram.port_addr);
+    wram.setPortAddrHigh(0xFF);
+    try std.testing.expectEqual(@as(u17, 0x1_1234), wram.port_addr);
+    wram.setPortAddrHigh(0x02);
+    try std.testing.expectEqual(@as(u17, 0x0_1234), wram.port_addr);
+}
+
+test "a port read at $1FFFF returns that byte and wraps the pointer to 0" {
+    var wram: Wram = .init;
+    wram.data[0x1_FFFF] = 0x42;
+    wram.data[0] = 0x24;
+    wram.setPortAddrLow(0xFF);
+    wram.setPortAddrMid(0xFF);
+    wram.setPortAddrHigh(0x01);
+    try std.testing.expectEqual(@as(u8, 0x42), wram.portRead());
+    try std.testing.expectEqual(@as(u17, 0), wram.port_addr);
+    try std.testing.expectEqual(@as(u8, 0x24), wram.portRead());
+    try std.testing.expectEqual(@as(u17, 1), wram.port_addr);
+}

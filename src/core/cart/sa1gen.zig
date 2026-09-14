@@ -59,6 +59,244 @@ const patchgen = @import("patchgen.zig");
 const profile = @import("../profile.zig");
 const usage_map = @import("../usage_map.zig");
 
+// The rewrite is split into modules under sa1gen/; each is re-exported
+// here so this file remains the public root and every internal name keeps
+// resolving. Pure code motion — see each module's header.
+const split_mod = @import("sa1gen/split.zig");
+const offload_mod = @import("sa1gen/offload.zig");
+const window_mod = @import("sa1gen/window.zig");
+const thunks_mod = @import("sa1gen/thunks.zig");
+const demirror_mod = @import("sa1gen/demirror.zig");
+const supermetroid_mod = @import("sa1gen/supermetroid.zig");
+const coverage_mod = @import("sa1gen/coverage.zig");
+
+pub const cm_data = coverage_mod.cm_data;
+pub const cm_interior = coverage_mod.cm_interior;
+pub const cm_m8 = coverage_mod.cm_m8;
+pub const cm_m_known = coverage_mod.cm_m_known;
+pub const cm_start = coverage_mod.cm_start;
+pub const cm_wram_pointer = coverage_mod.cm_wram_pointer;
+pub const cm_x8 = coverage_mod.cm_x8;
+pub const cm_x_known = coverage_mod.cm_x_known;
+pub const codeMapAt = coverage_mod.codeMapAt;
+pub const codeMapForbids = coverage_mod.codeMapForbids;
+pub const extendCoverage = coverage_mod.extendCoverage;
+pub const demirrorQueueBankImms = demirror_mod.demirrorQueueBankImms;
+pub const demirrorTwinJsls = demirror_mod.demirrorTwinJsls;
+pub const loromFileOffset = demirror_mod.loromFileOffset;
+pub const relocateHdmaIndirect = demirror_mod.relocateHdmaIndirect;
+pub const relocateWmdataFills = demirror_mod.relocateWmdataFills;
+pub const Chosen = offload_mod.Chosen;
+pub const OffloadKind = offload_mod.OffloadKind;
+pub const PtrSpec = offload_mod.PtrSpec;
+pub const Runs = offload_mod.Runs;
+pub const asyncStubLen = offload_mod.asyncStubLen;
+pub const bwramLive = offload_mod.bwramLive;
+pub const callSites = offload_mod.callSites;
+pub const countCallSites = offload_mod.countCallSites;
+pub const dbg_walk_root = offload_mod.dbg_walk_root;
+pub const dpMoved = offload_mod.dpMoved;
+pub const dropPtr = offload_mod.dropPtr;
+pub const eligibleLeaf = offload_mod.eligibleLeaf;
+pub const eligiblePointer = offload_mod.eligiblePointer;
+pub const emitAsyncStub = offload_mod.emitAsyncStub;
+pub const emitFence = offload_mod.emitFence;
+pub const emitNbFence = offload_mod.emitNbFence;
+pub const emitPtrStub = offload_mod.emitPtrStub;
+pub const fenceLen = offload_mod.fenceLen;
+pub const fixupJmps = offload_mod.fixupJmps;
+pub const iramLive = offload_mod.iramLive;
+pub const iram_offload_limit = offload_mod.iram_offload_limit;
+pub const jslSitesInsideTree = offload_mod.jslSitesInsideTree;
+pub const mailbox = offload_mod.mailbox;
+pub const marshal_budget_den = offload_mod.marshal_budget_den;
+pub const marshal_budget_num = offload_mod.marshal_budget_num;
+pub const mvn_cycles_per_byte = offload_mod.mvn_cycles_per_byte;
+pub const namedOutside = offload_mod.namedOutside;
+pub const nb_fence_len = offload_mod.nb_fence_len;
+pub const offload_max = offload_mod.offload_max;
+pub const pageRuns = offload_mod.pageRuns;
+pub const ptrStubLen = offload_mod.ptrStubLen;
+pub const ptr_db_cap = offload_mod.ptr_db_cap;
+pub const ptr_pages_cap = offload_mod.ptr_pages_cap;
+pub const ptr_run_cap = offload_mod.ptr_run_cap;
+pub const ptr_slot_cap = offload_mod.ptr_slot_cap;
+pub const ptr_tree_cap = offload_mod.ptr_tree_cap;
+pub const ptr_tree_span_max = offload_mod.ptr_tree_span_max;
+pub const ptr_wram_long_cap = offload_mod.ptr_wram_long_cap;
+pub const put = offload_mod.put;
+pub const putJsr = offload_mod.putJsr;
+pub const putMvnRun = offload_mod.putMvnRun;
+pub const rebaseTreeJsls = offload_mod.rebaseTreeJsls;
+pub const rewriteCallSites = offload_mod.rewriteCallSites;
+pub const shadow_bank = offload_mod.shadow_bank;
+pub const shadow_linear = offload_mod.shadow_linear;
+pub const stub_id_cmp_off = offload_mod.stub_id_cmp_off;
+pub const stub_id_send_off = offload_mod.stub_id_send_off;
+pub const stub_template = offload_mod.stub_template;
+pub const tryOffload = offload_mod.tryOffload;
+pub const walkMember = offload_mod.walkMember;
+pub const Displaced = split_mod.Displaced;
+pub const MathSite = split_mod.MathSite;
+pub const emitSplit = split_mod.emitSplit;
+pub const emitSplitIo = split_mod.emitSplitIo;
+pub const emitSplitIoBanked = split_mod.emitSplitIoBanked;
+pub const emitSplitMath = split_mod.emitSplitMath;
+pub const emitSplitReaders = split_mod.emitSplitReaders;
+pub const inlineArgs = split_mod.inlineArgs;
+pub const splitAddrInImage = split_mod.splitAddrInImage;
+pub const splitFile = split_mod.splitFile;
+pub const splitPrefixSpan = split_mod.splitPrefixSpan;
+pub const splitTargeted = split_mod.splitTargeted;
+pub const splitUsage = split_mod.splitUsage;
+pub const split_args = split_mod.split_args;
+pub const split_asc_a = split_mod.split_asc_a;
+pub const split_asc_x = split_mod.split_asc_x;
+pub const split_asc_y = split_mod.split_asc_y;
+pub const split_cell_a = split_mod.split_cell_a;
+pub const split_cell_d = split_mod.split_cell_d;
+pub const split_cell_dbr = split_mod.split_cell_dbr;
+pub const split_cell_p = split_mod.split_cell_p;
+pub const split_cell_pret = split_mod.split_cell_pret;
+pub const split_cell_pw = split_mod.split_cell_pw;
+pub const split_cell_ret = split_mod.split_cell_ret;
+pub const split_cell_s = split_mod.split_cell_s;
+pub const split_cell_t = split_mod.split_cell_t;
+pub const split_cell_tb = split_mod.split_cell_tb;
+pub const split_cell_x = split_mod.split_cell_x;
+pub const split_cell_y = split_mod.split_cell_y;
+pub const split_cop_dp = split_mod.split_cop_dp;
+pub const split_ctx_a = split_mod.split_ctx_a;
+pub const split_ctx_x = split_mod.split_ctx_x;
+pub const split_ctx_y = split_mod.split_ctx_y;
+pub const split_done = split_mod.split_done;
+pub const split_engaged = split_mod.split_engaged;
+pub const split_in_replay = split_mod.split_in_replay;
+pub const split_last = split_mod.split_last;
+pub const split_m7_last = split_mod.split_m7_last;
+pub const split_m7_latch = split_mod.split_m7_latch;
+pub const split_m7_prod = split_mod.split_m7_prod;
+pub const split_m7a = split_mod.split_m7a;
+pub const split_m7b = split_mod.split_m7b;
+pub const split_math_a = split_mod.split_math_a;
+pub const split_math_div = split_mod.split_math_div;
+pub const split_math_q = split_mod.split_math_q;
+pub const split_math_r = split_mod.split_math_r;
+pub const split_ml_pump_stack = split_mod.split_ml_pump_stack;
+pub const split_ml_sa1_stack = split_mod.split_ml_sa1_stack;
+pub const split_owner = split_mod.split_owner;
+pub const split_pad_mirror = split_mod.split_pad_mirror;
+pub const split_pump_stack = split_mod.split_pump_stack;
+pub const split_ring = split_mod.split_ring;
+pub const split_ring2 = split_mod.split_ring2;
+pub const split_ring2_rd = split_mod.split_ring2_rd;
+pub const split_ring2_wr = split_mod.split_ring2_wr;
+pub const split_ring_rd = split_mod.split_ring_rd;
+pub const split_ring_wr = split_mod.split_ring_wr;
+pub const split_rpc_ack = split_mod.split_rpc_ack;
+pub const split_sa1_stack = split_mod.split_sa1_stack;
+pub const split_scr_a = split_mod.split_scr_a;
+pub const split_scr_p = split_mod.split_scr_p;
+pub const split_scr_pw = split_mod.split_scr_pw;
+pub const split_token = split_mod.split_token;
+pub const split_vbl_mirror = split_mod.split_vbl_mirror;
+pub const SmInlineDests = supermetroid_mod.SmInlineDests;
+pub const SmRoomWalk = supermetroid_mod.SmRoomWalk;
+pub const rebankSmAreaMapTable = supermetroid_mod.rebankSmAreaMapTable;
+pub const rebankSmBgRecord = supermetroid_mod.rebankSmBgRecord;
+pub const rebankSmDecompInlineDests = supermetroid_mod.rebankSmDecompInlineDests;
+pub const rebankSmEnemyHeaders = supermetroid_mod.rebankSmEnemyHeaders;
+pub const rebankSmPointerSeeds = supermetroid_mod.rebankSmPointerSeeds;
+pub const rebankSmRoomLevelPointers = supermetroid_mod.rebankSmRoomLevelPointers;
+pub const rebankSmTilesetTable = supermetroid_mod.rebankSmTilesetTable;
+pub const smConditionArgBytes = supermetroid_mod.smConditionArgBytes;
+pub const smLongIndirectUse = supermetroid_mod.smLongIndirectUse;
+pub const sm_area_map_entries = supermetroid_mod.sm_area_map_entries;
+pub const sm_area_map_lo = supermetroid_mod.sm_area_map_lo;
+pub const sm_enemy_hdr_hi = supermetroid_mod.sm_enemy_hdr_hi;
+pub const sm_enemy_hdr_lo = supermetroid_mod.sm_enemy_hdr_lo;
+pub const sm_tileset_hi = supermetroid_mod.sm_tileset_hi;
+pub const sm_tileset_lo = supermetroid_mod.sm_tileset_lo;
+pub const BigRun = thunks_mod.BigRun;
+pub const FarPad = thunks_mod.FarPad;
+pub const PadAlloc = thunks_mod.PadAlloc;
+pub const a1bThunkBody = thunks_mod.a1bThunkBody;
+pub const a1b_thunk_len = thunks_mod.a1b_thunk_len;
+pub const biggestRun = thunks_mod.biggestRun;
+pub const coldDispatcherBody = thunks_mod.coldDispatcherBody;
+pub const cold_disp_len = thunks_mod.cold_disp_len;
+pub const copy_reserve = thunks_mod.copy_reserve;
+pub const dasbThunkBody = thunks_mod.dasbThunkBody;
+pub const dasb_thunk_len = thunks_mod.dasb_thunk_len;
+pub const dbg_thunk_pad = thunks_mod.dbg_thunk_pad;
+pub const far_stub_len = thunks_mod.far_stub_len;
+pub const idxThunkBody = thunks_mod.idxThunkBody;
+pub const idxThunkBodyShort = thunks_mod.idxThunkBodyShort;
+pub const idxThunkBodyV2 = thunks_mod.idxThunkBodyV2;
+pub const idxThunkBodyWrap = thunks_mod.idxThunkBodyWrap;
+pub const idx_thunk_len = thunks_mod.idx_thunk_len;
+pub const idx_thunk_max = thunks_mod.idx_thunk_max;
+pub const idx_thunk_short_len = thunks_mod.idx_thunk_short_len;
+pub const idx_thunk_v2_len = thunks_mod.idx_thunk_v2_len;
+pub const idx_thunk_wrap_len = thunks_mod.idx_thunk_wrap_len;
+pub const longNegThunkBody = thunks_mod.longNegThunkBody;
+pub const longThunkBody = thunks_mod.longThunkBody;
+pub const longThunkBodyWrap = thunks_mod.longThunkBodyWrap;
+pub const long_neg_thunk_len = thunks_mod.long_neg_thunk_len;
+pub const long_thunk_len = thunks_mod.long_thunk_len;
+pub const long_wrap_thunk_len = thunks_mod.long_wrap_thunk_len;
+pub const padAllocFor = thunks_mod.padAllocFor;
+pub const placeThunk = thunks_mod.placeThunk;
+pub const rebankDasbWrites = thunks_mod.rebankDasbWrites;
+pub const splitThunkBody = thunks_mod.splitThunkBody;
+pub const split_disp_max = thunks_mod.split_disp_max;
+pub const split_thunk_len = thunks_mod.split_thunk_len;
+pub const split_thunk_max = thunks_mod.split_thunk_max;
+pub const win_disp_max = thunks_mod.win_disp_max;
+pub const NmiSites = window_mod.NmiSites;
+pub const WgIndex = window_mod.WgIndex;
+pub const WgSite = window_mod.WgSite;
+pub const WgSiteKind = window_mod.WgSiteKind;
+pub const WinChosen = window_mod.WinChosen;
+pub const WinSpec = window_mod.WinSpec;
+pub const dbg_win_root = window_mod.dbg_win_root;
+pub const emitWinAbort = window_mod.emitWinAbort;
+pub const emitWinAsyncStub = window_mod.emitWinAsyncStub;
+pub const emitWinBlock = window_mod.emitWinBlock;
+pub const emitWinBusyGuard = window_mod.emitWinBusyGuard;
+pub const emitWinGuard = window_mod.emitWinGuard;
+pub const emitWinStub = window_mod.emitWinStub;
+pub const emitWinVblankGuard = window_mod.emitWinVblankGuard;
+pub const emitWindowOffloads = window_mod.emitWindowOffloads;
+pub const wg_bw_window = window_mod.wg_bw_window;
+pub const wg_mailbox = window_mod.wg_mailbox;
+pub const wg_moves_max = window_mod.wg_moves_max;
+pub const wg_sites_max = window_mod.wg_sites_max;
+pub const wg_uniq_max = window_mod.wg_uniq_max;
+pub const winWalkMember = window_mod.winWalkMember;
+pub const win_abort_len = window_mod.win_abort_len;
+pub const win_async_stub_len = window_mod.win_async_stub_len;
+pub const win_block_len = window_mod.win_block_len;
+pub const win_busy_guard_len = window_mod.win_busy_guard_len;
+pub const win_guard_len = window_mod.win_guard_len;
+pub const win_nmi_off_extra = window_mod.win_nmi_off_extra;
+pub const win_nmi_thunk_len = window_mod.win_nmi_thunk_len;
+pub const win_stub_len = window_mod.win_stub_len;
+pub const win_vblank_guard_len = window_mod.win_vblank_guard_len;
+pub const win_vblank_margin_lines = window_mod.win_vblank_margin_lines;
+pub const win_watchdog_vcnt = window_mod.win_watchdog_vcnt;
+pub const windowEligible = window_mod.windowEligible;
+
+test {
+    _ = split_mod;
+    _ = offload_mod;
+    _ = window_mod;
+    _ = thunks_mod;
+    _ = demirror_mod;
+    _ = supermetroid_mod;
+    _ = coverage_mod;
+}
+
 pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 
 /// S5 — the mainline/NMI split (measured on v17: the architecture that
@@ -74,7 +312,11 @@ pub const Error = error{ OutOfMemory, NoHeader, RomTooSmall, Refused };
 /// needs to know which CPU it is on. The game's own vblank wait,
 /// reading the mirror, becomes the frame fence.
 pub const SplitIo = struct {
-    entry: u16,
+    /// 24-bit CPU address; bank $00 for the tail flavor, any code bank
+    /// for the mainloop flavor (the stub and trampoline are placed in the
+    /// entry's own bank, so its RTS-shaped return and bank-local jumps
+    /// stay sound).
+    entry: u24,
     /// A pure-writer body runs on BOTH CPUs (its MMIO writes vanish on
     /// the SA-1); a handshake body — one that READ-WAITS on an MMIO
     /// echo — would spin forever on SA-1 open bus, so post-engage the
@@ -96,14 +338,26 @@ pub const SplitSpec = struct {
     /// Each gets the enqueue prefix; its first 3 bytes must be whole
     /// instructions with no branch.
     io_entries: []const SplitIo,
-    /// Address ranges (bank $00) whose absolute reads of $4212 and
+    /// Address ranges (24-bit) whose absolute reads of $4212 and
     /// $4218-$421F swap to the I-RAM mirrors — the mainline's vblank
     /// wait and pad reads. Boot-path readers stay native.
-    vbl_ranges: []const [2]u16,
-    /// Where the split engages: the main loop's top (bank $00). Its
-    /// first 4 bytes must be whole instructions with no branch. Ignored
-    /// when `tail` is set.
-    mainloop: u16 = 0,
+    vbl_ranges: []const [2]u24,
+    /// Where the split engages: the main loop's top (24-bit, any bank).
+    /// Its first 4 to 8 bytes must be whole flow-free instructions (a
+    /// JSL is fine — it returns into the displaced copy; a JSR, branch or
+    /// jump is not); the site keeps a JML and NOP fill. Ignored when
+    /// `tail` is set.
+    mainloop: u24 = 0,
+    /// Mainloop flavor, dual image: the S-CPU instruction addresses the
+    /// split's census saw run while the upper copy was mapped (the NMI and
+    /// IRQ handlers, the IO bodies the pump replays, their callees), sorted.
+    /// A math site outside this set is the SA-1's alone in that copy and
+    /// becomes a direct I-RAM cell access — the same opcode, the cell for
+    /// the register — instead of a COP (measured: the COP handler was 65%
+    /// of a gameplay lap, the game itself 25%). Trigger stores (the
+    /// multiplier's B, the divisor, the mode-7 inputs) keep the COP: the
+    /// shadow has to compute. Empty = every site is a COP.
+    shared_sites: []const u24 = &.{},
     /// NMI-TAIL flavor (the shape Gradius III actually has: the whole
     /// engine runs inside the NMI handler). `tail` is the boundary in
     /// the handler — the vblank-timed upload cluster before it stays on
@@ -129,39 +383,20 @@ pub const SplitSpec = struct {
     /// starved the mainline's staging sweep mid-list, and the unterminated
     /// list wedged the options screen black — while the verified stages
     /// never touch those paths).
-    mode_cell: u8 = 0,
+    /// Tail flavor: a direct-page offset. Mainloop flavor: a 16-bit
+    /// low-WRAM address (read at its window home, `+$6000`, through bank
+    /// $00 — both CPUs see the same BW-RAM byte); the loop belongs to the
+    /// SA-1 while the cell holds `mode_value` and to the S-CPU otherwise,
+    /// ownership changing hands at the anchor, once per lap at most.
+    mode_cell: u16 = 0,
     mode_value: u8 = 0,
+    /// Mainloop flavor: the gate accepts the whole range `mode_value ..=
+    /// mode_hi` when `mode_hi` is nonzero — gameplay plus the door
+    /// transitions ($08-$0C on Super Metroid), where the visible slowdown
+    /// lives. Zero = the single value.
+    mode_hi: u8 = 0,
     mode_gate: bool = false,
 };
-
-/// The split's I-RAM cells, clear of the offload mailbox ($3780-$378F).
-const split_ring_wr: u16 = 0x3790; // SA-1 appends
-const split_ring_rd: u16 = 0x3791; // S-CPU drains
-const split_vbl_mirror: u16 = 0x3792; // live $4212 image
-const split_pad_mirror: u16 = 0x3794; // $4218-$421F, 8 bytes
-const split_cell_d: u16 = 0x379C; // game D at engage
-const split_cell_p: u16 = 0x379D; // game P at engage
-const split_cell_s: u16 = 0x379E; // game S at engage (16-bit)
-const split_ring: u16 = 0x37A0; // 16 ids
-const split_engaged: u16 = 0x37B0; // 0 until the S-CPU engages; the SA-1's laps through the anchor bounce off it
-const split_scr_p: u16 = 0x37B1; // deferred-skip scratch (SA-1-exclusive: interrupt-free)
-const split_scr_a: u16 = 0x37B2;
-const split_token: u16 = 0x37B3; // the S-CPU NMI increments; the SA-1 frame loop edges on it
-const split_last: u16 = 0x37B4; // the SA-1's copy of the last token it ran
-const split_done: u16 = 0x37B5;
-const split_cell_dbr: u16 = 0x37B6;
-const split_rpc_ack: u16 = 0x37B7; // bumped AFTER a replayed body returns — the RPC release (rd consumes EARLY so nested drains cannot re-enter an in-service call) // the RPC caller's DBR (one call in flight, ever) // the last token whose tail COMPLETED — the head's gate
-const split_cell_a: u16 = 0x37BC; // RPC caller A (16-bit)
-const split_cell_x: u16 = 0x37BE; // RPC caller X — $9231 takes its VRAM fill target HERE
-const split_cell_y: u16 = 0x37C0; // RPC caller Y — and its word count here
-const split_cell_t: u16 = 0x37C2; // drain scratch: the dispatch pointer, so the caller's X can be restored before the call
-const split_cell_pw: u16 = 0x37BA; // the RPC caller's P — replays must enter with the caller's M/X widths (a width-agnostic appender ran X8 and truncated its 16-bit cursor)
-const split_in_replay: u16 = 0x37BB; // nonzero while a drain's replay is in flight: a nested NMI's mini-tok must not start another (a multi-frame sample stream nested 25 bytes deeper every frame)
-const split_ring2_wr: u16 = 0x37B8; // fire-and-forget ring (sound family): slot index 0-11
-const split_ring2_rd: u16 = 0x37B9;
-const split_ring2: u16 = 0x3680; // 24 records of [id][D.lo][D.hi][pad] — bursts (a boss-area SFX barrage) lapped a 12-slot ring and the drain replayed a blank record
-const split_sa1_stack: u16 = 0x3778; // the old dispatcher stack slot, free in split mode
-const split_pump_stack: u16 = 0x37F0;
 
 pub const Reason = enum {
     coprocessor,
@@ -223,9 +458,19 @@ pub const Stats = struct {
     shim_addr: u16 = 0,
     park_addr: u16 = 0,
     rewritten_long: u32 = 0,
+    /// Sites skipped because their operand bytes carry an opcode flag (two decodes overlapping).
+    skipped_overlap: u32 = 0,
+    /// Low-WRAM pointer immediates shifted on the code map's word.
+    rewritten_map_pointers: u32 = 0,
+    /// WMDATA-port fills (DMA into $2180 at a relocated WMADD) turned into
+    /// MVN block moves into BW-RAM. See `relocateWmdataFills`.
+    rewritten_wmdata_fills: u32 = 0,
     /// Mirror-intent bank bytes re-banked for a >2 MiB image (the $80 fold
     /// is not a mirror on the Super MMC's flat map).
     rewritten_demirror: u32 = 0,
+    /// Mirror-bank `JSL`s re-banked on their de-mirrored twin's evidence,
+    /// at sites no coverage reached — see `demirrorTwinJsls`.
+    rewritten_twin_jsls: u32 = 0,
     /// Battery-SRAM sites re-banked into BW-RAM $20000+ (bank $42), offsets
     /// normalized by the chip's mirror mask.
     rewritten_sram: u32 = 0,
@@ -266,6 +511,49 @@ pub const Stats = struct {
     rewritten_hi_banks: u32 = 0,
     /// Measured $A0-$BF bank values re-banked -$80 (>2 MiB window mode).
     rewritten_a0_banks: u32 = 0,
+    /// Super Metroid room-state level-data pointer banks re-banked -$20 by
+    /// the room-graph walk (`rebankSmRoomLevelPointers`) at states no
+    /// surface loaded; the rooms/states counts are what the walk reached.
+    rewritten_room_level_banks: u32 = 0,
+    room_walk_rooms: u32 = 0,
+    room_walk_states: u32 = 0,
+    /// Non-zero when the walk refused: the $8F address that failed
+    /// validation. Nothing was rewritten.
+    room_walk_refused_at: u32 = 0,
+    /// Super Metroid tileset-table pointer banks de-mirrored by
+    /// `rebankSmTilesetTable` (the picture's tile table/GFX/palette) at
+    /// tilesets no surface loaded; `tileset_records` is the table length.
+    rewritten_tileset_banks: u32 = 0,
+    tileset_records: u32 = 0,
+    tileset_refused_at: u32 = 0,
+    /// Super Metroid enemy-header bank bytes (+$0C) de-mirrored by
+    /// `rebankSmEnemyHeaders` at species no surface met; `enemy_headers` is
+    /// how many records validated as headers.
+    rewritten_enemy_banks: u32 = 0,
+    enemy_headers: u32 = 0,
+    /// Pointer-seed immediates (see `rebankSmPointerSeeds`): sites whose
+    /// `LDA #imm / STA dp` seeds a long pointer's bank or low-WRAM
+    /// address, and the immediates rewritten (the rest were proven).
+    pointer_seed_sites: u32 = 0,
+    rewritten_pointer_seeds: u32 = 0,
+    /// Area map tilemap table (see `rebankSmAreaMapTable`): entries
+    /// validated, bank bytes de-mirrored, or the $82 address that refused.
+    area_map_entries: u32 = 0,
+    rewritten_area_map_banks: u32 = 0,
+    area_map_refused_at: u32 = 0,
+    /// Super Metroid background (library) DMA-list source banks de-mirrored
+    /// (the BG2 picture) across the records the room walk reached.
+    rewritten_bg_banks: u32 = 0,
+    bg_records: u32 = 0,
+    /// Super Metroid `JSL $80:B0FF` inline destination banks re-banked
+    /// $7E/$7F -> $40/$41 (`rebankSmDecompInlineDests`); `decomp_inline_sites`
+    /// is every such site whose destination is WRAM.
+    rewritten_decomp_inline_banks: u32 = 0,
+    decomp_inline_sites: u32 = 0,
+    /// Queue-bank immediates re-banked BY SIGNATURE (window mode): a
+    /// `LDA #imm16` staged into a dispatch queue's bank column and PLB'd
+    /// by later code — see `demirrorQueueBankImms`.
+    rewritten_queue_imms: u32 = 0,
     /// Misfit-bank DBR-pin sites patched with a translate-in thunk
     /// (window mode): the pinned bank maps -$20/-$80 at runtime, the
     /// table byte stays stock.
@@ -285,6 +573,13 @@ pub const Stats = struct {
     /// and covered hazards the audit found (WAI/STP, or an MMIO read the
     /// split leaves unhandled) — each a 24-bit CPU address, capped.
     split_mul: u8 = 0,
+    /// Mainloop flavor: math sites shadowed (uncapped).
+    split_math_sites: u32 = 0,
+    split_math_direct: u32 = 0,
+    split_inline_args: u8 = 0,
+    split_trigger_jsl: u32 = 0,
+    /// Mainloop flavor: the dual image is in effect (see emitSplit).
+    split_dual: bool = false,
     split_hazards: [8]u24 = @splat(0),
     n_split_hazards: u8 = 0,
     /// Of `split_sites`, how many dispatch on the INDEX register instead
@@ -623,11 +918,11 @@ pub fn convert(
 
 /// Worst-case shim size (with the D move): SEI + PEA/PLD + 4 stores + STZ +
 /// JMP = 1 + 4 + 20 + 3 + 3 = 31; rounded up for slack.
-const shim_len_max: u32 = 40;
-const park_len: u32 = 2;
+pub const shim_len_max: u32 = 40;
+pub const park_len: u32 = 2;
 /// The async offload's NMI prologue: save context, JSL the fence, restore,
 /// JMP the game's own handler. Carved after the park stub.
-const nmi_prologue_len: u32 = 21;
+pub const nmi_prologue_len: u32 = 21;
 
 fn emitStore(w: []u8, n: usize, reg: u16, value: u8) usize {
     w[n] = 0xA9; // LDA #value
@@ -638,7 +933,7 @@ fn emitStore(w: []u8, n: usize, reg: u16, value: u8) usize {
     return n + 5;
 }
 
-fn refuse(refusal: *?Refusal, r: Refusal) Error {
+pub fn refuse(refusal: *?Refusal, r: Refusal) Error {
     refusal.* = r;
     return error.Refused;
 }
@@ -799,1370 +1094,6 @@ fn rewrite(
     }
 }
 
-/// The I-RAM mailbox the offload handshake marshals registers through
-/// (window addresses $3780-$3786: A, X, Y 16-bit; P 8-bit at +6). The SA-1's
-/// stack is parked just below it. Plans that filled I-RAM past $3700 skip
-/// offload rather than collide.
-const mailbox: u16 = 0x3780;
-const iram_offload_limit: u32 = 0x700;
-
-/// S3b: offload the first eligible hot routine to the SA-1. Eligibility is a
-/// static walk of the routine's covered code (leaf, single RTS exit, every
-/// data access SA-1-visible after the relocation); the machinery is an
-/// S-CPU stub and an SA-1 dispatcher speaking the real CFR/SFR message
-/// nibbles, registers marshalled through the I-RAM mailbox. Executed JSR
-/// call sites are re-pointed at the stub; unseen call sites keep calling the
-/// original routine on the S-CPU, which stays correct — the routine's code
-/// is never modified.
-pub const offload_max: usize = 7;
-
-/// The pointer-offload's BW-RAM shadow: WRAM $7E:xxxx mirrors at bank $41
-/// (linear $10000+xxxx) — identity offsets, so pointer VALUES survive and
-/// only bank bytes translate. Bank $41 keeps the whole shadow inside the
-/// cart's 128 KiB BW-RAM ceiling (`cartridge.max_sram`); routines whose
-/// profiled pages touch $7F have no shadow home and stay on the S-CPU.
-/// The SA-1 runs pointer routines with D=$6000 and its BW-RAM window
-/// (CBM block 8) mapped over the shadow's first 8 KiB, so dp operands
-/// stay byte-identical too.
-const shadow_linear: u32 = 0x1_0000;
-const shadow_bank: u8 = 0x41;
-const ptr_slot_cap = 6;
-const ptr_db_cap = 4;
-const ptr_tree_cap = 8;
-const ptr_wram_long_cap = 16;
-/// Sum-of-spans budget for one tree's copies (overlapping members each
-/// carry their own copy of any shared tail, so this bounds the carve).
-const ptr_tree_span_max: u32 = 4096;
-const ptr_run_cap = 8;
-const ptr_pages_cap = 32;
-
-/// Master cycles the S-CPU's MVN spends per byte, each way. The marshal
-/// copies the working set in and out, so a page costs 2 * 256 * this.
-const mvn_cycles_per_byte: u64 = 7;
-
-/// The marshal must cost less than this fraction of what the routine
-/// actually spends computing, per call — otherwise the "offload" is a
-/// regression dressed as a conversion. Half is deliberately conservative:
-/// the SA-1 runs the work at ~2.7x the S-CPU's clock with no bus
-/// contention, so a marshal at half the routine's own cost still leaves a
-/// real win, and anything dearer is refused rather than shipped and
-/// measured later.
-const marshal_budget_num: u64 = 1;
-const marshal_budget_den: u64 = 2;
-
-/// What the pointer-eligibility walk proves about a routine.
-const PtrSpec = struct {
-    /// dp offsets of the BANK bytes of long-indirect pointers ([dp] /
-    /// [dp],y name a 24-bit pointer at dp..dp+2) — translated $7E/$7F ->
-    /// $42/$43 in the shadow before the SA-1 runs, and back after.
-    slots: [ptr_slot_cap]u8 = undefined,
-    n_slots: usize = 0,
-    /// File offsets of the $7E immediate in a LDA #$7E / PHA / PLB idiom —
-    /// rewritten to the shadow bank IN THE SA-1'S COPY of the routine so
-    /// (dp),y stores land in the shadow. The original body is never
-    /// modified: unseen S-CPU callers keep calling unchanged code.
-    db_sites: [ptr_db_cap]u32 = undefined,
-    n_db: usize = 0,
-    /// Bytes from entry to the closing RTL: the span copied for the SA-1.
-    span: u32 = 0,
-    /// The CALL TREE: members[0] is the root; the rest are bank-$00
-    /// JSL/RTL helpers the tree JSLs, each walked by the same rules and
-    /// copied alongside the root (JSL operands in the copies are rebased
-    /// member-to-member). Only the ROOT's call sites are re-pointed at a
-    /// stub — a helper's outside callers keep running the original, which
-    /// is safe for a synchronous offload because the S-CPU spins in the
-    /// stub for the whole SA-1 run. `pin` is the data bank the member
-    /// INHERITS at entry — the caller's pin at every tree JSL that
-    /// reaches it (the copy is only ever entered through those JSLs); a
-    /// disagreement between call sites sets `conflict` and refuses the
-    /// tree.
-    members: [ptr_tree_cap]struct { entry: u16, span: u32, pin: ?u8, conflict: bool } = undefined,
-    n_members: usize = 0,
-    /// Sum of the members' spans: the carve the copies need.
-    total_span: u32 = 0,
-    /// File offsets of the BANK byte of long WRAM operands ($7E:xxxx, or
-    /// the $00-$3F low mirror of it) — rewritten to the shadow bank in
-    /// the copy (identity offsets make the 16 bits carry over; a $00-$3F
-    /// mirror's low half IS $7E:0000-1FFF). On the SA-1 those addresses
-    /// are I-RAM or nothing, so without the rewrite the body reads noise.
-    wram_long_sites: [ptr_wram_long_cap]u32 = undefined,
-    n_wram_long: usize = 0,
-    /// Every helper's executed JSL sites lie inside the tree: nothing
-    /// outside can run a helper WHILE the SA-1 does — the gate async
-    /// needs (sync never overlaps, so it never cares).
-    helpers_private: bool = true,
-};
-
-/// The routine's profiled WRAM pages coalesced into marshal runs (split at
-/// the $7E/$7F boundary so each run has one MVN bank pair).
-const Runs = struct {
-    start: [ptr_run_cap]u16 = undefined, // first page index
-    len: [ptr_run_cap]u16 = undefined, // pages
-    n: usize = 0,
-};
-
-fn pageRuns(pages: profile.WramPages) ?Runs {
-    var runs: Runs = .{};
-    var total: u32 = 0;
-    var p: u16 = 0;
-    while (p < 512) : (p += 1) {
-        if (!profile.getPage(pages, p)) continue;
-        if (p >= 256) return null; // $7F has no shadow home
-        total += 1;
-        if (runs.n > 0 and runs.start[runs.n - 1] + runs.len[runs.n - 1] == p) {
-            runs.len[runs.n - 1] += 1;
-        } else {
-            if (runs.n == ptr_run_cap) return null;
-            runs.start[runs.n] = p;
-            runs.len[runs.n] = 1;
-            runs.n += 1;
-        }
-    }
-    if (total > ptr_pages_cap) return null;
-    return runs;
-}
-
-const OffloadKind = enum { leaf, ptr };
-
-const Chosen = struct {
-    entry: u16,
-    kind: OffloadKind,
-    spec: PtrSpec = .{},
-    runs: Runs = .{},
-    /// Sibling entry points inside this routine's span whose page sets
-    /// were folded into the marshal set.
-    siblings: u32 = 0,
-    /// This routine's data lives in BW-RAM permanently instead of being
-    /// marshalled: the original body's data-bank idiom is rewritten too,
-    /// so the S-CPU's own calls address the same single copy.
-    resident: bool = false,
-    /// Fire-and-forget: the S-CPU stub sends the message and returns
-    /// immediately with the caller's own registers; a fence (at the next
-    /// call, and each NMI) completes the handshake. NOTHING is copied
-    /// back — register results and dp writes are dropped; only effects on
-    /// BW-RAM-resident state survive, so resident routines only.
-    is_async: bool = false,
-    /// Where the SA-1's rewritten copy of a pointer routine landed (the
-    /// dispatcher JSLs it; the original body is never modified).
-    copy_addr: u16 = 0,
-    copy_bank: u8 = 0,
-};
-
-fn tryOffload(
-    out: []u8,
-    plan: *const profile.Plan,
-    usage: []const u8,
-    candidates: []const Candidate,
-    neighbours: []const Candidate,
-    dma_pages: profile.WramPages,
-    shim_carve: u32,
-    allow_async: bool,
-    res: *Result,
-    crv: *u16,
-) void {
-    // The offload machinery parks the SA-1 stack and mailbox in I-RAM
-    // $700-$7FF, which must not carry LIVE relocated state. A region that
-    // "moved" with zero rewritten sites is dead storage — nothing refers
-    // to its new home — and may be overlaid.
-    if (iramLive(plan, res) > iram_offload_limit) return;
-    const shadow_ok = bwramLive(plan, res) <= shadow_linear;
-    var chosen: [offload_max]Chosen = undefined;
-    var n: usize = 0;
-    for (candidates) |c| {
-        if (n == offload_max) break;
-        if (c.entry >> 16 != 0 or (c.entry & 0xFFFF) < 0x8000) continue;
-        const e: u16 = @truncate(c.entry);
-        const dup = for (chosen[0..n]) |x| {
-            if (x.entry == e) break true;
-        } else false;
-        if (dup) continue;
-        // An async offload monopolizes the mailbox: a sibling stub that
-        // sends its message while the fire-and-forget call is still in
-        // flight deadlocks the dispatcher (it holds the async done echo,
-        // awaiting an ack; the sibling overwrites the message port and
-        // spins on an echo the dispatcher will never send). Until sync
-        // stubs learn to fence first, async rides alone.
-        if (n > 0 and chosen[0].is_async) break;
-        if (eligibleLeaf(out, usage, plan, res, e)) {
-            if (countCallSites(out, usage, e, 0x20) == 0) continue;
-            chosen[n] = .{ .entry = e, .kind = .leaf };
-            n += 1;
-            continue;
-        }
-        // Pointer path: dynamic evidence (the profiled page set) + the
-        // static walk; requires the shadow banks free and D unmoved (the
-        // dispatcher swaps D to $6000 per call and back to 0).
-        if (!shadow_ok or res.stats.d_moved) continue;
-        const spec = eligiblePointer(out, usage, e) orelse continue;
-        // The marshal set is the union over every candidate whose entry
-        // lies INSIDE this routine's span: alternate entry points into one
-        // body (a resumable state machine's "start" and "continue") are
-        // separately attributed by the profiler, but they are one routine
-        // sharing one working set. Marshalling only the entry we offload
-        // ships a partial view of that state — the exact failure the
-        // auto-bisector caught on a real cart.
-        // The direct page is MANDATORY, not evidence-driven: the SA-1
-        // runs the body with D over the shadow window, so every dp
-        // operand it executes resolves into the shadow. If the dp page
-        // is not marshalled the routine runs on whatever the shadow
-        // happened to hold — which is exactly how a resumable state
-        // machine reads its own progress cursor as "already finished"
-        // and returns having done nothing. The profiled page set does
-        // not reliably carry it (a routine's dp traffic can be
-        // attributed elsewhere, and coldness is not absence), so the
-        // mechanism supplies it unconditionally.
-        var marshal_pages = c.pages;
-        var siblings: u32 = 0;
-        for ([_][]const Candidate{ candidates, neighbours }) |list| {
-            for (list) |o| {
-                if (o.entry == c.entry) continue;
-                // Inside ANY tree member: alternate entry points into the
-                // root, and the helpers themselves — the SA-1 runs their
-                // code, so their working sets ride along.
-                const in_tree = for (spec.members[0..spec.n_members]) |m| {
-                    if (o.entry >= m.entry and o.entry - m.entry < m.span) break true;
-                } else false;
-                if (!in_tree) continue;
-                for (&marshal_pages, o.pages) |*p, op| p.* |= op;
-                siblings += 1;
-            }
-        }
-        // --- persistent BW-RAM residency -------------------------------
-        // Marshalling is a copy of state that exists in two places; every
-        // copy is a chance for the two to disagree, and the window
-        // between them is exactly where an NMI can write WRAM that the
-        // copy-back then overwrites. Residency removes the copy instead
-        // of shrinking the race: the routine's data lives in BW-RAM
-        // permanently, which BOTH CPUs address identically (bank $41 at
-        // the same 16-bit offset), so there is one copy and nothing to
-        // synchronise.
-        //
-        // It is earned, not assumed. The routine must reach its data
-        // through the LDA #$7E / PHA / PLB data-bank idiom (so rewriting
-        // that one immediate re-points every access it makes, on both
-        // CPUs — the ORIGINAL body is rewritten too, which is what makes
-        // the S-CPU's own calls agree), and every page it touches must
-        // be PRIVATE to it: no other profiled routine reads or writes
-        // them, and no DMA arm names them. It is all-or-nothing, because
-        // one data bank serves every access the routine makes: a
-        // half-resident routine would send some writes to BW-RAM and
-        // leave the rest in WRAM.
-        //
-        // The direct page is never resident: the 65816's direct page is
-        // always bank $00, so the S-CPU cannot see BW-RAM through it.
-        // It stays marshalled — 256 bytes instead of kilobytes.
-        const dp_page: u16 = @intCast((c.entry_d >> 8) & 0xFF);
-        var resident = spec.n_db > 0 and !c.d_varies;
-        if (resident) {
-            var p: u16 = 0;
-            while (p < 512) : (p += 1) {
-                if (!profile.getPage(marshal_pages, p) or p == dp_page) continue;
-                if (profile.getPage(dma_pages, p)) {
-                    if (dbg_walk_root != 0 and e == dbg_walk_root)
-                        std.debug.print("[walk] {x:0>4}: page {x:0>2} feeds DMA — not resident\n", .{ e, p });
-                    resident = false;
-                    break;
-                }
-                for ([_][]const Candidate{ neighbours, candidates }) |list| {
-                    for (list) |o| {
-                        if (o.entry == c.entry) continue;
-                        // Tree members and the siblings inside them share
-                        // the body and get the same rewrite, so their
-                        // traffic is this routine's traffic.
-                        const in_tree = for (spec.members[0..spec.n_members]) |m| {
-                            if (o.entry >= m.entry and o.entry - m.entry < m.span) break true;
-                        } else false;
-                        if (in_tree) continue;
-                        if (profile.getPage(o.pages, p)) {
-                            if (dbg_walk_root != 0 and e == dbg_walk_root)
-                                std.debug.print("[walk] {x:0>4}: page {x:0>2} shared with ${x:0>6} — not resident\n", .{ e, p, o.entry });
-                            resident = false;
-                            break;
-                        }
-                    }
-                    if (!resident) break;
-                }
-                if (!resident) break;
-            }
-            // The profile says who TOUCHED these pages; the coverage map
-            // says who NAMES them. Both matter: a routine the profile
-            // never separated out, or one that reads the data once from
-            // a long operand, still breaks if the bytes move. So refuse
-            // residency when any executed instruction outside this
-            // routine's own span statically names a page we would move.
-            if (resident and namedOutside(out, usage, &spec, marshal_pages, dp_page))
-                resident = false;
-        }
-        // Resident pages are not copied: only the direct page is, and
-        // that one dynamically (the stub reads D at run time).
-        var static_pages = marshal_pages;
-        if (resident) static_pages = @splat(0);
-        const runs = pageRuns(static_pages) orelse Runs{};
-        // Economics: the marshal must be cheaper than the compute it
-        // enables. Candidates with no measured calls skip the test (the
-        // synthetic unit tests, which carry no profile).
-        if (c.calls != 0) {
-            var bytes: u64 = 0;
-            for (0..runs.n) |r| bytes += @as(u64, runs.len[r]) * 256;
-            const marshal_cost = bytes * 2 * mvn_cycles_per_byte;
-            const per_call = c.self_cycles / c.calls;
-            if (marshal_cost * marshal_budget_den > per_call * marshal_budget_num) {
-                if (dbg_walk_root != 0 and e == dbg_walk_root)
-                    std.debug.print("[walk] {x:0>4}: UNECONOMIC — marshal {} bytes ({} cycles) vs {} cycles/call\n", .{ e, bytes, marshal_cost, per_call });
-                continue;
-            }
-        }
-        if (countCallSites(out, usage, e, 0x22) == 0) {
-            if (dbg_walk_root != 0 and e == dbg_walk_root)
-                std.debug.print("[walk] {x:0>4}: no executed JSL call sites\n", .{e});
-            continue;
-        }
-        // Fire-and-forget: RESIDENT routines only — an async call keeps no
-        // write-back at all (register results and dp writes are both
-        // dropped; see emitFence), so only effects on BW-RAM-resident
-        // state can survive, and a routine without any has nothing async
-        // could deliver. FIRST and therefore alone (the monopoly guard
-        // above stops the choosing once an async is in — a sibling's
-        // un-fenced send would deadlock the dispatcher), few slots, and
-        // never when the ladder already demoted it. Whether any caller
-        // needed the dropped effects is exactly what verification
-        // arbitrates, and the mode ladder retries synchronously when it
-        // says so.
-        // A tree with a SHARED helper additionally rules out async: an
-        // outside caller would run the helper's original on the S-CPU
-        // while the SA-1 runs the copy — sync never overlaps, async is
-        // nothing but overlap.
-        const is_async = allow_async and resident and !c.no_async and spec.n_slots <= 2 and n == 0 and
-            (spec.n_members == 1 or spec.helpers_private);
-        chosen[n] = .{ .entry = e, .kind = .ptr, .spec = spec, .runs = runs, .siblings = siblings, .resident = resident, .is_async = is_async };
-        n += 1;
-    }
-    if (n == 0) return;
-
-    // Dispatcher layout (byte-exact; the emitters below mirror it):
-    //   prologue 28 | loop body 12 | id blocks (leaf 16 / ptr 25) |
-    //   JMP loop 3 | signal 19 | unmarshal 21 | marshal 24
-    // Pointer stubs are fully long-addressed and JSL-reached, so they may
-    // live in ANY bank — carved from padding past the shim region, which
-    // keeps every carve disjoint by construction. No room for them keeps
-    // the leaves and retries the sizing.
-    const ptr_area_start: u32 = shim_carve + shim_len_max + park_len;
-    var blocks_len: u32 = 0;
-    var leaf_stubs: u32 = 0;
-    var base: u32 = 0;
-    var ptr_base: u32 = 0;
-    while (true) {
-        blocks_len = 0;
-        leaf_stubs = 0;
-        var ptr_stub_len: u32 = 0;
-        for (chosen[0..n]) |c| switch (c.kind) {
-            .leaf => {
-                blocks_len += 16;
-                leaf_stubs += 1;
-            },
-            .ptr => {
-                blocks_len += 33;
-                ptr_stub_len += if (c.is_async)
-                    fenceLen(c.spec) + asyncStubLen(c.spec) + c.spec.total_span
-                else
-                    ptrStubLen(c.spec, c.runs) + c.spec.total_span;
-            },
-        };
-        const dl: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
-        base = patchgen.findFreeSpace(out[0..shim_carve], leaf_stubs * @as(u32, stub_template.len) + dl) orelse return;
-        if (ptr_stub_len == 0) break;
-        if (patchgen.findFreeSpace(out[ptr_area_start..], ptr_stub_len)) |off| {
-            ptr_base = ptr_area_start + off;
-            // Stubs and body copies execute in place: the allocation must
-            // not straddle a 32 KiB bank boundary (PC wraps inside a bank).
-            if ((ptr_base % 0x8000) + ptr_stub_len <= 0x8000) break;
-        }
-        dropPtr(&chosen, &n);
-        if (n == 0) return;
-    }
-    const disp_len: u32 = 28 + 12 + blocks_len + 3 + 19 + 21 + 24;
-
-    const disp_addr: u16 = 0x8000 + @as(u16, @intCast(base)) +
-        @as(u16, @intCast(leaf_stubs * stub_template.len));
-    const loop_addr: u16 = disp_addr + 28;
-    const sig_addr: u16 = disp_addr + @as(u16, @intCast(28 + 12 + blocks_len + 3));
-    const unm_addr: u16 = sig_addr + 19;
-    const mar_addr: u16 = unm_addr + 21;
-    const dp_base: u16 = if (res.stats.d_moved) 0x3000 else 0;
-
-    // Stubs (and, for pointer routines, the SA-1's rewritten body copy)
-    // plus their call-site rewrites.
-    var leaf_i: u32 = 0;
-    var ptr_cur: u32 = ptr_base;
-    for (chosen[0..n], 0..) |*c, i| {
-        const id: u8 = @intCast(i + 1);
-        switch (c.kind) {
-            .leaf => {
-                var stub = stub_template;
-                stub[stub_id_send_off] = id;
-                stub[stub_id_cmp_off] = id;
-                @memcpy(out[base + leaf_i * stub_template.len ..][0..stub_template.len], &stub);
-                const stub_addr: u16 = 0x8000 + @as(u16, @intCast(base + leaf_i * stub_template.len));
-                leaf_i += 1;
-                res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x20, stub_addr, 0);
-            },
-            .ptr => {
-                // The async variant carves its fence first, so the stub can
-                // JSL it by the address just decided.
-                if (c.is_async) {
-                    const fence_file = ptr_cur;
-                    const flen = emitFence(out[fence_file..], c.spec);
-                    std.debug.assert(flen == fenceLen(c.spec));
-                    ptr_cur += flen;
-                    res.stats.async_entry = c.entry;
-                    res.stats.async_fence = @as(u24, @intCast(fence_file / 0x8000)) << 16 |
-                        @as(u24, @intCast(0x8000 + (fence_file % 0x8000)));
-                }
-                const stub_file = ptr_cur;
-                const emitted = if (c.is_async)
-                    emitAsyncStub(out[stub_file..], res.stats.async_fence, id, c.entry, c.spec)
-                else
-                    emitPtrStub(out[stub_file..], id, c.entry, c.spec, c.runs);
-                std.debug.assert(emitted == if (c.is_async) asyncStubLen(c.spec) else ptrStubLen(c.spec, c.runs));
-                ptr_cur += emitted;
-                // The SA-1's copies of the TREE, immediately after the
-                // stub — the root first, so the dispatcher's JSL lands on
-                // it. In each copy the DB idiom's and the long-WRAM
-                // operands' bank bytes become the shadow bank, intra-
-                // member JMP targets are re-based, and member-to-member
-                // JSLs are re-pointed at the copies. The ORIGINAL bodies
-                // stay untouched for unseen S-CPU callers.
-                const copy_file = ptr_cur;
-                var member_copy: [ptr_tree_cap]u32 = undefined;
-                for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
-                    member_copy[mi] = ptr_cur;
-                    @memcpy(out[ptr_cur..][0..m.span], out[m.entry - 0x8000 ..][0..m.span]);
-                    ptr_cur += m.span;
-                }
-                for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
-                    const m_file: u32 = m.entry - 0x8000;
-                    for (c.spec.db_sites[0..c.spec.n_db]) |site| {
-                        if (site < m_file or site - m_file >= m.span) continue;
-                        std.debug.assert(out[member_copy[mi] + (site - m_file)] == 0x7E);
-                        out[member_copy[mi] + (site - m_file)] = shadow_bank;
-                        // Residency: the ORIGINAL body's data bank moves
-                        // too, so the S-CPU's own calls — including the
-                        // sibling entry points that were never re-pointed
-                        // — address the one BW-RAM copy rather than a
-                        // stale WRAM one. That is the whole difference
-                        // between residency and marshalling: one copy,
-                        // nothing to synchronise. (Idempotent: a site
-                        // shared by overlapping members rewrites once.)
-                        if (c.resident and out[site] == 0x7E) out[site] = shadow_bank;
-                    }
-                    for (c.spec.wram_long_sites[0..c.spec.n_wram_long]) |site| {
-                        if (site < m_file or site - m_file >= m.span) continue;
-                        out[member_copy[mi] + (site - m_file)] = shadow_bank;
-                        if (c.resident and (out[site] == 0x7E or (out[site] & 0x7F) <= 0x3F))
-                            out[site] = shadow_bank;
-                    }
-                    fixupJmps(out, usage, m.entry, m.span, member_copy[mi], @intCast(0x8000 + (member_copy[mi] % 0x8000)));
-                    rebaseTreeJsls(out, usage, &c.spec, m.entry, m.span, member_copy[mi], &member_copy);
-                }
-                if (c.resident) res.stats.resident_offloads += 1;
-                c.copy_bank = @intCast(copy_file / 0x8000);
-                c.copy_addr = @intCast(0x8000 + (copy_file % 0x8000));
-                res.stats.offload_copy[i] = @as(u24, c.copy_bank) << 16 | c.copy_addr;
-                res.stats.offload_copy_len[i] = c.spec.total_span;
-                const stub_bank: u8 = @intCast(stub_file / 0x8000);
-                const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
-                res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
-                res.stats.pointer_offloads += 1;
-                res.stats.marshal_siblings += c.siblings;
-                for (0..c.runs.n) |r| res.stats.marshal_bytes += @as(u32, c.runs.len[r]) * 256 * 2;
-            },
-        }
-    }
-
-    // The dispatcher, emitted around the computed addresses.
-    const d = out[base + leaf_stubs * @as(u32, stub_template.len) ..];
-    var cur: usize = 0;
-    // Prologue: gates, the shadow window (CBM block 16 = linear $20000,
-    // the $7E shadow's first 8 KiB, for pointer routines' dp), native
-    // mode, stack under the mailbox, D.
-    put(d, &cur, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0xA9, 0x08, 0x8D, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
-    // loop: wait for a nonzero message, park its id at $3787.
-    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
-    for (chosen[0..n], 0..) |c, i| {
-        const id: u8 = @intCast(i + 1);
-        switch (c.kind) {
-            // CMP #id / BNE +12 / JSR unm / JSR entry / JSR mar / JMP sig.
-            .leaf => {
-                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x0C });
-                putJsr(d, &cur, unm_addr);
-                putJsr(d, &cur, c.entry);
-                putJsr(d, &cur, mar_addr);
-                put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
-            },
-            // Pointer block: same shape with D swapped to $6000 around a
-            // JSL of the SA-1's body copy (which returns RTL), then back
-            // to the base D.
-            .ptr => {
-                put(d, &cur, &.{ 0xC9, id, 0xD0, 0x1D });
-                // D = $6000 + the caller's own D, so every dp operand in
-                // the body lands on that page's mirror in the shadow.
-                // Set before the unmarshal, whose PLP restores the entry
-                // widths last.
-                // SEP #$20 again before the unmarshal: it assembles B:A
-                // bytewise and pairs PHA with PLP, so it must run 8-bit.
-                put(d, &cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x18, 0x69, 0x00, 0x60, 0x5B, 0xE2, 0x20 });
-                putJsr(d, &cur, unm_addr);
-                put(d, &cur, &.{ 0x22, @truncate(c.copy_addr), @truncate(c.copy_addr >> 8), c.copy_bank });
-                put(d, &cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
-                putJsr(d, &cur, mar_addr);
-                put(d, &cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
-            },
-        }
-    }
-    // Unknown id: back to the loop.
-    put(d, &cur, &.{ 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
-    // sig: echo the id as the done message, await the ack, clear, loop.
-    put(d, &cur, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x09, 0x22, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xD0, 0xF9, 0x9C, 0x09, 0x22, 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
-    // unm: caller P staged, registers in, PLP last (sets the entry widths).
-    put(d, &cur, &.{ 0xAD, 0x86, 0x37, 0x48, 0xAD, 0x81, 0x37, 0xEB, 0xAD, 0x80, 0x37, 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37, 0x28, 0x60 });
-    // mar: exit P captured first, registers out.
-    put(d, &cur, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
-    std.debug.assert(cur == disp_len);
-
-    res.stats.offloaded = chosen[0].entry;
-    res.stats.offload_count = @intCast(n);
-    for (chosen[0..n], 0..) |c, i| {
-        res.stats.offload_entries[i] = c.entry;
-        if (c.kind == .ptr) res.stats.offload_ptr_mask |= @as(u8, 1) << @intCast(i);
-    }
-    crv.* = disp_addr;
-}
-
-/// Highest I-RAM byte carrying LIVE relocated state (a clean region with at
-/// least one rewritten site, or the moved dp window).
-fn iramLive(plan: *const profile.Plan, res: *const Result) u32 {
-    var live: u32 = 0;
-    for (plan.regions[0..plan.n], 0..) |r, ri| {
-        if (res.fate[ri] != .clean or r.dest != .iram) continue;
-        if (res.region_sites[ri] == 0 and !(r.dp and res.stats.d_moved)) continue;
-        live = @max(live, r.dest_off + r.len);
-    }
-    return live;
-}
-
-/// Highest BW-RAM byte carrying live relocated state, for the shadow guard.
-fn bwramLive(plan: *const profile.Plan, res: *const Result) u32 {
-    var live: u32 = 0;
-    for (plan.regions[0..plan.n], 0..) |r, ri| {
-        if (res.fate[ri] != .clean or r.dest != .bwram) continue;
-        if (res.region_sites[ri] == 0) continue;
-        live = @max(live, r.dest_off + r.len);
-    }
-    return live;
-}
-
-/// Does any executed instruction OUTSIDE [entry, entry+span) statically
-/// name a byte of `pages` (excluding the direct page, which never becomes
-/// resident)? Long and low-mirror-absolute operands are the forms that
-/// name WRAM without depending on a runtime register, so they are exactly
-/// the references that would break if the bytes moved to BW-RAM.
-fn namedOutside(
-    out: []const u8,
-    usage: []const u8,
-    spec: *const PtrSpec,
-    pages: profile.WramPages,
-    dp_page: u16,
-) bool {
-    var bank: u32 = 0;
-    while (bank < 0x40) : (bank += 1) {
-        const bank_file = bank * 0x8000;
-        if (bank_file >= out.len) break;
-        var a16: u32 = 0x8000;
-        while (a16 < 0x10000) : (a16 += 1) {
-            const cpu_addr = (bank << 16) | a16;
-            const fl = usage[cpu_addr] | usage[0x80_0000 | cpu_addr];
-            if (fl & usage_map.flag_opcode == 0) continue;
-            // Inside the tree's own bodies: their accesses are the ones
-            // the data-bank rewrite re-points.
-            if (bank == 0) {
-                const in_tree = for (spec.members[0..spec.n_members]) |m| {
-                    if (a16 >= m.entry and a16 - m.entry < m.span) break true;
-                } else false;
-                if (in_tree) continue;
-            }
-            const file = bank_file + (a16 - 0x8000);
-            if (file + 4 > out.len) continue;
-            const op = out[file];
-            const wram_off: u32 = switch (usage_map.mode(op)) {
-                .abs, .abs_x, .abs_y => blk: {
-                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                    if (v >= 0x2000) continue;
-                    break :blk v;
-                },
-                .long, .long_x => blk: {
-                    const b = out[file + 3];
-                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                    if (b == 0x7E) break :blk v;
-                    if (b == 0x7F) break :blk 0x10000 + @as(u32, v);
-                    if ((b & 0x7F) <= 0x3F and v < 0x2000) break :blk v;
-                    continue;
-                },
-                else => continue,
-            };
-            const pg: u16 = @intCast(wram_off >> 8);
-            if (pg != dp_page and profile.getPage(pages, pg)) return true;
-        }
-    }
-    return false;
-}
-
-/// Re-base intra-span JMP abs targets in a pointer routine's copy. All
-/// other flow in the span is relative (branches, BRL) and relocates for
-/// free; the eligibility walk refused everything else.
-fn fixupJmps(out: []u8, usage: []const u8, entry: u16, span: u32, copy_file: u32, copy_addr: u16) void {
-    var pc: u32 = entry;
-    while (pc - entry < span) {
-        if (usage[pc] & usage_map.flag_opcode == 0) {
-            pc += 1;
-            continue;
-        }
-        const file = pc - 0x8000;
-        const op = out[file];
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        if (op == 0x4C) {
-            const t = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            const rebased: u16 = copy_addr + (t - entry);
-            std.mem.writeInt(u16, out[copy_file + (pc - entry) + 1 ..][0..2], rebased, .little);
-        }
-        pc += usage_map.instrLen(op, m8, x8);
-    }
-}
-
-/// Re-point member-to-member JSLs inside one member's COPY at the other
-/// members' copies. The eligibility walk proved every JSL in the span
-/// targets a tree member, so this scan is exhaustive by construction.
-fn rebaseTreeJsls(
-    out: []u8,
-    usage: []const u8,
-    spec: *const PtrSpec,
-    entry: u16,
-    span: u32,
-    copy_file: u32,
-    member_copy: *const [ptr_tree_cap]u32,
-) void {
-    var pc: u32 = entry;
-    while (pc - entry < span) {
-        if (usage[pc] & usage_map.flag_opcode == 0) {
-            pc += 1;
-            continue;
-        }
-        const file = pc - 0x8000;
-        const op = out[file];
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        if (op == 0x22 and out[file + 3] == 0x00) {
-            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            for (spec.members[0..spec.n_members], 0..) |m, mj| {
-                if (m.entry != tgt) continue;
-                const dst = copy_file + (pc - entry);
-                std.mem.writeInt(u16, out[dst + 1 ..][0..2], @intCast(0x8000 + (member_copy[mj] % 0x8000)), .little);
-                out[dst + 3] = @intCast(member_copy[mj] / 0x8000);
-                break;
-            }
-        }
-        pc += usage_map.instrLen(op, m8, x8);
-    }
-}
-
-fn dropPtr(chosen: *[offload_max]Chosen, n: *usize) void {
-    var w: usize = 0;
-    for (chosen[0..n.*]) |c| {
-        if (c.kind == .leaf) {
-            chosen[w] = c;
-            w += 1;
-        }
-    }
-    n.* = w;
-}
-
-fn put(d: []u8, cur: *usize, bytes: []const u8) void {
-    @memcpy(d[cur.*..][0..bytes.len], bytes);
-    cur.* += bytes.len;
-}
-
-fn putJsr(d: []u8, cur: *usize, target: u16) void {
-    put(d, cur, &.{ 0x20, @truncate(target), @truncate(target >> 8) });
-}
-
-/// Count executed call sites of `entry` (bank $00): `op` is 0x20 (JSR,
-/// scanned in bank $00 — a JSR's target shares the caller's bank) or 0x22
-/// (JSL with an explicit bank-$00 target, scanned across every bank,
-/// executed flags merged over the $80+ fast mirrors).
-fn countCallSites(out: []const u8, usage: []const u8, entry: u16, op: u8) u32 {
-    return callSites(out, null, usage, entry, op, 0, 0);
-}
-
-/// Re-point every executed call site of `entry` at the stub. JSR sites take
-/// a 16-bit target (stub in bank $00); JSL sites take the full 24-bit stub
-/// address. Returns the number rewritten.
-fn rewriteCallSites(out: []u8, usage: []const u8, entry: u16, op: u8, stub_addr: u16, stub_bank: u8) u32 {
-    return callSites(out, out, usage, entry, op, stub_addr, stub_bank);
-}
-
-fn callSites(ro: []const u8, rw: ?[]u8, usage: []const u8, entry: u16, op: u8, stub_addr: u16, stub_bank: u8) u32 {
-    var count: u32 = 0;
-    const bank_top: u32 = if (op == 0x20) 1 else 0x40;
-    var bank: u32 = 0;
-    while (bank < bank_top) : (bank += 1) {
-        const bank_file = bank * 0x8000;
-        if (bank_file >= ro.len) break;
-        var a16: u32 = 0x8000;
-        while (a16 < 0x10000) : (a16 += 1) {
-            const cpu_addr = (bank << 16) | a16;
-            if ((usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
-            const file = bank_file + (a16 - 0x8000);
-            if (ro[file] != op) continue;
-            if (std.mem.readInt(u16, ro[file + 1 ..][0..2], .little) != entry) continue;
-            if (op == 0x22 and ro[file + 3] != 0x00) continue;
-            if (rw) |w| {
-                std.mem.writeInt(u16, w[file + 1 ..][0..2], stub_addr, .little);
-                if (op == 0x22) w[file + 3] = stub_bank;
-            }
-            count += 1;
-        }
-    }
-    return count;
-}
-
-/// Static pointer-eligibility walk: a JSL/RTL routine whose data flows
-/// through dp cells and runtime pointers, offloadable as COMPUTE against
-/// the BW-RAM shadow of its profiled working set. The walk proves what it
-/// can (return shape, span containment, no MMIO/stack-relative sites, the
-/// DB idiom, the long-pointer bank slots); the pointer VALUES are dynamic
-/// evidence — anything they reach outside the marshalled shadow diverges
-/// in S4 verification and no patch ships. Refusal here is a skip, not an
-/// error: the routine simply stays on the S-CPU.
-///
-/// The walk covers a CALL TREE: a JSL to a bank-$00 target makes that
-/// target a member, walked by the same rules and copied alongside the
-/// root. Absolute (DB-relative) operands are allowed while the data bank
-/// is PINNED by an immediate LDA #bank / PHA / PLB — tracked linearly,
-/// which matches the idiom's real use (pin once up front, restore at the
-/// end); a backward branch across a re-pin is dynamic evidence like the
-/// rest. Long WRAM operands are recorded as bank-byte rewrite sites: the
-/// shadow is identity-offset, so only the bank byte changes in the copy.
-fn eligiblePointer(out: []const u8, usage: []const u8, entry: u16) ?PtrSpec {
-    var spec: PtrSpec = .{};
-    var has_idp = false;
-    spec.members[0] = .{ .entry = entry, .span = 0, .pin = null, .conflict = false };
-    spec.n_members = 1;
-    var walked: usize = 0;
-    while (walked < spec.n_members) : (walked += 1) {
-        if (!walkMember(out, usage, &spec, walked, &has_idp)) {
-            if (dbg_walk_root != 0 and entry == dbg_walk_root)
-                std.debug.print("[walk] root {x:0>4}: member {} (${x:0>4}) refused\n", .{ entry, walked, spec.members[walked].entry });
-            return null;
-        }
-    }
-    // A member validated under an inherited pin that a LATER call site
-    // contradicts was validated on a false premise.
-    for (spec.members[0..spec.n_members]) |m| if (m.conflict) return null;
-    if (has_idp and spec.n_db == 0) return null;
-    spec.span = spec.members[0].span;
-    spec.total_span = 0;
-    for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
-    if (spec.total_span > ptr_tree_span_max) return null;
-    // Helper privacy (an ASYNC-only requirement, recorded for the gate):
-    // every executed JSL site of every helper lies inside the tree.
-    for (spec.members[1..spec.n_members]) |m| {
-        if (!jslSitesInsideTree(out, usage, &spec, m.entry)) {
-            spec.helpers_private = false;
-            break;
-        }
-    }
-    return spec;
-}
-
-/// Walk diagnostics: set to a root entry to print why the offload gates
-/// skip it (walk refusal per member, residency's shared/DMA page, the
-/// marshal economics). Zero compiles every print away.
-const dbg_walk_root: u16 = 0;
-
-fn walkMember(out: []const u8, usage: []const u8, spec: *PtrSpec, mi: usize, has_idp: *bool) bool {
-    const span_max: u32 = 1024;
-    const entry: u32 = spec.members[mi].entry;
-    const dbg = dbg_walk_root != 0 and spec.members[0].entry == dbg_walk_root;
-    var pc: u32 = entry;
-    var limit: u32 = entry;
-    // The pinned data bank, if an LDA #imm / PHA / PLB executed and no
-    // later PLB unpinned it. Tracked linearly. A helper starts with the
-    // pin it INHERITS from its tree call sites (see PtrSpec.members).
-    var db_pin: ?u8 = spec.members[mi].pin;
-    while (pc - entry < span_max) {
-        if (pc > 0xFFFF) return false;
-        if (usage[pc] & usage_map.flag_opcode == 0) {
-            // A gap (data or never-taken padding) is fine while pending
-            // flow still reaches past it; a gap at the frontier is not.
-            if (pc >= limit) return false;
-            pc += 1;
-            continue;
-        }
-        const file = pc - 0x8000;
-        const op = out[file];
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        const len = usage_map.instrLen(op, m8, x8);
-        if (dbg) std.debug.print("  [walk] {x:0>4}: {x:0>2} pin={?x}\n", .{ pc, op, db_pin });
-        switch (op) {
-            0x6B => { // RTL: done once every pending path has closed
-                if (pc >= limit) {
-                    spec.members[mi].span = pc + 1 - entry;
-                    return true;
-                }
-            },
-            0x22 => { // JSL: a bank-$00 target joins the tree
-                if (out[file + 3] != 0x00) return false;
-                const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if (tgt < 0x8000) return false;
-                const existing: ?usize = for (spec.members[0..spec.n_members], 0..) |m, j| {
-                    if (m.entry == tgt) break j;
-                } else null;
-                if (existing) |j| {
-                    // A second call site with a different pin invalidates
-                    // whatever the member's walk assumed.
-                    if (!std.meta.eql(spec.members[j].pin, db_pin)) spec.members[j].conflict = true;
-                } else {
-                    if (spec.n_members == ptr_tree_cap) return false;
-                    spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .pin = db_pin, .conflict = false };
-                    spec.n_members += 1;
-                }
-            },
-            // Wrong return shape, near calls, far jumps, block moves,
-            // interrupt-adjacent, D/S relocation: not this routine.
-            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => return false,
-            0x00, 0x02, 0xCB, 0xDB, 0x44, 0x54 => return false,
-            0x2B, 0x5B, 0x1B, 0x9A, 0xFB, 0x58 => return false,
-            0x4C, 0x82, 0x80 => { // JMP abs / BRL / BRA: intra-member only
-                const dst: u32 = switch (op) {
-                    0x4C => std.mem.readInt(u16, out[file + 1 ..][0..2], .little),
-                    0x82 => pc + 3 +% @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little)))))),
-                    else => pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1]))))),
-                };
-                if (dst < entry or dst - entry >= span_max) return false;
-                limit = @max(limit, dst);
-                // An unconditional BACKWARD transfer at the frontier
-                // closes the member like an RTL: no pending path reaches
-                // past it, and the loop it forms stays inside the span.
-                if (dst <= pc and pc >= limit) {
-                    spec.members[mi].span = pc + len - entry;
-                    return true;
-                }
-            },
-            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
-                const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
-                if (dst < entry or dst - entry >= span_max) return false;
-                limit = @max(limit, dst);
-            },
-            0xA9 => if (m8) {
-                const imm = out[file + 1];
-                if (file + 3 < out.len and out[file + 2] == 0x48 and out[file + 3] == 0xAB) {
-                    // LDA #imm / PHA / PLB pins the data bank. #$7E is
-                    // the shadow's rewrite point and gets recorded; any
-                    // other immediate is a pin the walk merely tracks.
-                    db_pin = imm;
-                    if (imm == 0x7E) {
-                        // Overlapping members walk shared tails twice;
-                        // record each site once.
-                        const dup = for (spec.db_sites[0..spec.n_db]) |s| {
-                            if (s == file + 1) break true;
-                        } else false;
-                        if (!dup) {
-                            if (spec.n_db == ptr_db_cap) return false;
-                            spec.db_sites[spec.n_db] = file + 1;
-                            spec.n_db += 1;
-                        }
-                    }
-                } else if (imm == 0x7E) {
-                    // A bare #$7E has an unknowable purpose — refuse.
-                    return false;
-                }
-            },
-            0xAB => {
-                // A PLB outside the idiom restores a pushed bank the walk
-                // cannot see: unpinned from here on.
-                if (file < 3 or out[file - 3] != 0xA9 or out[file - 1] != 0x48) db_pin = null;
-            },
-            else => {},
-        }
-        // Long-indirect pointers ([dp] / [dp],y, the $x7 column): the bank
-        // byte at dp+2 is a translation slot ($7E/$7F -> shadow).
-        if (op & 0x0F == 0x07) {
-            const slot: u16 = @as(u16, out[file + 1]) + 2;
-            if (slot > 0xFF) return false; // bank byte past the dp window
-            const dup = for (spec.slots[0..spec.n_slots]) |s| {
-                if (s == slot) break true;
-            } else false;
-            if (!dup) {
-                if (spec.n_slots == ptr_slot_cap) return false;
-                spec.slots[spec.n_slots] = @intCast(slot);
-                spec.n_slots += 1;
-            }
-        }
-        // 16-bit-indirect pointers ((dp) / (dp),y) resolve with DB: only
-        // sound once the DB idiom pins it to the shadow. (dp,x) hides the
-        // pointer cell behind a runtime index; stack-relative reads the
-        // S-CPU stack the SA-1 does not have.
-        if (op & 0x1F == 0x11 or op & 0x1F == 0x12) has_idp.* = true;
-        if (op & 0x1F == 0x01 or op & 0x0F == 0x03) return false;
-        switch (usage_map.mode(op)) {
-            .none, .dp => {},
-            // dp,X/dp,Y: a runtime index that can leave the shadow's dp
-            // window (8 KiB under D=$6000). Statically unprovable — but
-            // the pointer path runs on dynamic evidence: an index that
-            // actually left the marshalled shadow reads ROM instead of
-            // state, diverges in S4 verification, and no patch ships.
-            .dp_idx => {},
-            // DB-relative: allowed exactly while the idiom pins the bank.
-            // Pinned $7E is WRAM top to bottom — the rewritten idiom
-            // re-points every one of these at the shadow. A pinned ROM
-            // bank reads identically on both CPUs above $8000; below it
-            // the banks diverge (S-CPU mirrors, SA-1 I-RAM), so refuse.
-            .abs, .abs_x, .abs_y => {
-                const b = db_pin orelse return false;
-                if (b == 0x7E) {
-                    // follows the rewritten DB into the shadow
-                } else if ((b <= 0x3F or (b >= 0x80 and b != 0x7F)) and
-                    std.mem.readInt(u16, out[file + 1 ..][0..2], .little) >= 0x8000)
-                {
-                    // ROM through a pinned bank: same bytes on both CPUs
-                } else return false;
-            },
-            .long, .long_x => {
-                const b = out[file + 3];
-                const a16 = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                // ROM and BW-RAM read identically on the SA-1. Long WRAM
-                // becomes a bank-byte rewrite to the identity-offset
-                // shadow: $7E:xxxx directly, and a $00-$3F bank's low 8K
-                // is the same bytes through the mirror. $7F and MMIO
-                // cannot follow execution across.
-                if (b == 0x7E or ((b & 0x7F) <= 0x3F and a16 < 0x2000 and usage_map.mode(op) == .long)) {
-                    // The system-bank low-mirror form only counts when
-                    // UNINDEXED: with an index the same base can walk a
-                    // ROM table ($01:0000,X in Gradius III's sound code),
-                    // and re-banking it would read the wrong ROM. $7E is
-                    // unambiguous either way.
-                    const dup = for (spec.wram_long_sites[0..spec.n_wram_long]) |s| {
-                        if (s == file + 3) break true;
-                    } else false;
-                    if (!dup) {
-                        if (spec.n_wram_long == ptr_wram_long_cap) return false;
-                        spec.wram_long_sites[spec.n_wram_long] = file + 3;
-                        spec.n_wram_long += 1;
-                    }
-                } else if ((b >= 0x40 and b <= 0x4F) or b >= 0xC0 or
-                    ((b & 0x7F) <= 0x3F and a16 >= 0x8000))
-                {
-                    // ROM / BW-RAM: fine as-is
-                } else return false;
-            },
-        }
-        pc += len;
-    }
-    return false;
-}
-
-/// Are all executed JSL call sites of `entry` inside the tree's spans?
-fn jslSitesInsideTree(out: []const u8, usage: []const u8, spec: *const PtrSpec, entry: u16) bool {
-    var bank: u32 = 0;
-    while (bank < 0x40) : (bank += 1) {
-        const bank_file = bank * 0x8000;
-        if (bank_file >= out.len) break;
-        var a16: u32 = 0x8000;
-        while (a16 < 0x10000) : (a16 += 1) {
-            const cpu_addr = (bank << 16) | a16;
-            if ((usage[cpu_addr] | usage[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
-            const file = bank_file + (a16 - 0x8000);
-            if (out[file] != 0x22) continue;
-            if (std.mem.readInt(u16, out[file + 1 ..][0..2], .little) != entry) continue;
-            if (out[file + 3] != 0x00) continue;
-            const inside = bank == 0 and for (spec.members[0..spec.n_members]) |m| {
-                if (a16 >= m.entry and a16 - m.entry < m.span) break true;
-            } else false;
-            if (!inside) return false;
-        }
-    }
-    return true;
-}
-
-/// Byte-exact length of a pointer stub (the emitter asserts against it).
-fn ptrStubLen(spec: PtrSpec, runs: Runs) u32 {
-    return 151 + 24 * @as(u32, @intCast(runs.n)) + 54 * @as(u32, @intCast(spec.n_slots));
-}
-
-/// The S-CPU side of a pointer offload, emitted per routine. Everything is
-/// long-addressed (mailbox, message ports, shadow) so the stub is correct
-/// under ANY caller data bank and may itself live in any ROM bank — which
-/// is also why JSL sites can reach it with a 24-bit rewrite. Sequence:
-/// marshal registers -> copy the working set into the shadow (MVN) ->
-/// translate the long-pointer bank slots ($7E/$7F -> $42/$43) -> send the
-/// message id and spin the double handshake -> translate back -> copy the
-/// shadow back -> restore DB -> unmarshal with the routine's exit state ->
-/// RTL.
-fn emitPtrStub(d: []u8, id: u8, entry: u16, spec: PtrSpec, runs: Runs) u32 {
-    var cur: usize = 0;
-    // Precondition, checked rather than assumed: the marshal mirrors the
-    // caller's direct page at WRAM $0000-$00FF into the shadow, and the
-    // SA-1 runs the body with D over that mirror. A caller whose D is
-    // something else would have the SA-1 resolve dp operands to the wrong
-    // shadow bytes, so this hands such a call straight back to the
-    // ORIGINAL routine on the S-CPU — always correct, merely not
-    // accelerated. (JML, not JSL: the original's own RTL returns to our
-    // caller.)
-    put(d, &cur, &.{
-        0x08, // PHP
-        0xC2, 0x20, // REP #$20
-        0x48, // PHA
-        0x0B, 0x68, // PHD / PLA  -> A = caller D
-        0xC9, 0x01, 0x1F, // CMP #$1F01
-        0x90, 0x06, // BCC ok  (a whole dp page fits the 8 KiB window)
-        0x68, 0x28, // PLA / PLP  (restore exactly what we found)
-        0x5C, @truncate(entry), @truncate(entry >> 8), 0x00, // JML original
-        // ok:
-        0x8F, 0x88, 0x37, 0x00, // STA $00:3788 — caller D into the mailbox
-        0x68, 0x28, // PLA / PLP
-    });
-    // Register marshal in (33). PHB first so the caller P (pushed second)
-    // is on top for the PLA below.
-    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 }); // PHB / PHP / SEP #$20
-    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB }); // A low, B
-    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 }); // X, Y via A
-    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 }); // caller P
-    // Shadow copy-in (2 + 12/run). MVN encoding: opcode, DEST bank, SRC bank.
-    put(d, &cur, &.{ 0xC2, 0x30 });
-    // The caller's direct page, wherever it is: MVN takes its offsets
-    // from X/Y, so one emitted copy serves every D the guard admits.
-    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, shadow_bank, 0x7E });
-    for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], false);
-    // Slot translate-in: $7E pointer bank bytes -> the shadow bank. The
-    // slots are DIRECT-PAGE offsets, so each is indexed by the caller's
-    // own D — the pointers live wherever its direct page is, not at
-    // $0000. (A plain LoROM game has no $40+ pointers to collide with
-    // the exact compare; $7F pointers stay untranslated and fail S4 if
-    // followed.)
-    for (spec.slots[0..spec.n_slots]) |s| {
-        put(d, &cur, &.{
-            0xAF, 0x88, 0x37, 0x00, // LDA $00:3788  (caller D)
-            0x18, 0x69, s, 0x00, // CLC / ADC #slot
-            0xAA, // TAX
-            0xE2, 0x20, // SEP #$20
-            0xBF, 0x00, 0x00, shadow_bank, // LDA $41:0000,x
-            0xC9, 0x7E, // CMP #$7E
-            0xD0, 0x06, // BNE skip
-            0xA9, shadow_bank, // LDA #$41
-            0x9F, 0x00, 0x00, shadow_bank, // STA $41:0000,x
-            0xC2, 0x20, // skip: REP #$20
-        });
-    }
-    put(d, &cur, &.{ 0xE2, 0x20 });
-    // Send + double handshake (30), all long-addressed.
-    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 }); // message id -> CFR
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 }); // await echo
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // ack
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 }); // await clear
-    // Slot translate-back, indexed the same way.
-    put(d, &cur, &.{ 0xC2, 0x20 });
-    for (spec.slots[0..spec.n_slots]) |s| {
-        put(d, &cur, &.{
-            0xAF,        0x88, 0x37,        0x00,
-            0x18,        0x69, s,           0x00,
-            0xAA,        0xE2, 0x20,        0xBF,
-            0x00,        0x00, shadow_bank, 0xC9,
-            shadow_bank, 0xD0, 0x06,        0xA9,
-            0x7E,        0x9F, 0x00,        0x00,
-            shadow_bank, 0xC2, 0x20,
-        });
-    }
-    put(d, &cur, &.{ 0xE2, 0x20 });
-    // Shadow copy-out (2 + 12/run).
-    put(d, &cur, &.{ 0xC2, 0x30 });
-    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, 0x7E, shadow_bank });
-    for (0..runs.n) |r| putMvnRun(d, &cur, runs.start[r], runs.len[r], true);
-    // Restore caller DB, then unmarshal — long-addressed, so DB-proof (30).
-    put(d, &cur, &.{0xAB}); // PLB
-    put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 }); // X, Y
-    put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 }); // exit P staged
-    put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 }); // B, A low
-    put(d, &cur, &.{ 0x28, 0x6B }); // PLP (exit flags/widths) / RTL
-    return @intCast(cur);
-}
-
-/// Byte-exact length of the shared async fence (the emitter asserts).
-fn fenceLen(spec: PtrSpec) u32 {
-    _ = spec;
-    return 41;
-}
-
-/// The asynchronous offload's fence: complete the handshake of a
-/// fire-and-forget call so the mailbox and message ports free up. Nothing
-/// is copied back — that is the async CONTRACT, not a shortcut: the
-/// routine's register results are dropped, and so are its direct-page
-/// writes. A deferred whole-page copy-back is unsound against ANY S-CPU
-/// dp write between send and fence (measured on a real cart: the NMI
-/// fence reverting the APU upload counter mid-handshake wedged the boot).
-/// Only effects on BW-RAM-RESIDENT state survive an async call, because
-/// both CPUs address that state directly and no copy exists to disagree.
-/// Whether any caller needed the dropped effects is exactly what
-/// behavioral verification arbitrates.
-///
-/// JSL-reached and long-addressed, so it works from any bank; the caller
-/// has already saved every register it cares about. Idempotent: an NMI
-/// can interrupt a fence mid-handshake and run the fence again — the
-/// inner call either sees busy already cleared or completes the same
-/// handshake, and the outer's remaining reads find the ports quiet.
-fn emitFence(d: []u8, spec: PtrSpec) u32 {
-    _ = spec;
-    var cur: usize = 0;
-    const body: u32 = 32;
-    put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
-    put(d, &cur, &.{ 0xAF, 0x8A, 0x37, 0x00 }); // busy id, 0 = idle
-    put(d, &cur, &.{ 0xF0, @intCast(body) }); // BEQ done
-    // Await the SA-1's done echo of exactly the in-flight id, ack it, and
-    // wait for the port to clear — the back half of the handshake the
-    // async stub deliberately left unfinished.
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xCF, 0x8A, 0x37, 0x00, 0xD0, 0xF4 });
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8A, 0x37, 0x00 }); // busy = idle
-    put(d, &cur, &.{0x6B}); // done: RTL
-    return @intCast(cur);
-}
-
-/// The NON-BLOCKING fence, for the NMI prologue. The blocking fence in
-/// the NMI moved every in-flight wait into vblank — the one place a
-/// wait costs a frame deadline — and the async flavor measured 290
-/// dropped frames against sync's 115 doing exactly that. This variant
-/// acks a COMPLETED call (the SA-1 answers from its sig-hold loop
-/// within microseconds) and SKIPS a still-running one; the next fence
-/// point collects it. Only the async stub's own fence must block — it
-/// is about to reuse the mailbox.
-const nb_fence_len: u32 = 39;
-fn emitNbFence(d: []u8) u32 {
-    var cur: usize = 0;
-    put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
-    put(d, &cur, &.{ 0xAF, 0x8A, 0x37, 0x00 }); // busy id, 0 = idle
-    put(d, &cur, &.{ 0xF0, 0x1E }); // BEQ done
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F }); // done echo?
-    put(d, &cur, &.{ 0xCF, 0x8A, 0x37, 0x00 });
-    put(d, &cur, &.{ 0xD0, 0x12 }); // BNE done — still running, skip
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 }); // ack
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 }); // echo clears (bounded: the SA-1 is in its hold loop)
-    put(d, &cur, &.{ 0x8F, 0x8A, 0x37, 0x00 }); // busy = idle (A is 0)
-    put(d, &cur, &.{0x6B}); // done: RTL
-    return @intCast(cur);
-}
-
-/// Byte-exact length of an async stub (the emitter asserts).
-fn asyncStubLen(spec: PtrSpec) u32 {
-    return 122 + 27 * @as(u32, @intCast(spec.n_slots));
-}
-
-/// The fire-and-forget S-CPU stub for THE async offload: fence first (a
-/// previous call may still be in flight — and the D-guard's bail path runs
-/// the original body on the S-CPU, which must never race the SA-1 over the
-/// resident data), then the synchronous stub's whole front half, then send
-/// the message, mark busy, and return with the CALLER's registers — the
-/// routine's register results are dropped, which is the async contract;
-/// verification arbitrates whether any caller actually needed them.
-fn emitAsyncStub(d: []u8, fence: u24, id: u8, entry: u16, spec: PtrSpec) u32 {
-    var cur: usize = 0;
-    // Save the caller's context across the fence, which clobbers freely.
-    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // PHP REP PHA PHX PHY PHB
-    put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
-    // REP #$30 before the pulls: the fence returns with M narrowed (its
-    // final SEP #$20), and an 8-bit PLA against the 16-bit PHA above
-    // leaves a stray byte that shears the stack — the RTL at the tail
-    // would return into hyperspace.
-    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // PLB REP PLY PLX PLA PLP
-    // Re-save what the marshal below consumes (its own PHB balances the
-    // tail's PLB).
-    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // PHP REP PHA PHX PHY
-    // D guard, exactly as the sync stub: a caller whose direct page cannot
-    // mirror into the shadow window is handed the original body — safe on
-    // the S-CPU now, because the fence above drained the SA-1.
-    put(d, &cur, &.{
-        0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68,
-        0xC9, 0x01, 0x1F, // CMP #$1F01
-        0x90, 0x0C, // BCC ok
-        0x68, 0x28, // PLA / PLP
-        0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, // unwind the re-save
-        0x5C, @truncate(entry), @truncate(entry >> 8), 0x00, // JML original
-        // ok:
-        0x8F, 0x88, 0x37, 0x00, // caller D -> mailbox
-        0x68, 0x28, // PLA / PLP
-    });
-    // Register marshal into the mailbox (the SA-1's unmarshal input),
-    // identical to the sync stub's.
-    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
-    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
-    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
-    // Caller P: NOT the live P (the re-save REP'd it — the sync stub can
-    // read its own PHP because nothing widened P before its marshal). The
-    // true caller P is the re-save's PHP byte, at a fixed stack depth
-    // once our own PHP is pulled: B(1) + Y(2) + X(2) + A(2) above it.
-    // Marshalling the REP'd P hands the SA-1 16-bit index width for an
-    // 8-bit caller — its immediates then swallow the following opcode.
-    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0xA3, 0x08, 0x8F, 0x86, 0x37, 0x00 });
-    // dp page into the shadow (resident routines marshal nothing else).
-    put(d, &cur, &.{ 0xC2, 0x30 });
-    put(d, &cur, &.{ 0xAF, 0x88, 0x37, 0x00, 0xAA, 0xA8, 0xA9, 0xFF, 0x00, 0x54, shadow_bank, 0x7E });
-    // Slot translate-in, as sync.
-    for (spec.slots[0..spec.n_slots]) |s| {
-        put(d, &cur, &.{
-            0xAF,        0x88, 0x37,        0x00,
-            0x18,        0x69, s,           0x00,
-            0xAA,        0xE2, 0x20,        0xBF,
-            0x00,        0x00, shadow_bank, 0xC9,
-            0x7E,        0xD0, 0x06,        0xA9,
-            shadow_bank, 0x9F, 0x00,        0x00,
-            shadow_bank, 0xC2, 0x20,
-        });
-    }
-    put(d, &cur, &.{ 0xE2, 0x20 });
-    // Send, mark busy, and DO NOT WAIT — the SA-1's signal loop holds the
-    // done echo until the fence acks it. The busy flag lives at $378A,
-    // OUTSIDE the caller-D slot ($3788-$3789, which the dispatcher reads
-    // 16-bit): a busy byte at $3789 is a +$0100 bias on the SA-1's D.
-    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00, 0x8F, 0x8A, 0x37, 0x00 });
-    // Caller context back (mirrors the re-save; the marshal's PHB pairs
-    // with this PLB), and out.
-    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, 0x6B });
-    return @intCast(cur);
-}
-
-/// One MVN marshal run: pages [start, start+len) of $7E WRAM to/from the
-/// identity-offset shadow at bank $41. `back` copies shadow -> WRAM.
-fn putMvnRun(d: []u8, cur: *usize, start_page: u16, n_pages: u16, back: bool) void {
-    const off: u16 = (start_page & 0xFF) << 8;
-    const count: u16 = n_pages * 256 - 1;
-    const dst: u8 = if (back) 0x7E else shadow_bank;
-    const src: u8 = if (back) shadow_bank else 0x7E;
-    put(d, cur, &.{ 0xA2, @truncate(off), @truncate(off >> 8) }); // LDX #off (source)
-    put(d, cur, &.{ 0xA0, @truncate(off), @truncate(off >> 8) }); // LDY #off (dest, identity)
-    put(d, cur, &.{ 0xA9, @truncate(count), @truncate(count >> 8) }); // LDA #count-1
-    put(d, cur, &.{ 0x54, dst, src }); // MVN
-}
-
-/// Static leaf-eligibility walk from `entry` over covered code: ends at the
-/// first RTS; refuses calls, jumps, block moves, interrupts-adjacent opcodes,
-/// any data access the SA-1 could not see after the relocation, and branches
-/// escaping the span. Returns true when the routine can run on the SA-1.
-fn eligibleLeaf(out: []const u8, usage: []const u8, plan: *const profile.Plan, res: *const Result, entry: u16) bool {
-    const span_max: u32 = 512;
-    var pc: u32 = entry;
-    var max_branch: u32 = 0;
-    while (pc - entry < span_max) {
-        if (pc < 0x8000 or pc > 0xFFFF) return false;
-        if (usage[pc] & usage_map.flag_opcode == 0) return false; // uncovered
-        const file = pc - 0x8000;
-        const op = out[file];
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        const len = usage_map.instrLen(op, m8, x8);
-        switch (op) {
-            0x60 => return max_branch <= pc, // RTS: every branch stayed inside
-            // Calls, jumps, returns-of-other-kinds, block moves, BRK/COP,
-            // WAI/STP, and RTI end the leaf dream.
-            0x20, 0x22, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x6B, 0x40, 0x00, 0x02, 0xCB, 0xDB, 0x44, 0x54 => return false,
-            // Branches must land inside the span.
-            0x10, 0x30, 0x50, 0x70, 0x80, 0x90, 0xB0, 0xD0, 0xF0 => {
-                const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
-                if (dst < entry or dst - entry >= span_max) return false;
-                max_branch = @max(max_branch, dst);
-            },
-            0x82 => return false, // BRL: cheap to allow later, refuse now
-            else => {},
-        }
-        switch (usage_map.mode(op)) {
-            .none => {},
-            .dp => {
-                // Allowed only inside a moved dp window (D=$3000 on both
-                // CPUs); anything else is unmoved WRAM the SA-1 cannot see.
-                const v: u32 = out[file + 1];
-                if (!dpMoved(plan, res, v)) return false;
-            },
-            .dp_idx, .abs_x, .abs_y, .long_x => return false,
-            .abs => {
-                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if (v < 0x3000 or v > 0x37FF) return false; // only the I-RAM window is DB-proof
-            },
-            .long => {
-                const b = out[file + 3];
-                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                const ok = (b >= 0x40 and b <= 0x4F) or // BW-RAM
-                    (b <= 0x3F and v >= 0x8000) or (b >= 0xC0) or // ROM
-                    (b <= 0x3F and v >= 0x3000 and v <= 0x37FF); // I-RAM
-                if (!ok) return false;
-            },
-        }
-        pc += len;
-    }
-    return false;
-}
-
-fn dpMoved(plan: *const profile.Plan, res: *const Result, off: u32) bool {
-    for (plan.regions[0..plan.n], 0..) |r, ri| {
-        if (r.dp and res.fate[ri] == .clean and off >= r.start and off < r.start + r.len)
-            return true;
-    }
-    return false;
-}
-
-/// The S-CPU side of the handshake: marshal registers into the mailbox, send
-/// message 1, spin on SFR until the SA-1 answers, ack, unmarshal, return
-/// with the routine's exit flags. Mode-safe: A is saved bytewise via XBA (so
-/// B survives), X/Y under REP #$10 (16-bit in native mode, benignly 8-bit in
-/// emulation mode where the index high bytes are dead anyway, and the pushed
-/// P carries M=X=1 so the SA-1 runs the routine 8-bit to match).
-const stub_template = [_]u8{
-    0x08, // 0  PHP (caller P)
-    0xE2, 0x20, // 1  SEP #$20
-    0x8D, 0x80, 0x37, // 3  STA $3780 (A low)
-    0xEB, // 6  XBA
-    0x8D, 0x81, 0x37, // 7  STA $3781 (B)
-    0xEB, // 10 XBA
-    0xC2, 0x10, // 11 REP #$10
-    0x8E, 0x82, 0x37, // 13 STX $3782
-    0x8C, 0x84, 0x37, // 16 STY $3784
-    0x68, // 19 PLA (caller P; A is 8-bit)
-    0x8D, 0x86, 0x37, // 20 STA $3786
-    0xA9, 0x01, // 23 LDA #$01
-    0x8D, 0x00, 0x22, // 25 STA $2200 (message 1 -> SA-1 CFR)
-    0xAD, 0x00, 0x23, // 28 w1: LDA $2300 (SFR)
-    0x29, 0x0F, // 31 AND #$0F
-    0xC9, 0x01, // 33 CMP #$01
-    0xD0, 0xF7, // 35 BNE w1
-    0x9C, 0x00, 0x22, // 37 STZ $2200 (ack)
-    0xAD, 0x00, 0x23, // 40 w2: LDA $2300
-    0x29, 0x0F, // 43 AND #$0F
-    0xD0, 0xF9, // 45 BNE w2 (SA-1 cleared done: safe to re-call)
-    0xC2, 0x10, // 47 REP #$10
-    0xAE, 0x82, 0x37, // 49 LDX $3782
-    0xAC, 0x84, 0x37, // 52 LDY $3784
-    0xAD, 0x86, 0x37, // 55 LDA $3786 (exit P; A still 8-bit)
-    0x48, // 58 PHA
-    0xAD, 0x81, 0x37, // 59 LDA $3781 (B)
-    0xEB, // 62 XBA
-    0xAD, 0x80, 0x37, // 63 LDA $3780 (A low)
-    0x28, // 66 PLP (routine's exit flags and widths)
-    0x60, // 67 RTS
-};
-
-/// Offsets of the message id inside `stub_template` (the LDA #id that sends
-/// it and the CMP #id that awaits the echo).
-const stub_id_send_off: usize = 24;
-const stub_id_cmp_off: usize = 34;
-
 comptime {
     std.debug.assert(stub_template[stub_id_send_off - 1] == 0xA9); // LDA #
     std.debug.assert(stub_template[stub_id_cmp_off - 1] == 0xC9); // CMP #
@@ -2201,1726 +1132,16 @@ comptime {
 // traffic lands in real WRAM, not I-RAM — either mismatch fails S4
 // verification rather than shipping wrong.
 
-/// I-RAM mailbox (S-CPU window addresses): +0 status, +1/2 reg, +3/4 value.
-/// Status: 0 idle, 1 write8 filed, 2 read8 filed, 3 write16 filed,
-/// 4 read16 filed, $FE read served — >= 5 means busy, not a request.
-const wg_mailbox: u16 = 0x37F0;
-
-const WgSiteKind = enum { w8, w16, r8, r16, stz8, stz16, c8, c16, ry8, ry16, rx8, rx16, wx8, wx16, wy8, wy16 };
-/// Which index register the site's addressing mode adds, if any. An indexed
-/// site's helper computes base+index at run time — in the caller's own index
-/// width, since TXA/TYA zero-extend exactly when the hardware would — and
-/// files the *effective* register; the mailbox protocol never sees the
-/// difference.
-const WgIndex = enum { none, x, y };
-const WgSite = struct { file: u32, kind: WgSiteKind, reg: u16, idx: WgIndex = .none };
-const wg_sites_max = 768;
-/// A helper is a pure function of (kind, reg, idx), so sites sharing all
-/// three share one helper — Gradius III alone has hundreds of MMIO sites
-/// but only a few dozen distinct shapes, and the carve is sized by the
-/// latter.
-const wg_uniq_max = 160;
-/// Executed TCD/TCS sites the BW-RAM window move can adjust.
-const wg_moves_max = 64;
-/// Where the BW-RAM window sits on both buses ($6000-$7FFF of every system
-/// bank). WRAM's low mirror $0000-$1FFF shifts here; $7E/$7F re-bank to
-/// $40/$41 instead, reaching the same bytes linearly.
-const wg_bw_window: u16 = 0x6000;
-
-// --- window offloads --------------------------------------------------
-//
-// On a WINDOW image the composition that took the S3 path a shadow, a
-// marshal, slot translation, and a D-swap costs NOTHING: the game's whole
-// working set already lives in BW-RAM at identity offsets, and the SA-1's
-// own $6000-$7FFF window (CBM block 0) shows the same bytes at the same
-// addresses as the S-CPU's (SBM block 0). A window-rewritten routine
-// therefore runs VERBATIM on the SA-1 — the stub passes registers, D, and
-// DBR through the mailbox and nothing else. Every offload is resident by
-// construction, which is exactly the shape the async contract wants:
-// there is nothing to write back, because there is no second copy.
-
-/// A window-offload call tree: members[0] is the root.
-const WinSpec = struct {
-    /// entry_pin: the DBR pin every in-tree call site carries into this
-    /// member (null = at least one call site is unpinned, or the root,
-    /// whose callers come through the stub with arbitrary DBR). A copy's
-    /// members are called ONLY from other copies in the same tree — the
-    /// member-to-member JSLs are re-pointed — so a pin proven at every
-    /// in-tree call site genuinely holds for the copy at runtime.
-    /// dbr_clean: the member's walked span — and, transitively, every
-    /// in-tree member it calls — contains no DBR-changing op (PLB, block
-    /// move), so a caller's pin survives calling it. Optimistic default;
-    /// the survey passes iterate it downward to the fixpoint.
-    /// pin_seen: a call site contributed this member's pin during the
-    /// current eligibility pass (the meet needs a first-write marker).
-    members: [ptr_tree_cap]struct {
-        entry: u16,
-        span: u32,
-        entry_pin: ?u8 = null,
-        pin_seen: bool = false,
-        dbr_clean: bool = true,
-    } = undefined,
-    n_members: usize = 0,
-    total_span: u32 = 0,
-};
-
-/// Window-tree eligibility: JSL/RTL shape over covered code, members via
-/// bank-$00 JSLs, closure at RTL or an unconditional backward transfer at
-/// the frontier. The rules ask one question — does the instruction mean
-/// the same thing on both CPUs' buses? Window/bank-$40 data, ROM, dp
-/// under a window-shifted D, and the tree's own control flow all do.
-/// MMIO and the stack-swap ops do not. Low-mirror absolutes ($0000-$1FFF,
-/// which the window rewrite left only as pointer-walkers and DBR-followers)
-/// are dynamic evidence: under a marshalled game DBR they read the same
-/// BW-RAM or ROM on both CPUs; under a system DBR they differ (WRAM vs
-/// I-RAM) and S4 verification is the judge.
-fn windowEligible(out: []const u8, usage: []const u8, evidence: ?[]const u8, thunks: []const u24, entry: u16) ?WinSpec {
-    var spec: WinSpec = .{};
-    spec.members[0] = .{ .entry = entry, .span = 0, .entry_pin = null, .pin_seen = true };
-    spec.n_members = 1;
-    // Two phases. SURVEY walks flow only — members, spans, and each
-    // member's DBR-cleanliness — repeating while new members appear
-    // (bounded by the member cap), with the pin- and evidence-gated
-    // refusals disarmed: they depend on entry pins, which depend on
-    // cleanliness, which the survey exists to compute. JUDGE then runs
-    // once with everything armed; entry pins computed in that pass are a
-    // pure function of the surveyed facts, so one pass is the fixpoint.
-    var pass: usize = 0;
-    while (pass <= 2 * ptr_tree_cap + 1) : (pass += 1) {
-        const n_before = spec.n_members;
-        var clean_before: [ptr_tree_cap]bool = undefined;
-        for (spec.members[0..n_before], 0..) |m, i| clean_before[i] = m.dbr_clean;
-        for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
-        var walked: usize = 0;
-        while (walked < spec.n_members) : (walked += 1) {
-            if (!winWalkMember(out, usage, evidence, thunks, &spec, walked, false)) return null;
-        }
-        var stable = spec.n_members == n_before;
-        if (stable) for (spec.members[0..n_before], 0..) |m, i| {
-            if (m.dbr_clean != clean_before[i]) stable = false;
-        };
-        if (stable) break;
-    }
-    for (spec.members[1..spec.n_members]) |*m| m.pin_seen = false;
-    var walked: usize = 0;
-    while (walked < spec.n_members) : (walked += 1) {
-        if (!winWalkMember(out, usage, evidence, thunks, &spec, walked, true)) return null;
-    }
-    spec.total_span = 0;
-    for (spec.members[0..spec.n_members]) |m| spec.total_span += m.span;
-    if (spec.total_span > ptr_tree_span_max) return null;
-    return spec;
-}
-
-/// Walk diagnostics, window flavor: set to a tree root to print every
-/// winWalkMember refusal for it (member, pc, opcode, operand, evidence
-/// class) plus each in-tree JSL's pin. Zero compiles every print away.
-const dbg_win_root: u16 = 0;
-
-fn winWalkMember(out: []const u8, usage: []const u8, evidence: ?[]const u8, thunks: []const u24, spec: *WinSpec, mi: usize, judge: bool) bool {
-    const dbg = dbg_win_root != 0 and spec.members[0].entry == dbg_win_root and judge;
-    const span_max: u32 = 1024;
-    const entry: u32 = spec.members[mi].entry;
-    var pc: u32 = entry;
-    var limit: u32 = entry;
-    // The data-bank pin, post-window flavor: the rewritten idiom loads
-    // $40/$41 now. Under a BW-RAM pin every absolute is data both CPUs
-    // read identically — including operands that happen to fall in the
-    // MMIO decode range ($8EF1 stores $3E00 under a pinned $40).
-    // A member starts with the pin every in-tree call site proved
-    // (entry_pin) — the pin the root's own PLB idiom establishes travels
-    // through the tree's JSLs, which is what admits an UNCOVERED site in
-    // a shared helper: $8EF1's walker branch `ASL $0000,X` never executed
-    // under any coverage, but every path to it inside the tree runs under
-    // the root's $40 pin, where a tiny-base indexed absolute is BW-RAM
-    // data on both buses whatever the index holds.
-    var db_pin: ?u8 = spec.members[mi].entry_pin;
-    // No DBR-changing op seen in this member's span so far (see WinSpec).
-    var dbr_clean = true;
-    // A DBR-clean member entered under a pin holds it at EVERY
-    // instruction: nothing in its span (or, transitively, its in-tree
-    // callees) can change DBR, so the per-op survival approximation —
-    // which a mid-span RTL would needlessly kill — is not consulted.
-    const pin_locked = judge and spec.members[mi].dbr_clean and spec.members[mi].entry_pin != null;
-    while (pc - entry < span_max) {
-        if (pc > 0xFFFF) {
-            if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: ran past $FFFF\n", .{entry});
-            return false;
-        }
-        if (usage[pc] & usage_map.flag_opcode == 0) {
-            if (pc >= limit) {
-                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: uncovered byte at ${x:0>4} past frontier\n", .{ entry, pc });
-                return false;
-            }
-            pc += 1;
-            continue;
-        }
-        const file = pc - 0x8000;
-        const op = out[file];
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        const len = usage_map.instrLen(op, m8, x8);
-        switch (op) {
-            0x6B => if (pc >= limit) {
-                spec.members[mi].span = pc + 1 - entry;
-                spec.members[mi].dbr_clean = dbr_clean;
-                return true;
-            },
-            0x22 => {
-                // A call into an index-split thunk is a LEAF, not a
-                // member. The thunk is SA-1-safe by construction — its
-                // window arm addresses the identity window (the same
-                // bytes at the same addresses on both buses) and its
-                // as-written arm only runs once the index has carried the
-                // address past $2000, so neither arm can land on the low
-                // mirror that is the SA-1's own I-RAM. Walking into it
-                // would see the as-written arm out of context and refuse
-                // the whole tree over the very hazard the thunk exists to
-                // remove — which is what kept the physics tree out.
-                const tfull: u24 = @as(u24, out[file + 3] & 0x7F) << 16 |
-                    std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                var is_thunk = false;
-                for (thunks) |t| {
-                    if (t == tfull) is_thunk = true;
-                }
-                if (is_thunk) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: thunk call ${x:0>6} at ${x:0>4} — leaf\n", .{ entry, tfull, pc });
-                } else if (out[file + 3] != 0x00) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: far JSL to bank {x:0>2} at ${x:0>4}\n", .{ entry, out[file + 3], pc });
-                    return false;
-                } else jsl: {
-                    const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                    if (tgt < 0x8000) {
-                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: JSL below ROM (${x:0>4}) at ${x:0>4}\n", .{ entry, tgt, pc });
-                        return false;
-                    }
-                    const dup_at: ?usize = for (spec.members[0..spec.n_members], 0..) |m, di| {
-                        if (m.entry == tgt) break di;
-                    } else null;
-                    const ci: usize = dup_at orelse blk: {
-                        if (spec.n_members == ptr_tree_cap) {
-                            if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: member cap at JSL ${x:0>4}\n", .{ entry, tgt });
-                            return false;
-                        }
-                        spec.members[spec.n_members] = .{ .entry = tgt, .span = 0, .entry_pin = db_pin, .pin_seen = true };
-                        spec.n_members += 1;
-                        break :blk spec.n_members - 1;
-                    };
-                    if (dup_at != null) {
-                        // Meet of the call sites' pins: the first site this
-                        // pass contributes its pin, every further site must
-                        // agree or the member weakens to unpinned.
-                        if (!spec.members[ci].pin_seen) {
-                            spec.members[ci].entry_pin = db_pin;
-                            spec.members[ci].pin_seen = true;
-                        } else if (!std.meta.eql(spec.members[ci].entry_pin, db_pin)) {
-                            spec.members[ci].entry_pin = null;
-                        }
-                    }
-                    // Transitive cleanliness: calling a dirty member dirties
-                    // this one.
-                    if (!spec.members[ci].dbr_clean) dbr_clean = false;
-                    break :jsl;
-                }
-            },
-            // Wrong return shape, near calls, far jumps, interrupt ops,
-            // and the ops that would swap the SA-1's stack from under it.
-            0x60, 0x40, 0x20, 0xFC, 0x5C, 0x6C, 0x7C, 0xDC => {
-                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: flow op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
-                return false;
-            },
-            0x00, 0x02, 0xCB, 0xDB => {
-                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: interrupt op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
-                return false;
-            },
-            0x1B, 0x9A => {
-                if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: stack-swap op {x:0>2} at ${x:0>4}\n", .{ entry, op, pc });
-                return false;
-            }, // TCS / TXS
-            0x44, 0x54 => {
-                // Block moves only between the BW-RAM banks, where both
-                // CPUs see the same bytes. (They also load DBR with the
-                // destination bank: not DBR-clean.)
-                const d0 = out[file + 1];
-                const s0 = out[file + 2];
-                if (!((d0 == 0x40 or d0 == 0x41) and (s0 == 0x40 or s0 == 0x41 or s0 >= 0x80 or (s0 >= 0x02 and s0 <= 0x3F))))
-                    return false;
-                dbr_clean = false;
-            },
-            0x4C, 0x82, 0x80 => {
-                const dst: u32 = switch (op) {
-                    0x4C => std.mem.readInt(u16, out[file + 1 ..][0..2], .little),
-                    0x82 => pc + 3 +% @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(std.mem.readInt(u16, out[file + 1 ..][0..2], .little)))))),
-                    else => pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1]))))),
-                };
-                if (dst < entry or dst - entry >= span_max) return false;
-                limit = @max(limit, dst);
-                if (dst <= pc and pc >= limit) {
-                    spec.members[mi].span = pc + len - entry;
-                    spec.members[mi].dbr_clean = dbr_clean;
-                    return true;
-                }
-            },
-            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
-                const dst = pc + 2 +% @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(out[file + 1])))));
-                if (dst < entry or dst - entry >= span_max) return false;
-                limit = @max(limit, dst);
-            },
-            0xA9 => if (m8 and file + 3 < out.len and out[file + 2] == 0x48 and out[file + 3] == 0xAB) {
-                db_pin = out[file + 1];
-            },
-            0xAB => {
-                if (file < 3 or out[file - 3] != 0xA9 or out[file - 1] != 0x48) db_pin = null;
-                dbr_clean = false;
-            },
-            else => {},
-        }
-        // A pin survives a call to an in-tree member whose own walked
-        // span is DBR-clean — the walk sees the callee's whole reachable
-        // body, which is a proof dbrTransparent's bounded scan cannot
-        // always deliver. (Cleanliness comes from the survey passes;
-        // in-tree callees of callees are members too, so the meet over
-        // every member's flag makes the property transitive.)
-        // A thunk is DBR-transparent by construction: its only bank
-        // traffic is a balanced PHB/PLA it reads and discards, and it
-        // exits through PLP. So the caller's pin survives it — which
-        // matters, because the pin is what admits the walker's uncovered
-        // sites, and losing it at a thunk call would refuse the tree just
-        // as surely as the hazard the thunk removed.
-        const thunk_call = op == 0x22 and out[file + 3] != 0x00 and blk: {
-            const tf: u24 = @as(u24, out[file + 3] & 0x7F) << 16 |
-                std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            for (thunks) |t| {
-                if (t == tf) break :blk true;
-            }
-            break :blk false;
-        };
-        const in_tree_clean = thunk_call or op == 0x22 and out[file + 3] == 0x00 and blk: {
-            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            for (spec.members[0..spec.n_members]) |m| {
-                if (m.entry == tgt) break :blk m.dbr_clean;
-            }
-            break :blk false;
-        };
-        if (dbg and op == 0x22) std.debug.print("[win $8ef1] member ${x:0>4}: JSL ${x:0>4} at ${x:0>4} pin {?x} in_tree_clean {}\n", .{ entry, std.mem.readInt(u16, out[file + 1 ..][0..2], .little), pc, db_pin, in_tree_clean });
-        if (!pin_locked and !in_tree_clean and !dbrSurvives(out, usage, file, op)) db_pin = null;
-        switch (usage_map.mode(op)) {
-            .none, .dp, .dp_idx => {},
-            .abs, .abs_x, .abs_y => {
-                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                // MMIO through a system bank is S-CPU-only hardware — but
-                // under a pinned BW-RAM bank the same operand is data both
-                // CPUs read identically.
-                const pinned_bw = db_pin != null and (db_pin.? == 0x40 or db_pin.? == 0x41);
-                if (judge and !pinned_bw and v >= 0x2100 and v < 0x4380) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: MMIO abs ${x:0>4} at ${x:0>4} (op {x:0>2}, pin {?x})\n", .{ entry, v, pc, op, db_pin });
-                    return false;
-                }
-                // An UNSHIFTED low-mirror site (mixed or absent evidence
-                // keeps the rewriter's hands off it) means WRAM on the
-                // S-CPU but the SA-1's OWN I-RAM in the copy — a tree
-                // containing one computes different results per CPU
-                // (measured: the offloaded sound path took the wrong
-                // branch at the START beep and the menu never reset its
-                // frame counter). Pure-ROM evidence is fine: same bytes
-                // on both buses.
-                if (judge and !pinned_bw and v < 0x2000) {
-                    const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
-                    const shifted = if (e != 0)
-                        e == usage_map.site_wram_low
-                    else
-                        usage_map.mode(op) == .abs or v >= 0x100;
-                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) {
-                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: I-RAM hazard abs op {x:0>2} ${x:0>4} at ${x:0>4} evidence {x:0>2} pin {?x}\n", .{ entry, op, v, pc, e, db_pin });
-                        return false;
-                    }
-                }
-            },
-            .long, .long_x => {
-                const b = out[file + 3];
-                const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                if ((b & 0x7F) <= 0x3F and v >= 0x2100 and v < 0x4380) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: MMIO long ${x:0>2}:{x:0>4} at ${x:0>4}\n", .{ entry, b, v, pc });
-                    return false;
-                }
-                // $7E/$7F would be real WRAM — the window rewrite
-                // re-banked every covered site, so seeing one here means
-                // the walk wandered into unrewritten territory.
-                if (b == 0x7E or b == 0x7F) {
-                    if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: unrewritten WRAM long ${x:0>2}:{x:0>4} at ${x:0>4}\n", .{ entry, b, v, pc });
-                    return false;
-                }
-                // Same I-RAM hazard as the absolute arm: an unshifted
-                // indexed-long low-mirror site diverges on the SA-1
-                // unless its measured traffic was pure ROM.
-                // A base at or above $FF00 wraps forward into the NEXT
-                // bank's low page, so it reaches the mirror just as surely
-                // as a base below $2000 — and testing only `v < $2000`
-                // is how `LDA $02:FFFF,X` was admitted into the physics
-                // tree and rendered the stage-1 boss out of I-RAM.
-                if (judge and usage_map.mode(op) == .long_x and (b & 0x7F) <= 0x3F and
-                    (v < 0x2000 or v >= 0xFF00))
-                {
-                    const e: u8 = if (evidence) |s| s[pc] | s[0x80_0000 | pc] else 0;
-                    const shifted = e != 0 and e == usage_map.site_wram_low;
-                    if (!shifted and (e == 0 or e & usage_map.site_wram_low != 0)) {
-                        if (dbg) std.debug.print("[win $8ef1] member ${x:0>4}: I-RAM hazard long_x ${x:0>2}:{x:0>4} at ${x:0>4} evidence {x:0>2}\n", .{ entry, b, v, pc, e });
-                        return false;
-                    }
-                }
-            },
-        }
-        pc += len;
-    }
-    return false;
-}
-
-/// The window stubs' D guard: a caller whose direct page is NOT
-/// window-shaped (D outside $6000-$7FFF) comes from a code path the
-/// rewriter never covered — its dp state lives in real WRAM, and handing
-/// it to the SA-1 would resolve dp operands into the SA-1's own I-RAM,
-/// smash the mailbox, and send the chip rampaging over shared BW-RAM
-/// (measured: a garbled-and-wiped session traced to exactly this). Such
-/// a call runs the ORIGINAL body on the S-CPU instead — no worse than
-/// the uncovered path already is, and the SA-1 stays sane.
-const win_guard_len: u32 = 24;
-fn emitWinGuard(d: []u8, cur: *usize, entry: u16) void {
-    put(d, cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68 }); // PHP REP PHA PHD/PLA
-    put(d, cur, &.{ 0xC9, 0x00, 0x60, 0x90, 0x05 }); // < $6000 -> bail
-    put(d, cur, &.{ 0xC9, 0x00, 0x80, 0x90, 0x06 }); // < $8000 -> ok
-    put(d, cur, &.{ 0x68, 0x28, 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 }); // bail
-    put(d, cur, &.{ 0x68, 0x28 }); // ok
-}
-
-/// The VBLANK-PROXIMITY guard: the interleaving hazard, closed by
-/// construction. A tree that reads NMI-shared state can only tear when
-/// the NMI fires MID-TREE — stock's inline walk is interrupted BY the
-/// handler and only ever sees interleavings the game was built for; the
-/// concurrent SA-1 copy is not (measured: a torn chain head sent the
-/// $8EF1 walker into a ROM cycle and parked the mainline forever). But
-/// NMI timing is knowable at call time: latch the V counter, and a call
-/// starting within `margin` scanlines of the NMI at line 225 runs the
-/// ORIGINAL body inline instead — the stock path. Everywhere else the
-/// tree (worst case well under the margin at ~10.74MHz) completes
-/// before the NMI can touch anything it reads; inside vblank the NMI
-/// has already fired and the runway is a whole frame. The two OPVCT
-/// reads are toggle-balanced and $213F resets the toggle first; a game
-/// that itself consumes the H/V latch could be disturbed — the
-/// verification surfaces and the soak gate arbitrate that.
-const win_vblank_margin_lines: u8 = 32;
-const win_vblank_guard_len: u32 = 41;
-fn emitWinVblankGuard(d: []u8, cur: *usize, entry: u16) void {
-    put(d, cur, &.{ 0x08, 0xE2, 0x20, 0x48 }); // PHP SEP #$20 PHA
-    // LONG-addressed PPU reads: the caller's DBR is live here (a pinned
-    // caller arrives with $40), and an absolute $2137 under it would
-    // read BW-RAM instead of the latch.
-    put(d, cur, &.{ 0xAF, 0x37, 0x21, 0x00 }); // SLHV: latch H/V
-    put(d, cur, &.{ 0xAF, 0x3F, 0x21, 0x00 }); // STAT78: reset the read toggle
-    put(d, cur, &.{ 0xAF, 0x3D, 0x21, 0x00, 0xEB }); // OPVCT low -> B
-    put(d, cur, &.{ 0xAF, 0x3D, 0x21, 0x00, 0x4A }); // OPVCT high; bit8 -> carry
-    put(d, cur, &.{ 0xB0, 0x0F }); // V >= 256: deep vblank, safe
-    put(d, cur, &.{ 0xEB, 0xC9, 225 - win_vblank_margin_lines }); // A = V low
-    put(d, cur, &.{ 0x90, 0x0A }); // below the window: safe
-    put(d, cur, &.{ 0xC9, 225, 0xB0, 0x06 }); // at/past NMI line: safe
-    put(d, cur, &.{ 0x68, 0x28, 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 }); // danger: inline
-    put(d, cur, &.{ 0x68, 0x28 }); // safe
-}
-
-/// The mailbox BUSY guard: the S-CPU's NMI keeps firing while a sync stub
-/// waits out its handshake, and the handler may call ANOTHER offloaded
-/// routine — the game's contexts shift by phase (measured: the sound
-/// pump is mainline in attract but interrupt-side at the title-exit
-/// transition), so a nested stub posts over the in-flight message,
-/// deadlocks both handshakes, parks the S-CPU forever and leaves the
-/// SA-1 mid-copy (the f830 freeze). A call that finds EITHER busy cell
-/// set ($378C sync in-flight, $378A async in-flight) is NMI-nested — it
-/// runs the original body inline on the S-CPU instead, which is exactly
-/// what the un-offloaded game would have done.
-const win_busy_guard_len: u32 = 30;
-fn emitWinBusyGuard(d: []u8, cur: *usize, entry: u16) void {
-    put(d, cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0xE2, 0x20 }); // PHP REP PHA SEP #$20
-    put(d, cur, &.{ 0xAF, 0x8C, 0x37, 0x00 }); // LDA sync busy
-    put(d, cur, &.{ 0x0F, 0x8A, 0x37, 0x00 }); // ORA async busy
-    put(d, cur, &.{ 0xD0, 0x06 }); // BNE bail
-    put(d, cur, &.{ 0xC2, 0x20, 0x68, 0x28, 0x80, 0x08 }); // ok: restore, skip bail
-    put(d, cur, &.{ 0xC2, 0x20, 0x68, 0x28 }); // bail: restore
-    put(d, cur, &.{ 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 });
-}
-
-/// Window sync stub: D guard, then caller D ($3788), registers, caller P,
-/// and caller DBR ($378B) into the mailbox; send; double handshake; exit
-/// registers back out. No shadow, no slots, no page copies.
-///
-/// With `nmi_off` (--wg-nmi-off): SEI + NMITIMEN masked (keeping the
-/// game's auto-joypad bit) across the send-and-wait, restored before
-/// ANY exit path from the $378F MIRROR the thunked writers maintain —
-/// the game's own shadow byte is not phase-accurate (its transition
-/// code disables $4200 without updating it) — and the caller's P (and
-/// its I bit) round-trips untouched because it was marshaled BEFORE the
-/// SEI. While the S-CPU waits here, nothing on it can mutate the tree's
-/// read-set: the concurrency hazard is closed by construction, not by
-/// timing. A straddled NMI is delivered late (real HW: fires on
-/// re-enable during vblank; this emulator: skipped like a lag frame).
-const win_stub_len: u32 = 158 + win_guard_len + win_busy_guard_len + win_vblank_guard_len;
-const win_nmi_off_extra: u32 = 27;
-/// Covered `STA $4200` sites re-pointed at mirror thunks (bank $00).
-const NmiSites = struct { at: [8]u32, n: usize };
-const win_nmi_thunk_len: u32 = 8;
-fn emitWinStub(d: []u8, id: u8, entry: u16, nmi_off: bool) u32 {
-    var cur: usize = 0;
-    emitWinGuard(d, &cur, entry);
-    emitWinBusyGuard(d, &cur, entry);
-    emitWinVblankGuard(d, &cur, entry);
-    // The mailbox is NMI-ATOMIC: busy is raised BEFORE the first mailbox
-    // write and dropped AFTER the last mailbox read. The S-CPU's NMI
-    // keeps firing through a stub, and a nested offload call landing in
-    // an unguarded window overwrites the marshal (the tree then runs
-    // with the NESTED call's registers) or the exit registers (the outer
-    // caller resumes with them) — measured live as rampaging indexed
-    // writes, a smashed stack top, and a wild RTL into open bus while
-    // the music played on. Fully transparent wrapper: PHP/SEP/PHA
-    // around the store.
-    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48, 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00, 0x68, 0x28 });
-    // Caller D, with A saved around the grab.
-    put(d, &cur, &.{ 0x08, 0xC2, 0x20, 0x48, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00, 0x68, 0x28 });
-    // Register marshal (the sync-ptr stub's, verbatim).
-    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
-    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
-    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
-    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0x8F, 0x86, 0x37, 0x00 });
-    // Caller DBR: the PHB byte, at the stack top now the PHP is pulled.
-    put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 });
-    if (nmi_off) {
-        // Interrupts off for the whole handshake: caller P is already in
-        // the mailbox, so the SEI never leaks back. RDNMI ack first —
-        // the game's own bracket idiom.
-        put(d, &cur, &.{0x78}); // SEI
-        put(d, &cur, &.{ 0xAF, 0x10, 0x42, 0x00 }); // RDNMI ack
-        put(d, &cur, &.{ 0xAF, 0x8F, 0x37, 0x00 }); // the $4200 mirror
-        put(d, &cur, &.{ 0x29, 0x01 }); // keep auto-joypad only
-        put(d, &cur, &.{ 0x8F, 0x00, 0x42, 0x00 });
-    }
-    // Send + double handshake.
-    put(d, &cur, &.{ 0xA9, id, 0x8F, 0x00, 0x22, 0x00 });
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xC9, id, 0xD0, 0xF6 });
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x00, 0x22, 0x00 });
-    put(d, &cur, &.{ 0xAF, 0x00, 0x23, 0x00, 0x29, 0x0F, 0xD0, 0xF8 });
-    if (nmi_off) {
-        // Restore the game's NMITIMEN before ANY exit path (the aborted
-        // check below JMLs away); the exit PLP restores the caller's I.
-        put(d, &cur, &.{ 0xAF, 0x10, 0x42, 0x00 }); // RDNMI ack
-        put(d, &cur, &.{ 0xAF, 0x8F, 0x37, 0x00 }); // the $4200 mirror
-        put(d, &cur, &.{ 0x8F, 0x00, 0x42, 0x00 });
-    }
-    // Exit registers from the mailbox; caller DBR back.
-    put(d, &cur, &.{0xAB});
-    put(d, &cur, &.{ 0xC2, 0x30, 0xAF, 0x82, 0x37, 0x00, 0xAA, 0xAF, 0x84, 0x37, 0x00, 0xA8 });
-    put(d, &cur, &.{ 0xE2, 0x20, 0xAF, 0x86, 0x37, 0x00, 0x48 });
-    put(d, &cur, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 });
-    // WATCHDOG-ABORTED check, matching THIS stub's id: the dispatcher's
-    // abort path skipped the exit marshal, so the registers just loaded
-    // ARE the caller's entry registers — clear the flag and the busy
-    // cell and run the ORIGINAL body inline, exactly the un-offloaded
-    // game (the tree never ran to completion; worst case is an
-    // interrupted copy's partial BW-RAM writes re-applied, a rare
-    // single-frame double-step instead of a permanent freeze).
-    put(d, &cur, &.{ 0x48, 0xAF, 0x8D, 0x37, 0x00, 0xC9, id, 0xD0, 0x10 }); // PHA; aborted us?
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8D, 0x37, 0x00, 0x8F, 0x8C, 0x37, 0x00 });
-    put(d, &cur, &.{ 0x68, 0x28, 0x5C, @truncate(entry), @truncate(entry >> 8), 0x00 });
-    put(d, &cur, &.{0x68}); // ok: PLA
-    // Mailbox reads done — NOW release it (A preserved around the store).
-    put(d, &cur, &.{ 0x48, 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00, 0x68 });
-    put(d, &cur, &.{ 0x28, 0x6B });
-    return @intCast(cur);
-}
-
-/// Window async stub: fence first (drain any in-flight call), marshal
-/// registers + D + DBR, send, mark busy, return AT ONCE with the
-/// caller's own registers. Nothing to write back — the routine's effects
-/// land in the shared BW-RAM both CPUs address.
-const win_async_stub_len: u32 = 111 + win_guard_len + win_busy_guard_len;
-fn emitWinAsyncStub(d: []u8, fence: u24, id: u8, entry: u16) u32 {
-    var cur: usize = 0;
-    emitWinGuard(d, &cur, entry);
-    emitWinBusyGuard(d, &cur, entry);
-    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B }); // save caller
-    put(d, &cur, &.{ 0x22, @truncate(fence), @truncate(fence >> 8), @truncate(fence >> 16) });
-    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 }); // restore (REP first)
-    // Raise busy BEFORE the marshal (see the sync stub: an NMI-nested
-    // call in the marshal window would overwrite the mailbox and the
-    // async tree would run with the nested call's registers).
-    put(d, &cur, &.{ 0x08, 0xE2, 0x20, 0x48, 0xA9, 0x01, 0x8F, 0x8C, 0x37, 0x00, 0x68, 0x28 });
-    put(d, &cur, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A }); // re-save P,A,X,Y
-    put(d, &cur, &.{ 0x8B, 0x08, 0xE2, 0x20 });
-    put(d, &cur, &.{ 0x8F, 0x80, 0x37, 0x00, 0xEB, 0x8F, 0x81, 0x37, 0x00, 0xEB });
-    put(d, &cur, &.{ 0xC2, 0x30, 0x8A, 0x8F, 0x82, 0x37, 0x00, 0x98, 0x8F, 0x84, 0x37, 0x00 });
-    // Caller P is the re-save's PHP byte: B(1)+Y(2)+X(2)+A(2) above it
-    // once our own PHP is pulled.
-    put(d, &cur, &.{ 0xE2, 0x20, 0x68, 0xA3, 0x08, 0x8F, 0x86, 0x37, 0x00 });
-    put(d, &cur, &.{ 0xA3, 0x01, 0x8F, 0x8B, 0x37, 0x00 }); // DBR (PHB byte)
-    // D last — the PLA clobbers A, which the mailbox already holds.
-    put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, 0x88, 0x37, 0x00 });
-    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, id, 0x8F, 0x00, 0x22, 0x00, 0x8F, 0x8A, 0x37, 0x00 });
-    // $378A now covers the in-flight async; drop the marshal guard.
-    put(d, &cur, &.{ 0xA9, 0x00, 0x8F, 0x8C, 0x37, 0x00 });
-    put(d, &cur, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28, 0x6B });
-    return @intCast(cur);
-}
-
-/// One dispatcher block for a window offload: game D as-is, WATCHDOG
-/// armed (while DBR is still the dispatcher's — the arm is absolute
-/// MMIO, and a game DBR would land it in BW-RAM), game DBR from the
-/// mailbox, the shared unmarshal, CLI, the copy, SEI, dispatcher DBR
-/// back, the shared marshal, exit-P I-bit repaired, dispatcher D back,
-/// signal. The watchdog: the SA-1's own linear timer restarts before
-/// each dispatch; a copy that overruns the budget takes the timer IRQ
-/// into the abort handler, which unwinds and signals "aborted" instead
-/// of wedging both CPUs forever (measured: the $8EF1 walker's torn
-/// chain-head ROM cycles survived every cheaper guard).
-///
-/// The I-bit dance: these trees are the INTERRUPT class — their game P
-/// arrives with I set, so without the CLI the watchdog would never
-/// fire for exactly the calls it exists to protect (the unmarshal's
-/// PLP hands game P to the copy). But P round-trips: the marshal
-/// stores the live post-copy P and the S-CPU caller PLPs it, so the
-/// forced CLI/SEI would leak a wrong I bit back into the GAME. Entry
-/// P's I bit is stashed at $378E before dispatch and patched into the
-/// stored exit P after the marshal. (PLB's N/Z clobber predates the
-/// watchdog and is measured non-load-bearing; I is not a flag to
-/// gamble on.)
-const win_block_len: u32 = 65;
-fn emitWinBlock(d: []u8, cur: *usize, id: u8, copy_addr: u16, copy_bank: u8, unm_addr: u16, mar_addr: u16, sig_addr: u16, dp_base: u16) void {
-    put(d, cur, &.{ 0xC9, id, 0xD0, win_block_len - 4 });
-    put(d, cur, &.{0x8B}); // dispatcher DBR
-    put(d, cur, &.{ 0xC2, 0x20, 0xAD, 0x88, 0x37, 0x5B }); // game D
-    put(d, cur, &.{ 0xE2, 0x20 });
-    put(d, cur, &.{ 0xAD, 0x86, 0x37, 0x29, 0x04, 0x8D, 0x8E, 0x37 }); // entry P's I bit -> $378E
-    put(d, cur, &.{ 0x9C, 0x11, 0x22 }); // CTR: counters to zero
-    put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // CIC: clear timer flag
-    putJsr(d, cur, unm_addr); // loads X/Y, sets game DBR, loads A/P long
-    put(d, cur, &.{0x58}); // CLI — the watchdog covers the copy whatever game P says
-    put(d, cur, &.{ 0x22, @truncate(copy_addr), @truncate(copy_addr >> 8), copy_bank });
-    put(d, cur, &.{0x78}); // SEI
-    put(d, cur, &.{0xAB}); // dispatcher DBR back
-    putJsr(d, cur, mar_addr);
-    put(d, cur, &.{ 0xAD, 0x86, 0x37, 0x29, 0xFB, 0x0D, 0x8E, 0x37, 0x8D, 0x86, 0x37 }); // exit P I <- entry I
-    put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // drop a crossing that never fired
-    put(d, cur, &.{ 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
-    put(d, cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
-}
-
-/// The watchdog budget: linear-timer V target. V increments every 2048
-/// master clocks, so 200 is ~19ms. Generous ON PURPOSE: the big worker
-/// tree's LEGITIMATE runs average ~4.4ms (measured: a 48-line budget
-/// aborted them wholesale, and every abort double-applies the partial
-/// BW-RAM writes plus the inline re-run — 28 KiB of divergence by
-/// frame 422). The watchdog exists to catch INFINITE loops, where the
-/// alternative is a permanent freeze; cutting one off within ~1.2
-/// frames is plenty.
-const win_watchdog_vcnt: u8 = 200;
-
-/// The abort handler the SA-1's timer IRQ vectors to (CIV). IRQs are
-/// open ONLY between a dispatch block's CLI and SEI, so the sole
-/// LEGITIMATE spurious crossing (the completed-call race: the flag trips
-/// just as the copy returns) interrupts bank 0 inside the blocks region
-/// — that exact shape is acked and resumed. EVERYTHING else is a
-/// runaway: a walker spinning inside the copy AND a torn pointer that
-/// flung it into wild ROM both fail the shape test (checking only the
-/// copies' span would RESUME the wild-chain case forever). Unwind:
-/// aborted flag for the S-CPU, stack reset to the dispatcher's base,
-/// dispatcher DBR/D back, and straight to the signal WITHOUT the exit
-/// marshal, so the mailbox still holds the caller's ENTRY registers and
-/// the stub's inline re-run starts from exactly the original call state.
-/// $378D carries the aborted ID (the $3787 latch), not a boolean: each
-/// sync stub consumes only its OWN id, so an aborted ASYNC tree — whose
-/// stub returned long ago and can never consume the flag — leaves a
-/// stale value no sync stub matches (that run's effects are dropped, one
-/// missed pump tick) instead of tricking the NEXT sync caller into
-/// re-running a body whose tree already completed.
-const win_abort_len: u32 = 58;
-fn emitWinAbort(d: []u8, cur: *usize, blocks_lo: u16, blocks_hi1: u16, sig_addr: u16) void {
-    put(d, cur, &.{ 0xC2, 0x20, 0x48 }); // REP #$20, PHA (preserve A for resume)
-    put(d, cur, &.{ 0xA3, 0x04 }); // interrupted PC (above A + P)
-    put(d, cur, &.{ 0xC9, @truncate(blocks_lo), @truncate(blocks_lo >> 8) });
-    put(d, cur, &.{ 0x90, 0x0B }); // below the blocks: runaway
-    put(d, cur, &.{ 0xC9, @truncate(blocks_hi1), @truncate(blocks_hi1 >> 8) });
-    put(d, cur, &.{ 0xB0, 0x06 }); // past them: runaway
-    put(d, cur, &.{ 0xE2, 0x20, 0xA3, 0x06 }); // interrupted PB
-    put(d, cur, &.{ 0xF0, 0x1C }); // bank 0 in-blocks: resume8
-    // Genuine runaway. The stack is about to be reset — nothing to unpush.
-    put(d, cur, &.{ 0xE2, 0x20 }); // (16-bit arrivals from the PC checks)
-    put(d, cur, &.{ 0x4B, 0xAB }); // PHK/PLB: dispatcher DBR
-    put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // ack the timer IRQ
-    put(d, cur, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x8D, 0x37 }); // $378D: aborted id
-    put(d, cur, &.{ 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A }); // stack to the dispatcher base
-    put(d, cur, &.{ 0xF4, 0x00, 0x37, 0x2B }); // dispatcher D
-    put(d, cur, &.{ 0x4C, @truncate(sig_addr), @truncate(sig_addr >> 8) });
-    put(d, cur, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // resume8: ack
-    put(d, cur, &.{ 0xC2, 0x20, 0x68, 0x40 }); // restore A, RTI
-}
-
 const wg_prologue_len = 21;
 /// Window mode's shim: SEI + 3 stores + XCE/REP + D + S + SEP + JMP =
 /// 1 + 15 + 4 + 4 + 4 + 2 + 3 = 33; +23 when offloads boot the SA-1
 /// (SIWP, CRV lo/hi, async busy init, reset release).
 const wg_window_shim_len = 33;
-const wg_window_shim_max = 33 + 48;
+pub const wg_window_shim_max = 33 + 72;
 /// What the shim must program before releasing the SA-1 from reset:
 /// its reset vector and — S-CPU-side registers both — its IRQ vector,
 /// aimed at the watchdog's abort handler.
-const WinBoot = struct { crv: u16, civ: u16 };
-/// Bank-0 reservation for the window dispatcher: prologue + message loop
-/// + JMP + sig + unm + mar + abort + blocks + NMI prologue + mirror thunks.
-/// The split flavor's carve budget: tok + mini-tok + sloop + the mul
-/// helper + up to 26 stub/trampoline pairs. Bank $00's whole padding
-/// run must cover shim + this.
-const split_disp_max: u32 = 1200;
-const win_disp_max: u32 = 51 + 12 + 3 + 19 + 29 + 24 + offload_max * win_block_len + win_abort_len + nmi_prologue_len + 8 * win_nmi_thunk_len;
-
-/// Context-split thunk: the DBR dispatch plus both flavors of the
-/// original 3-byte op (see the emission comment in convertWholeGame).
-const split_thunk_len: u32 = 24;
-/// Index-split thunk: the DBR test, the X-width test, the magnitude
-/// compare, and both flavors of the original 3-byte op — A-PRESERVING, so
-/// every op class (stores included) can be thunked, not just LDA shapes.
-const idx_thunk_len: u32 = 35;
-/// The same thunk WITHOUT the data-bank test, for a site whose measured
-/// evidence already rules a BW-RAM pin out. The test costs ~17 cycles on
-/// every call and these sites are hot — Gradius III's five measured
-/// split sites are its level-script walker, and paying for a question
-/// their evidence has already answered moved the whole timeline far
-/// enough to flip the behavioural verdict on a build that shipped.
-const idx_thunk_short_len: u32 = 27;
-/// Sites one conversion can thunk (Gradius III measures ~100).
-const split_thunk_max: usize = 192;
-/// Index-split sites one conversion can thunk. Far larger than the DBR
-/// flavor: with `--wg-static` every tiny-base indexed absolute in code the
-/// profile never reached is thunked on principle, because no evidence
-/// exists to prove which home it walks.
-const idx_thunk_max: usize = 2048;
-
-/// A bank-local padding allocator for the thunk populations.
-///
-/// `findFreeSpace` hands out the tail of the ONE largest run, which is the
-/// right shape for a single scaffold and the wrong one for a population:
-/// Gradius III's bank $00 carries its slack in several runs, and demanding
-/// 2 KiB in a single stretch for 62 thunks refused a conversion that fits
-/// comfortably across four. This walks every run in turn, and it skips the
-/// scaffold's carve by ADDRESS instead of by painting over it — the paint
-/// trick relied on the carve's run staying shorter than its neighbours,
-/// which is not a property anyone maintains.
-///
-/// $FF ONLY, unlike `findFreeSpace`: a long run of $00 is as often a real
-/// table of zeros as it is slack, and this allocator takes MANY small runs
-/// across MANY banks rather than one obvious tail, so it meets the
-/// ambiguous ones. Measured: a run of $00 in bank $0E was graphics data,
-/// and thunks written into it rendered pictures the original never showed.
-const PadAlloc = struct {
-    region: []const u8,
-    /// File offset of `region[0]`.
-    base: u32,
-    /// Reserved span (file offsets); empty when lo == hi.
-    lo: u32 = 0,
-    hi: u32 = 0,
-    scan: usize = 0,
-    cur: u32 = 0,
-    end: u32 = 0,
-
-    /// The same 8-byte cushion `findFreeSpace` keeps between real bytes
-    /// and whatever it hands out.
-    const margin = 8;
-
-    /// Rewind the scan. Safe because everything already handed out has
-    /// been WRITTEN by then, so a fresh pass reads it as occupied — which
-    /// is what lets a caller that failed to fit a 35-byte body come back
-    /// and ask for a 5-byte stub instead.
-    fn rewind(self: *@This()) void {
-        self.scan = 0;
-        self.cur = 0;
-        self.end = 0;
-    }
-
-    /// Padding still on offer, net of the per-run margin. Used to decide
-    /// bodies-or-stubs BEFORE placing anything: a bank that cannot hold
-    /// every body should hold no body at all, because a half-filled bank
-    /// leaves the tail thunks without even their 5-byte stub.
-    fn freeBytes(self: *const @This()) u32 {
-        var total: u32 = 0;
-        var i: usize = 0;
-        while (i < self.region.len) {
-            if (self.region[i] != 0xFF) {
-                i += 1;
-                continue;
-            }
-            var j = i + 1;
-            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
-            var s = self.base + @as(u32, @intCast(i));
-            var e = self.base + @as(u32, @intCast(j));
-            i = j;
-            if (self.hi > self.lo and s < self.hi and e > self.lo) {
-                const left = if (self.lo > s) self.lo - s else 0;
-                const right = if (e > self.hi) e - self.hi else 0;
-                if (left >= right) e = s + left else s = e - right;
-            }
-            if (e > s + margin) total += e - s - margin;
-        }
-        return total;
-    }
-
-    /// How many 5-byte far stubs the bank could hold if it held nothing
-    /// else. `freeBytes` cannot answer this: it nets one margin per run,
-    /// while `next` charges the margin only on OPENING a run and then
-    /// packs to its end — for a population of uniform 5-byte stubs the
-    /// per-run arithmetic here is exact.
-    fn stubCapacity(self: *const @This()) u32 {
-        var total: u32 = 0;
-        var i: usize = 0;
-        while (i < self.region.len) {
-            if (self.region[i] != 0xFF) {
-                i += 1;
-                continue;
-            }
-            var j = i + 1;
-            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
-            var s = self.base + @as(u32, @intCast(i));
-            var e = self.base + @as(u32, @intCast(j));
-            i = j;
-            if (self.hi > self.lo and s < self.hi and e > self.lo) {
-                const left = if (self.lo > s) self.lo - s else 0;
-                const right = if (e > self.hi) e - self.hi else 0;
-                if (left >= right) e = s + left else s = e - right;
-            }
-            if (e > s + margin) total += (e - s - margin) / far_stub_len;
-        }
-        return total;
-    }
-
-    fn next(self: *@This(), need: u32) ?u32 {
-        if (self.cur + need <= self.end) {
-            defer self.cur += need;
-            return self.cur;
-        }
-        while (self.scan < self.region.len) {
-            if (self.region[self.scan] != 0xFF) {
-                self.scan += 1;
-                continue;
-            }
-            var j = self.scan + 1;
-            while (j < self.region.len and self.region[j] == 0xFF) j += 1;
-            var s = self.base + @as(u32, @intCast(self.scan));
-            var e = self.base + @as(u32, @intCast(j));
-            self.scan = j;
-            // Clipped against the reservation, keeping the larger half.
-            if (self.hi > self.lo and s < self.hi and e > self.lo) {
-                const left = if (self.lo > s) self.lo - s else 0;
-                const right = if (e > self.hi) e - self.hi else 0;
-                if (left >= right) e = s + left else s = e - right;
-            }
-            if (e >= s + need + margin) {
-                self.cur = s + margin;
-                self.end = e;
-                defer self.cur += need;
-                return self.cur;
-            }
-        }
-        return null;
-    }
-};
-
-/// A `PadAlloc` over one bank of `out`, honouring a reserved span given as
-/// (offset, length) in FILE offsets. Bank $00 stops at the header, where
-/// the scaffold's carve is the thing reserved; other banks are their whole
-/// 32 KiB, where the reservation is the tail of the biggest run kept back
-/// for offload tree copies. Passing the reservation and then ignoring it
-/// for every bank but $00 is how the thunks quietly wrote 395 bytes into
-/// that tail and lost the trees anyway.
-fn padAllocFor(out: []const u8, header_off: u32, bank: u32, res_at: u32, res_len: u32) PadAlloc {
-    if (bank == 0) return .{
-        .region = out[0..header_off],
-        .base = 0,
-        .lo = res_at,
-        .hi = res_at + res_len,
-    };
-    const lo = bank * 0x8000;
-    return .{
-        .region = out[lo..@min(lo + 0x8000, out.len)],
-        .base = lo,
-        .lo = res_at,
-        .hi = res_at + res_len,
-    };
-}
-
-/// A padding allocator for thunk BODIES that will not fit their own bank;
-/// the site's bank keeps only the 5-byte stub.
-///
-/// It walks banks DOWNWARD from the top, and that direction is load-
-/// bearing twice over. Bank $00 is excluded because it is the bank under
-/// pressure and spending less of it is the whole point — but the low banks
-/// generally are: they hold the code, so they hold the sites, so they are
-/// the ones that still need their own stubs. Measured: filling upward from
-/// bank $01 emptied bank $02's padding on bank $00's behalf and then had
-/// nowhere to put bank $02's own stubs.
-const FarPad = struct {
-    out: []const u8,
-    header_off: u32,
-    /// 0 until the first call; the top bank thereafter.
-    bank: u32 = 0,
-    pad: ?PadAlloc = null,
-    /// Reserved span (file offsets) inside `keep_bank`: the TAIL of the
-    /// image's biggest padding run, kept for the offload tree copies.
-    ///
-    /// The copies need ONE contiguous block and cannot be split, while a
-    /// thunk body fits anywhere — so when they compete, the thunks must
-    /// yield. Measured: they did not, making the physics tree eligible
-    /// pushed the copies' demand past what was left, EVERY offload was
-    /// silently abandoned, and the patch shipped 186 dropped frames where
-    /// it had been doing 116. Reserving the whole BANK was worse still:
-    /// the far pool then ate banks $01-$04, which need their padding for
-    /// their own 5-byte stubs. The tail is the right unit — it is where
-    /// `findFreeSpace` allocates from, so thunks filling the head of the
-    /// same run cost the copies nothing.
-    keep_bank: u32 = 0,
-    keep_lo: u32 = 0,
-    keep_hi: u32 = 0,
-
-    fn next(self: *@This(), need: u32) ?u32 {
-        if (self.bank == 0) {
-            // >2 MiB: file banks $40+ live at CPU $A0-$BF through the
-            // Super MMC — a far body placed there and addressed by its
-            // FILE bank fetches the wrong megabyte (measured: a context
-            // thunk at $10:B6C8 called $5F:D777, marched the DXB fade
-            // tables, and BRK'd into the crash trap). The far pool stays
-            // in the identity banks.
-            self.bank = @intCast(@min((self.out.len + 0x7FFF) / 0x8000, 0x40) - 1);
-        }
-        while (self.bank >= 1) {
-            if (self.pad == null) self.pad = if (self.bank == self.keep_bank)
-                padAllocFor(self.out, self.header_off, self.bank, self.keep_lo, self.keep_hi - self.keep_lo)
-            else
-                padAllocFor(self.out, self.header_off, self.bank, 0, 0);
-            if (self.pad.?.next(need)) |at| return at;
-            self.pad = null;
-            self.bank -= 1;
-        }
-        if (dbg_thunk_pad)
-            std.debug.print("[farpad] EXHAUSTED for {} bytes\n", .{need});
-        return null;
-    }
-};
-
-/// How much of the biggest padding run to keep back for offload tree
-/// copies. Gradius III's two trees are 397 and 1324 bytes plus their
-/// stubs and fence — a shade over 2 KB — and 2.5 KiB leaves headroom
-/// without starving the thunk bodies, which have the rest of the image.
-pub const copy_reserve: u32 = 2560;
-
-/// The single biggest $FF run outside bank $00 — the one `findFreeSpace`
-/// will hand the offload tree copies, and whose tail `FarPad` keeps back
-/// for them. Returns its bank and its END file offset (exclusive).
-const BigRun = struct { bank: u32 = 0, end: u32 = 0, len: u32 = 0 };
-fn biggestRun(out: []const u8, header_off: u32) BigRun {
-    var best: BigRun = .{};
-    var bank: u32 = 1;
-    while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
-        const lo = bank * 0x8000;
-        const region = out[lo..@min(lo + 0x8000, out.len)];
-        var i: usize = 0;
-        while (i < region.len) {
-            if (region[i] != 0xFF) {
-                i += 1;
-                continue;
-            }
-            var j = i + 1;
-            while (j < region.len and region[j] == 0xFF) j += 1;
-            const len: u32 = @intCast(j - i);
-            if (len > best.len) best = .{ .bank = bank, .end = @intCast(lo + j), .len = len };
-            i = j;
-        }
-        _ = header_off;
-    }
-    return best;
-}
-
-/// Bank-local stub for a thunk body that had to go to another bank:
-/// `JSL far / RTS`. The body ends in RTL instead of RTS, so the pair
-/// returns to the site exactly as an in-bank thunk would, and the two
-/// pushes the body indexes off the stack ($02,S) sit at the same depth
-/// either way. Five bytes of the pressured bank instead of thirty-five.
-const far_stub_len: u32 = 5;
-
-/// Place one thunk body for a site and return the address its `JSR` should
-/// name. Prefers the site's own bank; falls back to the stub-plus-far-body
-/// shape. `near` and `far_body` are the same template with RTS/RTL tails.
-fn placeThunk(out: []u8, local: *PadAlloc, far: *FarPad, near: []const u8, far_body: []const u8, force_far: bool, n_far: *u16) ?u16 {
-    if (!force_far) {
-        if (local.next(@intCast(near.len))) |at| {
-            @memcpy(out[at..][0..near.len], near);
-            return @intCast(0x8000 + (at % 0x8000));
-        }
-        local.rewind();
-    }
-    n_far.* += 1;
-    const stub = local.next(far_stub_len) orelse return null;
-    const body = far.next(@intCast(far_body.len)) orelse return null;
-    @memcpy(out[body..][0..far_body.len], far_body);
-    out[stub] = 0x22; // JSL
-    std.mem.writeInt(u16, out[stub + 1 ..][0..2], @as(u16, @intCast(0x8000 + (body % 0x8000))), .little);
-    out[stub + 3] = @intCast(body / 0x8000);
-    out[stub + 4] = 0x60; // RTS
-    return @intCast(0x8000 + (stub % 0x8000));
-}
-
-/// The cold-site dispatcher: ONE shared far-stub per pressured bank,
-/// however many unmeasured split sites the bank carries.
-///
-/// The per-thunk far stub already cut a body's bank cost from ~35 bytes
-/// to 5, and Gradius III still refused: bank $02 keeps its entire slack
-/// in one 149-byte run, and the population that needs stubs there is the
-/// UNMEASURED one — tiny-base indexed sites the profile never reached —
-/// which grows with every cover movie harvested. Five bytes per site is
-/// a ceiling coverage itself walks into.
-///
-/// So the unmeasured sites of a bank that cannot afford per-thunk stubs
-/// all `JSR` to one shared `JSL dispatcher / RTS` stub, and the
-/// dispatcher works out which site called by the return address the JSR
-/// itself pushed: binary search over a sorted (site -> body) table, then
-/// a jump into the same RTL-tailed body a per-thunk far stub would have
-/// named. The body cannot tell the difference — it sees the identical
-/// [3-byte JSL frame][2-byte JSR return] stack — so every thunk template
-/// is reused unchanged, flags set by the body's op included (RTS/RTL do
-/// not touch P).
-///
-/// The search runs with interrupts live and no memory scratch: state
-/// lives on the stack, the jump target is written into a 3-byte hole
-/// reserved BELOW the saved registers, and an `RTL` consumes it after
-/// the registers are restored — reentrant against any NMI, including one
-/// that dispatches through this same code.
-///
-/// The price is ~150 cycles per call, paid only by sites that never
-/// executed once across every profiled surface.
-const cold_disp_len: u32 = 106;
-fn coldDispatcherBody(table: u24, n_records: u16) [cold_disp_len]u8 {
-    const t0 = table;
-    const t2 = table + 2;
-    const t4 = table + 4;
-    const t6 = table + 6;
-    const end: u16 = n_records * 8;
-    // Stack during the search, from S: $01-$02 key (the site's address),
-    // $03-$04 hi, $05-$06 saved Y, $07-$08 X, $09-$0A A, $0B P,
-    // $0C-$0E the RTL hole, $0F-$11 the stub's JSL frame (PBR at $11 is
-    // the SITE's bank), $12-$13 the site's JSR return address.
-    return .{
-        0x4B, 0x4B, 0x4B, // PHK x3 — the RTL target's hole
-        0x08, // PHP
-        0xC2, 0x30, // REP #$30
-        0x48, 0xDA, 0x5A, // PHA / PHX / PHY
-        0xF4, 0x00, 0x00, // PEA 0 — hi
-        0xF4, 0x00, 0x00, // PEA 0 — key
-        0xA3, 0x12, // LDA $12,S — the JSR pushed site+2
-        0x3A, 0x3A, // DEC A x2 — the site itself
-        0x83, 0x01, // STA $01,S
-        0xA9, @truncate(end), @truncate(end >> 8), // LDA #records*8
-        0x83, 0x03, // STA $03,S — hi (exclusive)
-        0xA0, 0x00, 0x00, // LDY #0 — lo
-        // loop (29): mid = ((lo + hi) / 2) floored to a record
-        0x98, 0x18, 0x63, 0x03, // TYA / CLC / ADC $03,S
-        0x4A, // LSR
-        0x29, 0xF8, 0xFF, // AND #$FFF8
-        0xAA, // TAX
-        0xA3, 0x01, // LDA $01,S — key
-        0xDF, @truncate(t0), @truncate(t0 >> 8), @truncate(t0 >> 16), // CMP table,X — record.addr16
-        0xF0, 0x0F, // BEQ bank_cmp (61)
-        0x90, 0x08, // BCC go_left (56)
-        // right (48): lo = mid + 8
-        0x8A, 0x18, 0x69, 0x08, 0x00, 0xA8, // TXA / CLC / ADC #8 / TAY
-        0x80, 0xE5, // BRA loop
-        // go_left (56): hi = mid
-        0x8A, 0x83, 0x03, // TXA / STA $03,S
-        0x80, 0xE0, // BRA loop
-        // bank_cmp (61): addr16 matched; order by bank on ties
-        0xE2, 0x20, // SEP #$20
-        0xA3, 0x11, // LDA $11,S — the site's PBR
-        0x29, 0x7F, // AND #$7F — fast mirrors fold onto the file bank
-        0xDF, @truncate(t2), @truncate(t2 >> 8), @truncate(t2 >> 16), // CMP table+2,X — record.bank
-        0xC2, 0x20, // REP #$20 — Z and C survive the width change
-        0xF0, 0x04, // BEQ found (79)
-        0x90, 0xEB, // BCC go_left
-        0x80, 0xE1, // BRA right
-        // found (79): body-1 into the hole, drop scratch, restore, RTL
-        0xBF, @truncate(t4), @truncate(t4 >> 8), @truncate(t4 >> 16), // LDA table+4,X
-        0x83, 0x0C, // STA $0C,S — hole PC
-        0xE2, 0x20, // SEP #$20
-        0xBF, @truncate(t6), @truncate(t6 >> 8), @truncate(t6 >> 16), // LDA table+6,X
-        0x83, 0x0E, // STA $0E,S — hole PBR
-        0xC2, 0x20, // REP #$20
-        0x3B, 0x18, 0x69, 0x04, 0x00, 0x1B, // TSC / CLC / ADC #4 / TCS — drop hi+key
-        0x7A, 0xFA, 0x68, 0x28, // PLY / PLX / PLA / PLP
-        0x6B, // RTL — into the body; JSL frame and JSR return intact
-    };
-}
-
-/// The DBR-dispatch thunk body (see the emission comment in
-/// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
-fn splitThunkBody(op: u8, v: u16, ret: u8) [split_thunk_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    return .{
-        0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
-        0x30, 0x0A, 0x89, 0x40,          0xF0,               0x06, // BMI sys / BIT #$40 / BEQ sys
-        0x68, 0x28, op,   @truncate(v),  @truncate(v >> 8),  ret,
-        0x68, 0x28, op,   @truncate(sh), @truncate(sh >> 8), ret,
-    };
-}
-
-/// The LONG,X index-dispatch thunk: 29 bytes, always entered by `JSL` and
-/// always leaving by `RTL`, so it needs no bank-local home.
-///
-/// No DBR test — a long access names its bank in the operand, so the only
-/// question is the index, and the answer is the same two-way split the
-/// absolute flavor makes: an index small enough to stay under $2000 is
-/// addressing the low mirror (which moved), anything bigger is walking ROM
-/// through the same bytes (which did not). The x8 arm short-circuits for
-/// the same reason it does there: an 8-bit index over a tiny base cannot
-/// leave the low page, and a 16-bit CPX immediate would misparse anyway.
-///
-///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
-///   CPX #($2000-v) / BCS rom
-///   low: PLA / PLP / op b:v+$6000,X / RTL
-///   rom: PLA / PLP / op b:v,X       / RTL
-const long_thunk_len: u32 = 29;
-fn longThunkBody(op: u8, v: u16, bank: u8) [long_thunk_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    const lim: u16 = 0x2000 - v;
-    return .{
-        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
-        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
-        0xE0, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x07, // CPX #lim / BCS rom
-        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
-        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom
-    };
-}
-
-/// The tiny-base `long,X` thunk WITH the forward-wrap arm. The ceiling
-/// body's guard asks only `X < $2000 - v` — but a huge X wraps the
-/// 24-bit sum into the NEXT bank's low page, the same mirror the
-/// negative-base body was built for (measured: the door-transition
-/// loader called `LDA $A0:003E,X` with X=$FFCF — effective $A1:000D,
-/// WRAM $0D — and the ceiling guard sent it down the ROM arm, so the
-/// room state loaded stale and the screen faded to black for good).
-/// No third read arm: `long,X` carries into bank+1 in hardware, so the
-/// shifted operand serves both low windows — the guard just routes
-/// X >= $10000 - v to it. Emitted only when bank+1 carries a window
-/// ((bank & $7F) < $3F); a $3F/$BF/$7D base keeps the ceiling body.
-///
-///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
-///   CPX #($2000-v)  / BCC low   ; small index: this bank's mirror
-///   CPX #($10000-v) / BCC rom   ; big but unwrapped: ROM
-///   low: PLA / PLP / op b:v+$6000,X / RTL   ; wrap carries to b+1
-///   rom: PLA / PLP / op b:v,X       / RTL
-const long_wrap_thunk_len: u32 = 34;
-fn longThunkBodyWrap(op: u8, v: u16, bank: u8) [long_wrap_thunk_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    const lim: u16 = 0x2000 - v;
-    const wl: u16 = @intCast(0x10000 - @as(u32, v));
-    return .{
-        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
-        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x0A, // LDA $02,S / BIT #$10 / BNE low
-        0xE0, @truncate(lim), @truncate(lim >> 8), 0x90, 0x05, // CPX #lim / BCC low
-        0xE0, @truncate(wl), @truncate(wl >> 8), 0x90, 0x07, // CPX #wl / BCC rom
-        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), bank, 0x6B, // low
-        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom
-    };
-}
-
-/// The HDMA indirect-bank ($43x7 DASB) rebank thunk. An indirect HDMA whose
-/// per-scanline source is WRAM names that WRAM bank in DASB, and the value
-/// is loaded from the channel's HDMA object (a ROM table) — not an
-/// immediate or a long operand — so no static rebanker can reach it. The
-/// register write itself is wrapped: on the way to `STA $43x7`, an 8-bit A
-/// holding $7E/$7F becomes $40/$41, so DASB follows its data into BW-RAM;
-/// any other bank passes through untouched, which makes the thunk sound on
-/// every DASB write, whatever the value's origin. `store` is the site's own
-/// three operand bytes (STA abs / abs,X / abs,Y — same 3-byte footprint the
-/// JSR replaces), replayed here with the remapped value; the caller's exact
-/// A and flags are restored, so a store that sat inside a CMP/branch pair or
-/// left A live behaves byte-for-byte as in situ. `ret` is RTS in-bank, RTL
-/// behind a far stub. SEP #$20 forces the byte width the register demands
-/// regardless of the caller's M (the PHA/PLA then move exactly one byte).
-const dasb_thunk_len: u32 = 21;
-fn dasbThunkBody(store: [3]u8, ret: u8) [dasb_thunk_len]u8 {
-    return .{
-        0x08, // PHP
-        0xE2, 0x20, // SEP #$20 — DASB is a byte register
-        0x48, // PHA — save the caller's value
-        0xC9, 0x7E, // CMP #$7E
-        0x90, 0x07, // BCC store — A < $7E, no WRAM bank
-        0xC9, 0x80, // CMP #$80
-        0xB0, 0x03, // BCS store — A >= $80, not $7E/$7F
-        0x38, 0xE9, 0x3E, // SEC / SBC #$3E — $7E->$40, $7F->$41
-        store[0], store[1], store[2], // STA $43x7[,X/Y] (remapped or as-is)
-        0x68, // PLA — restore the caller's value
-        0x28, // PLP
-        ret,
-    };
-}
-
-/// The A-bus bank (A1B, $43x4) runtime rebank thunk body: the FULL misfit
-/// map, because a staged DMA source bank can carry any mirror-intent value —
-/// $7E/$7F (WRAM -> BW-RAM, -$3E), $A0-$BF (mirror-of-MB1 intent that the
-/// shim parks at MB2, -$80), $C0-$DF (MB2 content homed $20 lower, -$20).
-/// Measured: Super Metroid's escape arms `$B0:C400 -> vdest $7000` through a
-/// staged bank byte the provenance never proved; the transfer read the MB2
-/// home (file $284400) instead of MB1 ($184400) and the door's second OBJ
-/// tile table arrived as confetti. Banks $00-$3F and $80-$9F pass through
-/// (region 2 restores that mirror). Same calling convention as the DASB
-/// body: the JSR replaces the 3-byte store; A and P are preserved.
-const a1b_thunk_len: u32 = 37;
-fn a1bThunkBody(store: [3]u8, ret: u8) [a1b_thunk_len]u8 {
-    // Branch offsets audited by simulation; store at body index 31.
-    return .{
-        0x08, // PHP
-        0xE2, 0x20, // SEP #$20
-        0x48, // PHA
-        0xC9, 0x7E, // CMP #$7E
-        0x90, 0x17, // BCC store — plain banks $00-$7D
-        0xC9, 0x80, // CMP #$80
-        0xB0, 0x05, // BCS mirror-region checks
-        0x38, 0xE9, 0x3E, // SEC / SBC #$3E — $7E/$7F -> $40/$41
-        0x80, 0x0E, // BRA store
-        0xC9, 0xA0, // CMP #$A0
-        0x90, 0x0A, // BCC store — $80-$9F: genuine mirror
-        0xC9, 0xC0, // CMP #$C0
-        0xB0, 0x04, // BCS hi
-        0xE9, 0x7F, // SBC #$7F (carry clear) — $A0-$BF -> -$80
-        0x80, 0x02, // BRA store
-        0xE9, 0x20, // hi: SBC #$20 (carry set) — $C0-$DF -> -$20
-        store[0], store[1], store[2], // STA $43x4[,X/Y]
-        0x68, // PLA
-        0x28, // PLP
-        ret,
-    };
-}
-
-/// Wrap every covered `STA $43x7` (a channel's DASB — the indirect HDMA
-/// source bank) in a runtime rebank thunk. When an indirect HDMA's source
-/// is WRAM, the game names the WRAM bank in DASB, and that bank is a byte
-/// loaded from the channel's HDMA object (a ROM table) — not an immediate
-/// or a long operand, so no static rebanker can reach it. Super Metroid's
-/// Ceres alarm is the witness: its color-math COLDATA HDMA reads a
-/// per-scanline gradient the game builds into live BW-RAM ($40), but its
-/// object still names bank $7E, so the hardware fetches the abandoned copy
-/// and the escape room renders as stripes while its logic runs correctly.
-/// The remap ($7E/$7F->$40/$41) is a no-op for a ROM or already-BW-RAM
-/// bank, so wrapping is sound on every DASB write whatever the value's
-/// origin — any DASB that named $7E/$7F on stock must name $40/$41 here.
-///
-/// A separate function from convertWholeGame on purpose: its own working
-/// set (the per-bank PadAlloc) stays out of that already-deep frame.
-fn rebankDasbWrites(
-    out: []u8,
-    cov: []const u8,
-    header_off: u32,
-    carve: u32,
-    carve_len: u32,
-    far: *FarPad,
-    refusal: *?Refusal,
-    res: *Result,
-) Error!void {
-    var dasb_pad: PadAlloc = undefined;
-    var dasb_pad_bank: u32 = 0xFFFF;
-    var dbank: u32 = 0;
-    while (dbank < 0x40) : (dbank += 1) {
-        const bank_file = dbank * 0x8000;
-        if (bank_file >= out.len) break;
-        var a16: u32 = 0x8000;
-        while (a16 < 0x10000) : (a16 += 1) {
-            const cpu_addr = (dbank << 16) | a16;
-            const fl_lo = cov[cpu_addr];
-            const fl_hi = cov[0x80_0000 | cpu_addr];
-            if ((fl_lo | fl_hi) & usage_map.flag_opcode == 0) continue;
-            const file = bank_file + (a16 - 0x8000);
-            if (file + 3 > out.len) continue;
-            const op = out[file];
-            // STA abs / abs,X / abs,Y whose target is a $43x7 register:
-            // column 7 is DASB. abs,X/abs,Y index by channel*$10, so the
-            // base already names column 7; abs names the channel outright.
-            switch (op) {
-                0x8D, 0x9D, 0x99 => {},
-                else => continue,
-            }
-            const tgt = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-            if (tgt < 0x4300 or tgt > 0x437F) continue;
-            const col = tgt & 0xF;
-            // Column 7 (DASB) always; column 4 (A1B) on >2 MiB images, where
-            // an unmapped mirror-intent bank sources the wrong megabyte.
-            if (col != 7 and !(col == 4 and out.len > 0x20_0000)) continue;
-            // The register is a byte, and the thunk compares an 8-bit A; a
-            // 16-bit store here would be writing DASB+A2A-low as a word, not
-            // a plain bank set — leave that shape untouched.
-            const fl = if (fl_lo & usage_map.flag_opcode != 0) fl_lo else fl_hi;
-            if (fl & usage_map.flag_m == 0) continue;
-            if (dbank != dasb_pad_bank) {
-                dasb_pad = padAllocFor(out, header_off, dbank, carve, carve_len);
-                dasb_pad_bank = dbank;
-            }
-            const store: [3]u8 = out[file..][0..3].*;
-            const taddr = (if (col == 7)
-                placeThunk(out, &dasb_pad, far, &dasbThunkBody(store, 0x60), &dasbThunkBody(store, 0x6B), false, &res.stats.split_far)
-            else
-                placeThunk(out, &dasb_pad, far, &a1bThunkBody(store, 0x60), &a1bThunkBody(store, 0x6B), false, &res.stats.split_far)) orelse
-                return refuse(refusal, .{ .reason = .no_free_space, .detail = a1b_thunk_len });
-            out[file] = 0x20; // JSR — same 3-byte footprint as the store
-            std.mem.writeInt(u16, out[file + 1 ..][0..2], taddr, .little);
-            res.stats.rewritten_dasb += 1;
-        }
-    }
-}
-
-/// The file offset a runtime CPU address reads from, under the window
-/// conversion's map. A <=2 MiB image is plain LoROM; a >2 MiB image follows
-/// the shim's Super-MMC programming ($00-$1F/$80-$9F -> MB0, $20-$3F -> MB1,
-/// $A0-$BF -> MB2), which is where the de-mirror pass parks the content.
-/// Only ROM homes are mapped; a bank with no fixed ROM home returns null.
-fn loromFileOffset(image_len: usize, cpu: u24) ?usize {
-    const bank: u32 = (cpu >> 16) & 0xFF;
-    const a16: u32 = cpu & 0xFFFF;
-    if (a16 < 0x8000) return null;
-    const off: usize = a16 - 0x8000;
-    const file: usize = if (image_len <= 0x20_0000)
-        (bank & 0x7F) * 0x8000 + off
-    else if (bank < 0x20 or (bank >= 0x80 and bank < 0xA0))
-        (bank & 0x1F) * 0x8000 + off // MB0
-    else if (bank >= 0x20 and bank < 0x40)
-        (bank - 0x20) * 0x8000 + 0x10_0000 + off // MB1
-    else if (bank >= 0xA0 and bank < 0xC0)
-        (bank - 0xA0) * 0x8000 + 0x20_0000 + off // MB2
-    else
-        return null;
-    return if (file < image_len) file else null;
-}
-
-/// Relocate low-WRAM indirect addresses inside the profiled indirect-HDMA
-/// tables (window mode; see PtrBankEvidence.hdma_tables and the Ceres
-/// escape). Each table is a run of `[line-count][addr-lo][addr-hi]` entries
-/// terminated by a zero count; an entry whose 16-bit indirect address names
-/// the moved low 8 KiB (< $2000) is shifted +$6000 so the DMA unit fetches
-/// the relocated buffer through the window instead of the abandoned physical
-/// mirror. The count byte's bit 7 (repeat vs. continuous) does not change the
-/// three-byte stride. Bounded against a table whose terminator was itself a
-/// relocated byte, and skips a table whose home is not statically mappable.
-fn relocateHdmaIndirect(out: []u8, tables: []const u24, res: *Result) void {
-    for (tables) |cpu| {
-        var f = loromFileOffset(out.len, cpu) orelse continue;
-        var guard: usize = 0;
-        while (guard < 256) : (guard += 1) {
-            if (f + 3 > out.len) break;
-            if (out[f] == 0) break; // zero line-count ends the table
-            const addr = std.mem.readInt(u16, out[f + 1 ..][0..2], .little);
-            if (addr < 0x2000) {
-                std.mem.writeInt(u16, out[f + 1 ..][0..2], addr + wg_bw_window, .little);
-                res.stats.rewritten_hdma_indirect += 1;
-            }
-            f += 3;
-        }
-    }
-}
-
-/// The ORIGINAL index-split thunk, kept verbatim for exactly the sites it
-/// already served: an LDA shape whose measured evidence is low|rom. Those
-/// five sites in Gradius III are the level-script walker, they are hot,
-/// and they are on a path that SHIPS — so they get the body that shipped,
-/// to the cycle. A is scratch here, which is why only LDA qualifies: the
-/// load overwrites it, and an 8-bit scratch leaves the B accumulator
-/// alone. Generalising this template — even to something strictly more
-/// correct — changed the timeline enough to fail a build that passed.
-const idx_thunk_v2_len: u32 = 24;
-fn idxThunkBodyV2(op: u8, v: u16, ret: u8) [idx_thunk_v2_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    const lim: u16 = 0x2000 - v;
-    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
-    return .{
-        0x08, 0xE2, 0x20, 0xA3, 0x01, 0x89, 0x10, 0xD0, 0x05, // PHP/SEP/LDA $01,S/BIT #$10/BNE low
-        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x05, // CPY #lim / BCS rom
-        0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: PLP / op v+$6000
-        0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: PLP / op v
-    };
-}
-
-/// The NEGATIVE-BASE `long,X` thunk. `LDA $02:FFFF,X` reaches the byte
-/// BEFORE a bank boundary when X is small, wrapping forward into the next
-/// bank's low page — `$02:FFFF` + 7 is `$03:0006`, which is relocated WRAM
-/// on the S-CPU and the SA-1's OWN I-RAM inside an offloaded copy. The
-/// slot walker uses the idiom on the boss's node-insertion path, which is
-/// why the stage-1 boss rendered as garbage: the tree read I-RAM for its
-/// chain links. Every net missed it, because all three tested `v < $2000`
-/// and $FFFF is not — the thunk rule, the window shift, and the
-/// eligibility walk's hazard check, which is how the tree was admitted.
-///
-/// Two compares, because the low mirror is a RANGE here rather than a
-/// ceiling: X below `$10000 - v` has not wrapped yet and is still reading
-/// this bank's ROM tail; X that far plus $2000 or more has passed the
-/// mirror. Only between them is the address the one that moved.
-///
-/// No A scratch: the dispatch reads X only. `REP #$10` makes the
-/// immediates parse and X read whole whatever width the caller had —
-/// setting the X flag zeroes XH, so an x8 caller's index has the same
-/// numeric value either way — and PLP puts the caller's width back before
-/// the op, which runs last so the exit flags are its own.
-///
-///   PHP / REP #$10
-///   CPX #($10000-v) / BCC rom      ; not wrapped: ROM tail
-///   CPX #($10000-v+$2000) / BCS rom ; past the mirror
-///   low: PLP / op (b+1):(v+$6000) / RTL
-///   rom: PLP / op b:v              / RTL
-const long_neg_thunk_len: u32 = 25;
-fn longNegThunkBody(op: u8, v: u16, bank: u8) [long_neg_thunk_len]u8 {
-    const lo: u16 = @intCast(0x10000 - @as(u32, v)); // wrap threshold
-    const hi: u16 = lo +% 0x2000;
-    // EA' = EA + $6000: the +$6000 always carries out of a base >= $FF00,
-    // so the bank advances and the operand keeps the same distance.
-    const sh: u16 = v +% wg_bw_window;
-    const sb: u8 = bank +% 1;
-    return .{
-        0x08, 0xC2, 0x10, // PHP / REP #$10
-        0xE0, @truncate(lo), @truncate(lo >> 8), 0x90, 0x0B, // CPX #lo / BCC rom
-        0xE0, @truncate(hi), @truncate(hi >> 8), 0xB0, 0x06, // CPX #hi / BCS rom
-        0x28, op, @truncate(sh), @truncate(sh >> 8), sb, 0x6B, // low: the window
-        0x28, op, @truncate(v), @truncate(v >> 8), bank, 0x6B, // rom: as written
-    };
-}
-
-/// The index-dispatch thunk for a site MEASURED never to run under a
-/// BW-RAM pin: the data-bank arm is dropped and only the index is asked
-/// about. Same A-preserving shape, eight bytes and ~17 cycles cheaper.
-///
-///   PHP / SEP #$20 / PHA / LDA $02,S / BIT #$10 / BNE low
-///   CPY #($2000-v) / BCS rom
-///   low: PLA / PLP / op v+$6000 / RTS
-///   rom: PLA / PLP / op v / RTS
-fn idxThunkBodyShort(op: u8, v: u16, ret: u8) [idx_thunk_short_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    const lim: u16 = 0x2000 - v;
-    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
-    return .{
-        0x08, 0xE2, 0x20, 0x48, // PHP / SEP #$20 / PHA
-        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // LDA $02,S / BIT #$10 / BNE low
-        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
-        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
-        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: as written
-    };
-}
-
-/// The index-dispatch thunk body (see the emission comment in
-/// convertWholeGame). `ret` is RTS in-bank, RTL behind a far stub.
-fn idxThunkBody(op: u8, v: u16, ret: u8) [idx_thunk_len]u8 {
-    const sh: u16 = v + wg_bw_window;
-    const lim: u16 = 0x2000 - v;
-    const cp: u8 = if (usage_map.mode(op) == .abs_y) 0xC0 else 0xE0;
-    return .{
-        0x08, 0xE2, 0x20, 0x48, 0x8B, 0x68, // PHP/SEP#$20/PHA/PHB/PLA
-        0x30, 0x04, 0x89, 0x40, 0xD0, 0x11, // BMI sys / BIT #$40 / BNE rom
-        0xA3, 0x02, 0x89, 0x10, 0xD0, 0x05, // sys: LDA $02,S / BIT #$10 / BNE low
-        cp, @truncate(lim), @truncate(lim >> 8), 0xB0, 0x06, // CPY #lim / BCS rom
-        0x68, 0x28, op, @truncate(sh), @truncate(sh >> 8), ret, // low: the window
-        0x68, 0x28, op, @truncate(v), @truncate(v >> 8), ret, // rom: as written
-    };
-}
-
-/// Diagnostics: report each bank's thunk demand against its padding.
-const dbg_thunk_pad = false;
-
-const WinChosen = struct { entry: u16, spec: WinSpec, is_async: bool, nmi_off: bool };
-
-/// Choose and emit window offloads onto the REWRITTEN image. The
-/// dispatcher (CRV is 16-bit) and the NMI prologue (a 16-bit vector)
-/// live in the bank-0 carve after the shim; stubs, copies, and the fence
-/// are long-addressed and carve from any bank's padding. Returns the CRV
-/// and CIV for the shim to program, or null when nothing offloaded.
-/// (CIV because $2207/8 is an S-CPU-SIDE register — the SA-1's own
-/// stores to it fall on deaf ports, measured as a frame-0 wedge when the
-/// prologue tried: the first timer IRQ vectored through CIV=0 into
-/// I-RAM garbage.)
-fn emitWindowOffloads(
-    out: []u8,
-    usage: []const u8,
-    evidence: ?[]const u8,
-    header_off: u32,
-    candidates: []const Candidate,
-    allow_async_in: bool,
-    bank0_at: u32,
-    /// Index-split thunk bodies (24-bit): a `JSL` into one is a leaf the
-    /// eligibility walk must not mistake for a tree member.
-    thunks: []const u24,
-    res: *Result,
-) ?WinBoot {
-    const nmi_native = std.mem.readInt(u16, out[header_off + 0x2A ..][0..2], .little);
-    const nmi_emu = std.mem.readInt(u16, out[header_off + 0x3A ..][0..2], .little);
-    const nmi_ok = nmi_native >= 0x8000 and
-        (nmi_emu == nmi_native or nmi_emu < 0x8000 or nmi_emu == 0xFFFF);
-    const allow_async = allow_async_in and nmi_ok;
-
-    var chosen: [offload_max]WinChosen = undefined;
-    var n: usize = 0;
-    for (candidates) |c| {
-        if (n == offload_max) break;
-        if (c.entry >> 16 != 0 or (c.entry & 0xFFFF) < 0x8000) continue;
-        const e: u16 = @truncate(c.entry);
-        const dup = for (chosen[0..n]) |x| {
-            if (x.entry == e) break true;
-        } else false;
-        if (dup) continue;
-        // The async monopoly, as in the S3 path: a sibling's un-fenced
-        // send mid-flight deadlocks the dispatcher.
-        if (n > 0 and chosen[0].is_async) break;
-        const spec = windowEligible(out, usage, evidence, thunks, e) orelse continue;
-        if (countCallSites(out, usage, e, 0x22) == 0) continue;
-        chosen[n] = .{
-            .entry = e,
-            .spec = spec,
-            .is_async = allow_async and !c.no_async and !c.nmi_off and n == 0,
-            .nmi_off = c.nmi_off,
-        };
-        n += 1;
-    }
-    if (n == 0) return null;
-
-    // --wg-nmi-off support: NMITIMEN is write-only, and the game's own
-    // shadow byte is NOT phase-accurate — GIII's transition code writes
-    // $4200=0 (screen off, interrupts off) WITHOUT touching its $1E82
-    // shadow, so a stub that restored from the shadow RE-ENABLED the
-    // NMI inside the game's own interrupts-off bracket (measured: a
-    // mid-transition NMI walked a garbage handler pointer through $57
-    // buffer data and the game parked forever in its frame-wait with
-    // the screen blanked). The truth must be MIRRORED: every covered
-    // `STA $4200` is re-pointed at an 8-byte thunk (JSR fits the 3-byte
-    // site exactly) that stores A to I-RAM $378F first, then to $4200 —
-    // mirror-first, so a caller nested between the two stores reads the
-    // value the game was about to set. The stub masks and restores from
-    // the mirror: exact, whatever phase the game is in. Sites must all
-    // be bank $00 (JSR reach) and the plain-STA shape; anything else
-    // (STZ form, other banks) forfeits the wrap, disclosed via stats.
-    const nmi_sites: ?NmiSites = blk: {
-        var want = false;
-        for (chosen[0..n]) |c| {
-            if (c.nmi_off and !c.is_async) want = true;
-        }
-        if (!want) break :blk null;
-        var s: NmiSites = .{ .at = undefined, .n = 0 };
-        var bank: u32 = 0;
-        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
-            var a16: u32 = 0x8000;
-            while (a16 < 0x10000) : (a16 += 1) {
-                const cpu = bank << 16 | a16;
-                if ((usage[cpu] | usage[0x80_0000 | cpu]) & usage_map.flag_opcode == 0) continue;
-                const f = bank * 0x8000 + (a16 - 0x8000);
-                if (f + 2 >= out.len) continue;
-                const op = out[f];
-                if ((op == 0x8D or op == 0x9C) and out[f + 1] == 0x00 and out[f + 2] == 0x42) {
-                    if (op == 0x9C or bank != 0 or s.n == s.at.len) break :blk null;
-                    s.at[s.n] = f;
-                    s.n += 1;
-                }
-            }
-        }
-        if (s.n == 0) break :blk null;
-        break :blk s;
-    };
-    res.stats.nmi_off_sites = if (nmi_sites) |s| @intCast(s.n) else 0;
-
-    // Any-bank sizes.
-    var any_len: u32 = 0;
-    var has_async = false;
-    for (chosen[0..n]) |c| {
-        any_len += c.spec.total_span;
-        if (c.is_async) {
-            has_async = true;
-            any_len += fenceLen(.{}) + nb_fence_len + win_async_stub_len;
-        } else any_len += win_stub_len + (if (c.nmi_off and nmi_sites != null) win_nmi_off_extra else 0);
-    }
-    // The copies need ONE contiguous run and cannot be split, which puts
-    // them in direct competition with the thunk bodies already written
-    // into the same padding. When the run is not there, EVERY offload is
-    // silently abandoned and the patch ships with none — measured: making
-    // the physics tree eligible raised the requirement past what was left
-    // and cost the sequencer tree too, 116 dropped frames back to 186,
-    // with nothing in the log to say why. Disclose it.
-    // Bank-contained: a copy that crosses $xx:FFFF executes into the WRAM
-    // mirror when the PC wraps, which after relocation is abandoned memory.
-    const any_at = patchgen.findFreeSpaceInBank(out, any_len) orelse {
-        res.stats.offload_space_short = any_len;
-        return null;
-    };
-    var cur: u32 = any_at;
-
-    // Copies first (their addresses feed the blocks and stubs).
-    var copy_at: [offload_max]u32 = undefined;
-    for (chosen[0..n], 0..) |c, i| {
-        var member_copy: [ptr_tree_cap]u32 = undefined;
-        copy_at[i] = cur;
-        for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
-            member_copy[mi] = cur;
-            @memcpy(out[cur..][0..m.span], out[m.entry - 0x8000 ..][0..m.span]);
-            cur += m.span;
-        }
-        for (c.spec.members[0..c.spec.n_members], 0..) |m, mi| {
-            fixupJmps(out, usage, m.entry, m.span, member_copy[mi], @intCast(0x8000 + (member_copy[mi] % 0x8000)));
-            // Member-to-member JSLs re-point at the copies.
-            var pc: u32 = m.entry;
-            while (pc - m.entry < m.span) {
-                if (usage[pc] & usage_map.flag_opcode == 0) {
-                    pc += 1;
-                    continue;
-                }
-                const mf = pc - 0x8000;
-                const op = out[mf];
-                if (op == 0x22 and out[mf + 3] == 0x00) {
-                    const tgt = std.mem.readInt(u16, out[mf + 1 ..][0..2], .little);
-                    for (c.spec.members[0..c.spec.n_members], 0..) |m2, mj| {
-                        if (m2.entry != tgt) continue;
-                        const dst = member_copy[mi] + (pc - m.entry);
-                        std.mem.writeInt(u16, out[dst + 1 ..][0..2], @intCast(0x8000 + (member_copy[mj] % 0x8000)), .little);
-                        out[dst + 3] = @intCast(member_copy[mj] / 0x8000);
-                        break;
-                    }
-                }
-                const m8 = usage[pc] & usage_map.flag_m != 0;
-                const x8 = usage[pc] & usage_map.flag_x != 0;
-                pc += usage_map.instrLen(op, m8, x8);
-            }
-        }
-        res.stats.offload_copy[i] = @as(u24, @intCast(copy_at[i] / 0x8000)) << 16 |
-            @as(u24, @intCast(0x8000 + (copy_at[i] % 0x8000)));
-        res.stats.offload_copy_len[i] = c.spec.total_span;
-    }
-
-    // Fence for the async offload, then the stubs; re-point call sites.
-    var fence24: u24 = 0;
-    var nb_fence24: u24 = 0;
-    for (chosen[0..n], 0..) |c, i| {
-        const id: u8 = @intCast(i + 1);
-        if (c.is_async) {
-            const flen = emitFence(out[cur..], .{});
-            std.debug.assert(flen == fenceLen(.{}));
-            fence24 = @as(u24, @intCast(cur / 0x8000)) << 16 |
-                @as(u24, @intCast(0x8000 + (cur % 0x8000)));
-            res.stats.async_entry = c.entry;
-            res.stats.async_fence = fence24;
-            cur += flen;
-            const nblen = emitNbFence(out[cur..]);
-            std.debug.assert(nblen == nb_fence_len);
-            nb_fence24 = @as(u24, @intCast(cur / 0x8000)) << 16 |
-                @as(u24, @intCast(0x8000 + (cur % 0x8000)));
-            cur += nblen;
-        }
-        const stub_file = cur;
-        const stub_wrap = c.nmi_off and nmi_sites != null;
-        const slen = if (c.is_async)
-            emitWinAsyncStub(out[cur..], fence24, id, c.entry)
-        else
-            emitWinStub(out[cur..], id, c.entry, stub_wrap);
-        std.debug.assert(slen == if (c.is_async)
-            win_async_stub_len
-        else
-            win_stub_len + (if (stub_wrap) win_nmi_off_extra else 0));
-        cur += slen;
-        const stub_bank: u8 = @intCast(stub_file / 0x8000);
-        const stub_addr: u16 = @intCast(0x8000 + (stub_file % 0x8000));
-        res.stats.offload_sites += rewriteCallSites(out, usage, c.entry, 0x22, stub_addr, stub_bank);
-        res.stats.offload_entries[i] = c.entry;
-        res.stats.offload_ptr_mask |= @as(u8, 1) << @intCast(i);
-    }
-    std.debug.assert(cur - any_at == any_len);
-
-    // The dispatcher, in the bank-0 carve after the shim.
-    const d = out[bank0_at..];
-    var dc: usize = 0;
-    const dp_base: u16 = 0x3700;
-    const base16: u16 = @intCast(0x8000 + (bank0_at % 0x8000));
-    // Prologue: I-RAM/BW-RAM gates, CBM block 0 (the identity window!),
-    // native mode, 16-bit X, stack under the mailbox, D — then the
-    // watchdog: the linear timer with a V budget, CIC BEFORE CIE (the
-    // clear bit is the line mask — enabling with it unset asserts the
-    // IRQ line at once, and the first dispatch's PLP of a mainline
-    // caller's P would take it instantly). CIV is programmed by the
-    // S-CPU shim: $2207/8 is not writable from this side.
-    const abort_addr: u16 = base16 + @as(u16, @intCast(51 + 12 + n * win_block_len + 3 + 19 + 29 + 24));
-    put(d, &dc, &.{ 0x78, 0xA9, 0xFF, 0x8D, 0x2A, 0x22, 0xA9, 0x80, 0x8D, 0x27, 0x22, 0x9C, 0x25, 0x22, 0x18, 0xFB, 0xC2, 0x10, 0xA2, 0x78, 0x37, 0x9A, 0xF4, @truncate(dp_base), @truncate(dp_base >> 8), 0x2B });
-    put(d, &dc, &.{ 0xA9, win_watchdog_vcnt, 0x8D, 0x14, 0x22 }); // VCNT lo
-    put(d, &dc, &.{ 0xA9, 0x00, 0x8D, 0x15, 0x22 }); // VCNT hi
-    put(d, &dc, &.{ 0xA9, 0x82, 0x8D, 0x10, 0x22 }); // TMC: linear, V compare
-    put(d, &dc, &.{ 0xA9, 0x40, 0x8D, 0x0B, 0x22 }); // CIC: line masked...
-    put(d, &dc, &.{ 0xA9, 0x40, 0x8D, 0x0A, 0x22 }); // ...THEN CIE: timer IRQ
-    std.debug.assert(dc == 51);
-    const loop_addr: u16 = base16 + @as(u16, @intCast(dc));
-    put(d, &dc, &.{ 0xE2, 0x20, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xF0, 0xF7, 0x8D, 0x87, 0x37 });
-    const blocks_at = dc;
-    dc += n * win_block_len; // blocks emitted below, once sig/unm/mar addresses exist
-    put(d, &dc, &.{ 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
-    const sig_addr: u16 = base16 + @as(u16, @intCast(dc));
-    put(d, &dc, &.{ 0xAD, 0x87, 0x37, 0x8D, 0x09, 0x22, 0xAD, 0x01, 0x23, 0x29, 0x0F, 0xD0, 0xF9, 0x9C, 0x09, 0x22, 0x4C, @truncate(loop_addr), @truncate(loop_addr >> 8) });
-    const unm_addr: u16 = base16 + @as(u16, @intCast(dc));
-    // The unmarshal sets the GAME DBR itself, and the mailbox reads that
-    // follow it go LONG. Ordering is load-bearing: a caller pinned to
-    // BW-RAM marshals DBR=$40, and an absolute $37xx read under that
-    // bank lands in BW-RAM game data, not I-RAM — the tree then runs
-    // with garbage registers and a garbage P (measured: the async
-    // flavor's pinned caller entered the copy in m8/x8, misparsed the
-    // m16 stream, and ran away until the watchdog). X and Y load first,
-    // under the dispatcher's DBR, because LDX/LDY have no long form.
-    put(d, &dc, &.{ 0xC2, 0x10, 0xAE, 0x82, 0x37, 0xAC, 0x84, 0x37 }); // REP #$10; LDX; LDY
-    put(d, &dc, &.{ 0xAD, 0x8B, 0x37, 0x48, 0xAB }); // game DBR
-    put(d, &dc, &.{ 0xAF, 0x86, 0x37, 0x00, 0x48 }); // P (long), pushed
-    put(d, &dc, &.{ 0xAF, 0x81, 0x37, 0x00, 0xEB, 0xAF, 0x80, 0x37, 0x00 }); // B, A (long)
-    put(d, &dc, &.{ 0x28, 0x60 }); // PLP; RTS
-    const mar_addr: u16 = base16 + @as(u16, @intCast(dc));
-    put(d, &dc, &.{ 0x08, 0xC2, 0x10, 0x8E, 0x82, 0x37, 0x8C, 0x84, 0x37, 0xE2, 0x20, 0x8D, 0x80, 0x37, 0xEB, 0x8D, 0x81, 0x37, 0xEB, 0x68, 0x8D, 0x86, 0x37, 0x60 });
-    // The watchdog's abort handler; the resume shape is bank 0 inside
-    // the blocks region (the only place a dispatch opens IRQs).
-    std.debug.assert(base16 + @as(u16, @intCast(dc)) == abort_addr);
-    const blocks_lo: u16 = base16 + @as(u16, @intCast(blocks_at));
-    emitWinAbort(d, &dc, blocks_lo, blocks_lo + @as(u16, @intCast(n * win_block_len)), sig_addr);
-    const nmi_at = dc;
-    var bc = blocks_at;
-    for (chosen[0..n], 0..) |_, i| {
-        const id: u8 = @intCast(i + 1);
-        emitWinBlock(d, &bc, id, @intCast(0x8000 + (copy_at[i] % 0x8000)), @intCast(copy_at[i] / 0x8000), unm_addr, mar_addr, sig_addr, dp_base);
-    }
-    std.debug.assert(bc == blocks_at + n * win_block_len);
-
-    // Async: the NMI prologue (bank 0 — the vector is 16-bit), vectors.
-    if (has_async) {
-        var nc = nmi_at;
-        put(d, &nc, &.{ 0x08, 0xC2, 0x30, 0x48, 0xDA, 0x5A, 0x8B });
-        put(d, &nc, &.{ 0x22, @truncate(nb_fence24), @truncate(nb_fence24 >> 8), @truncate(nb_fence24 >> 16) });
-        put(d, &nc, &.{ 0xAB, 0xC2, 0x30, 0x7A, 0xFA, 0x68, 0x28 });
-        put(d, &nc, &.{ 0x4C, @truncate(nmi_native), @truncate(nmi_native >> 8) });
-        std.debug.assert(nc - nmi_at == nmi_prologue_len);
-        const nmi_addr: u16 = base16 + @as(u16, @intCast(nmi_at));
-        std.mem.writeInt(u16, out[header_off + 0x2A ..][0..2], nmi_addr, .little);
-        std.mem.writeInt(u16, out[header_off + 0x3A ..][0..2], nmi_addr, .little);
-    }
-
-    // The $4200-mirror thunks (nmi-off wrap): each covered `STA $4200`
-    // becomes `JSR thunk`; the thunk stores A to the mirror FIRST, then
-    // to the register, so a caller nested between the two stores reads
-    // the value the game was about to set.
-    if (nmi_sites) |s| {
-        var tc = nmi_at + @as(usize, if (has_async) nmi_prologue_len else 0);
-        for (s.at[0..s.n]) |site| {
-            const thunk_addr: u16 = base16 + @as(u16, @intCast(tc));
-            put(d, &tc, &.{ 0x8F, 0x8F, 0x37, 0x00 }); // mirror first
-            put(d, &tc, &.{ 0x8D, 0x00, 0x42 }); // then NMITIMEN
-            put(d, &tc, &.{0x60});
-            out[site] = 0x20;
-            std.mem.writeInt(u16, out[site + 1 ..][0..2], thunk_addr, .little);
-        }
-    }
-
-    res.stats.offload_count = @intCast(n);
-    res.stats.offloaded = chosen[0].entry;
-    res.stats.pointer_offloads = @intCast(n);
-    res.stats.resident_offloads = @intCast(n); // by construction
-    return .{ .crv = base16, .civ = abort_addr };
-}
+pub const WinBoot = struct { crv: u16, civ: u16 };
 /// Extra prologue the BW-RAM window needs: select block 0, unprotect, and
 /// reproduce the power-on D and S inside the window (native mode first).
 const wg_prologue_bw_extra = 20;
@@ -3963,1173 +1184,31 @@ comptime {
     std.debug.assert(wg_service.len == 89);
 }
 
-/// `--wg-static`: extend the S1 coverage map by recursive-descent
-/// disassembly. Every dynamically covered opcode is a PROVEN instruction
-/// start with proven M/X widths — the profiler recorded them — which
-/// sidesteps the classic 65816 static-disassembly trap: immediates change
-/// length with the width flags, so a cold disassembler cannot even take
-/// instruction boundaries for granted. Seeded from every covered opcode
-/// plus the reset vector, the walk decodes forward through code the
-/// profiled run never reached, following static control flow (branches both
-/// ways, JSR/JSL target and return, JMP/JML/BRA/BRL targets) and
-/// propagating widths through SEP/REP. A path stops wherever the widths
-/// stop being provable (PLP, XCE, RTI) or control goes somewhere static
-/// analysis cannot follow — indirect jumps, whose targets are usually
-/// covered seeds already, which is the point of seeding from coverage.
-/// Bytes never reached stay data and are never rewritten.
-fn extendCoverage(
-    gpa: std.mem.Allocator,
-    image: []const u8,
-    header: header_mod.Header,
-    usage: []const u8,
-) ![]u8 {
-    const ext = try gpa.dupe(u8, usage);
-    errdefer gpa.free(ext);
-    // File-offset-shaped visit marks; one decode per byte is enough because
-    // dynamic flags are already trusted and a width conflict is grounds to
-    // stop, not re-decode.
-    const seen = try gpa.alloc(bool, image.len);
-    defer gpa.free(seen);
-    @memset(seen, false);
+/// Debug: addresses whose first static decode as an opcode is reported with the path that reached them.
+pub var dbg_walk_watch: [8]u32 = @splat(0);
 
-    const Item = struct { addr: u24, m8: bool, x8: bool };
-    var stack: std.array_list.Managed(Item) = .init(gpa);
-    defer stack.deinit();
-
-    if (header.reset_vector >= 0x8000)
-        try stack.append(.{ .addr = header.reset_vector, .m8 = true, .x8 = true });
-    var sbank: u32 = 0;
-    while (sbank < 0x40) : (sbank += 1) {
-        if (sbank * 0x8000 >= image.len) break;
-        var sa: u32 = 0x8000;
-        while (sa < 0x10000) : (sa += 1) {
-            const cpu = (sbank << 16) | sa;
-            for ([2]u32{ cpu, 0x80_0000 | cpu }) |c| {
-                const fl = usage[c];
-                if (fl & usage_map.flag_opcode != 0) try stack.append(.{
-                    .addr = @intCast(cpu),
-                    .m8 = fl & usage_map.flag_m != 0,
-                    .x8 = fl & usage_map.flag_x != 0,
-                });
-            }
-        }
-    }
-
-    // POINTER-LITERAL DESCENT (fixpoint): the walk cannot follow
-    // `JMP ($099C)`, but the pointers those cells hold are stored as
-    // IMMEDIATES by covered code — `LDA #$E737 / STA $099C` — so the
-    // targets are statically enumerable. Each round: walk; then scan the
-    // covered instructions for a 16-bit immediate load whose value is
-    // stored straight into a cell some covered indirect jump dispatches
-    // through, and seed that value as a code entry in the DISPATCHER's
-    // bank. Re-walk until nothing new appears (measured: Super Metroid's
-    // cutscene script chains eleven handlers through $099C; the covered
-    // seed store was rewritten to the window while the uncovered
-    // dispatcher kept the stale home, the chain died at the first link,
-    // the tileset-palette decompression never ran, and the new-game
-    // cutscene faded into a black room with input alive).
-    var round: u32 = 0;
-    fixpoint: while (round < 6) : (round += 1) {
-        while (stack.pop()) |item| {
-            var addr: u32 = item.addr;
-            var m8 = item.m8;
-            var x8 = item.x8;
-            walk: while (true) {
-                const wbank = addr >> 16;
-                const a16 = addr & 0xFFFF;
-                const cpu0: u32 = addr;
-                if (wbank >= 0x40 or a16 < 0x8000) break;
-                const file = wbank * 0x8000 + (a16 - 0x8000);
-                if (file >= image.len) break;
-                if (seen[file]) break;
-                const dyn = usage[cpu0] | usage[0x80_0000 | cpu0];
-                if (dyn & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                    dyn & usage_map.flag_opcode == 0) break;
-                seen[file] = true;
-                const op = image[file];
-                const len: u32 = usage_map.instrLen(op, m8, x8);
-                if (a16 + len > 0x10000) break;
-                if (ext[addr] & usage_map.flag_opcode == 0) {
-                    ext[addr] &= ~(usage_map.flag_m | usage_map.flag_x);
-                    ext[addr] |= usage_map.flag_opcode | usage_map.flag_exec |
-                        (if (m8) usage_map.flag_m else @as(u8, 0)) |
-                        (if (x8) usage_map.flag_x else @as(u8, 0));
-                    var i: u32 = 1;
-                    while (i < len) : (i += 1) ext[addr + i] |= usage_map.flag_exec;
-                }
-                switch (op) {
-                    // Path enders: returns, software interrupts, STP — and the
-                    // two instructions after which the widths are anyone's
-                    // guess.
-                    0x60, 0x6B, 0x40, 0x00, 0x02, 0xDB, 0x28, 0xFB => break,
-                    0xE2 => { // SEP #imm
-                        const im = image[file + 1];
-                        if (im & 0x20 != 0) m8 = true;
-                        if (im & 0x10 != 0) x8 = true;
-                    },
-                    0xC2 => { // REP #imm
-                        const im = image[file + 1];
-                        if (im & 0x20 != 0) m8 = false;
-                        if (im & 0x10 != 0) x8 = false;
-                    },
-                    0x4C => { // JMP abs: bank-confined
-                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                        break;
-                    },
-                    0x5C, 0x22 => { // JML long / JSL long
-                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                        const tb: u32 = image[file + 3] & 0x7F;
-                        try stack.append(.{ .addr = @intCast((tb << 16) | t), .m8 = m8, .x8 = x8 });
-                        if (op == 0x5C) break; // JSL falls through on return
-                        // A JSL the profiled run EXECUTED whose return address
-                        // it never marked as an opcode is a call with INLINE
-                        // PARAMS — the callee walks the return address past
-                        // them (SM's DMA launcher carries 8 bytes after every
-                        // JSL). Decoding those as code plants rewrites inside
-                        // data (measured: `19 00 00` in a param block became a
-                        // context-split thunk and the armed transfer read
-                        // $F768 — the thunk's own address). The profile
-                        // outranks static reach: stop the fall-through.
-                        if (a16 + 4 < 0x10000) {
-                            const dyn_site = usage[addr] & usage_map.flag_opcode != 0 or
-                                usage[0x80_0000 | addr] & usage_map.flag_opcode != 0;
-                            if (dyn_site) {
-                                // Two shapes leave a covered JSL with an
-                                // uncovered fall-through, and they need opposite
-                                // treatment. INLINE PARAMS: the callee returns
-                                // PAST the params, so the profile marked a real
-                                // opcode a few bytes further on — trust it and
-                                // stop, or the params decode as code (measured:
-                                // `19 00 00` in a param block became a
-                                // context-split thunk). CALL NEVER RETURNED: the
-                                // profiled run died or was cut inside the callee
-                                // (measured: the door-transition JSL chain at
-                                // $82:E1CA — the player's recording crashed in
-                                // the first callee, so the two SIBLING JSLs
-                                // behind it kept their stock $A0 banks and the
-                                // next walk-through crashed one call later).
-                                // There the window past the call is dyn-DEAD,
-                                // and the static fall-through is both safe and
-                                // the only way to make progress.
-                                var probe: u32 = addr + 4;
-                                var dyn_near = false;
-                                const lim: u32 = @min(addr + 4 + 32, (wbank << 16) | 0xFFFF);
-                                while (probe < lim) : (probe += 1) {
-                                    if (usage[probe] & usage_map.flag_opcode != 0 or
-                                        usage[0x80_0000 | probe] & usage_map.flag_opcode != 0)
-                                    {
-                                        dyn_near = true;
-                                        break;
-                                    }
-                                }
-                                if (dyn_near) break; // inline params: profile wins
-                            }
-                        }
-                    },
-                    0x20 => { // JSR abs: target plus fall-through
-                        const t = std.mem.readInt(u16, image[file + 1 ..][0..2], .little);
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                    },
-                    0x80, 0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0 => {
-                        const rel: i8 = @bitCast(image[file + 1]);
-                        const t = (a16 +% 2 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                        if (op == 0x80) break; // BRA is unconditional
-                    },
-                    0x82 => { // BRL
-                        const rel: i16 = @bitCast(std.mem.readInt(u16, image[file + 1 ..][0..2], .little));
-                        const t = (a16 +% 3 +% @as(u32, @bitCast(@as(i32, rel)))) & 0xFFFF;
-                        try stack.append(.{ .addr = @intCast((wbank << 16) | t), .m8 = m8, .x8 = x8 });
-                        break;
-                    },
-                    // Indirect control transfers: statically opaque. (JSR
-                    // (abs,X) does fall through on return, so it continues.)
-                    0x6C, 0x7C, 0xDC => break,
-                    else => {},
-                }
-                addr += len;
-                continue :walk;
-            }
-        }
-        // Scan for new pointer-literal seeds. The dispatchers themselves are
-        // usually part of the UNCOVERED cluster (that is the hole being
-        // closed), so they are matched in the RAW image — any `JMP (cell)` /
-        // `JSR (cell,X)` shape naming a low-WRAM cell — and the conjunction
-        // with a COVERED immediate store to the same cell is what makes a
-        // false positive unlikely: both sides must independently name the
-        // same sub-$2000 pointer. A matched dispatcher is seeded as code too,
-        // so its own pointer operand shifts with the cell.
-        // Banks with ANY dynamically-executed opcode: dispatchers are CODE, and
-        // real ones live amid covered code (the cutscene dispatchers sit in bank
-        // $02's covered cluster). A pure DATA bank supplies raw $6C/$FC bytes by
-        // the thousand — 3,526 of them matched across the 3 MiB image once the
-        // site list was uncapped (22fd4a2), each planting a window-shifted fake
-        // operand inside stream data (the Ceres door confetti was one such byte;
-        // the rest garble tilesets of rooms the profiled surfaces never visit).
-        var bank_has_exec = [_]bool{false} ** 0x40;
-        {
-            var eb: u32 = 0;
-            while (eb < 0x40) : (eb += 1) {
-                if (eb * 0x8000 >= image.len) break;
-                var ea: u32 = 0x8000;
-                while (ea < 0x10000) : (ea += 1) {
-                    const ec = (eb << 16) | ea;
-                    if ((usage[ec] | usage[0x80_0000 | ec]) & usage_map.flag_opcode != 0) {
-                        bank_has_exec[eb] = true;
-                        break;
-                    }
-                }
-            }
-        }
-        var ptr_bank = [_]u8{0} ** 0x2000; // cell -> dispatcher bank + 1
-        var pb2: u32 = 0;
-        while (pb2 < 0x40) : (pb2 += 1) {
-            if (pb2 * 0x8000 >= image.len) break;
-            var pa2: u32 = 0x8000;
-            while (pa2 < 0x10000) : (pa2 += 1) {
-                const f2 = pb2 * 0x8000 + (pa2 - 0x8000);
-                const o2 = image[f2];
-                if (o2 == 0x6C or o2 == 0x7C or o2 == 0xFC or o2 == 0xDC) {
-                    if (f2 + 2 < image.len) {
-                        // DATA-GATE: a byte the profile READ without ever
-                        // executing is stream/table data, and a raw `$FC` there
-                        // is a coincidence, not a dispatcher. Seeding it as code
-                        // window-shifts a fake operand INSIDE the data
-                        // (measured: `FC FC 0A` in the Ceres door-tileset's
-                        // compressed stream became `JSR ($0AFC,X)`, its "$0AFC"
-                        // was shifted to $6AFC — one byte, $0A -> $6A — and the
-                        // decompressor's back-references cascaded it across the
-                        // whole door sprite band as confetti).
-                        if (!bank_has_exec[pb2]) continue;
-                        const cpu2 = (pb2 << 16) | pa2;
-                        const dflags = usage[cpu2] | usage[0x80_0000 | cpu2];
-                        const data_only = dflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                            dflags & usage_map.flag_opcode == 0;
-                        const cell = std.mem.readInt(u16, image[f2 + 1 ..][0..2], .little);
-                        if (cell < 0x2000 and !data_only) ptr_bank[cell] = @intCast(pb2 + 1);
-                    }
-                }
-            }
-        }
-        var grew = false;
-        // TWO-TIER ACTIVATION: matching raw stores image-wide over-reaches
-        // (measured: the raw scan activated cells across the whole image and
-        // ballooned coverage by 16 KiB of speculation, and the dispatcher
-        // marks were lost under overlapping walks). A cell ACTIVATES only
-        // when a COVERED 16-bit literal store names it — the genuine
-        // mixed-population signal — and only active cells accept the
-        // raw-store expansion that reaches the chain's deeper links.
-        var cell_active = [_]bool{false} ** 0x2000;
-        var ab: u32 = 0;
-        while (ab < 0x40) : (ab += 1) {
-            if (ab * 0x8000 >= image.len) break;
-            var aa: u32 = 0x8000;
-            while (aa < 0x10000) : (aa += 1) {
-                const ca = (ab << 16) | aa;
-                const fla = ext[ca] | ext[0x80_0000 | ca];
-                if (fla & usage_map.flag_opcode == 0) continue;
-                if (fla & usage_map.flag_m != 0) continue;
-                const fa = ab * 0x8000 + (aa - 0x8000);
-                if (fa + 6 > image.len) continue;
-                if (image[fa] != 0xA9 or image[fa + 3] != 0x8D) continue;
-                const acell = std.mem.readInt(u16, image[fa + 4 ..][0..2], .little);
-                if (acell < 0x2000 and ptr_bank[acell] != 0) cell_active[acell] = true;
-            }
-        }
-        var sb3: u32 = 0;
-        while (sb3 < 0x40) : (sb3 += 1) {
-            if (sb3 * 0x8000 >= image.len) break;
-            var sa3: u32 = 0x8000;
-            while (sa3 < 0x10000) : (sa3 += 1) {
-                const c3 = (sb3 << 16) | sa3;
-                const f3 = sb3 * 0x8000 + (sa3 - 0x8000);
-                if (f3 + 6 > image.len) continue;
-                if (image[f3] != 0xA9 or image[f3 + 3] != 0x8D) continue;
-                const cell = std.mem.readInt(u16, image[f3 + 4 ..][0..2], .little);
-                if (cell >= 0x2000 or !cell_active[cell]) continue;
-                const tgt = std.mem.readInt(u16, image[f3 + 1 ..][0..2], .little);
-                if (tgt < 0x8000) continue;
-                const fl3 = ext[c3] | ext[0x80_0000 | c3];
-                const covered3 = fl3 & usage_map.flag_opcode != 0;
-                if (covered3 and fl3 & usage_map.flag_m != 0) continue;
-                const db3: u32 = ptr_bank[cell] - 1;
-                const taddr: u32 = (db3 << 16) | tgt;
-                const tfile = db3 * 0x8000 + (tgt - 0x8000);
-                if (tfile >= image.len) continue;
-                const x8_3 = covered3 and fl3 & usage_map.flag_x != 0;
-                if (!seen[tfile]) {
-                    try stack.append(.{ .addr = @intCast(taddr), .m8 = false, .x8 = x8_3 });
-                    grew = true;
-                }
-                if (!covered3 and !seen[f3]) {
-                    try stack.append(.{ .addr = @intCast(c3), .m8 = false, .x8 = x8_3 });
-                    grew = true;
-                }
-            }
-        }
-        // Dispatchers of ACTIVE cells: marked as instruction starts DIRECTLY —
-        // a `JMP (cell)` is three bytes and the walk would only break on it
-        // anyway, and walk-order overlaps were losing the mark. Re-scanned
-        // raw and uncapped here: a fixed-size site list overflowed on the
-        // coincidental `6C xx` bytes of three megabytes of data long before
-        // it reached the real dispatchers (measured: 64 slots died in bank
-        // $01 while the cutscene dispatchers live at $02:E16F/$02:E28F).
-        var mb2: u32 = 0;
-        while (mb2 < 0x40) : (mb2 += 1) {
-            if (mb2 * 0x8000 >= image.len) break;
-            var ma2: u32 = 0x8000;
-            while (ma2 < 0x10000) : (ma2 += 1) {
-                const mf = mb2 * 0x8000 + (ma2 - 0x8000);
-                const mo = image[mf];
-                if (mo != 0x6C and mo != 0x7C and mo != 0xFC and mo != 0xDC) continue;
-                if (mf + 2 >= image.len) continue;
-                if (!bank_has_exec[mb2]) continue;
-                const mcell = std.mem.readInt(u16, image[mf + 1 ..][0..2], .little);
-                if (mcell >= 0x2000 or !cell_active[mcell]) continue;
-                const msite = (mb2 << 16) | ma2;
-                // Same DATA-GATE as the ptr_bank scan: a byte the profile READ
-                // without executing is data, and marking it as a dispatcher
-                // start window-shifts a fake operand inside it (the Ceres
-                // door-stream `FC FC 0A` confetti byte).
-                const mflags = usage[msite] | usage[0x80_0000 | msite];
-                if (mflags & (usage_map.flag_read | usage_map.flag_write) != 0 and
-                    mflags & usage_map.flag_opcode == 0) continue;
-                if (ext[msite] & usage_map.flag_opcode == 0) {
-                    ext[msite] &= ~(usage_map.flag_m | usage_map.flag_x);
-                    ext[msite] |= usage_map.flag_opcode | usage_map.flag_exec;
-                    ext[msite + 1] |= usage_map.flag_exec;
-                    ext[msite + 2] |= usage_map.flag_exec;
-                    grew = true;
-                }
-            }
-        }
-        if (!grew) break :fixpoint;
-    }
-    return ext;
-}
-
-/// Convert for whole-game migration. Needs only the coverage map — no plan:
-/// state stays at its own addresses inside the identity window.
-/// A split anchor's displaced prefix must be whole instructions with no
-/// flow op: both the enqueue stub and the pump trampoline re-execute
-/// those bytes at a different address.
-fn splitPrefixSpan(out: []const u8, usage: []const u8, entry: u16, need: u32) u32 {
-    var pc: u32 = entry;
-    while (pc - entry < need) {
-        const op = out[pc - 0x8000];
-        switch (op) {
-            0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0, 0x80, 0x82, 0x20, 0xFC, 0x4C, 0x5C, 0x6C, 0x7C, 0xDC, 0x60, 0x6B, 0x40, 0x00, 0x22 => return 0,
-            else => {},
-        }
-        const m8 = usage[pc] & usage_map.flag_m != 0;
-        const x8 = usage[pc] & usage_map.flag_x != 0;
-        pc += usage_map.instrLen(op, m8, x8);
-    }
-    // Anything past `need` is NOP-filled at the site, so the enqueue
-    // stub's RTS (landing at entry+3) walks fill until the boundary.
-    return if (pc - entry <= 6) pc - entry else 0;
-}
-
-/// S5: emit the mainline/NMI split scaffold into the bank-$00 carve
-/// after the shim slot, swap the declared ranges' $4212/$421x reads to
-/// the I-RAM mirrors, and displace the anchors. See `SplitSpec`.
-fn emitSplit(
-    out: []u8,
-    usage: []const u8,
-    spec: SplitSpec,
-    d: []u8,
-    base16: u16,
-    far: *FarPad,
-    refusal: *?Refusal,
-    res: *Result,
-) Error!void {
-    // Anchor shapes first: nothing is written until every check holds.
-    if (spec.tail == 0) {
-        if (splitPrefixSpan(out, usage, spec.mainloop, 4) != 4)
-            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.mainloop });
-    } else if (out[spec.tail - 0x8000] != 0x22 or spec.tail_epilogue == 0) {
-        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail });
-    }
-    for (spec.io_entries) |io| {
-        if (splitPrefixSpan(out, usage, io.entry, 3) == 0)
-            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
-    }
-    if (spec.io_entries.len > 26)
-        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = 0 });
-
-    // Mirror swaps: absolute reads of $4212 -> $3792 and $4218-$421F ->
-    // $3794+, inside the declared ranges only. The pump feeds the cells
-    // continuously post-engage; boot-path readers outside the ranges
-    // keep the real registers.
-    for (spec.vbl_ranges) |r| {
-        var pc: u32 = r[0];
-        while (pc < r[1]) {
-            const op = out[pc - 0x8000];
-            const m8 = usage[pc] & usage_map.flag_m != 0;
-            const x8 = usage[pc] & usage_map.flag_x != 0;
-            const len = usage_map.instrLen(op, m8, x8);
-            const md = usage_map.mode(op);
-            if (len == 3 and (md == .abs or md == .abs_x or md == .abs_y)) {
-                const v = std.mem.readInt(u16, out[pc - 0x8000 + 1 ..][0..2], .little);
-                const nv: u16 = if (v == 0x4212)
-                    split_vbl_mirror
-                else if (v >= 0x4218 and v <= 0x421F)
-                    split_pad_mirror + (v - 0x4218)
-                else
-                    0;
-                if (nv != 0)
-                    std.mem.writeInt(u16, out[pc - 0x8000 + 1 ..][0..2], nv, .little);
-            }
-            pc += len;
-        }
-    }
-
-    // The S-CPU-multiplier idiom: a 16-bit STA $4202 (both multiplicands,
-    // the high write triggering), the 8-cycle NOP wait, LDA $4216 for the
-    // product. On the SA-1 those registers are open bus, so the span is
-    // displaced with a JSL to a helper the engaged cell splits: the
-    // original sequence pre-engage and on the pump, the SA-1's own
-    // arithmetic unit ($2251+, immediate) on the mainline. Strict shape
-    // only — anything looser is a named refusal, not a guess.
-    var mul_sites: [4]u32 = undefined;
-    var n_mul: usize = 0;
-    {
-        var bank: u32 = 0;
-        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
-            var aa: u32 = 0x8000;
-            while (aa < 0xFFF6) : (aa += 1) {
-                const ac = (bank << 16) | aa;
-                if ((usage[ac] | usage[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
-                const file = bank * 0x8000 + (aa - 0x8000);
-                if (!std.mem.eql(u8, out[file..][0..3], &.{ 0x8D, 0x02, 0x42 })) continue;
-                // Only the FULL idiom is claimed. A bare STA $4202 (the
-                // boot's register-clear sweep has eleven of them) is a
-                // write that vanishes harmlessly on the SA-1; a product
-                // READ without this shape shows up in the audit instead.
-                if (!std.mem.eql(u8, out[file + 3 ..][0..4], &.{ 0xEA, 0xEA, 0xEA, 0xEA }) or
-                    !std.mem.eql(u8, out[file + 7 ..][0..3], &.{ 0xAD, 0x16, 0x42 }))
-                    continue;
-                if (n_mul == mul_sites.len)
-                    return refuse(refusal, .{ .reason = .wg_split_shape, .detail = ac });
-                mul_sites[n_mul] = file;
-                n_mul += 1;
-            }
-        }
-    }
-
-    var cur: usize = wg_window_shim_max;
-    if (n_mul != 0) {
-        // The helper, in the carve (JSL-reachable from every bank).
-        const mul16: u16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0x48, 0xAF, @truncate(split_engaged), 0x37, 0x00 }); // PHA / LDA engaged (16-bit; the scratch neighbor masks off)
-        put(d, &cur, &.{ 0x29, 0xFF, 0x00 }); // AND #$00FF
-        put(d, &cur, &.{ 0xD0, 0x0C }); // BNE sa1 path
-        put(d, &cur, &.{ 0x68, 0x8D, 0x02, 0x42 }); // PLA / STA $4202 — the original
-        put(d, &cur, &.{ 0xEA, 0xEA, 0xEA, 0xEA }); // the hardware's 8 cycles
-        put(d, &cur, &.{ 0xAD, 0x16, 0x42, 0x6B }); // LDA $4216 / RTL
-        // sa1: the arithmetic unit — MA = low byte, MB = high byte.
-        put(d, &cur, &.{ 0x68, 0x48, 0x29, 0xFF, 0x00 }); // PLA / PHA / AND #$00FF
-        put(d, &cur, &.{ 0x8F, 0x51, 0x22, 0x00 }); // MA
-        put(d, &cur, &.{ 0x68, 0xEB, 0x29, 0xFF, 0x00 }); // PLA / XBA / AND #$00FF
-        put(d, &cur, &.{ 0x8F, 0x53, 0x22, 0x00 }); // MB — the $2254 write triggers
-        put(d, &cur, &.{ 0xAF, 0x06, 0x23, 0x00, 0x6B }); // product / RTL
-        for (mul_sites[0..n_mul]) |file| {
-            out[file] = 0x22; // JSL helper
-            std.mem.writeInt(u16, out[file + 1 ..][0..2], mul16, .little);
-            out[file + 3] = 0x00;
-            @memset(out[file + 4 ..][0..6], 0xEA);
-        }
-        res.stats.split_mul = @intCast(n_mul);
-    }
-
-    // The audit: covered WAI/STP (the SA-1 gets no interrupts, so a
-    // mainline WAI never wakes), and any covered absolute MMIO read the
-    // split leaves unhandled — open bus on the SA-1. Report, capped;
-    // verification arbitrates what the operator accepts.
-    {
-        var bank: u32 = 0;
-        while (bank * 0x8000 < out.len and bank < 0x40) : (bank += 1) {
-            var aa: u32 = 0x8000;
-            while (aa < 0x10000) : (aa += 1) {
-                const ac = (bank << 16) | aa;
-                if ((usage[ac] | usage[0x80_0000 | ac]) & usage_map.flag_opcode == 0) continue;
-                const file = bank * 0x8000 + (aa - 0x8000);
-                const op = out[file];
-                var hazard = op == 0xCB or op == 0xDB;
-                if (!hazard and (op == 0xAD or op == 0xAC or op == 0xAE or op == 0x2C or op == 0xCD)) {
-                    const v = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
-                    hazard = (v >= 0x2100 and v <= 0x21FF) or (v >= 0x4200 and v <= 0x43FF);
-                }
-                if (hazard and res.stats.n_split_hazards < res.stats.split_hazards.len) {
-                    res.stats.split_hazards[res.stats.n_split_hazards] = @intCast(ac);
-                    res.stats.n_split_hazards += 1;
-                }
-            }
-        }
-    }
-
-    if (spec.tail != 0) {
-        // === NMI-TAIL FLAVOR (see SplitSpec.tail) =====================
-        // --- tok stub: the S-CPU boundary, once per frame in vblank ---
-        const tok16: u16 = base16 + @as(u16, @intCast(cur));
-        // The boundary is reachable along MORE than the vectored head —
-        // a transition path arrives with its own D (measured: D=0, three
-        // frames into a stage banner) — and the drain's replayed bodies
-        // are dp users. Pin the window D for the stub's whole span and
-        // hand back whatever the caller had.
-        put(d, &cur, &.{ 0x0B, 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // PHD; D = the window
-        put(d, &cur, &.{0x8B}); // PHB
-        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20 (M widths per the handler)
-        // DBR = $00 EXPLICITLY — not PHK: under fastrom the boundary
-        // executes from PBR=$80, and a PHK'd DBR sends every absolute
-        // $37xx at a mirror whose I-RAM mapping is nobody's contract.
-        // The offload stubs always went long for exactly this reason.
-        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB }); // LDA #$00 / PHA / PLB
-        put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37 });
-        const bne_at = cur;
-        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE engaged (patched)
-        put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP open
-        put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 });
-        put(d, &cur, &.{ 0x9C, @truncate(split_token), 0x37, 0x9C, @truncate(split_last), 0x37 });
-        put(d, &cur, &.{ 0x9C, @truncate(split_in_replay), 0x37 });
-        const crv_ref = cur;
-        put(d, &cur, &.{ 0xA9, 0x00, 0x8D, 0x03, 0x22, 0xA9, 0x00, 0x8D, 0x04, 0x22 }); // CRV (patched)
-        put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
-        put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
-        d[bne_at + 1] = @intCast(cur - (bne_at + 2));
-        // The boundary is ALSO reachable on the SA-1: the hazard audit
-        // proves the tail re-enters the handler head ($8237's $4210 ack
-        // is in its static reach), and that walk ends here. Without a
-        // CPU test the SA-1 spins in the auto-joy wait on open bus — or
-        // worse, bumps the token and wedges the gate arithmetic. The
-        // SA-1 branch unwinds the pins and does exactly what the stock
-        // boundary did: the displaced JSL, then the tail.
-        put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
-        put(d, &cur, &.{ 0xD0, 0x03 }); // BNE over the BRL (not the SA-1)
-        const tok_sa1_at = cur;
-        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the SA-1 island (patched; past the pump's reach)
-        put(d, &cur, &.{ 0xE2, 0x20 });
-        // engaged: run the displaced boundary instruction — JSL $892B —
-        // NATIVELY. The S-CPU polls the real pads at the game's own
-        // cadence (the verifier pairs runs poll-for-poll, and a mirror
-        // diet here left the baseline ~246 polls ahead through the
-        // loader), and the results land in window dp cells the SA-1
-        // tail reads directly. No pad mirrors at all.
-        @memcpy(d[cur .. cur + 4], out[spec.tail - 0x8000 ..][0..4]);
-        cur += 4;
-        // M=8 FORCED after the replay: $892B returns wide, and a 16-bit
-        // INC on the token treats token+last as one word — fine for 255
-        // crossings, then the FF->00 carry clobbers `last` in the same
-        // cycle and no edge ever reaches the SA-1 (measured: the wedge
-        // at exactly the 256th crossing, frame 455).
-        put(d, &cur, &.{ 0xE2, 0x20 });
-        // MODE GATE: outside gameplay the tail runs nested-native (the
-        // branch below unpins and runs the chain on this CPU). The dp
-        // read goes through the pinned window D, the single home both
-        // CPUs share. The token freezes across the era; the SA-1 idles
-        // at its edge-gate and wakes when gameplay returns.
-        // BEQ-over-BRL: the nested-native branch sits past the whole pump
-        // loop (166 bytes measured), out of a short branch's reach — the
-        // original BNE truncated to $A6 and jumped BACKWARD into the tok's
-        // own bytes. It was never taken on a verified path; the mode gate
-        // takes it every menu frame and wedged at engage (frame 232).
-        var tok_mode_at: usize = 0;
-        if (spec.mode_gate) {
-            put(d, &cur, &.{ 0xA5, spec.mode_cell, 0xC9, spec.mode_value });
-            put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ over the BRL
-            tok_mode_at = cur;
-            put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the nested-native branch (patched)
-        }
-        // REENTRANT full path: the transition runs as a multi-frame NMI
-        // ($3C is stock's own nesting guard and the transition handler
-        // clears it mid-flight), so a real per-frame NMI can take the
-        // full path while a tail — or a parked replay — is still in
-        // flight beneath us. The SA-1 is busy then; dispatching a second
-        // token deadlocks the nested gate on top of the very replay it
-        // suspends (measured: tok=3/done=2, frame ~714). Stock ran the
-        // nested tail on the S-CPU — so do exactly that: unpin and run
-        // the chain natively; the stubs run bodies directly for S-CPU
-        // callers, and the shared window makes the state evolution
-        // identical.
-        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37 });
-        put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ over the BRL (done == token: dispatch)
-        const tok_nest_at = cur;
-        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the nested-native branch (patched)
-        // Dispatch, then PUMP until the tail lands. A pure exit-wait
-        // deadlocked (the SA-1's enqueued uploads starve without the
-        // drain); pure non-blocking let the mainline overlap the tail
-        // and the shared fade cells ($3A/$3E/$1280) diverged from tick
-        // 3. The wait body IS the pump: each lap re-feeds the vbl
-        // mirror live (stock's $892B reads $4212 live too) and replays
-        // one ring entry, so the gate cannot starve what it waits on.
-        put(d, &cur, &.{ 0xEE, @truncate(split_token), 0x37 }); // token++
-        const drain16: u16 = base16 + @as(u16, @intCast(cur));
-        // Widths are forced EVERY lap: a replayed body returns with
-        // whatever REP it last executed (measured: $86E1 left m16, the
-        // 8-bit ring compare read the vbl mirror as a high byte, and the
-        // drain spun forever).
-        put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
-        put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
-        const beq2_at = cur;
-        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ the done-check (patched)
-        // rd consumes EARLY — a nested NMI's drain must see this entry
-        // gone (re-entering an in-service call regressed forever); the
-        // RPC release is the ACK bump after the body instead.
-        put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
-        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
-        put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
-        // The pump's pinned DBR=$00 is the body's contract too: the
-        // relocation shifts low-absolute operands into the $6000 window,
-        // which every bank $00-$3F maps identically. The replay borrows
-        // the CALLER's D (see the far stub's capture) — the body's dp
-        // rewrites were made against it — then the pump's pins return.
-        // The replay runs on a SCRATCH STACK (real WRAM — unused under
-        // the relocation). RE-ENTRANT: a nested NMI's drain that arrives
-        // already on the scratch page must NOT reset S to the top — that
-        // trampled the outer replay's frames and the nested RTI popped
-        // garbage (measured: P=$F5/PC=$02:8553, frame ~1131). Old S rides
-        // on the stack either way, so the restore is uniform.
-        // (original note follows)
-        // the relocation, and a $1xxx page keeps the far stubs' CPU
-        // discriminator honest). The game writes transition records into
-        // its own FREED stack bytes; stock survives because its frames
-        // sit below them, and our extra gate/trampoline depth moved a
-        // return frame into the write zone (measured: an $A77B record
-        // shredded the $7DE8 frame, frame ~714). Old S rides ON the
-        // scratch stack, so nested drains unwind naturally.
-        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 });
-        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B, 0xE2, 0x20 });
-        // WIDTHS ONLY (AND #$30): the SA-1's P carries I=1 — it runs masked
-        // by design — and PLPing it whole masked NMI on the S-CPU for the
-        // replay's span; a multi-frame sample stream then lost every nested
-        // frame its APU handshake depends on (measured: $9A68 spinning at
-        // p=$04 with no NMI for 400K cycles, frame 745).
-        // The dispatch pointer is fetched FIRST (it needs the drain's X),
-        // then the caller's registers come back — A, X, Y from the stub's
-        // capture, widths via P — and the call goes through the scratch
-        // pointer, PEA giving it a JSR-shaped frame.
-        put(d, &cur, &.{ 0xC2, 0x30 });
-        const jsr2_at = cur;
-        put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl,X — patched by emitSplitIo
-        put(d, &cur, &.{ 0x8D, @truncate(split_cell_t), 0x37 });
-        put(d, &cur, &.{ 0xAE, @truncate(split_cell_x), 0x37, 0xAC, @truncate(split_cell_y), 0x37 });
-        put(d, &cur, &.{ 0xE2, 0x20 });
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48 });
-        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_a), 0x37, 0x28 });
-        const ret1: u16 = base16 + @as(u16, @intCast(cur)) + 6;
-        put(d, &cur, &.{ 0xF4, @truncate(ret1 - 1), @truncate((ret1 - 1) >> 8) }); // PEA return-1
-        put(d, &cur, &.{ 0x6C, @truncate(split_cell_t), 0x37 }); // JMP (cell_t)
-        put(d, &cur, &.{ 0xE2, 0x30 }); // widths again — the body's REPs leak
-        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB });
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 });
-        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
-        put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
-        put(d, &cur, &.{ 0x4C, @truncate(drain16), @truncate(drain16 >> 8) });
-        d[beq2_at + 1] = @intCast(cur - (beq2_at + 2));
-        // Ring-2 backpressure: at half-full, drain it here — the frame
-        // exits that normally drain it don't happen while a multi-frame
-        // transition keeps this gate closed.
-        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_wr), 0x37, 0x38, 0xED, @truncate(split_ring2_rd), 0x37 });
-        put(d, &cur, &.{ 0xB0, 0x02, 0x69, 0x18 }); // mod-24 distance
-        put(d, &cur, &.{ 0xC9, 0x0C });
-        const r2bp_at = cur;
-        put(d, &cur, &.{ 0x90, 0x03 }); // BCC past the call
-        put(d, &cur, &.{ 0x20, 0x00, 0x00 }); // JSR r2 drain (patched)
-        // Stock's overrun release, performed by the gate: $86CD parks a
-        // waiter on $3C's bit7, and on stock the NEXT NMI's overrun path
-        // rewrites $3C:=1 to release it. While the S-CPU is gated here
-        // no such NMI can run — but the gate IS the NMI in progress, so
-        // when the tail itself is the waiter (the SA-1 runs $86CD
-        // natively), the gate makes stock's write for it.
-        put(d, &cur, &.{ 0xA5, 0x3C, 0x10, 0x0A }); // dp via pinned D — BPL past the release
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, 0x01, 0x00, 0x85, 0x3C, 0xE2, 0x30, 0xEA });
-        put(d, &cur, &.{ 0xAD, @truncate(split_done), 0x37, 0xCD, @truncate(split_token), 0x37 });
-        // BEQ-over-BRL: the pump body outgrew a short branch's reach
-        // (the Debug build panicked on the cast; ReleaseFast would have
-        // emitted a silently wrong offset).
-        put(d, &cur, &.{ 0xF0, 0x03 }); // BEQ done: fall out of the gate
-        const back = @as(i32, @intCast(drain16)) - (@as(i32, @intCast(base16)) + @as(i32, @intCast(cur)) + 3);
-        put(d, &cur, &.{ 0x82, @truncate(@as(u32, @bitCast(back))), @truncate(@as(u32, @bitCast(back)) >> 8) }); // BRL the pump head
-        put(d, &cur, &.{ 0xC2, 0x10 }); // X wide again for the epilogue's pulls
-        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the caller's context back
-        put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue), @truncate(spec.tail_epilogue >> 8) });
-        // The nested-native branch: unpin, run the tail on THIS CPU (the
-        // displaced boundary JSL above already made this frame's poll).
-        std.mem.writeInt(u16, d[tok_nest_at + 1 ..][0..2], @intCast(cur - (tok_nest_at + 3)), .little);
-        if (spec.mode_gate) std.mem.writeInt(u16, d[tok_mode_at + 1 ..][0..2], @intCast(cur - (tok_mode_at + 3)), .little);
-        // The game's P first — the SA-1 path enters the tail with the P
-        // captured at engage, and so must this CPU: the tok's own widths
-        // (M8 for the token INC, X as the pins left it) leaked into the
-        // chain, and $9231's 16-bit fill count in Y truncated to 8 bits
-        // (measured: the option screen cleared 256 of each map's 1024
-        // words and the menu logo stayed behind the text).
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // LDA cell_p / PHA / PLP
-        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD — the head's context
-        put(d, &cur, &.{ 0x4C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8) });
-        // The SA-1 island: unwind the pins (the head's own D/B come
-        // back) and run the tail. The displaced JSL $892B is SKIPPED on
-        // this CPU — the SA-1 cannot poll pads, and the S-CPU's poll
-        // this frame already filled the window cells the routine feeds.
-        std.mem.writeInt(u16, d[tok_sa1_at + 1 ..][0..2], @intCast(cur - (tok_sa1_at + 3)), .little);
-        put(d, &cur, &.{ 0xE2, 0x20 }); // M=8, as stock's boundary had it
-        put(d, &cur, &.{ 0xAB, 0x2B }); // PLB, PLD
-        put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 }); // JML the tail proper
-
-        // --- SA-1 prologue: gates, own I-RAM stack ---------------------
-        const prologue16: u16 = base16 + @as(u16, @intCast(cur));
-        d[crv_ref + 1] = @truncate(prologue16);
-        d[crv_ref + 6] = @truncate(prologue16 >> 8);
-        put(d, &cur, &.{ 0x78, 0x18, 0xFB }); // SEI / native
-        put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP
-        put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE
-        put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0
-        put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply, for the helper
-        put(d, &cur, &.{ 0xC2, 0x30 }); // REP #$30
-        put(d, &cur, &.{ 0xA9, @truncate(split_sa1_stack), @truncate(split_sa1_stack >> 8), 0x1B });
-
-        // --- the SA-1 frame loop --------------------------------------
-        const sloop16: u16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0xE2, 0x20 }); // SEP #$20
-        // publish: the RTI lands here, so `last` is a COMPLETED tail now
-        put(d, &cur, &.{ 0xAF, @truncate(split_last), 0x37, 0x00 });
-        put(d, &cur, &.{ 0x8F, @truncate(split_done), 0x37, 0x00 });
-        put(d, &cur, &.{ 0xAF, @truncate(split_token), 0x37, 0x00 }); // wait:
-        put(d, &cur, &.{ 0xCF, @truncate(split_last), 0x37, 0x00 });
-        put(d, &cur, &.{ 0xF0, 0xF6 }); // BEQ the wait (-10)
-        put(d, &cur, &.{ 0x8F, @truncate(split_last), 0x37, 0x00 });
-        // Fake the handler frame the epilogue unwinds: the RTI comes
-        // back HERE. RTI pulls P, PC, PBR — push PBR, PCH, PCL, P.
-        put(d, &cur, &.{ 0xA9, 0x00, 0x48 }); // PBR
-        put(d, &cur, &.{ 0xA9, @truncate(sloop16 >> 8), 0x48, 0xA9, @truncate(sloop16), 0x48 }); // PC
-        put(d, &cur, &.{ 0xA9, 0x34, 0x48 }); // P: M8/X8/I
-        // the pulls' dummies: A, X, Y (16-bit each), then D — which is
-        // NOT the stock handler's zero: the window relocation's dp
-        // scheme exists because the CONVERTED handler establishes
-        // D=$6000, and a zero here sends every tail dp access into the
-        // SA-1's I-RAM instead of the window (measured: the first boot
-        // probe wrote $00:005C where the game meant window $605C).
-        put(d, &cur, &.{ 0xC2, 0x30, 0xA9, 0x00, 0x00, 0x48, 0x48, 0x48 });
-        put(d, &cur, &.{ 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x48 }); // the PLD's word
-        put(d, &cur, &.{ 0xE2, 0x20, 0xA9, spec.tail_dbr, 0x48 }); // the PLB's byte
-        // live context, as the CONVERTED handler set it: DBR and D
-        put(d, &cur, &.{ 0xA9, spec.tail_dbr, 0x48, 0xAB }); // DBR
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // D = the window
-        // into the tail — the displaced JSL $892B is the S-CPU's now
-        // (it polls the real pads in the tok; the results are already
-        // in the window when the token arrives here)
-        put(d, &cur, &.{ 0x5C, @truncate(spec.tail + 4), @truncate((spec.tail + 4) >> 8), 0x00 });
-
-        // --- mini-tok: unconditional per-frame service ----------------
-        // The load-skip path never reaches the boundary, yet the SA-1's
-        // loader waits on replays only the drain provides. All paths
-        // converge on the epilogue, so its head is displaced onto this:
-        // pins, mirror feed, drain, the displaced bytes, onward.
-        const epi_span = splitPrefixSpan(out, usage, spec.tail_epilogue, 3);
-        if (epi_span == 0)
-            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = spec.tail_epilogue });
-        const mini16: u16 = base16 + @as(u16, @intCast(cur));
-
-        // Both CPUs arrive here: every S-CPU handler exit, and the SA-1's
-        // faked-frame return through the same epilogue. Only the S-CPU
-        // feeds mirrors and drains; the SA-1 skips straight to the
-        // displaced bytes (a pair of REPs -- harmless to repeat).
-        put(d, &cur, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30 }); // TSC & $F000 == $3000?
-        // BNE-over-BRL: the ring-2 drain pushed the target past a short
-        // branch's +127 reach, and the u8 cast wrapped it into a silent
-        // BACKWARD branch (measured: the SA-1 flew into BW-RAM-as-code).
-        put(d, &cur, &.{ 0xD0, 0x03 }); // BNE past the BRL — the S-CPU path
-        const msa1_at = cur;
-        put(d, &cur, &.{ 0x82, 0x00, 0x00 }); // BRL the displaced epilogue (patched)
-        put(d, &cur, &.{ 0x0B, 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B }); // PHD; D = the window
-        put(d, &cur, &.{ 0x8B, 0xE2, 0x20, 0xA9, 0x00, 0x48, 0xAB }); // PHB; DBR = $00
-        // A nested NMI over an in-flight replay must not start another:
-        // a sample stream replay spans frames, and per-frame nested
-        // drains stacked streams 25 bytes deeper each frame until a
-        // frame was corrupt (measured: $00:FFBC once per frame, S
-        // 1b45/1b2c/1b13/1afa). The outer drain loops take the backlog.
-        const mdrain16: u16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0xE2, 0x30 });
-        put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
-        const mbeq_at = cur;
-        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
-        put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 });
-        put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 }); // rd consumes EARLY (see the tok drain)
-        put(d, &cur, &.{ 0x68, 0x0A, 0xAA });
-        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 }); // scratch stack (see the tok drain)
-        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_d), 0x37, 0x5B, 0xE2, 0x20 }); // caller D (see the far stub's capture)
-        put(d, &cur, &.{ 0xC2, 0x30 }); // registers + dispatch: see the tok drain
-        const mjsr_at = cur;
-        put(d, &cur, &.{ 0xBD, 0x00, 0x00 }); // LDA tbl,X — patched by emitSplitIo
-        put(d, &cur, &.{ 0x8D, @truncate(split_cell_t), 0x37 });
-        put(d, &cur, &.{ 0xAE, @truncate(split_cell_x), 0x37, 0xAC, @truncate(split_cell_y), 0x37 });
-        put(d, &cur, &.{ 0xE2, 0x20 });
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48 });
-        put(d, &cur, &.{ 0xC2, 0x20, 0xAD, @truncate(split_cell_a), 0x37, 0x28 });
-        const mret1: u16 = base16 + @as(u16, @intCast(cur)) + 6;
-        put(d, &cur, &.{ 0xF4, @truncate(mret1 - 1), @truncate((mret1 - 1) >> 8) }); // PEA return-1
-        put(d, &cur, &.{ 0x6C, @truncate(split_cell_t), 0x37 }); // JMP (cell_t)
-        put(d, &cur, &.{ 0xE2, 0x30 });
-        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB }); // pump DBR back
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // pump D back
-        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
-        put(d, &cur, &.{ 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release
-        put(d, &cur, &.{ 0x4C, @truncate(mdrain16), @truncate(mdrain16 >> 8) });
-        d[mbeq_at + 1] = @intCast(cur - (mbeq_at + 2));
-        // Ring 2 — the fire-and-forget sound calls — drains HERE and
-        // only here: the frame exit is stock's own phase for the
-        // trailing sound dispatch, and pacing it anywhere earlier
-        // skewed the APU echo family for hundreds of ticks.
-        // Emitted as a SUBROUTINE: the mini-tok calls it at every frame
-        // exit, and the GATE calls it under backpressure — a multi-frame
-        // gated transition has no frame exits, and 24 slots overwrote
-        // (measured: dropped sound dispatches overfilled the command
-        // queue and its cursor walked into the dp floor at $46).
-        const r2skip_at = cur;
-        put(d, &cur, &.{ 0x80, 0x00 }); // BRA past the sub (patched)
-        const r2_16: u16 = base16 + @as(u16, @intCast(cur));
-        put(d, &cur, &.{ 0xE2, 0x30 });
-        // Nesting guard, RING 2 ONLY: a sound stream spans frames and a
-        // nested NMI starting another stacked them 25 bytes/frame. Ring
-        // 1 (uploads) must still drain from a nested frame — each is
-        // short and the scratch frame is stack-safe — or the uploads
-        // land a frame late (measured: 1,476 divergent ticks from the
-        // one 2-frame stream at frame 1126 when both rings were gated).
-        put(d, &cur, &.{ 0xAD, @truncate(split_in_replay), 0x37 });
-        const r2nest_at = cur;
-        put(d, &cur, &.{ 0xD0, 0x00 }); // BNE out (patched)
-        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_rd), 0x37, 0xCD, @truncate(split_ring2_wr), 0x37 });
-        const r2beq_at = cur;
-        put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ out (patched)
-        put(d, &cur, &.{ 0x0A, 0x0A, 0xAA }); // slot*4 -> X
-        put(d, &cur, &.{ 0xBD, @truncate(split_ring2), @truncate(split_ring2 >> 8), 0x48 }); // id pushed
-        put(d, &cur, &.{ 0xC2, 0x20, 0xBD, @truncate(split_ring2 + 1), @truncate((split_ring2 + 1) >> 8), 0x5B, 0xE2, 0x20 }); // D := record.D
-        put(d, &cur, &.{ 0xBD, @truncate(split_ring2 + 3), @truncate((split_ring2 + 3) >> 8), 0x8D, @truncate(split_cell_pw), 0x37 }); // record.P parked in the cell
-        put(d, &cur, &.{ 0xAD, @truncate(split_ring2_rd), 0x37, 0x1A, 0xC9, 0x18, 0xD0, 0x02, 0xA9, 0x00 });
-        put(d, &cur, &.{ 0x8D, @truncate(split_ring2_rd), 0x37 }); // rd2 bumped EARLY (nested-safe)
-        put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // id*2 -> X
-        put(d, &cur, &.{ 0xC2, 0x30, 0x3B, 0xA8, 0x29, 0x00, 0xFF, 0xC9, 0x00, 0x1B, 0xF0, 0x04, 0xA9, 0xFF, 0x1B, 0x1B, 0x98, 0x48, 0xE2, 0x30 }); // scratch stack
-        put(d, &cur, &.{ 0xEE, @truncate(split_in_replay), 0x37 }); // in flight
-        put(d, &cur, &.{ 0xAD, @truncate(split_cell_pw), 0x37, 0x29, 0x30, 0x48, 0x28 }); // caller P
-        const r2jsr_at = cur;
-        put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) — patched below
-        put(d, &cur, &.{ 0xE2, 0x30 });
-        put(d, &cur, &.{ 0xCE, @truncate(split_in_replay), 0x37 }); // landed
-        put(d, &cur, &.{ 0xA9, 0x00, 0x48, 0xAB });
-        put(d, &cur, &.{ 0xC2, 0x20, 0x68, 0x1B, 0xE2, 0x20 }); // old S back
-        put(d, &cur, &.{ 0x4C, @truncate(r2_16), @truncate(r2_16 >> 8) });
-        d[r2beq_at + 1] = @intCast(cur - (r2beq_at + 2));
-        d[r2nest_at + 1] = @intCast(cur - (r2nest_at + 2));
-        put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(wg_bw_window), @truncate(wg_bw_window >> 8), 0x5B, 0xE2, 0x20 }); // pump D back
-        put(d, &cur, &.{0x60}); // RTS — the drain sub's exit
-        d[r2skip_at + 1] = @intCast(cur - (r2skip_at + 2));
-        put(d, &cur, &.{ 0x20, @truncate(r2_16), @truncate(r2_16 >> 8) }); // the mini-tok's own call
-        std.mem.writeInt(u16, d[r2bp_at + 3 ..][0..2], r2_16, .little); // the gate's backpressure call
-        put(d, &cur, &.{ 0xC2, 0x10, 0xAB, 0x2B }); // X wide, PLB, PLD
-        std.mem.writeInt(u16, d[msa1_at + 1 ..][0..2], @intCast(cur - (msa1_at + 3)), .little);
-        @memcpy(d[cur .. cur + epi_span], out[spec.tail_epilogue - 0x8000 ..][0..epi_span]);
-        cur += epi_span;
-        put(d, &cur, &.{ 0x4C, @truncate(spec.tail_epilogue + @as(u16, @intCast(epi_span))), @truncate((spec.tail_epilogue + @as(u16, @intCast(epi_span))) >> 8) });
-
-        // --- displace the boundary on the S-CPU side ------------------
-        out[spec.tail - 0x8000] = 0x4C; // JMP tok (the JSL's 4th byte is unreachable)
-        std.mem.writeInt(u16, out[spec.tail - 0x8000 + 1 ..][0..2], tok16, .little);
-        // ... and the epilogue onto the mini-tok.
-        out[spec.tail_epilogue - 0x8000] = 0x4C;
-        std.mem.writeInt(u16, out[spec.tail_epilogue - 0x8000 + 1 ..][0..2], mini16, .little);
-        if (epi_span > 3) @memset(out[spec.tail_epilogue - 0x8000 + 3 ..][0 .. epi_span - 3], 0xEA);
-        res.stats.split_engage_addr = tok16;
-
-        // --- the DMA-queue bank-slot translator -----------------------
-        // The game's upload records carry their source bank as DATA — ROM
-        // templates copied whole into the queue (the stage-2 boss's
-        // sprite strips live at $01:90CB/D6/E3 with src bank $7F). No
-        // static rewrite reaches a template only late-game code copies,
-        // and no S-CPU harvest ever executes the SA-1-side builder — so
-        // the CONSUMER translates: $8E00's one bank-slot store becomes a
-        // thunk mapping $7E->$40, $7F->$41 at run time, correct for
-        // every template the game will ever build a record from. The
-        // site is M8 (the walker SEPs first), stores leave flags dead
-        // (the next op is an immediate load), and the caller's DBR=$01
-        // reaches the same $4304 mirror the store always hit.
-        {
-            const pat = [_]u8{ 0xBF, 0x08, 0x00, 0x40, 0x8D, 0x04, 0x43 };
-            var site: ?usize = null;
-            var sp: usize = 0;
-            while (sp + pat.len <= 0x8000) : (sp += 1) {
-                if (std.mem.eql(u8, out[sp .. sp + pat.len], &pat)) {
-                    site = sp + 4;
-                    break;
-                }
-            }
-            if (site) |st| {
-                const th16: u16 = base16 + @as(u16, @intCast(cur));
-                put(d, &cur, &.{ 0xC9, 0x7E }); // CMP #$7E
-                put(d, &cur, &.{ 0x90, 0x08 }); // BCC store
-                put(d, &cur, &.{ 0xC9, 0x80 }); // CMP #$80
-                put(d, &cur, &.{ 0xB0, 0x04 }); // BCS store
-                put(d, &cur, &.{ 0x38, 0xE9, 0x3E }); // SEC / SBC #$3E
-                put(d, &cur, &.{0xEA}); // pad: both branches land on the store
-                put(d, &cur, &.{ 0x8D, 0x04, 0x43, 0x60 }); // STA $4304 / RTS
-                out[st] = 0x20; // JSR thunk over the 3-byte STA
-                std.mem.writeInt(u16, out[st + 1 ..][0..2], th16, .little);
-            }
-        }
-
-        try emitSplitIo(out, usage, spec, d, &cur, base16, jsr2_at, far, refusal, res);
-        std.mem.writeInt(u16, d[mjsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
-        std.mem.writeInt(u16, d[r2jsr_at + 1 ..][0..2], std.mem.readInt(u16, d[jsr2_at + 1 ..][0..2], .little), .little);
-        // A real refusal, not an assert: ReleaseFast strips asserts, and
-        // an overflowing emission wrote through the shim and vectors.
-        if (cur > wg_window_shim_max + split_disp_max)
-            return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
-        return;
-    }
-
-    // --- pump loop (S-CPU): feed the mirrors, drain the ring ----------
-    const pump16: u16 = base16 + @as(u16, @intCast(cur));
-    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
-    put(d, &cur, &.{ 0xAD, 0x12, 0x42, 0x8D, @truncate(split_vbl_mirror), @truncate(split_vbl_mirror >> 8) });
-    put(d, &cur, &.{ 0xC2, 0x20 }); // REP #$20 -- pads as words
-    var pi: u16 = 0;
-    while (pi < 8) : (pi += 2) {
-        put(d, &cur, &.{ 0xAD, @truncate(0x4218 + pi), 0x42, 0x8D, @truncate(split_pad_mirror + pi), @truncate((split_pad_mirror + pi) >> 8) });
-    }
-    put(d, &cur, &.{ 0xE2, 0x30 }); // SEP #$30
-    put(d, &cur, &.{ 0xAD, @truncate(split_ring_rd), 0x37, 0xCD, @truncate(split_ring_wr), 0x37 });
-    const beq_at = cur;
-    put(d, &cur, &.{ 0xF0, 0x00 }); // BEQ pump (patched below)
-    put(d, &cur, &.{ 0xAA, 0xBD, @truncate(split_ring), 0x37, 0x48 }); // TAX / LDA ring,X / PHA
-    put(d, &cur, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8D, @truncate(split_ring_rd), 0x37 });
-    put(d, &cur, &.{ 0x68, 0x0A, 0xAA }); // PLA / ASL / TAX
-    const jsr_tbl_at = cur;
-    put(d, &cur, &.{ 0xFC, 0x00, 0x00 }); // JSR (tbl,X) -- patched below
-    put(d, &cur, &.{ 0xE2, 0x30, 0xEE, @truncate(split_rpc_ack), 0x37 }); // the RPC release (the stubs spin on the ack now)
-    put(d, &cur, &.{ 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
-    d[beq_at + 1] = @bitCast(@as(i8, @intCast(@as(i32, pump16) - (@as(i32, base16) + @as(i32, @intCast(beq_at)) + 2))));
-
-    // --- engage (S-CPU, via the displaced JML from the mainloop) ------
-    const engage16: u16 = base16 + @as(u16, @intCast(cur));
-    // The anchor is SHARED: the S-CPU hits it once at engage, and the
-    // SA-1 passes through it on every mainloop lap thereafter. The
-    // engaged cell splits the two: zero exactly once, at first arrival.
-    // (Width-safe: a 16-bit LDA reads the zero neighbor into the high
-    // byte, and BEQ judges the pair.)
-    put(d, &cur, &.{ 0xAD, @truncate(split_engaged), 0x37, 0xF0, 0x04 }); // LDA engaged / BEQ first
-    const lap_jml_at = cur;
-    put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML mainloop_tramp (patched below)
-    put(d, &cur, &.{ 0x4B, 0xAB, 0x08, 0xE2, 0x20 }); // PHK/PLB, PHP, SEP #$20
-    put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x29, 0x22 }); // SIWP: open I-RAM to the S-CPU — every cell store below bounces without this
-    put(d, &cur, &.{ 0xA9, 0x01, 0x8D, @truncate(split_engaged), 0x37 }); // engaged = 1
-    put(d, &cur, &.{0x68}); // PLA — the pushed game P
-    put(d, &cur, &.{ 0x8D, @truncate(split_cell_p), 0x37 }); // game P
-    put(d, &cur, &.{ 0x9C, @truncate(split_ring_wr), 0x37, 0x9C, @truncate(split_ring_rd), 0x37 }); // ring reset: boot-phase enqueues are stale, drop them
-    put(d, &cur, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8D, @truncate(split_cell_d), 0x37 }); // game D
-    put(d, &cur, &.{ 0x3B, 0x8D, @truncate(split_cell_s), 0x37 }); // game S
-    const prologue16: u16 = base16 + @as(u16, @intCast(cur)) + 26;
-    put(d, &cur, &.{ 0xE2, 0x20, 0xA9, @truncate(prologue16), 0x8D, 0x03, 0x22 }); // CRV lo
-    put(d, &cur, &.{ 0xA9, @truncate(prologue16 >> 8), 0x8D, 0x04, 0x22 }); // CRV hi
-    put(d, &cur, &.{ 0x9C, 0x00, 0x22 }); // release the SA-1
-    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_pump_stack), @truncate(split_pump_stack >> 8), 0x1B });
-    put(d, &cur, &.{ 0xE2, 0x30, 0x4C, @truncate(pump16), @truncate(pump16 >> 8) });
-    std.debug.assert(base16 + @as(u16, @intCast(cur)) == prologue16);
-
-    // --- SA-1 prologue: gates, game S/D/P, into the mainline ----------
-    put(d, &cur, &.{ 0x78, 0x18, 0xFB }); // SEI / native
-    put(d, &cur, &.{ 0xA9, 0xFF, 0x8D, 0x2A, 0x22 }); // CIWP: I-RAM writable
-    put(d, &cur, &.{ 0xA9, 0x80, 0x8D, 0x27, 0x22 }); // CBWE: BW-RAM writes
-    put(d, &cur, &.{ 0x9C, 0x25, 0x22 }); // CBM block 0 -- the identity window
-    put(d, &cur, &.{ 0x9C, 0x50, 0x22 }); // ACM: multiply mode, for the helper
-    // The SA-1's OWN I-RAM stack, in this flavor too: the stack page is
-    // the CPU discriminator everywhere, and two CPUs sharing the game
-    // stack was never sound anyway.
-    put(d, &cur, &.{ 0xC2, 0x20, 0xA9, @truncate(split_sa1_stack), @truncate(split_sa1_stack >> 8), 0x1B });
-    put(d, &cur, &.{ 0xAD, @truncate(split_cell_d), 0x37, 0x5B }); // game D
-    put(d, &cur, &.{ 0xE2, 0x20, 0xAD, @truncate(split_cell_p), 0x37, 0x48, 0x28 }); // game P
-    const tramp16: u16 = base16 + @as(u16, @intCast(cur)) + 4;
-    put(d, &cur, &.{ 0x5C, @truncate(tramp16), @truncate(tramp16 >> 8), 0x00 });
-    // --- mainloop trampoline: the displaced 4 bytes, then onward ------
-    std.debug.assert(base16 + @as(u16, @intCast(cur)) == tramp16);
-    std.mem.writeInt(u16, d[lap_jml_at + 1 ..][0..2], tramp16, .little);
-    @memcpy(d[cur .. cur + 4], out[spec.mainloop - 0x8000 ..][0..4]);
-    cur += 4;
-    put(d, &cur, &.{ 0x5C, @truncate(spec.mainloop + 4), @truncate((spec.mainloop + 4) >> 8), 0x00 });
-
-    try emitSplitIo(out, usage, spec, d, &cur, base16, jsr_tbl_at, far, refusal, res);
-
-    if (cur > wg_window_shim_max + split_disp_max)
-        return refuse(refusal, .{ .reason = .wg_split_shape, .detail = @intCast(cur) });
-
-    // --- displace the mainloop anchor, last -----------------------------
-    out[spec.mainloop - 0x8000] = 0x5C; // JML engage
-    std.mem.writeInt(u16, out[spec.mainloop - 0x8000 + 1 ..][0..2], engage16, .little);
-    out[spec.mainloop - 0x8000 + 3] = 0x00;
-    res.stats.split_engage_addr = engage16;
-}
-
-/// The shared IO machinery: per-routine drain trampolines, enqueue
-/// stubs (span-generalized: sites whose whole-instruction prefix runs
-/// past 3 bytes are NOP-filled so the stub's RTS lands in fill), the
-/// dispatch table, and the site displacements. `jsr_patch_at` is the
-/// draining `JSR (tbl,X)` whose operand this fills in.
-fn emitSplitIo(
-    out: []u8,
-    usage: []const u8,
-    spec: SplitSpec,
-    d: []u8,
-    curp: *usize,
-    base16: u16,
-    jsr_patch_at: usize,
-    far: *FarPad,
-    refusal: *?Refusal,
-    res: *Result,
-) Error!void {
-    var cur = curp.*;
-    // Drain trampolines stay in the carve: the drains' `JSR (tbl,X)`
-    // fetches its pointer from PBR's bank, and they are small.
-    //
-    // The call frame is pushed BEFORE the displaced prefix runs: a
-    // prefix may open with PHP (the screen family does), and the body's
-    // closing PLP must find that P on top — with the old layout the
-    // bridge's frame sat between them, the PLP ate the frame's PCL, and
-    // the RTL flew into bank $34 padding (measured: an IRQ-storming
-    // wild march at clk 70.37M).
-    var tramp_addrs: [26]u16 = undefined;
-    for (spec.io_entries, 0..) |io, i| {
-        const span = splitPrefixSpan(out, usage, io.entry, 3);
-        if (span == 0) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
-        tramp_addrs[i] = base16 + @as(u16, @intCast(cur));
-        if (io.rtl) {
-            const helper = tramp_addrs[i] + 5;
-            put(d, &cur, &.{ 0x22, @truncate(helper), @truncate(helper >> 8), 0x00, 0x60 });
-        } else {
-            const helper = tramp_addrs[i] + 4;
-            put(d, &cur, &.{ 0x20, @truncate(helper), @truncate(helper >> 8), 0x60 });
-        }
-        @memcpy(d[cur .. cur + span], out[io.entry - 0x8000 ..][0..span]);
-        cur += span;
-        put(d, &cur, &.{ 0x4C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8) });
-    }
-    // Enqueue stubs live in the FAR pool — seventeen of them overran
-    // the carve, and a stripped assert let the overflow eat the shim.
-    // Bank $00 keeps a 4-byte JML hop per entry; an RTS-shaped deferred
-    // return needs its pop to happen with PBR=$00, so its hop carries
-    // one RTS byte the far stub JMLs back to.
-    var enq_addrs: [26]u16 = undefined;
-    for (spec.io_entries, 0..) |io, i| {
-        enq_addrs[i] = base16 + @as(u16, @intCast(cur));
-        const hop_jml_at = cur;
-        put(d, &cur, &.{ 0x5C, 0x00, 0x00, 0x00 }); // JML far stub (patched)
-        var rts_hop16: u16 = 0;
-        if (io.deferred and !io.rtl) {
-            rts_hop16 = base16 + @as(u16, @intCast(cur));
-            put(d, &cur, &.{0x60});
-        }
-        const need: u32 = 200;
-        const at = far.next(need) orelse
-            return refuse(refusal, .{ .reason = .no_free_space, .detail = need });
-        var fb = out[at .. at + need];
-        var fc: usize = 0;
-        const fbank: u8 = @intCast(at / 0x8000);
-        const fbase: u16 = @intCast(0x8000 + (at % 0x8000));
-        // Caller A/X/Y captured whole before anything is disturbed —
-        // $9231 takes its VRAM fill target in X and its count in Y, and
-        // a replay entering with the drain's registers zero-filled VRAM
-        // at (dispatch index * 2) instead: the title menu's gridlines.
-        put(fb, &fc, &.{ 0x08, 0xC2, 0x30 }); // PHP / REP #$30
-        put(fb, &fc, &.{ 0x8F, @truncate(split_cell_a), 0x37, 0x00 });
-        put(fb, &fc, &.{ 0x98, 0x8F, @truncate(split_cell_y), 0x37, 0x00 }); // TYA
-        put(fb, &fc, &.{ 0x8A, 0x8F, @truncate(split_cell_x), 0x37, 0x00 }); // TXA
-        put(fb, &fc, &.{ 0xAF, @truncate(split_cell_a), 0x37, 0x00 }); // A back
-        put(fb, &fc, &.{0x28}); // PLP — caller state fully intact
-        // PHY too: SEP #$30 ZEROES the high bytes of X and Y on the 65816.
-        // X rode the stack; Y only rode the cell the replay restores from,
-        // so every S-CPU-native call left with Y's high byte gone
-        // (measured: the option screen's map clear entered with Y=$0FFF
-        // and filled $00FF words — the menu logo stayed behind the text).
-        put(fb, &fc, &.{ 0x48, 0xDA, 0x5A, 0x08, 0xE2, 0x30 }); // PHA/PHX/PHY/PHP/SEP #$30
-        put(fb, &fc, &.{ 0xC2, 0x20, 0x3B, 0x29, 0x00, 0xF0, 0xC9, 0x00, 0x30, 0xE2, 0x20 }); // TSC & $F000 == $3000?
-        const not_sa1_at = fc;
-        put(fb, &fc, &.{ 0xD0, 0x00 }); // BNE the common tail (patched)
-        if (io.ff) {
-            // Fire-and-forget (ring 2): record [id][caller D], bump the
-            // slot cursor mod 12, restore, return. No spin — the replay
-            // happens at the mini-tok, the frame-exit phase where stock
-            // ran its trailing sound call anyway.
-            put(fb, &fc, &.{ 0xAF, @truncate(split_ring2_wr), 0x37, 0x00, 0x0A, 0x0A, 0xAA });
-            put(fb, &fc, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring2), @truncate(split_ring2 >> 8), 0x00 });
-            put(fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x9F, @truncate(split_ring2 + 1), @truncate((split_ring2 + 1) >> 8), 0x00, 0xE2, 0x20 });
-            put(fb, &fc, &.{ 0xA3, 0x01, 0x9F, @truncate(split_ring2 + 3), @truncate((split_ring2 + 3) >> 8), 0x00 }); // caller P -> record[3]
-            put(fb, &fc, &.{ 0xAF, @truncate(split_ring2_wr), 0x37, 0x00, 0x1A, 0xC9, 0x18, 0xD0, 0x02, 0xA9, 0x00 });
-            put(fb, &fc, &.{ 0x8F, @truncate(split_ring2_wr), 0x37, 0x00 });
-            put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 });
-            if (io.rtl) {
-                put(fb, &fc, &.{0x6B});
-            } else {
-                put(fb, &fc, &.{ 0x5C, @truncate(rts_hop16), @truncate(rts_hop16 >> 8), 0x00 });
-            }
-        }
-        // Carry the CALLER's D and DBR to the replay: the body's dp and
-        // absolute rewrites were made against them (the APU-stream
-        // feeder runs D=$7A00 — its count under the pump's $6000 pin
-        // read a different page and the ring-copy scan ran unbounded).
-        // RPC serializes — one call in flight — so one cell pair holds.
-        put(fb, &fc, &.{ 0xC2, 0x20, 0x0B, 0x68, 0x8F, @truncate(split_cell_d), 0x37, 0x00, 0xE2, 0x20 });
-        put(fb, &fc, &.{ 0x8B, 0x68, 0x8F, @truncate(split_cell_dbr), 0x37, 0x00 });
-        put(fb, &fc, &.{ 0xA3, 0x01, 0x8F, @truncate(split_cell_pw), 0x37, 0x00 }); // caller P (pushed at stub entry)
-        put(fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00, 0x8F, @truncate(split_scr_a), 0x37, 0x00 }); // old ack
-        put(fb, &fc, &.{ 0xAF, @truncate(split_ring_wr), 0x37, 0x00, 0xAA }); // wr -> X
-        put(fb, &fc, &.{ 0xA9, @intCast(i), 0x9F, @truncate(split_ring), 0x37, 0x00 }); // id -> ring,X
-        put(fb, &fc, &.{ 0xE8, 0x8A, 0x29, 0x0F, 0x8F, @truncate(split_ring_wr), 0x37, 0x00 });
-        if (io.deferred) {
-            // RPC, not fire-and-forget: the body's SHARED-STATE writes
-            // must land in program order, so wait for the replay. The
-            // release is the ACK bump (after the body), NOT the ring
-            // cursor: rd consumes the entry BEFORE the body runs, so a
-            // NESTED NMI's drain sees an empty ring and falls through to
-            // the displaced epilogue — which is exactly the overrun
-            // release a body parked on the $3C handshake is waiting for.
-            // Spinning on rd==wr instead made every releasing NMI
-            // re-enter the in-service call: infinite regress (measured
-            // at the demo transition, frame ~714).
-            put(fb, &fc, &.{ 0xAF, @truncate(split_rpc_ack), 0x37, 0x00 }); // spin: ack
-            put(fb, &fc, &.{ 0xCF, @truncate(split_scr_a), 0x37, 0x00 }); // still the old one?
-            put(fb, &fc, &.{ 0xF0, 0xF6 }); // BEQ spin
-            put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
-            if (io.rtl) {
-                put(fb, &fc, &.{0x6B}); // pop the GAME frame — RTL is bank-safe anywhere
-            } else {
-                put(fb, &fc, &.{ 0x5C, @truncate(rts_hop16), @truncate(rts_hop16 >> 8), 0x00 }); // the hop's RTS pops with PBR=$00
-            }
-        }
-        fb[not_sa1_at + 1] = @intCast(fc - (not_sa1_at + 2));
-        put(fb, &fc, &.{ 0x28, 0x7A, 0xFA, 0x68 }); // PLP/PLX/PLA
-        {
-            const span = splitPrefixSpan(out, usage, io.entry, 3);
-            @memcpy(fb[fc .. fc + span], out[io.entry - 0x8000 ..][0..span]);
-            fc += span;
-            put(fb, &fc, &.{ 0x5C, @truncate(io.entry + @as(u16, @intCast(span))), @truncate((io.entry + @as(u16, @intCast(span))) >> 8), 0x00 }); // JML back into the body
-        }
-        if (fc > need) return refuse(refusal, .{ .reason = .wg_split_shape, .detail = io.entry });
-        std.mem.writeInt(u16, d[hop_jml_at + 1 ..][0..2], fbase, .little);
-        d[hop_jml_at + 3] = fbank;
-    }
-    const tbl16: u16 = base16 + @as(u16, @intCast(cur));
-    for (spec.io_entries, 0..) |_, i| {
-        put(d, &cur, &.{ @truncate(tramp_addrs[i]), @truncate(tramp_addrs[i] >> 8) });
-    }
-    std.mem.writeInt(u16, d[jsr_patch_at + 1 ..][0..2], tbl16, .little);
-
-    // --- displacements, last: everything they jump into now exists ----
-    for (spec.io_entries, 0..) |io, i| {
-        const span = splitPrefixSpan(out, usage, io.entry, 3);
-        out[io.entry - 0x8000] = 0x4C; // JMP enq — frameless, so pushes in the prefix are legal
-        std.mem.writeInt(u16, out[io.entry - 0x8000 + 1 ..][0..2], enq_addrs[i], .little);
-        if (span > 3) @memset(out[io.entry - 0x8000 + 3 ..][0 .. span - 3], 0xEA);
-    }
-    res.stats.split_io = @intCast(spec.io_entries.len);
-    curp.* = cur;
-}
+/// `--code-map`: a hand-made disassembly's verdict on every ROM byte, one
+/// flag byte per CPU address in the bank-$80 form (see
+/// tools/sm_disasm_oracle.py --export). An OPTIONAL input: the generator
+/// works from coverage alone, and where a map exists it (1) refuses any
+/// static decode, dispatcher mark, pointer seed or rewrite at a byte the
+/// map places inside an instruction or in data, (2) takes an immediate's
+/// operand width from the map instead of the walk's guess, and (3) seeds
+/// the static walk with every instruction start it names. Measured on
+/// Super Metroid without it: the static walk decoded bank $B3's enemy
+/// spritemaps and instruction lists as code and the relocation corrupted
+/// seven Gamet/Geega instructions and 273 data bytes nothing had ever
+/// executed; with it, the walk cannot leave the code.
+pub var dbg_code_map: ?[]const u8 = null;
+/// Debug (`--cov-out`): after a generation, the coverage the relocation
+/// walked — the profiled union (`dbg_usage_kept`) and its static
+/// extension (`dbg_cov_kept`), one byte per CPU address (usage_map flags) —
+/// so an external oracle (a hand-made disassembly) can audit every
+/// instruction boundary the generator believed, not just the ones a
+/// session happened to reach.
+pub var dbg_keep_cov: bool = false;
+pub var dbg_usage_kept: ?[]u8 = null;
+pub var dbg_cov_kept: ?[]u8 = null;
 
 pub fn convertWholeGame(
     gpa: std.mem.Allocator,
@@ -5234,6 +1313,10 @@ pub fn convertWholeGame(
     // when asked. `usage` stays the authority on what actually ran — the
     // refusal policy keys on it.
     const cov: []const u8 = if (static_walk) try extendCoverage(gpa, image, header, usage) else usage;
+    if (dbg_keep_cov) {
+        dbg_usage_kept = try gpa.dupe(u8, usage);
+        dbg_cov_kept = try gpa.dupe(u8, cov);
+    }
     defer if (static_walk) gpa.free(@constCast(cov));
     // Reach, for the audit: instructions the profile never ran that the
     // recursive descent found anyway.
@@ -5740,10 +1823,25 @@ pub fn convertWholeGame(
                             return refuse(refusal, .{ .reason = .wg_mmio_shape, .detail = cpu_addr });
                         sites[n_sites] = .{ .file = file, .kind = kind, .reg = v, .idx = idx };
                         n_sites += 1;
-                    } else return refuse(refusal, .{
-                        .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
-                        .detail = cpu_addr,
-                    });
+                    } else {
+                        // Window mode: leave the site native rather than
+                        // refuse. If DBR is really WRAM at runtime, the
+                        // value re-bank to $40/$41 makes the native absolute
+                        // read the moved byte anyway — linear BW-RAM carries
+                        // the whole 64 KiB, not just the window's 8 —  and
+                        // under any other DBR the read returns what stock's
+                        // bus returned (open bus, cart space), except the
+                        // window range itself, which verification arbitrates.
+                        // Measured on Super Metroid: Ridley's AI does
+                        // LDA $7820 under an unproven DBR (open bus on the
+                        // stock cart) and refused the whole conversion over
+                        // a read the game discards.
+                        if (window) continue;
+                        return refuse(refusal, .{
+                            .reason = if (bwram) Reason.wg_wram_beyond_bwram else .wg_wram_beyond_iram,
+                            .detail = cpu_addr,
+                        });
+                    }
                 },
                 .long, .long_x => {
                     const b = image[file + 3];
@@ -5959,6 +2057,10 @@ pub fn convertWholeGame(
         }
     }
     res.stats.rewritten_demirror = n_demirror;
+    // The class the coverage-gated pass above structurally cannot see:
+    // mirror JSLs at sites no surface and no walk ever reached.
+    if (image.len > 0x20_0000)
+        res.stats.rewritten_twin_jsls = try demirrorTwinJsls(gpa, image, out, cov);
     res.stats.expanded_to = if (win_expand_to > image.len) win_expand_to else 0;
     {
         var ab: u32 = 0;
@@ -6078,6 +2180,55 @@ pub fn convertWholeGame(
             if ((cov[cpu_addr] | cov[0x80_0000 | cpu_addr]) & usage_map.flag_opcode == 0) continue;
             const file = bank_file + (a16 - 0x8000);
             const op = out[file];
+            if (codeMapForbids(cpu_addr)) {
+                res.stats.skipped_overlap += 1;
+                continue;
+            }
+            if (bwram and codeMapAt(cpu_addr) & cm_wram_pointer != 0) {
+                // A stored immediate the disassembly names with a WRAM label
+                // (see `cm_wram_pointer`): the value moves with the window.
+                const fl_p = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                const wide = switch (op) {
+                    0xA9 => fl_p & usage_map.flag_m == 0,
+                    0xA2, 0xA0 => fl_p & usage_map.flag_x == 0,
+                    0xF4 => true,
+                    else => false,
+                };
+                if (wide and file + 2 < out.len) {
+                    const pv = std.mem.readInt(u16, out[file + 1 ..][0..2], .little);
+                    if (pv < 0x2000) {
+                        std.mem.writeInt(u16, out[file + 1 ..][0..2], pv + wg_bw_window, .little);
+                        res.stats.rewritten_map_pointers += 1;
+                    }
+                }
+            }
+            // Two opcodes cannot overlap. A site whose operand bytes carry
+            // an opcode flag of their own is a decode that started inside
+            // another instruction — a stale flag from a cover harvested
+            // on an image whose code lay elsewhere, or a static path that
+            // arrived mid-instruction — and rewriting its "operand" would
+            // corrupt the real instruction after it. MEASURED on Super
+            // Metroid: `$FC $8D $17` (the immediate of `AND #$FC` and the
+            // `STA $2117` after it) carried an opcode flag on the `$FC`,
+            // decoded as `JSR ($178D,X)`, and the window shift turned the
+            // store into `STA $2177` — the APU mailbox mirror. Four sites,
+            // every patch from v66 to v68, the sound driver dead on the
+            // first one a session reached. Skip the overlapping site; the
+            // instruction it overlaps is the one the profile proved.
+            {
+                const fl_site = if (cov[cpu_addr] & usage_map.flag_opcode != 0) cov[cpu_addr] else cov[0x80_0000 | cpu_addr];
+                const site_len = usage_map.instrLen(op, fl_site & usage_map.flag_m != 0, fl_site & usage_map.flag_x != 0);
+                var overlap = false;
+                var k: u32 = 1;
+                while (k < site_len and a16 + k < 0x10000) : (k += 1) {
+                    const ic = cpu_addr + k;
+                    if ((cov[ic] | cov[0x80_0000 | ic]) & usage_map.flag_opcode != 0) overlap = true;
+                }
+                if (overlap) {
+                    res.stats.skipped_overlap += 1;
+                    continue;
+                }
+            }
             if (bwram) {
                 // A WRAM bank byte materialized by an immediate and stored —
                 // the bank slot of a long pointer the game will dereference
@@ -6379,8 +2530,17 @@ pub fn convertWholeGame(
                     // JSR/RTS per access. `--wg-static` is what puts those
                     // sites in coverage in the first place.
                     const im = usage_map.mode(op);
-                    if (window and v < 0x100 and (im == .abs_x or im == .abs_y) and
-                        (e == 0 or e == usage_map.site_wram_low | usage_map.site_rom))
+                    // A real table base whose index was measured both in
+                    // the table and past it (see `idxThunkBodyWrap`): the
+                    // pointer-idiom rule below never admits it (v >= $100)
+                    // and the evidence rule would leave it as written.
+                    const wrap_mixed = window and v >= 0x100 and v <= 0x1F00 and
+                        (im == .abs_x or im == .abs_y) and
+                        e & usage_map.site_wram_low != 0 and
+                        e & usage_map.site_wram_bank == 0 and
+                        e != usage_map.site_wram_low;
+                    if (wrap_mixed or (window and v < 0x100 and (im == .abs_x or im == .abs_y) and
+                        (e == 0 or e == usage_map.site_wram_low | usage_map.site_rom)))
                     {
                         if (n_ithunks == idx_thunk_max)
                             return refuse(refusal, .{ .reason = .wg_split_overflow, .detail = cpu_addr });
@@ -6514,6 +2674,8 @@ pub fn convertWholeGame(
             }
         }
     }
+    if (bwram) res.stats.rewritten_queue_imms += demirrorQueueBankImms(out, out.len > 0x20_0000);
+    if (bwram) res.stats.rewritten_wmdata_fills += relocateWmdataFills(out, out.len > 0x20_0000);
     // Measured pointer-bank sources: table bytes (and immediate operands
     // the shape pass above didn't already reach) that carry $7E/$7F into
     // runtime pointers. The byte may sit anywhere in ROM; the proof it is
@@ -6591,6 +2753,38 @@ pub fn convertWholeGame(
             }
         }
     };
+    // Data no evidence can reach in full: Super Metroid's room-state level
+    // pointers, one per state, each naming MB2. The profile proves the
+    // states it loaded; the room graph names all of them.
+    if (bwram and image.len > 0x20_0000) {
+        const hdr = header_mod.detect(image) catch null;
+        if (hdr != null and std.mem.startsWith(u8, &hdr.?.title, "Super Metroid")) {
+            const walk = try rebankSmRoomLevelPointers(gpa, image, out);
+            res.stats.rewritten_room_level_banks = walk.rebanked;
+            res.stats.room_walk_rooms = walk.rooms;
+            res.stats.room_walk_states = walk.states;
+            res.stats.room_walk_refused_at = walk.refused_at;
+            res.stats.rewritten_bg_banks = walk.bg_banks;
+            res.stats.bg_records = walk.bg_records;
+            const inl = rebankSmDecompInlineDests(image, out);
+            res.stats.rewritten_decomp_inline_banks = inl.rebanked;
+            res.stats.decomp_inline_sites = inl.sites;
+            const ts = rebankSmTilesetTable(image, out);
+            res.stats.rewritten_tileset_banks = ts.rebanked;
+            res.stats.tileset_records = ts.states;
+            res.stats.tileset_refused_at = ts.refused_at;
+            const en = rebankSmEnemyHeaders(image, out);
+            res.stats.rewritten_enemy_banks = en.rebanked;
+            res.stats.enemy_headers = en.states;
+            const ps = rebankSmPointerSeeds(image, out);
+            res.stats.pointer_seed_sites = ps.sites;
+            res.stats.rewritten_pointer_seeds = ps.rebanked;
+            const am = rebankSmAreaMapTable(image, out);
+            res.stats.area_map_entries = am.states;
+            res.stats.rewritten_area_map_banks = am.rebanked;
+            res.stats.area_map_refused_at = am.refused_at;
+        }
+    }
     // Misfit-bank pin sites: translate-in thunks. The map, in 8-bit A:
     // $A0-$BF -> -$80 (MB1's home), $C0-$DF -> -$20 (MB2's home), else
     // untouched. Both idioms span 4 bytes at the site.
@@ -6787,13 +2981,17 @@ pub fn convertWholeGame(
         op: u8,
         idx: bool,
         pin: bool,
-        /// Which of the three index bodies this site takes (see each one).
+        /// Which of the four index bodies this site takes (see each one).
+        fn wrap(self: @This()) bool {
+            return self.idx and !self.pin and self.v >= 0x100;
+        }
         fn v2(self: @This()) bool {
-            return self.idx and !self.pin and (self.op == 0xB9 or self.op == 0xBD);
+            return self.idx and !self.pin and !self.wrap() and (self.op == 0xB9 or self.op == 0xBD);
         }
         fn len(self: @This()) u32 {
             if (!self.idx) return split_thunk_len;
             if (self.pin) return idx_thunk_len;
+            if (self.wrap()) return idx_thunk_wrap_len;
             return if (self.v2()) idx_thunk_v2_len else idx_thunk_short_len;
         }
     };
@@ -6915,6 +3113,8 @@ pub fn convertWholeGame(
                         placeThunk(out, &pad, &far, &splitThunkBody(t.op, t.v, 0x60), &splitThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else if (t.pin)
                         placeThunk(out, &pad, &far, &idxThunkBody(t.op, t.v, 0x60), &idxThunkBody(t.op, t.v, 0x6B), ff, &res.stats.split_far)
+                    else if (t.wrap())
+                        placeThunk(out, &pad, &far, &idxThunkBodyWrap(t.op, t.v, 0x60), &idxThunkBodyWrap(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else if (t.v2())
                         placeThunk(out, &pad, &far, &idxThunkBodyV2(t.op, t.v, 0x60), &idxThunkBodyV2(t.op, t.v, 0x6B), ff, &res.stats.split_far)
                     else
@@ -7097,6 +3297,20 @@ pub fn convertWholeGame(
         }
         wn = emitStore(d, wn, 0x2226, 0x80); // SWEN: S-CPU BW-RAM writes
         wn = emitStore(d, wn, 0x2228, 0x00); // BWPA: nothing protected
+        // The mainloop split's stubs and COP handler store into I-RAM from
+        // the S-CPU from the first frame on (boot-time IO calls, boot-time
+        // math), long before the engage stub's own SIWP open: open it here.
+        if (ml_split != null) {
+            wn = emitStore(d, wn, 0x2229, 0xFF);
+            // The split's cells are power-on garbage until the first engage
+            // resets them — and the NMI hook drains the ring from the first
+            // frame (measured: boot-era NMIs replayed nonsense ids and the
+            // intro gained four lag frames). Zero them here.
+            wn = emitStore(d, wn, split_ring_wr, 0x00);
+            wn = emitStore(d, wn, split_ring_rd, 0x00);
+            wn = emitStore(d, wn, split_in_replay, 0x00);
+            wn = emitStore(d, wn, split_owner, 0x00);
+        }
         if (boot) |b| {
             // Boot the SA-1 into the window dispatcher; the async busy
             // flag starts idle (I-RAM is garbage at power-on, and SIWP
@@ -7122,7 +3336,7 @@ pub fn convertWholeGame(
         std.debug.assert(wn <= wg_window_shim_max);
         // Reset -> shim; the other vectors stay the game's own unless an
         // async offload injected its NMI prologue above.
-        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, &far, refusal, &res);
+        if (ml_split) |sp| try emitSplit(out, cov, sp, d, base16, &far, carve, carve_len, refusal, &res);
         std.mem.writeInt(u16, out[header.offset + 0x3C ..][0..2], base16, .little);
         out[header.offset + 0x15] = 0x23;
         out[header.offset + 0x16] = 0x34; // no battery: the relocated WRAM must not persist
@@ -7314,7 +3528,7 @@ fn branches(op: u8) bool {
 /// survives when the callee provably never touches DBR. Everything else
 /// unconditional (JMP/BRA/returns/interrupts) is a join point another
 /// DBR may reach — the knowledge dies.
-fn dbrSurvives(image: []const u8, cov: []const u8, file: u32, op: u8) bool {
+pub fn dbrSurvives(image: []const u8, cov: []const u8, file: u32, op: u8) bool {
     switch (op) {
         // Conditional branches and short unconditional skips (BRA/BRL):
         // neither touches DBR, and the next LINEAR instruction is the
@@ -9265,7 +5479,7 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     for ([_]u32{ 0x8050, 0x8051, 0x8054, 0x8055 }) |a| markOp(bytes, a);
 
     const io = [_]SplitIo{ .{ .entry = 0x8040 }, .{ .entry = 0x8060, .deferred = true, .rtl = true } };
-    const vr = [_][2]u16{.{ 0x8014, 0x8040 }};
+    const vr = [_][2]u24{.{ 0x8014, 0x8040 }};
     var ref: ?Refusal = null;
     const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
         .io_entries = &io,
@@ -9278,8 +5492,8 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     // The anchors wear their displacements.
     try testing.expectEqual(@as(u8, 0x5C), res.image[0x0014]); // JML engage
     try testing.expectEqual(@as(u8, 0x4C), res.image[0x0040]); // JMP enq
-    // The mainloop's $4212 reads look at the mirror now.
-    try testing.expectEqual(split_vbl_mirror, std.mem.readInt(u16, res.image[0x0019..0x001B], .little));
+    // The mainloop's $4212 read goes through a reader helper now.
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x0018]);
 
     const cart = try cartridge.Cartridge.load(gpa, res.image);
     const con = try gpa.create(console.FastConsole);
@@ -9310,6 +5524,207 @@ test "split: the SA-1 runs the mainline, the S-CPU pump replays the IO" {
     try testing.expect(con.bus.sa1.bwram[0x0102] >= 3);
     try testing.expect(con.bus.sa1.bwram[0x0102] <= con.bus.sa1.bwram[0x0100]);
     // And the low-WRAM home of the counter stayed abandoned.
+    try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
+}
+
+test "split mainloop: a second bank, the mode-gate handoff and the math shadow" {
+    // The bank-general mainloop flavor end to end. The loop lives in bank
+    // $01 and alternates the mode cell every lap, so ownership ping-pongs
+    // between the CPUs at the anchor; each lap multiplies 12x13 and
+    // divides 1000/7 through the S-CPU's math registers and ACCUMULATES
+    // the results — a lap the SA-1 computes wrong (its shadow) or a lap
+    // lost in a handoff breaks the totals against the lap count. An
+    // RTS-shaped IO routine in bank $01 writes WMDATA (real on the S-CPU
+    // only, replayed by the pump for the SA-1's laps); a deferred RTL one
+    // in bank $00 counts its own runs.
+    const gpa = testing.allocator;
+    const console = @import("../console.zig");
+    const sa1_trace = @import("../sa1_trace.zig");
+
+    const rom = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(rom);
+    for (rom, 0..) |*b, i| b.* = @truncate(0x11 + i *% 7);
+    {
+        const h = rom[0x7FC0..][0..64];
+        @memcpy(h[0..21], "WG MIGRATION TEST    ");
+        h[0x15] = 0x20;
+        h[0x16] = 0x00;
+        h[0x17] = 7; // 128 KiB
+        h[0x18] = 0;
+        std.mem.writeInt(u16, h[0x1C..0x1E], 0xFFFF, .little);
+        std.mem.writeInt(u16, h[0x1E..0x20], 0x0000, .little);
+        @memset(h[0x20..0x40], 0);
+        std.mem.writeInt(u16, h[0x3C..0x3E], 0x8000, .little);
+        std.mem.writeInt(u16, h[0x2A..0x2C], 0x8050, .little); // NMI
+    }
+    @memset(rom[0x1000..0x7FC0], 0xFF); // bank $00 carve space
+    @memset(rom[0x8000..0x10000], 0xFF); // bank $01: the loop, then padding
+    // bank $00: boot, the deferred RTL routine, the NMI handler
+    @memcpy(rom[0x0000..0x001C], &[_]u8{
+        0x18, 0xFB, 0xE2, 0x30, // CLC / XCE / SEP #$30
+        0x9C, 0x81, 0x21, // STZ $2181 — WMADD = $001000
+        0xA9, 0x10, 0x8D, 0x82, 0x21, // LDA #$10 / STA $2182
+        0x9C, 0x83, 0x21, // STZ $2183
+        0xA9, 0x80, 0x8D, 0x00, 0x42, // NMI on
+        0xF4, 0x00, 0x01, 0x2B, // PEA $0100 / PLD (the shift moves it to $6100) — a nonzero D the lap USES (below): a
+        // handoff that hands the SA-1 a wrong D breaks the remainder total
+        // (the cells once overlapped: P's store clobbered D's high byte)
+        0x5C, 0x00, 0x80, 0x01, // JML $01:8000
+    });
+    @memcpy(rom[0x0060..0x0064], &[_]u8{ 0xEE, 0x02, 0x01, 0x6B }); // INC $0102 / RTL
+    @memcpy(rom[0x0050..0x0056], &[_]u8{ 0x48, 0xAD, 0x10, 0x42, 0x68, 0x40 }); // NMI ack
+    // bank $01: the loop
+    const loop = [_]u8{
+        0xC2, 0x20, 0xEA, 0xEA, 0xEA, // 8000 anchor: REP #$20 and NOPs (5 bytes: the site keeps a JML + fill)
+        0xE2, 0x20, // 8005 SEP #$20
+        0xAD, 0x12, 0x42, // 8007 LDA $4212 (mirror-swapped)
+        0x10, 0xFB, // 800A BPL — wait for vblank
+        0xA9, 0x0C, 0x8D, 0x02, 0x42, // 800C LDA #12 / STA $4202
+        0xA9, 0x0D, 0x8D, 0x03, 0x42, // 8011 LDA #13 / STA $4203
+        0xEA, 0xEA, 0xEA, 0xEA, // 8016 the multiplier's 8 cycles
+        0xC2, 0x20, // 801A REP #$20
+        0xAD, 0x16, 0x42, // 801C LDA $4216 — the product
+        0x18, 0x6D, 0x04, 0x01, 0x8D, 0x04, 0x01, // 801F CLC / ADC $0104 / STA $0104
+        0xA9, 0xE8, 0x03, 0x8D, 0x04, 0x42, // 8026 LDA #1000 / STA $4204 (16-bit dividend)
+        0xE2, 0x20, // 802C SEP #$20
+        0xA9, 0x07, 0x8D, 0x06, 0x42, // 802E LDA #7 / STA $4206
+        0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, // 8033 the divider's 16 cycles
+        0xC2, 0x20, // 803B REP #$20
+        0xAD, 0x14, 0x42, // 803D LDA $4214 — the quotient
+        0x18, 0x6D, 0x06, 0x01, 0x8D, 0x06, 0x01, // 8040 += into $0106
+        0xA5, 0x08, 0xEA, // 8047 LDA $08 — the remainder total, direct-page ($6108: D=$6100)
+        0x18, 0x6D, 0x16, 0x42, 0x85, 0x08, 0xEA, // 804A CLC / ADC $4216 — the remainder, through an ALU read of the register / STA $08
+        0xE2, 0x20, // 8051 SEP #$20
+        0x20, 0x80, 0x80, // 8053 JSR $8080 — the RTS-shaped IO routine (bank $01)
+        0x22, 0x60, 0x80, 0x00, // 8056 JSL $00:8060 — the deferred RTL one
+        0xC2, 0x20, 0xEE, 0x00, 0x01, 0xE2, 0x20, // 805A the lap counter (16-bit), at the lap's END
+        0xAD, 0x00, 0x01, 0x29, 0x01, 0x8D, 0x10, 0x01, // 8061 LDA $0100 / AND #1 / STA $0110 — the mode cell
+        0x4C, 0x90, 0x80, // 8069 JMP $8090 — the mode-7 multiply, then around
+    };
+    @memcpy(rom[0x8000 .. 0x8000 + loop.len], &loop);
+    @memcpy(rom[0x8080..0x8087], &[_]u8{ 0xAD, 0x00, 0x01, 0x8D, 0x80, 0x21, 0x60 }); // LDA $0100 / STA $2180 / RTS
+    // the PPU's mode-7 multiplier as a signed 16x8 unit: -2 x 3 = -6 into $010A
+    @memcpy(rom[0x8090..0x80B2], &[_]u8{
+        0xE2, 0x20, // 8090 SEP #$20
+        0xA9, 0xFE, 0x8D, 0x1B, 0x21, // 8092 LDA #$FE / STA $211B (low)
+        0xA9, 0xFF, 0x8F, 0x1B, 0x21, 0x00, // 8097 LDA #$FF / STA $00:211B (high, long form)
+        0xA9, 0x03, 0x8D, 0x1C, 0x21, // 809D LDA #3 / STA $211C
+        0xC2, 0x20, // 80A2 REP #$20
+        0xAF, 0x34, 0x21, 0x00, // 80A4 LDA $00:2134 (long form) — the product's low word: $FFFA
+        0x18, 0x6D, 0x0A, 0x01, 0x8D, 0x0A, 0x01, // 80A8 CLC / ADC $010A / STA $010A
+        0x4C, 0x00, 0x80, // 80AF JMP $8000
+    });
+
+    const bytes = try gpa.alloc(u8, usage_map.cpu_map_len);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const mark = struct {
+        fn f(u: []u8, a: u32, m8: bool) void {
+            u[a] |= usage_map.flag_opcode | usage_map.flag_exec | usage_map.flag_x;
+            if (m8) u[a] |= usage_map.flag_m;
+        }
+    }.f;
+    for ([_]u32{ 0x8000, 0x8001, 0x8002, 0x8004, 0x8007, 0x8009, 0x800C, 0x800F, 0x8011, 0x8014, 0x8017, 0x8018 }) |a| mark(bytes, a, true);
+    for ([_]u32{ 0x8060, 0x8063, 0x8050, 0x8051, 0x8054, 0x8055 }) |a| mark(bytes, a, true);
+    // the loop: 8-bit until 801A, 16-bit to 802C, 8-bit to 803B, 16-bit to 8051, 8-bit after
+    for ([_]u32{ 0x8000, 0x8002, 0x8003, 0x8004, 0x8005, 0x8007, 0x800A, 0x800C, 0x800E, 0x8011, 0x8013, 0x8016, 0x8017, 0x8018, 0x8019, 0x801A }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x801C, 0x801F, 0x8020, 0x8023, 0x8026, 0x8029, 0x802C }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x802E, 0x8030, 0x8033, 0x8034, 0x8035, 0x8036, 0x8037, 0x8038, 0x8039, 0x803A, 0x803B }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x803D, 0x8040, 0x8041, 0x8044, 0x8047, 0x8049, 0x804A, 0x804B, 0x804E, 0x8050, 0x8051 }) |a| mark(bytes, 0x01_0000 | a, false);
+    for ([_]u32{ 0x8053, 0x8056, 0x805A, 0x805C, 0x805F, 0x8061, 0x8064, 0x8066, 0x8069, 0x8080, 0x8083, 0x8086 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x8090, 0x8092, 0x8094, 0x8097, 0x8099, 0x809D, 0x809F, 0x80A2 }) |a| mark(bytes, 0x01_0000 | a, true);
+    for ([_]u32{ 0x80A4, 0x80A8, 0x80A9, 0x80AC, 0x80AF }) |a| mark(bytes, 0x01_0000 | a, false);
+
+    const io = [_]SplitIo{ .{ .entry = 0x01_8080 }, .{ .entry = 0x00_8060, .deferred = true, .rtl = true } };
+    const vr = [_][2]u24{.{ 0x01_8005, 0x01_8069 }};
+    var ref: ?Refusal = null;
+    const res = try convertWholeGame(gpa, rom, bytes, null, null, false, true, &.{}, false, 0, copy_reserve, .{
+        .io_entries = &io,
+        .vbl_ranges = &vr,
+        .mainloop = 0x01_8000,
+        .mode_cell = 0x0110,
+        .mode_value = 0,
+        .mode_gate = true,
+    }, &ref);
+    defer gpa.free(res.image);
+    try testing.expectEqual(@as(u8, 2), res.stats.split_io);
+    try testing.expect(res.stats.split_engage_addr != 0);
+    // Eleven math sites shadowed (seven on the S-CPU's unit, four on the
+    // mode-7 one): the five trigger stores as JSLs to their own far
+    // routines, the six others as COPs; the one hazard the audit lists is
+    // the NMI handler's $4210 ack read, which only the S-CPU ever runs.
+    try testing.expectEqual(@as(u8, 6), res.stats.split_mul);
+    try testing.expectEqual(@as(u32, 5), res.stats.split_trigger_jsl);
+    try testing.expectEqual(@as(u8, 1), res.stats.n_split_hazards);
+    try testing.expectEqual(@as(u24, 0x00_8051), res.stats.split_hazards[0]);
+    // The anchors wear their displacements, in their own banks.
+    try testing.expectEqual(@as(u8, 0x5C), res.image[0x8000]); // JML engage at $01:8000
+    try testing.expectEqual(@as(u8, 0xEA), res.image[0x8004]); // the 5th byte NOP-filled
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x8080]); // JMP stub at $01:8080
+    try testing.expect(std.mem.readInt(u16, res.image[0x8081..0x8083], .little) >= 0x8000); // a bank-$01 stub
+    try testing.expectEqual(@as(u8, 0x4C), res.image[0x0060]); // JMP stub at $00:8060
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x800E]); // COP at STA $4202
+    try testing.expectEqual(@as(u8, 0xEA), res.image[0x8010]);
+    try testing.expectEqual(@as(u8, 0x20), res.image[0x8007]); // JSR reader helper at LDA $4212
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x804B]); // COP at ADC $4216: the operate kind
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8099]); // JSL at STA $00:211B (a 4-byte site: no rider)
+    try testing.expectEqual(@as(u8, 0x22), res.image[0x8013]); // JSL at STA $4203, carrying the NOP after it
+    try testing.expectEqual(@as(u8, 0x02), res.image[0x80A4]); // COP at LDA $00:2134
+
+    const cart = try cartridge.Cartridge.load(gpa, res.image);
+    const con = try gpa.create(console.FastConsole);
+    defer {
+        con.cart.deinit(gpa);
+        gpa.destroy(con);
+    }
+    con.init(cart);
+    const trace = try gpa.create(sa1_trace.Trace);
+    defer gpa.destroy(trace);
+    trace.* = sa1_trace.Trace.init(0x01_8000);
+    con.bus.sa1.trace = trace;
+    for (0..12) |_| con.runFrame();
+
+    const laps = std.mem.readInt(u16, con.bus.sa1.bwram[0x0100..0x0102], .little);
+    const acc_mul = std.mem.readInt(u16, con.bus.sa1.bwram[0x0104..0x0106], .little);
+    const acc_q = std.mem.readInt(u16, con.bus.sa1.bwram[0x0106..0x0108], .little);
+    const acc_r = std.mem.readInt(u16, con.bus.sa1.bwram[0x0108..0x010A], .little);
+    const acc_m7 = std.mem.readInt(u16, con.bus.sa1.bwram[0x010A..0x010C], .little);
+    // Laps ran on BOTH CPUs (the SA-1's trace saw the loop; the gate
+    // alternates), and the math totals match the lap count exactly:
+    // the shadow's product, quotient and remainder equal the S-CPU's.
+    try testing.expect(trace.total > 0);
+    try testing.expect(laps >= 6);
+    // The run stops mid-lap: the lap in flight may have done its sums and
+    // not yet counted itself, so the totals stand for `laps` or `laps + 1`
+    // laps — the same number for all three.
+    // (the lap in flight may also have stopped BETWEEN its three sums, so
+    // each total is exact for its own count, the counts descending)
+    const k_mul: u16 = acc_mul / 156;
+    const k_q: u16 = acc_q / 142;
+    const k_r: u16 = acc_r / 6;
+    try testing.expect(k_mul == laps or k_mul == laps + 1);
+    try testing.expect(k_q == laps or k_q == laps + 1);
+    try testing.expect(k_r == laps or k_r == laps + 1);
+    try testing.expect(k_mul >= k_q and k_q >= k_r);
+    try testing.expectEqual(@as(u16, k_mul *% 156), acc_mul);
+    try testing.expectEqual(@as(u16, k_q *% 142), acc_q);
+    try testing.expectEqual(@as(u16, k_r *% 6), acc_r);
+    // the mode-7 product: -6 per lap, on both units (it follows the lap
+    // counter, so the total stands for `laps` or `laps - 1`)
+    const neg6: u16 = 0xFFFA;
+    try testing.expect(acc_m7 == laps *% neg6 or acc_m7 == (laps -% 1) *% neg6);
+    // The IO routine's WMDATA writes landed in real WRAM — natively on the
+    // S-CPU's laps, through the pump on the SA-1's.
+    var wm_writes: usize = 0;
+    for (con.bus.wram.data[0x1000..0x1100]) |b| {
+        if (b != 0) wm_writes += 1;
+    }
+    try testing.expect(wm_writes >= 4);
+    // The deferred routine ran once per lap, never twice.
+    const deferred_runs = std.mem.readInt(u16, con.bus.sa1.bwram[0x0102..0x0104], .little);
+    try testing.expect(deferred_runs >= 4);
+    try testing.expect(deferred_runs <= laps);
+    // The low-WRAM homes stayed abandoned.
     try testing.expectEqual(@as(u8, 0), con.bus.wram.data[0x0100]);
 }
 

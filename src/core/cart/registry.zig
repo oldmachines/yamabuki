@@ -93,3 +93,15 @@ test "sha256Hex matches a known vector" {
     const want = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     try std.testing.expectEqualStrings(want, &sha256Hex("abc"));
 }
+
+test "find rejects keys of the wrong length instead of prefix-matching" {
+    try std.testing.expectEqual(@as(?*const Entry, null), find(""));
+    // A 63-character prefix of a real key is not that key.
+    const e = registry.patches[0];
+    try std.testing.expectEqual(@as(?*const Entry, null), find(e.source_sha256[0..63]));
+    // Nor is a 65-character extension of it.
+    var longer: [65]u8 = undefined;
+    @memcpy(longer[0..64], e.source_sha256);
+    longer[64] = '0';
+    try std.testing.expectEqual(@as(?*const Entry, null), find(&longer));
+}

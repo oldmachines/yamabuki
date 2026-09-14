@@ -503,3 +503,47 @@ test "a channel decompresses only when both enable and arm are set, once" {
     try std.testing.expect(!chip.channelArmed(1));
     try std.testing.expectEqual(@as(u8, 0b0000_0001), chip.xfer_enable);
 }
+
+test "$4804-$4807 pick the 1 MiB slice each quarter of $C0-$FF reads from" {
+    // A 4 MiB image with one marker byte per slice, at the same in-slice
+    // offset, so the byte read back names the slice that was mapped.
+    const alloc = std.testing.allocator;
+    const rom = try alloc.alloc(u8, 4 * slice_size);
+    defer alloc.free(rom);
+    @memset(rom, 0);
+    for (0..4) |k| rom[(k << 20) | 0x1234] = 0xA0 + @as(u8, @intCast(k));
+
+    var chip: Sdd1 = .init;
+    chip.attach(rom, @intCast(rom.len - 1));
+    // Power-on identity: quarter n reads slice n.
+    try std.testing.expectEqual(@as(u8, 0xA0), chip.romByte(chip.windowOffset(0xC0_1234)));
+    try std.testing.expectEqual(@as(u8, 0xA1), chip.romByte(chip.windowOffset(0xD0_1234)));
+    try std.testing.expectEqual(@as(u8, 0xA2), chip.romByte(chip.windowOffset(0xE0_1234)));
+    try std.testing.expectEqual(@as(u8, 0xA3), chip.romByte(chip.windowOffset(0xF0_1234)));
+
+    // Remap: $4804 (quarter 0) -> slice 3, $4807 (quarter 3) -> slice 0.
+    try std.testing.expect(chip.mmioWrite(0x4804, 3));
+    try std.testing.expect(chip.mmioWrite(0x4807, 0));
+    try std.testing.expectEqual(@as(u8, 0xA3), chip.romByte(chip.windowOffset(0xC0_1234)));
+    try std.testing.expectEqual(@as(u32, 0x3F_1234), chip.windowOffset(0xCF_1234)); // 16 banks per slice
+    try std.testing.expectEqual(@as(u8, 0xA0), chip.romByte(chip.windowOffset(0xF0_1234)));
+    // The quarters in between did not move.
+    try std.testing.expectEqual(@as(u8, 0xA1), chip.romByte(chip.windowOffset(0xD0_1234)));
+    try std.testing.expectEqual(@as(u8, 0xA2), chip.romByte(chip.windowOffset(0xE0_1234)));
+    // A slice past the image wraps through the ROM mask (5 -> 1 on 4 MiB).
+    try std.testing.expect(chip.mmioWrite(0x4805, 5));
+    try std.testing.expectEqual(@as(u8, 0xA1), chip.romByte(chip.windowOffset(0xD0_1234)));
+}
+
+test "a channel armed through $4801 but never enabled through $4800 stays plain" {
+    var chip: Sdd1 = .init;
+    _ = chip.mmioWrite(0x4801, 0xFF); // arm every channel
+    for (0..8) |ch| try std.testing.expect(!chip.channelArmed(ch));
+    // Enabling afterwards is what completes the arm.
+    _ = chip.mmioWrite(0x4800, 0x04);
+    try std.testing.expect(chip.channelArmed(2));
+    try std.testing.expect(!chip.channelArmed(1));
+    try std.testing.expect(!chip.channelArmed(3));
+    // Reads back what was written, unconsumed.
+    try std.testing.expectEqual(@as(u8, 0xFF), chip.mmioRead(0x4801, 0));
+}

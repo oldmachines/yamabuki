@@ -76,7 +76,9 @@ inline fn indexY(cpu: anytype, comptime x8: bool) u16 {
 
 fn effAddr(cpu: anytype, comptime mode: Mode, comptime x8: bool, comptime kind: AccessKind) u24 {
     switch (mode) {
-        .imm => unreachable,
+        // `mode` is comptime: an immediate operand has no effective
+        // address, and asking for one is a compile error, not a trap.
+        .imm => comptime unreachable,
         .abs => {
             return @as(u24, cpu.regs.dbr) << 16 | cpu.fetch16();
         },
@@ -1073,4 +1075,166 @@ pub fn dispatch(cpu: anytype, comptime m8: bool, comptime x8: bool) void {
             cpu.state = .stopped;
         },
     }
+}
+
+// --- tests ---------------------------------------------------------------
+
+const FlatBus = wdc.FlatBus;
+const TestCpu = wdc.Cpu(FlatBus);
+
+/// A CPU at power-on (emulation mode, 8-bit M/X) with `prog` at $8000.
+fn loadProg(bus: *FlatBus, prog: []const u8) TestCpu {
+    @memcpy(bus.mem[0x8000 .. 0x8000 + prog.len], prog);
+    var cpu = TestCpu.init(bus);
+    cpu.regs.pc = 0x8000;
+    return cpu;
+}
+
+test "ADC 8-bit decimal: nibble carry and the $99+$99+1 wrap" {
+    var bus: FlatBus = .{};
+    const prog = [_]u8{
+        0xF8, // SED
+        0x18, // CLC
+        0xA9, 0x09, // LDA #$09
+        0x69, 0x01, // ADC #$01 -> $10, no carry
+        0xA9, 0x99, // LDA #$99
+        0x38, // SEC
+        0x69, 0x99, // ADC #$99 (+1) -> $99, carry out
+    };
+    var cpu = loadProg(&bus, &prog);
+    for (0..4) |_| cpu.step();
+    try std.testing.expectEqual(@as(u8, 0x10), cpu.al());
+    try std.testing.expect(!cpu.getFlag(Flags.c));
+    try std.testing.expect(!cpu.getFlag(Flags.z));
+    for (0..3) |_| cpu.step();
+    try std.testing.expectEqual(@as(u8, 0x99), cpu.al());
+    try std.testing.expect(cpu.getFlag(Flags.c));
+}
+
+test "SBC 16-bit decimal: $0000 - $0001 borrows through every nibble" {
+    var bus: FlatBus = .{};
+    const prog = [_]u8{
+        0x18, 0xFB, // CLC; XCE (native)
+        0xC2, 0x20, // REP #$20 (16-bit A)
+        0xF8, // SED
+        0x38, // SEC (no borrow in)
+        0xA9, 0x00, 0x00, // LDA #$0000
+        0xE9, 0x01, 0x00, // SBC #$0001
+    };
+    var cpu = loadProg(&bus, &prog);
+    for (0..7) |_| cpu.step();
+    try std.testing.expectEqual(@as(u16, 0x9999), cpu.regs.c);
+    try std.testing.expect(!cpu.getFlag(Flags.c)); // borrow out
+    try std.testing.expect(cpu.getFlag(Flags.n));
+    try std.testing.expect(!cpu.getFlag(Flags.v));
+}
+
+test "MVN copies C+1 bytes, advances X/Y, and leaves DBR = destination bank" {
+    var bus: FlatBus = .{};
+    // MVN dst=$01, src=$00 (opcode, dst bank, src bank). The flat bus folds
+    // banks away, so the destination lands at $0010 in the same array.
+    const prog = [_]u8{ 0x54, 0x01, 0x00 };
+    var cpu = loadProg(&bus, &prog);
+    cpu.regs.e = false;
+    cpu.regs.p = 0; // 16-bit A and X/Y
+    cpu.regs.c = 0x0003;
+    cpu.regs.x = 0x0000;
+    cpu.regs.y = 0x0010;
+    bus.mem[0..4].* = .{ 0xAA, 0xBB, 0xCC, 0xDD };
+    bus.mem[4] = 0xEE; // one past the block: must not move
+
+    // Each step is one byte; the instruction re-executes until C wraps.
+    for (0..4) |_| {
+        cpu.step();
+        if (cpu.regs.c != 0xFFFF) try std.testing.expectEqual(@as(u16, 0x8000), cpu.regs.pc);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD }, bus.mem[0x10..0x14]);
+    try std.testing.expectEqual(@as(u8, 0), bus.mem[0x14]);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), cpu.regs.c);
+    try std.testing.expectEqual(@as(u16, 0x0004), cpu.regs.x);
+    try std.testing.expectEqual(@as(u16, 0x0014), cpu.regs.y);
+    try std.testing.expectEqual(@as(u8, 0x01), cpu.regs.dbr);
+    try std.testing.expectEqual(@as(u16, 0x8003), cpu.regs.pc);
+}
+
+test "abs,X read with 8-bit X pays one cycle only when the index crosses a page" {
+    const prog = [_]u8{ 0xBD, 0xFF, 0x10 }; // LDA $10FF,X
+
+    var bus_same: FlatBus = .{};
+    var cpu_same = loadProg(&bus_same, &prog);
+    cpu_same.regs.x = 0;
+    cpu_same.step();
+    const same_page = bus_same.clock;
+
+    var bus_cross: FlatBus = .{};
+    var cpu_cross = loadProg(&bus_cross, &prog);
+    cpu_cross.regs.x = 1; // $10FF + 1 = $1100
+    cpu_cross.step();
+    const crossed = bus_cross.clock;
+
+    try std.testing.expectEqual(@as(u64, 4), same_page); // opcode, 2 operand, data
+    try std.testing.expectEqual(same_page + 1, crossed);
+}
+
+test "TSB/TRB set Z from A & mem before the modify and leave N and V alone" {
+    var bus: FlatBus = .{};
+    const prog = [_]u8{
+        0x04, 0x40, // TSB $40
+        0x14, 0x40, // TRB $40
+        0x04, 0x40, // TSB $40
+    };
+    var cpu = loadProg(&bus, &prog);
+    bus.mem[0x40] = 0x0F;
+    cpu.setAl(0xF0);
+    cpu.regs.p |= Flags.n | Flags.v;
+
+    cpu.step(); // TSB: $F0 & $0F == 0 -> Z set; mem |= A
+    try std.testing.expectEqual(@as(u8, 0xFF), bus.mem[0x40]);
+    try std.testing.expect(cpu.getFlag(Flags.z));
+    try std.testing.expect(cpu.getFlag(Flags.n));
+    try std.testing.expect(cpu.getFlag(Flags.v));
+
+    cpu.step(); // TRB: $F0 & $FF != 0 -> Z clear; mem &= ~A
+    try std.testing.expectEqual(@as(u8, 0x0F), bus.mem[0x40]);
+    try std.testing.expect(!cpu.getFlag(Flags.z));
+    try std.testing.expect(cpu.getFlag(Flags.n));
+    try std.testing.expect(cpu.getFlag(Flags.v));
+
+    // With N/V clear, a result of $FF must not set N the way INC/ASL would.
+    cpu.regs.p &= ~(Flags.n | Flags.v);
+    cpu.step();
+    try std.testing.expectEqual(@as(u8, 0xFF), bus.mem[0x40]);
+    try std.testing.expect(cpu.getFlag(Flags.z));
+    try std.testing.expect(!cpu.getFlag(Flags.n));
+    try std.testing.expect(!cpu.getFlag(Flags.v));
+}
+
+test "a taken branch across a page costs one extra cycle in emulation mode only" {
+    const bra = [_]u8{ 0x80, 0x0E }; // BRA +14
+
+    // Within a page: $8000 -> $8010.
+    var bus_in: FlatBus = .{};
+    var cpu_in = loadProg(&bus_in, &bra);
+    cpu_in.step();
+    try std.testing.expectEqual(@as(u16, 0x8010), cpu_in.regs.pc);
+    try std.testing.expectEqual(@as(u64, 3), bus_in.clock); // opcode, operand, idle
+
+    // Across a page: $80F0 -> $8100.
+    var bus_x: FlatBus = .{};
+    @memcpy(bus_x.mem[0x80F0..0x80F2], &bra);
+    var cpu_x = TestCpu.init(&bus_x);
+    cpu_x.regs.pc = 0x80F0;
+    cpu_x.step();
+    try std.testing.expectEqual(@as(u16, 0x8100), cpu_x.regs.pc);
+    try std.testing.expectEqual(@as(u64, 4), bus_x.clock);
+
+    // Native mode does not charge the page cross.
+    var bus_n: FlatBus = .{};
+    @memcpy(bus_n.mem[0x80F0..0x80F2], &bra);
+    var cpu_n = TestCpu.init(&bus_n);
+    cpu_n.regs.pc = 0x80F0;
+    cpu_n.regs.e = false;
+    cpu_n.step();
+    try std.testing.expectEqual(@as(u16, 0x8100), cpu_n.regs.pc);
+    try std.testing.expectEqual(@as(u64, 3), bus_n.clock);
 }

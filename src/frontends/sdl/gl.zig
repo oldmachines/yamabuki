@@ -37,6 +37,12 @@ pub const Sizeiptr = isize;
 pub const FALSE: Int = 0;
 pub const TRUE: Int = 1;
 pub const NO_ERROR: Enum = 0;
+pub const OUT_OF_MEMORY: Enum = 0x0505;
+pub const INVALID_FRAMEBUFFER_OPERATION: Enum = 0x0506;
+/// GL ES 3 / KHR_robustness: the context was lost (GPU reset, display
+/// change, a laptop switching GPUs). Every object name the chain holds is
+/// dead after this; the only recovery is to rebuild the chain.
+pub const CONTEXT_LOST: Enum = 0x0507;
 
 // Buffers
 pub const ARRAY_BUFFER: Enum = 0x8892;

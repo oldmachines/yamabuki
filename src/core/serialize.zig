@@ -25,7 +25,7 @@ fn isSkipped(comptime T: type, comptime field_name: []const u8) bool {
 
 /// Widest-alignment byte count needed to store T's bit size.
 fn intByteSize(comptime T: type) usize {
-    return comptime std.math.divCeil(usize, @bitSizeOf(T), 8) catch unreachable;
+    return comptime (@bitSizeOf(T) + 7) / 8;
 }
 
 fn IntBacking(comptime T: type) type {
@@ -368,4 +368,51 @@ test "array fast path respects short input" {
     _ = write(S, &v, &buf);
     var back: S = std.mem.zeroes(S);
     try std.testing.expectError(error.EndOfState, read(S, &back, buf[0 .. buf.len - 1]));
+}
+
+test "every truncated prefix reads as EndOfState, never a panic" {
+    const Inner = struct { c: u17, d: bool, e: [3]u16, f: i8 };
+    const Mode = enum(u8) { fast, accurate };
+    const State = struct {
+        a: u8,
+        inner: Inner,
+        mode: Mode,
+        g: [2]u32, // memcpy fast path
+        h: [3]u8, // byte-array fast path
+        i: [2]u24, // element loop
+        j: i16,
+    };
+    const v: State = .{
+        .a = 0xAB,
+        .inner = .{ .c = 0x1FFFF, .d = true, .e = .{ 1, 2, 0xFFFF }, .f = -5 },
+        .mode = .accurate,
+        .g = .{ 0xDEADBEEF, 1 },
+        .h = .{ 9, 8, 7 },
+        .i = .{ 0xABCDEF, 1 },
+        .j = -1234,
+    };
+    var buf: [byteSize(State)]u8 = undefined;
+    try std.testing.expectEqual(buf.len, write(State, &v, &buf));
+
+    var back: State = std.mem.zeroes(State);
+    for (0..buf.len) |n| {
+        try std.testing.expectError(error.EndOfState, read(State, &back, buf[0..n]));
+    }
+    // The full buffer reads cleanly and consumes exactly its length.
+    try std.testing.expectEqual(buf.len, try read(State, &back, &buf));
+    try std.testing.expectEqual(v, back);
+}
+
+test "a narrow integer whose wire bytes exceed its width is Corrupt" {
+    var v: u17 = 0;
+    const top = [_]u8{ 0xFF, 0xFF, 0x01 }; // 0x1FFFF: the widest valid value
+    try std.testing.expectEqual(@as(usize, 3), try read(u17, &v, &top));
+    try std.testing.expectEqual(@as(u17, 0x1FFFF), v);
+    const over = [_]u8{ 0x00, 0x00, 0x02 }; // bit 17 set
+    try std.testing.expectError(error.Corrupt, read(u17, &v, &over));
+    const way_over = [_]u8{ 0xFF, 0xFF, 0xFF };
+    try std.testing.expectError(error.Corrupt, read(u17, &v, &way_over));
+    // A bool is a 1-bit integer for this purpose.
+    var b: bool = false;
+    try std.testing.expectError(error.Corrupt, read(bool, &b, &[_]u8{2}));
 }

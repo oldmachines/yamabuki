@@ -20,6 +20,11 @@ pub const cycles_per_dot: u64 = 4;
 /// The dot at which output pixel 0 leaves the PPU (dots 0-21 are setup /
 /// left border).
 pub const render_start_dot: u64 = 22;
+/// HVBJOY's H-blank flag ($4212 bit 6) is set from this dot to the end of
+/// the line and through dot `hblank_end_dot` of the next one — the beam's
+/// horizontal retrace, where games park DMA and register writes.
+pub const hblank_start_dot: u16 = 274;
+pub const hblank_end_dot: u16 = 1;
 
 pub const ntsc_lines_per_frame: u32 = 262;
 pub const pal_lines_per_frame: u32 = 312;
@@ -72,4 +77,23 @@ test "regionFromHeaderByte: PAL codes" {
     for ([_]u8{ 0x02, 0x03, 0x09, 0x0A, 0x11, 0xFF }) |b| {
         try std.testing.expectEqual(Region.pal, regionFromHeaderByte(b));
     }
+}
+
+test "regionFromHeaderByte: exactly the five NTSC codes over the whole byte" {
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const want: Region = switch (b) {
+            0x00, 0x01, 0x0D, 0x0F, 0x10 => .ntsc,
+            else => .pal,
+        };
+        try std.testing.expectEqual(want, regionFromHeaderByte(b));
+    }
+}
+
+test "beam arithmetic: dots x cycles per dot is the scanline, vblank follows the last visible line" {
+    try std.testing.expectEqual(cycles_per_line, @as(u64, dots_per_line) * cycles_per_dot);
+    try std.testing.expectEqual(visible_lines_224 + 1, vblank_line_224);
+    try std.testing.expectEqual(visible_lines_239 + 1, vblank_line_239);
+    try std.testing.expect(vblank_line_239 < ntsc_lines_per_frame);
+    try std.testing.expect(render_start_dot < dots_per_line);
 }

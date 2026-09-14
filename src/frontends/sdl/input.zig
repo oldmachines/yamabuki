@@ -346,7 +346,10 @@ pub const HotkeyStrings = struct {
     /// published infinite-lives code freezes the title screen — on the stock
     /// ROM too, so it is the code and not the emulator). Hardware cheat
     /// devices have a switch for exactly this reason; this is the switch.
-    cheats: []const u8 = "key:f11",
+    /// F8, not F11: F11 is the takes screen, handled before the bindings
+    /// (a dev affordance that must survive any config), and the two used
+    /// to fire together.
+    cheats: []const u8 = "key:f8",
     /// Toggle the session info palette: game, patch, volume, save states.
     /// `i` is free in the historical keyboard layout (the SNES buttons sit
     /// on z/x/a/s/q/w and the hotkeys on F-keys, Tab, and P).

@@ -160,21 +160,28 @@ pub const LoadResult = union(enum) {
 /// can seed a fresh file on first run without ever clobbering a broken one.
 pub fn load(io: std.Io, gpa: std.mem.Allocator, path: []const u8) LoadResult {
     const src = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch return .missing;
+    defer gpa.free(src);
     const cfg = parseText(gpa, src) catch return .invalid;
     return .{ .loaded = cfg };
 }
 
 /// Write `cfg` to `path` through a sibling temp file + rename, so a crash
-/// mid-write can never leave a truncated config behind.
+/// mid-write can never leave a truncated config behind. Called on every
+/// settings change, so it must not leak its intermediates.
 pub fn save(io: std.Io, gpa: std.mem.Allocator, cfg: Config, path: []const u8) !void {
     const text = try serializeText(gpa, cfg);
+    defer gpa.free(text);
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
     try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io);
 }
 
 fn parseText(gpa: std.mem.Allocator, src: []const u8) !Config {
+    // The parse allocates every string it keeps, so the NUL-terminated
+    // copy it reads from is scratch.
     const z = try gpa.dupeZ(u8, src);
+    defer gpa.free(z);
     return std.zon.parse.fromSliceAlloc(Config, gpa, z, null, .{ .ignore_unknown_fields = true });
 }
 

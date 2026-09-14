@@ -4,13 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Renderer VRAM-traffic perf counter: off for every shipping build and
-    // test (the increment folds away), on only for the bench so `bench --check`
-    // has a deterministic memory-traffic metric to gate against.
-    const perf_off = perfModule(b, false);
-    const perf_on = perfModule(b, true);
+    // Two comptime knobs on the core, both off in every shipping build:
+    //  - `perf_counters`: the renderer's VRAM-traffic counter, on only for the
+    //    bench so `bench --check` has a deterministic memory-traffic metric.
+    //  - `diagnostics`: the SA-1 conversion tooling's hooks (watch/stale/trace
+    //    globals, the MMIO writer set, the behavioral tick snapshot, the S-CPU
+    //    overclock, the SA-1 usage/trace donors). They are tested on every
+    //    instruction and every data access; with the knob off those tests
+    //    fold away. On only for the headless runner (which exposes them as
+    //    flags) and the core's own unit tests (which exercise them).
+    const perf_off = coreOptions(b, false, false);
+    const perf_on = coreOptions(b, true, false);
+    const diag_on = coreOptions(b, false, true);
 
-    // The emulator core: pure Zig, no libc, no external dependencies.
+    // The emulator core: pure Zig, no libc, no external dependencies. This is
+    // the shipping configuration (SDL, libretro, every runner and gate).
     const core_mod = b.addModule("snes_core", .{
         .root_source_file = b.path("src/core/core.zig"),
         .target = target,
@@ -21,6 +29,26 @@ pub fn build(b: *std.Build) void {
     // module root, so it is injected as an anonymous import.
     core_mod.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
     core_mod.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
+
+    // The same core with the diagnostics compiled in, for the headless runner
+    // and the core's unit tests. (A file is the root of one module per build
+    // graph, so the headless gets its own util module bound to this core.)
+    const core_diag_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_diag_mod.addImport("perf_options", diag_on);
+    core_diag_mod.addAnonymousImport("patch_registry.zon", .{ .root_source_file = b.path("patches/registry.zon") });
+    core_diag_mod.addAnonymousImport("fastrom_compat.zon", .{ .root_source_file = b.path("patches/fastrom-compat.zon") });
+    const diag_util_mod = b.createModule(.{
+        .root_source_file = b.path("src/frontends/util.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snes_core", .module = core_diag_mod },
+        },
+    });
 
     // Shared frontend/test-runner helpers (RGB565 expansion, PPM/WAV writers,
     // audio drain+hash, --shot capture, arg-iterator setup): imported by the
@@ -45,8 +73,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "snes_core", .module = core_mod },
-                .{ .name = "util", .module = frontend_util_mod },
+                .{ .name = "snes_core", .module = core_diag_mod },
+                .{ .name = "util", .module = diag_util_mod },
             },
         }),
     });
@@ -62,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -87,7 +116,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(sdl_frontend);
 
     // Unit tests live inline in core modules.
-    const core_tests = b.addTest(.{ .root_module = core_mod });
+    const core_tests = b.addTest(.{ .root_module = core_diag_mod });
     const run_core_tests = b.addRunArtifact(core_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
@@ -131,8 +160,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "snes_core", .module = core_mod },
-                .{ .name = "util", .module = frontend_util_mod },
+                .{ .name = "snes_core", .module = core_diag_mod },
+                .{ .name = "util", .module = diag_util_mod },
             },
         }),
     });
@@ -357,7 +386,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path("src/frontends/libretro/core.zig"),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "snes_core", .module = core_mod }},
+                    .imports = &.{ .{ .name = "snes_core", .module = core_mod }, .{ .name = "util", .module = frontend_util_mod } },
                 }) },
             },
         }),
@@ -418,9 +447,12 @@ pub fn build(b: *std.Build) void {
     bench_check_step.dependOn(&run_bench_check.step);
 }
 
-/// A one-field options module exposing `enabled: bool` as `@import("perf_options")`.
-fn perfModule(b: *std.Build, enabled: bool) *std.Build.Module {
+/// The core's comptime knobs as `@import("perf_options")`: `enabled` (the
+/// renderer's VRAM-traffic counter) and `diagnostics` (the conversion
+/// tooling's per-access hooks).
+fn coreOptions(b: *std.Build, perf_counters: bool, diagnostics: bool) *std.Build.Module {
     const opts = b.addOptions();
-    opts.addOption(bool, "enabled", enabled);
+    opts.addOption(bool, "enabled", perf_counters);
+    opts.addOption(bool, "diagnostics", diagnostics);
     return opts.createModule();
 }

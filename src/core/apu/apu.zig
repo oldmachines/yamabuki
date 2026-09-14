@@ -39,6 +39,9 @@ const audio_capacity: u32 = 8192;
 
 const BootState = enum(u8) { ready, transfer, done };
 
+/// Debug: print every port-3 write with its master clock (set by the headless tool).
+pub var dbg_port_trace: bool = false;
+
 pub const Apu = struct {
     // The audio ring is transient output (like the framebuffer), not
     // machine state: a loaded save state resumes with an empty ring.
@@ -154,6 +157,7 @@ pub const Apu = struct {
     pub fn cpuWrite(self: *Apu, master_clock: u64, port: u2, value: u8) void {
         self.catchUp(master_clock);
         self.cpu_in[port] = value;
+        if (dbg_port_trace and port == 3) std.debug.print("[apu-port] port3 <= {x:0>2} clk={}\n", .{ value, master_clock });
         if (self.boot != .done and port == 0) self.boot_pending = true;
     }
 
@@ -195,7 +199,10 @@ pub const Apu = struct {
                 }
                 self.cpu_out[0] = value; // echo = acknowledge
             },
-            .done => unreachable,
+            // The caller gates on `boot != .done`, but both `boot` and
+            // `boot_pending` are serialized: a state that carries the
+            // pair inconsistently must be a no-op here, not a trap.
+            .done => {},
         }
     }
 
