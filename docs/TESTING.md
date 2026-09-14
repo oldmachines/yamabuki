@@ -8,7 +8,7 @@ expects data that is never committed.
 
 | Step | What it proves | Needs | In CI |
 |---|---|---|---|
-| `zig build test` | Unit tests in every module (about 550 `test` blocks across core and frontends), collected from five roots: the core, the frontend helpers, the shader pipeline, the SDL frontend's pure code, and the headless frontend's pure code. | nothing | Debug and ReleaseFast |
+| `zig build test` | Unit tests in every module (about 550 `test` blocks across core and frontends), collected from five roots: the core (built with the `diagnostics` knob on, so the conversion hooks are exercised), the frontend helpers, the shader pipeline, the SDL frontend's pure code, and the headless frontend's pure code. | nothing | Debug and ReleaseFast |
 | `zig build fuzz` | Deterministic fuzz: random PPU register/memory states rendered as full frames, random bus traffic against a running console (plain and SA-1), and a periodic serialize → restore → step round trip that must stay byte-identical. Runs in Debug so every safety check is armed. | nothing | Debug |
 | `zig build test-sst` | The 65816 core against the SingleStepTests vectors: registers, memory, cycle count and per-cycle bus position over all 5.12 M cases. | `test-data/sst-65816` | sampled (`-Dsst-sample=500`) |
 | `zig build test-sst-spc700` | The SPC700 core against its SingleStepTests vectors. | `test-data/sst-spc700` | sampled |
@@ -89,4 +89,6 @@ dummy drivers (built from source and cached); a cross-compile matrix
 (x86_64 and aarch64 glibc, aarch64 and armv7 musl with a static-linkage
 assertion, x86_64 Windows); and the shader bake with its promised-preset
 assertion. A `windows-latest` job builds and runs the unit tests natively,
-because three frontends carry Windows-only code.
+because three frontends carry Windows-only code. A nightly workflow
+(`nightly-fuzz.yml`) runs the fuzz harness with four fresh seeds and more
+iterations; a failure names its seed for `-Dfuzz-seed`.

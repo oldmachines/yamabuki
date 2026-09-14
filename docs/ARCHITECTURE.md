@@ -26,7 +26,9 @@ site/                the landing page and its screenshots
 | Module | What it is |
 |---|---|
 | `core.zig` | Public API root: re-exports every module below and the `Console` instantiations. |
-| `console.zig` | `Console(comptime cfg)`: wires CPU, bus, PPU, APU and DMA; owns the scheduler (`runFrame`, scanline stepping, NMI/IRQ), save states (`saveState`/`loadState`), and the profiler hooks. `AnyConsole` is the runtime tagged union over the fast and accurate instantiations. |
+| `console.zig` | `Console(comptime cfg)`: wires CPU, bus, PPU, APU and DMA; owns the scheduler (`runFrame`, scanline stepping, NMI/IRQ) and the profiler hooks. `AnyConsole` is the runtime tagged union over the fast and accurate instantiations. |
+| `state.zig` | The save-state container: versioned header, layout fingerprint, cart-RAM tail, image identity; `Format(Self, accuracy)` gives each console type its size and save/load pair. |
+| `ptr_bank_tracker.zig` | The conversion generator's pointer-bank provenance tracker (which ROM byte fed each bank value); runs only under the profiling console. |
 | `timing.zig` | Master-clock constants: cycles per line, lines per frame (NTSC/PAL), memory speeds, beam positions. |
 | `serialize.zig` | Comptime-reflection save-state serializer. Refuses pointers; derived state is rebuilt by `postLoad` hooks. |
 | `cpu/wdc65816.zig` | The 65C816 core: registers, flags, interrupts, the bus wrappers (`read8`/`write8`), and the diagnostics the SA-1 tooling hooks into. |
@@ -64,7 +66,7 @@ site/                the landing page and its screenshots
 | Module | What it is |
 |---|---|
 | `headless/main.zig` | The CLI: plain runs, movie replay, every inspection instrument, the analyser, the patch generators, the harvest and baseline caches, threaded verification. `docs/CLI.md` documents every flag. |
-| `sdl/main.zig`, `sdl/app.zig` | The desktop player: argument parsing, the session loop (video, audio, input, overlay menu, saves, rewind, takes), the library screen. |
+| `sdl/main.zig`, `sdl/app.zig`, `sdl/app/*.zig` | The desktop player: argument parsing and boot (`main.zig`), the session loop (`app.zig`), and under `app/`: the GL shader path (`video_gl`), frame pacing, takes, save-state slots, screenshots, and the library screen (its own SDL session). |
 | `sdl/sdl3.zig`, `sdl/gl.zig` | Hand-ported SDL3 and GL ES ABI subsets, resolved at runtime (`dlopen`, `SDL_GL_GetProcAddress`). No headers, no link-time dependency. |
 | `sdl/shader.zig`, `sdl/preset.zig` | The multi-pass shader chain and the baked-preset manifest parser. |
 | `sdl/input.zig`, `sdl/menu.zig`, `sdl/ui.zig`, `sdl/font.zig`, `sdl/osd.zig`, `sdl/infopanel.zig` | Bindings model, the overlay menu, software UI primitives, the 5x7 font, the shader toast, the info palette. |
@@ -226,9 +228,10 @@ The CRT shaders are compiled ahead of time by glslang and SPIRV-Cross on the
 build host ([`SHADERS.md`](SHADERS.md)); the binary holds no shader
 compiler, no SPIR-V and no image decoder.
 
-**Process-global diagnostics are the one departure from "no globals".** The
-SA-1 conversion tooling hooks the CPU, DMA and PPU through `dbg_*` globals
-that are off in normal play. They cost a load and a predicted branch on the
-hot path and they couple every `Console` in the process; moving them behind
-a comptime core config is the next performance step (see the audit in
-[`AUDIT_2026-09.md`](AUDIT_2026-09.md)).
+**The conversion diagnostics are compiled out of the shipping core.** The
+SA-1 tooling hooks the CPU, bus, DMA, PPU and SA-1 through `dbg_*` knobs
+tested on every instruction and data access. They exist only behind the
+`diagnostics` option of the core module (`build.zig`): on for the headless
+runner and the core's unit tests, off for the SDL player, the libretro
+core, every gate and the bench. The shipping core has no branch for them;
+the headless runner is the only binary that can set them.

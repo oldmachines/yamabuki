@@ -266,6 +266,8 @@ all are rebindable in the overlay menu or in `config.zon`.
 |---|---|---|---|
 | `yamabuki_accuracy` | `fast` \| `accurate` | `fast` | Which console core is instantiated. Read once at load-game, so changing it takes effect on the next game load (restart the content). |
 
+Cheats arrive through the frontend's cheat interface (`retro_cheat_set`): up to 32 slots, each an Action Replay `ADDRVV` code (several joined with `+`, the same syntax as `--cheat`), held after every frame while enabled; a code that does not parse is ignored.
+
 ---
 
 ## 4. Recipes
