@@ -162,7 +162,8 @@ const testing = std.testing;
 
 test "boxart: stem and the candidate list, in order" {
     try testing.expectEqualStrings("Game (U)", stem("roms/Game (U).zip"));
-    try testing.expectEqualStrings("Game", stem("C:\\roms\\Game.sfc"));
+    // A backslash is a separator only where the OS says so.
+    if (@import("builtin").os.tag == .windows) try testing.expectEqualStrings("Game", stem("C:\\roms\\Game.sfc"));
     try testing.expectEqualStrings("dump", stem("dump"));
     try testing.expectEqualStrings(".hidden", stem("x/.hidden"));
 
