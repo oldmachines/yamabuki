@@ -72,6 +72,16 @@ pub const Rewind = struct {
         self.counter = 0;
     }
 
+    /// Release the history and the two state buffers. The ring is not
+    /// usable afterwards.
+    pub fn deinit(self: *Rewind) void {
+        self.clear();
+        self.deltas.deinit(self.gpa);
+        self.gpa.free(self.latest);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
     pub fn depth(self: *const Rewind) usize {
         return self.deltas.items.len - self.head;
     }
@@ -219,12 +229,7 @@ test "rewind: history walks back through every pushed state" {
         .scratch = try a.alloc(u8, 64),
         .budget = 1 << 20,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var prng = std.Random.DefaultPrng.init(99);
     const rand = prng.random();
@@ -256,12 +261,7 @@ test "rewind: the budget evicts oldest history but never the newest" {
         // Small enough that a few dense deltas overflow it.
         .budget = 600,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var prng = std.Random.DefaultPrng.init(3);
     const rand = prng.random();
@@ -301,12 +301,7 @@ test "rewind: a rewound console is byte-identical to a straight run" {
     con.init(.fast, cart);
 
     var rw = try Rewind.init(a, 8 << 20);
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
     for (0..30) |_| {
         con.runFrame();
         rw.onFrame(con);
@@ -341,12 +336,7 @@ test "rewind: clear forgets history and re-anchors" {
         .scratch = try a.alloc(u8, 32),
         .budget = 1 << 16,
     };
-    defer {
-        rw.clear();
-        rw.deltas.deinit(a);
-        a.free(rw.latest);
-        a.free(rw.scratch);
-    }
+    defer rw.deinit();
 
     var s1: [32]u8 = @splat(1);
     var s2: [32]u8 = @splat(2);

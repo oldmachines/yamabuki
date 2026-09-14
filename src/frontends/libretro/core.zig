@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const core = @import("snes_core");
+const util = @import("util");
 pub const api = @import("api.zig");
 
 const Button = core.joypad.Button;
@@ -141,6 +142,7 @@ pub export fn retro_run() void {
     }
 
     con.runFrame();
+    applyCheats(con);
 
     if (cb_video) |video| {
         const fb = con.framebuffer();
@@ -180,12 +182,37 @@ pub export fn retro_unserialize(data: ?*const anyopaque, size: usize) bool {
     return true;
 }
 
-pub export fn retro_cheat_reset() void {}
+/// One frontend cheat slot: the pokes its code parsed to, and whether the
+/// frontend has it switched on. RetroArch hands codes over one slot at a
+/// time in the Action Replay `ADDRVV` form the cheat module parses (several
+/// joined with `+`); a code it cannot parse is ignored, which is what the
+/// other cores do too.
+const CheatSlot = struct {
+    pokes: [4]util.cheat.Poke = undefined,
+    n: u8 = 0,
+    enabled: bool = false,
+};
+const max_cheat_slots = 32;
+var cheat_slots: [max_cheat_slots]CheatSlot = @splat(.{});
+
+pub export fn retro_cheat_reset() void {
+    cheat_slots = @splat(.{});
+}
 
 pub export fn retro_cheat_set(index: c_uint, enabled: bool, code: ?[*:0]const u8) void {
-    _ = index;
-    _ = enabled;
-    _ = code;
+    if (index >= max_cheat_slots) return;
+    const slot = &cheat_slots[index];
+    slot.* = .{};
+    const text = std.mem.span(code orelse return);
+    slot.n = @intCast(util.cheat.parseCodes(text, &slot.pokes, 0) catch return);
+    slot.enabled = enabled;
+}
+
+/// Hold every enabled cheat's bytes after a frame, as the SDL player does.
+fn applyCheats(con: *core.AnyConsole) void {
+    for (&cheat_slots) |*slot| {
+        if (slot.enabled and slot.n != 0) _ = util.cheat.apply(con, slot.pokes[0..slot.n]);
+    }
 }
 
 pub export fn retro_load_game(game: ?*const api.GameInfo) bool {

@@ -20,6 +20,11 @@ pub const cycles_per_dot: u64 = 4;
 /// The dot at which output pixel 0 leaves the PPU (dots 0-21 are setup /
 /// left border).
 pub const render_start_dot: u64 = 22;
+/// HVBJOY's H-blank flag ($4212 bit 6) is set from this dot to the end of
+/// the line and through dot `hblank_end_dot` of the next one — the beam's
+/// horizontal retrace, where games park DMA and register writes.
+pub const hblank_start_dot: u16 = 274;
+pub const hblank_end_dot: u16 = 1;
 
 pub const ntsc_lines_per_frame: u32 = 262;
 pub const pal_lines_per_frame: u32 = 312;

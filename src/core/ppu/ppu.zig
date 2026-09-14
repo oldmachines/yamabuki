@@ -25,6 +25,12 @@ pub const fb_height: u32 = 239;
 /// two apart by "is it exactly 512" without carrying a separate flag.
 pub const wide_margin_max: u32 = 64;
 
+/// VRAM is 32768 words; a translated word address wraps into it.
+pub const vram_word_mask: u16 = 0x7FFF;
+/// OAM: the 512-byte low table, then the 32-byte high table.
+pub const oam_low_bytes: u16 = 0x200;
+pub const oam_last_byte: u16 = 0x21F;
+
 /// Per-background-layer configuration latched from the register file.
 pub const BgLayer = struct {
     /// Tilemap base, in VRAM words.
@@ -362,11 +368,11 @@ pub const Ppu = struct {
             },
             0x16 => { // VMADDL — hardware prefetches the read latch on VMADD writes
                 self.vram_addr = (self.vram_addr & 0xFF00) | value;
-                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+                self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             },
             0x17 => { // VMADDH — same prefetch
                 self.vram_addr = (self.vram_addr & 0x00FF) | (@as(u16, value) << 8);
-                self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+                self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             },
             0x18 => self.writeVramLow(value), // VMDATAL
             0x19 => self.writeVramHigh(value), // VMDATAH
@@ -508,13 +514,13 @@ pub const Ppu = struct {
     }
 
     fn writeVramLow(self: *Ppu, value: u8) void {
-        const a = self.vramTranslate() & 0x7FFF;
+        const a = self.vramTranslate() & vram_word_mask;
         self.vram[a] = (self.vram[a] & 0xFF00) | value;
         self.vramStep(false);
     }
 
     fn writeVramHigh(self: *Ppu, value: u8) void {
-        const a = self.vramTranslate() & 0x7FFF;
+        const a = self.vramTranslate() & vram_word_mask;
         self.vram[a] = (self.vram[a] & 0x00FF) | (@as(u16, value) << 8);
         self.vramStep(true);
     }
@@ -529,7 +535,7 @@ pub const Ppu = struct {
         // fetch odd source bytes through exactly that idiom, and the Ceres
         // station tiles rendered as speckle).
         if (!self.vram_inc_high) {
-            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             self.vramStep(false);
         }
         return v;
@@ -538,7 +544,7 @@ pub const Ppu = struct {
     fn readVramHigh(self: *Ppu) u8 {
         const v: u8 = @truncate(self.vram_read_latch >> 8);
         if (self.vram_inc_high) {
-            self.vram_read_latch = self.vram[self.vramTranslate() & 0x7FFF];
+            self.vram_read_latch = self.vram[self.vramTranslate() & vram_word_mask];
             self.vramStep(true);
         }
         return v;
@@ -578,7 +584,7 @@ pub const Ppu = struct {
 
     fn writeOam(self: *Ppu, value: u8) void {
         const a = self.oam_addr;
-        if (a < 0x200) {
+        if (a < oam_low_bytes) {
             // Low table: even byte is buffered, odd byte commits the pair.
             if (a & 1 == 0) {
                 self.oam_latch = value;
@@ -588,15 +594,15 @@ pub const Ppu = struct {
             }
         } else {
             // High table: written directly.
-            self.oam[a & 0x21F] = value;
+            self.oam[a & oam_last_byte] = value;
         }
-        self.oam_addr = if (a >= 0x21F) 0 else a + 1;
+        self.oam_addr = if (a >= oam_last_byte) 0 else a + 1;
     }
 
     fn readOam(self: *Ppu) u8 {
         const a = self.oam_addr;
-        const v = self.oam[a & 0x21F];
-        self.oam_addr = if (a >= 0x21F) 0 else a + 1;
+        const v = self.oam[a & oam_last_byte];
+        self.oam_addr = if (a >= oam_last_byte) 0 else a + 1;
         return v;
     }
 
@@ -677,7 +683,7 @@ pub const Ppu = struct {
     }
 
     /// Visible framebuffer for the current display height and frame width.
-    pub fn frame(self: *const Ppu, height: u32) []const u16 {
+    pub fn frameRows(self: *const Ppu, height: u32) []const u16 {
         return self.fb[0 .. self.fb_line_width * height];
     }
 };

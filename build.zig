@@ -90,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snes_core", .module = core_mod },
+                .{ .name = "util", .module = frontend_util_mod },
             },
         }),
     });
@@ -385,7 +386,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path("src/frontends/libretro/core.zig"),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "snes_core", .module = core_mod }},
+                    .imports = &.{ .{ .name = "snes_core", .module = core_mod }, .{ .name = "util", .module = frontend_util_mod } },
                 }) },
             },
         }),

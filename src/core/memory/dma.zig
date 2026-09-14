@@ -17,6 +17,7 @@ const std = @import("std");
 /// headless runner and the core tests (see build.zig).
 const diag = @import("perf_options").diagnostics;
 const wdc65816 = @import("../cpu/wdc65816.zig");
+const timing = @import("../timing.zig");
 
 /// GDMA timing: a fixed per-DMA setup, a per-active-channel overhead, and a
 /// per-byte transfer cost, all in master cycles. These replace the bus
@@ -69,12 +70,16 @@ var dbg_dma_n: usize = 0;
 /// each scanline, to isolate which per-scanline effect a render depends on.
 pub var dbg_hdma_disable: u8 = 0;
 
+/// The dedup window of the DMA trace: ~370 NTSC frames of master
+/// clocks, so the same upload recurring in a later scene prints again.
+const dma_trace_bucket_cycles: u64 = 370 * @as(u64, timing.cycles_per_line) * timing.ntsc_lines_per_frame;
+
 fn noteGpDma(i: usize, src: u24, b_reg: u8, bytes: u32, a_is_dest: bool, vdest: u16, control: u8, clk: u64) void {
     // Dedup within a ~370-frame bucket only: the same (src, reg) upload
     // recurring in a LATER scene (the Ceres re-upload after the intro) must
     // print again, or the trace claims a region was never written twice.
     if (clk < dbg_dma_from) return;
-    const key: u64 = (clk / (357366 * 370)) << 40 | @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
+    const key: u64 = (clk / dma_trace_bucket_cycles) << 40 | @as(u64, src) << 16 | @as(u64, b_reg) << 8 | @as(u64, i);
     for (dbg_dma_seen[0..dbg_dma_n]) |k| if (k == key) return;
     if (dbg_dma_n == dbg_dma_seen.len or dbg_dma_n == dbg_dma) return;
     dbg_dma_seen[dbg_dma_n] = key;

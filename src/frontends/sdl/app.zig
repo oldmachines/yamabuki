@@ -100,6 +100,9 @@ pub const RegionArg = enum { auto, ntsc, pal };
 /// recording start/stop): one line at the picture's bottom-left for a
 /// couple of seconds, drawn into the compose buffer so both render paths
 /// show it and the shader shades it like game pixels.
+/// Frames between the last shader change and the config write (1.5 s).
+const config_persist_delay: u32 = 90;
+
 const Toast = struct {
     buf: [48]u8 = undefined,
     len: usize = 0,
@@ -380,6 +383,7 @@ pub fn run(
     // Rewind history. The one number the whole design leans on — the real
     // state size — is printed rather than assumed.
     var rw: ?rewind.Rewind = null;
+    defer if (rw) |*r| r.deinit();
     if (opts.rewind_enabled) {
         rw = rewind.Rewind.init(gpa, @as(usize, opts.rewind_budget_mib) * 1024 * 1024) catch null;
         if (rw != null) {
@@ -480,6 +484,12 @@ pub fn run(
     // `.start.srm`), when it began from one.
     var rec_start_srm: ?[]u8 = null;
     var next_deadline = sdl.SDL_GetTicksNS() + frame_ns;
+    // Shader cycling writes the chosen preset to config.zon, but not on
+    // every tap: tapping through twenty presets used to rewrite the file
+    // twenty times. The write lands `config_persist_delay` frames after
+    // the last change, or at exit.
+    var config_persist_at: ?u32 = null;
+    defer if (config_persist_at != null) persistConfig(io, gpa, &opts, err);
 
     // --record: open the take here, before any frame has run, so the movie
     // is a true power-on take with the boot frames in it. The F10 path can
@@ -881,7 +891,7 @@ pub fn run(
                     .shader_next, .shader_prev => if (glv) |g| {
                         cycleShader(io, gpa, g, if (req == .shader_next) 1 else -1, err);
                         opts.cfg.video.shader = g.names[g.index];
-                        persistConfig(io, gpa, &opts, err);
+                        config_persist_at = frames_run + config_persist_delay;
                     },
                 }
                 continue;
@@ -1479,6 +1489,10 @@ pub fn run(
             }
         }
 
+        if (config_persist_at) |at| if (frames_run >= at) {
+            persistConfig(io, gpa, &opts, err);
+            config_persist_at = null;
+        };
         if (opts.frames != 0 and frames_run >= opts.frames) running = false;
 
         // Pacing: sleep up to the next NTSC frame boundary.

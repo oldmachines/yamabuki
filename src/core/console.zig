@@ -500,7 +500,7 @@ pub fn Console(comptime cfg: CoreConfig) type {
         /// The visible RGB565 framebuffer for the current display height.
         pub fn framebuffer(self: *const Self) []const u16 {
             const height: u32 = if (self.bus.ppu.overscan()) timing.visible_lines_239 else timing.visible_lines_224;
-            return self.bus.ppu.frame(height);
+            return self.bus.ppu.frameRows(height);
         }
 
         /// Pixel width of the last rendered frame (256, or 512 for hi-res).

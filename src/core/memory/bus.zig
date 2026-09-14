@@ -852,7 +852,7 @@ pub const Bus = struct {
 /// flag ($4212 bit 6) — the thing `BIT $4212 / BVC` waits on, because BIT puts
 /// bit 6 straight into the V flag.
 pub fn isHblank(dot: u16) bool {
-    return dot >= 274 or dot <= 1;
+    return dot >= timing.hblank_start_dot or dot <= timing.hblank_end_dot;
 }
 
 pub fn isSystemBank(bank: u8) bool {
