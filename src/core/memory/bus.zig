@@ -7,6 +7,9 @@
 //! traffic for free.
 
 const std = @import("std");
+/// The conversion tooling's per-access hooks, compiled in only for the
+/// headless runner and the core tests (see build.zig).
+const diag = @import("perf_options").diagnostics;
 const wdc65816 = @import("../cpu/wdc65816.zig");
 const mappers = @import("mappers.zig");
 const Wram = @import("wram.zig").Wram;
@@ -434,7 +437,10 @@ pub const Bus = struct {
 
     /// The S-CPU's own cycles, under the overclock divisor.
     pub inline fn cpuCycles(self: *Bus, n: u32) void {
-        if (self.overclock <= 1) {
+        // The overclock is a verification-only divisor (the behavioral
+        // tier's lag-free reference); without the diagnostics knob the test
+        // folds away and this is one add on the innermost accessor.
+        if (!diag or self.overclock <= 1) {
             self.clock += n;
             return;
         }
@@ -595,7 +601,7 @@ pub const Bus = struct {
     /// behavioral verifier only — the once-per-frame tick snapshot.
     inline fn notePoll(self: *Bus) void {
         self.input_polled = true;
-        if (wdc65816.lap_cell == 0) self.tickSnap();
+        if (diag and wdc65816.lap_cell == 0) self.tickSnap();
     }
 
     /// The behavioral verifier's once-per-tick snapshot.

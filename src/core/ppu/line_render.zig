@@ -23,6 +23,7 @@ const fb_width_max = ppu_mod.fb_width_max;
 /// Compiled in only for the bench (see the `perf_counters` build option); false
 /// everywhere else, so `vread`'s increment folds away in shipping builds.
 const perf_counters = @import("perf_options").enabled;
+const diag = @import("perf_options").diagnostics;
 
 /// Read one VRAM word through the renderer's deterministic traffic counter.
 /// Every render-path VRAM fetch goes through here; the count is what
@@ -194,9 +195,11 @@ const mode_table = [8]ModeDesc{
 /// TM/TS as the renderer sees them, with any `--bg-disable` layers masked out
 /// (diagnostic only; zero when unset, so this is the register value).
 inline fn tmOf(ppu: *const Ppu) u8 {
+    if (!diag) return ppu.main_screen;
     return ppu.main_screen & ~ppu_mod.dbg_layer_disable;
 }
 inline fn tsOf(ppu: *const Ppu) u8 {
+    if (!diag) return ppu.sub_screen;
     return ppu.sub_screen & ~ppu_mod.dbg_layer_disable;
 }
 
@@ -333,7 +336,7 @@ inline fn selectOrder(ppu: *const Ppu, comptime md: ModeDesc) []const Entry {
 /// clips the main screen to black; otherwise the direct lpal path is taken
 /// and none of the math state is read.
 inline fn mathActive(ppu: *const Ppu) bool {
-    if (ppu_mod.dbg_no_color_math) return false;
+    if (diag and ppu_mod.dbg_no_color_math) return false;
     return ppu.cgadsub & 0x3F != 0 or ppu.cgwsel & 0xC0 != 0;
 }
 

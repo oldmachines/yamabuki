@@ -13,6 +13,9 @@
 //! time — no function pointers, one jump-table switch per instruction.
 
 const std = @import("std");
+/// The conversion tooling's per-access hooks, compiled in only for the
+/// headless runner and the core tests (see build.zig).
+const diag = @import("perf_options").diagnostics;
 const ops = @import("ops.zig");
 
 pub const Flags = struct {
@@ -236,33 +239,38 @@ pub fn Cpu(comptime BusT: type) type {
                 return;
             }
 
-            if (dbg_clock_pc != 0 and !dbg_clock_fired and
-                (self.regs.pbr & 0x7F) == (dbg_clock_pc >> 16) and
-                self.regs.pc == @as(u16, @truncate(dbg_clock_pc)) and
-                @hasField(BusT, "clock"))
-            {
-                dbg_clock_fired = true;
-                std.debug.print("[clk] pc={x:0>2}:{x:0>4} clock={}\n", .{ self.regs.pbr, self.regs.pc, self.bus.clock });
-            }
-            if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
-                const clk = self.bus.clock;
-                if (clk >= dbg_trace_from and clk < dbg_trace_to)
-                    std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} s={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.s, self.regs.d, self.regs.dbr, self.regs.p, clk });
-            }
-            if (dbg_scpu_set) |m| if (@hasField(BusT, "clock") and dbg_upper_mapped and self.regs.pc >= 0x8000 and (self.regs.pbr & 0x7F) < 0x40) {
-                m[(@as(usize, self.regs.pbr & 0x3F) << 15) | (self.regs.pc & 0x7FFF)] = 1;
-            };
-            if (dbg_stale_ring and !@hasField(BusT, "clock")) {
-                dbg_ring[dbg_ring_n % dbg_ring.len] = .{ .pbr = self.regs.pbr, .pc = self.regs.pc, .c = self.regs.c, .x = self.regs.x, .y = self.regs.y, .d = self.regs.d, .dbr = self.regs.dbr, .p = self.regs.p };
-                dbg_ring_n += 1;
-            }
-            // SA-1-side trace: fires once the S-CPU-side watch has armed.
-            if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {
-                dbg_trace_sa1_n += 1;
-                // The SA-1's own clock, in master cycles: what the catch-up has
-                // handed it minus what it has not yet spent.
-                const sclk: u64 = if (@hasField(BusT, "last_sync") and @hasField(BusT, "budget")) self.bus.last_sync -% @as(u64, @intCast(@max(self.bus.budget, 0))) else 0;
-                std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p, sclk });
+            // The per-instruction diagnostic hooks: five global-flag tests
+            // per step, compiled in only with the `diagnostics` knob (the
+            // headless runner); a shipping core has none of them.
+            if (diag) {
+                if (dbg_clock_pc != 0 and !dbg_clock_fired and
+                    (self.regs.pbr & 0x7F) == (dbg_clock_pc >> 16) and
+                    self.regs.pc == @as(u16, @truncate(dbg_clock_pc)) and
+                    @hasField(BusT, "clock"))
+                {
+                    dbg_clock_fired = true;
+                    std.debug.print("[clk] pc={x:0>2}:{x:0>4} clock={}\n", .{ self.regs.pbr, self.regs.pc, self.bus.clock });
+                }
+                if (dbg_trace_to != 0 and @hasField(BusT, "clock")) {
+                    const clk = self.bus.clock;
+                    if (clk >= dbg_trace_from and clk < dbg_trace_to)
+                        std.debug.print("[tr] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} s={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.s, self.regs.d, self.regs.dbr, self.regs.p, clk });
+                }
+                if (dbg_scpu_set) |m| if (@hasField(BusT, "clock") and dbg_upper_mapped and self.regs.pc >= 0x8000 and (self.regs.pbr & 0x7F) < 0x40) {
+                    m[(@as(usize, self.regs.pbr & 0x3F) << 15) | (self.regs.pc & 0x7FFF)] = 1;
+                };
+                if (dbg_stale_ring and !@hasField(BusT, "clock")) {
+                    dbg_ring[dbg_ring_n % dbg_ring.len] = .{ .pbr = self.regs.pbr, .pc = self.regs.pc, .c = self.regs.c, .x = self.regs.x, .y = self.regs.y, .d = self.regs.d, .dbr = self.regs.dbr, .p = self.regs.p };
+                    dbg_ring_n += 1;
+                }
+                // SA-1-side trace: fires once the S-CPU-side watch has armed.
+                if (dbg_trace_sa1 != 0 and !@hasField(BusT, "clock") and dbg_watch_armed and dbg_trace_sa1_n < dbg_trace_sa1) {
+                    dbg_trace_sa1_n += 1;
+                    // The SA-1's own clock, in master cycles: what the catch-up has
+                    // handed it minus what it has not yet spent.
+                    const sclk: u64 = if (@hasField(BusT, "last_sync") and @hasField(BusT, "budget")) self.bus.last_sync -% @as(u64, @intCast(@max(self.bus.budget, 0))) else 0;
+                    std.debug.print("[trs] {x:0>2}:{x:0>4} a={x:0>4} x={x:0>4} y={x:0>4} d={x:0>4} db={x:0>2} p={x:0>2} clk={}\n", .{ self.regs.pbr, self.regs.pc, self.regs.c, self.regs.x, self.regs.y, self.regs.d, self.regs.dbr, self.regs.p, sclk });
+                }
             }
             const m8 = self.regs.e or (self.regs.p & Flags.m) != 0;
             const x8 = self.regs.e or (self.regs.p & Flags.x) != 0;
@@ -334,9 +342,9 @@ pub fn Cpu(comptime BusT: type) type {
         }
 
         pub inline fn read8(self: *Self, addr: u24) u8 {
-            if (dbg_stale != 0) self.noteStale(addr, 'r');
+            if (diag and dbg_stale != 0) self.noteStale(addr, 'r');
             if (@hasField(BusT, "last_data_read")) self.bus.last_data_read = addr;
-            if (@hasDecl(BusT, "noteTickRead")) self.bus.noteTickRead(addr);
+            if (diag and @hasDecl(BusT, "noteTickRead")) self.bus.noteTickRead(addr);
             return self.bus.read8(addr);
         }
 
@@ -420,13 +428,18 @@ pub fn Cpu(comptime BusT: type) type {
         }
 
         pub inline fn write8(self: *Self, addr: u24, value: u8) void {
-            if (lap_cell != 0) self.noteLap(addr, value);
-            if (dbg_stale != 0) self.noteStale(addr, 'w');
-            if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
-            if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);
-            if (@hasField(BusT, "mmio_writers")) if (self.bus.mmio_writers) |w| w.noteWrite(addr, self.regs.pbr, self.instr_pc);
+            // Every hook but `last_data_write` (the profiler's, which the
+            // player's FastROM offer uses) is conversion tooling: seven
+            // tests per data write, gone without the `diagnostics` knob.
+            if (diag) {
+                if (lap_cell != 0) self.noteLap(addr, value);
+                if (dbg_stale != 0) self.noteStale(addr, 'w');
+                if (dbg_dmabank != 0) self.noteDmaBank(addr, value);
+                if (dbg_watch_lo != 0) self.dbgWatchWrite(addr, value);
+                if (@hasField(BusT, "mmio_writers")) if (self.bus.mmio_writers) |w| w.noteWrite(addr, self.regs.pbr, self.instr_pc);
+            }
             if (@hasField(BusT, "last_data_write")) self.bus.last_data_write = addr;
-            if (@hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
+            if (diag and @hasDecl(BusT, "noteTickWrite")) self.bus.noteTickWrite(addr);
             self.bus.write8(addr, value);
         }
 
@@ -500,7 +513,7 @@ pub fn Cpu(comptime BusT: type) type {
         /// how most SNES main loops are written — must not look like a loop with
         /// side effects just because it pushed a return address.
         pub fn push8(self: *Self, value: u8) void {
-            if (dbg_watch_lo != 0) self.dbgWatchWrite(self.regs.s, value);
+            if (diag and dbg_watch_lo != 0) self.dbgWatchWrite(self.regs.s, value);
             self.bus.write8(self.regs.s, value);
             if (self.regs.e) {
                 self.regs.s = 0x0100 | ((self.regs.s -% 1) & 0xFF);

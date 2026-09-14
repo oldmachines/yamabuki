@@ -27,6 +27,9 @@
 //!    count, not the exact cycle.
 
 const std = @import("std");
+/// The conversion tooling's per-access hooks, compiled in only for the
+/// headless runner and the core tests (see build.zig).
+const diag = @import("perf_options").diagnostics;
 const wdc65816 = @import("../cpu/wdc65816.zig");
 const sa1_trace = @import("../sa1_trace.zig");
 const usage_map = @import("../usage_map.zig");
@@ -246,11 +249,14 @@ pub const Sa1 = struct {
                 break;
             }
             self.pollInterrupts();
-            if (self.trace) |t| {
+            // Both donors are conversion tooling (the trace and the usage
+            // map); without the diagnostics knob the two optional tests per
+            // SA-1 instruction fold away.
+            if (diag) if (self.trace) |t| {
                 const r = &self.cpu.regs;
                 t.note(@as(u24, r.pbr) << 16 | r.pc, r.c, r.x, r.y, r.d, r.dbr, r.p);
-            }
-            if (self.usage) |u| {
+            };
+            if (diag) if (self.usage) |u| {
                 const r = &self.cpu.regs;
                 // ROM-window pcs only, folded through the fast mirrors —
                 // and peeked without touching budget or MDR.
@@ -271,7 +277,7 @@ pub const Sa1 = struct {
                         self.usage = null;
                     } else u.noteInstr(pc, op, m8, x8);
                 }
-            }
+            };
             const before = self.budget;
             self.cpu.step();
             self.advanceTimer(@intCast(before - self.budget));

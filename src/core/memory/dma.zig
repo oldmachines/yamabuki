@@ -13,6 +13,9 @@
 //! overriding the per-access charge the bus accessors would otherwise add.
 
 const std = @import("std");
+/// The conversion tooling's per-access hooks, compiled in only for the
+/// headless runner and the core tests (see build.zig).
+const diag = @import("perf_options").diagnostics;
 const wdc65816 = @import("../cpu/wdc65816.zig");
 
 /// GDMA timing: a fixed per-DMA setup, a per-active-channel overhead, and a
@@ -225,7 +228,7 @@ pub const Dma = struct {
             const ch = &self.channels[i];
             self.last_gdma_src[i] = (@as(u24, ch.a_bank) << 16) | ch.a_addr;
             self.last_gdma_len[i] = if (ch.count == 0) 0x10000 else ch.count;
-            if (dbg_dma != 0)
+            if (diag and dbg_dma != 0)
                 noteGpDma(i, self.last_gdma_src[i], ch.b_addr, self.last_gdma_len[i], ch.control & 0x80 != 0, if (@hasField(@TypeOf(bus.*), "ppu")) bus.ppu.vram_addr else 0, ch.control, if (@hasField(@TypeOf(bus.*), "clock")) bus.clock else 0);
         }
         const start = bus.clock;
@@ -281,7 +284,7 @@ pub const Dma = struct {
         const decompress = bus.cart.chip == .sdd1 and !b_to_a and bus.sdd1.channelArmed(i);
         if (decompress) bus.sdd1.beginTransfer(i, (@as(u24, ch.a_bank) << 16) | ch.a_addr);
         if (a_guarded or ch.a_bank == 0x7E or ch.a_bank == 0x7F)
-            wdc65816.noteStaleDma(if (b_to_a) "D<" else "D>", (@as(u24, ch.a_bank) << 16) | ch.a_addr, bus.clock);
+            if (diag) wdc65816.noteStaleDma(if (b_to_a) "D<" else "D>", (@as(u24, ch.a_bank) << 16) | ch.a_addr, bus.clock);
 
         var remaining = total;
         var p: usize = 0;
@@ -330,7 +333,7 @@ pub const Dma = struct {
         for (0..8) |i| {
             const ch = &self.channels[i];
             if (self.hdmaen & (@as(u8, 1) << @intCast(i)) == 0) continue;
-            if (dbg_hdma_disable & (@as(u8, 1) << @intCast(i)) != 0) continue;
+            if (diag and dbg_hdma_disable & (@as(u8, 1) << @intCast(i)) != 0) continue;
             if (ch.line_counter == 0) continue; // channel completed this frame
 
             if (ch.hdma_do_transfer) self.hdmaTransfer(bus, ch);
@@ -356,7 +359,7 @@ pub const Dma = struct {
                 (@as(u24, ch.indirect_bank) << 16) | ch.count
             else
                 (@as(u24, ch.a_bank) << 16) | ch.table_addr;
-            wdc65816.noteStaleDma(if (indirect) "H*" else "H>", a, bus.clock);
+            if (diag) wdc65816.noteStaleDma(if (indirect) "H*" else "H>", a, bus.clock);
             if (b_to_a) {
                 aWrite(bus, a, bus.read8(b));
             } else {
@@ -371,7 +374,7 @@ pub const Dma = struct {
         _ = self;
         const a: u24 = (@as(u24, ch.a_bank) << 16) | ch.table_addr;
         ch.table_addr +%= 1;
-        wdc65816.noteStaleDma("HT", a, bus.clock);
+        if (diag) wdc65816.noteStaleDma("HT", a, bus.clock);
         return aRead(bus, a);
     }
 
