@@ -907,11 +907,7 @@ pub fn runBehavioralProbe(
     conv_path: []const u8,
     movs: []const util.movie.Movie,
 ) !void {
-    const conv_raw = std.Io.Dir.cwd().readFileAlloc(io, conv_path, gpa, .limited(16 * 1024 * 1024)) catch {
-        try out.print("error: cannot read '{s}'\n", .{conv_path});
-        try out.flush();
-        std.process.exit(1);
-    };
+    const conv_raw = util.readRomFile(io, gpa, conv_path, out) orelse std.process.exit(1);
     const conv_image = core.header.stripCopierHeader(conv_raw);
     var plan: profile.Plan = .{};
     var res: core.sa1gen.Result = .{ .image = @constCast(conv_image), .stats = .{}, .fate = @splat(.not_attempted) };

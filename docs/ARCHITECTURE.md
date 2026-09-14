@@ -70,10 +70,11 @@ site/                the landing page and its screenshots
 | `sdl/sdl3.zig`, `sdl/gl.zig` | Hand-ported SDL3 and GL ES ABI subsets, resolved at runtime (`dlopen`, `SDL_GL_GetProcAddress`). No headers, no link-time dependency. |
 | `sdl/shader.zig`, `sdl/preset.zig` | The multi-pass shader chain and the baked-preset manifest parser. |
 | `sdl/input.zig`, `sdl/menu.zig`, `sdl/ui.zig`, `sdl/font.zig`, `sdl/osd.zig`, `sdl/infopanel.zig` | Bindings model, the overlay menu, software UI primitives, the 5x7 font, the shader toast, the info palette. |
-| `sdl/config.zig`, `sdl/paths.zig`, `sdl/saves.zig`, `sdl/rewind.zig`, `sdl/library.zig`, `sdl/dirpicker.zig`, `sdl/patchfind.zig`, `sdl/takes.zig`, `sdl/png.zig` | Persistence and the player's screens: `config.zon`, per-user paths, `.srm` and state slots, the rewind ring, the ROM library, the folder picker, patch discovery, the takes screen, the PNG encoder. |
+| `sdl/config.zig`, `sdl/paths.zig`, `sdl/saves.zig`, `sdl/rewind.zig`, `sdl/library.zig`, `sdl/dirpicker.zig`, `sdl/patchfind.zig`, `sdl/takes.zig`, `sdl/png.zig`, `sdl/boxart.zig` | Persistence and the player's screens: `config.zon`, per-user paths, `.srm` and state slots, the rewind ring, the ROM library, the folder picker, patch discovery, the takes screen, the PNG encoder and decoder, box-art discovery and thumbnails. |
 | `libretro/api.zig`, `libretro/core.zig` | The stable libretro ABI subset and the `retro_*` exports. |
 | `movie.zig` | The `.ymv` input-movie format (versions 1 to 4) and the replay feed. |
 | `cheat.zig` | Action Replay style held writes. |
+| `zipfile.zig` | A ROM out of a `.zip`, in memory: central-directory walk, store/deflate, CRC check. Behind `util.readRomBytes`, so every frontend takes zipped ROMs. |
 | `util.zig` | Shared helpers: PPM/WAV writers, audio draining, the verification envelope. |
 
 ## Core architecture

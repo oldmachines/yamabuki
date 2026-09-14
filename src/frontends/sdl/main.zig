@@ -227,6 +227,7 @@ pub fn main(init: std.process.Init) !void {
             config_path,
             if (user_paths) |p| p.library else null,
             if (user_paths) |p| p.patches else null,
+            if (user_paths) |p| p.boxart else null,
             err,
         ) orelse break;
         const b = bootConsole(io, gpa, picked, args, &cfg, if (user_paths) |p| p.patches else null, err) catch continue;
@@ -648,6 +649,7 @@ test {
     _ = @import("ui.zig");
     _ = @import("font.zig");
     _ = @import("png.zig");
+    _ = @import("boxart.zig");
     _ = @import("rewind.zig");
     _ = @import("library.zig");
     _ = @import("infopanel.zig");

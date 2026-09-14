@@ -14,9 +14,13 @@ pub const movie = @import("movie.zig");
 /// Cheat pokes (Action-Replay-style held writes); see cheat.zig.
 pub const cheat = @import("cheat.zig");
 
+/// A ROM inside a `.zip`; see zipfile.zig.
+pub const zipfile = @import("zipfile.zig");
+
 test {
     _ = movie;
     _ = cheat;
+    _ = zipfile;
 }
 
 /// Expand one RGB565 pixel to RGB888 by bit-replicating the 5/6-bit channels
@@ -119,16 +123,80 @@ pub fn writeWav(io: std.Io, path: []const u8, samples: []const i16) !void {
 /// player's generation offer, where each used to carry its own.
 pub const max_rom_file_bytes: usize = core.cartridge.max_rom_bytes + core.header.copier_header_size;
 
+/// The largest `.zip` a ROM is read out of. A ROM archive is the ROM plus
+/// a text file or two, so a cartridge's own cap with room to spare; a set
+/// of several games in one archive is not something the loaders go
+/// looking through.
+pub const max_rom_archive_bytes: usize = 64 << 20;
+
+pub const ReadRomError = error{ CannotRead, OutOfMemory } || zipfile.Error;
+
 /// Read a ROM file whole (copier header kept — `Cartridge.load` strips it,
-/// and a patch is applied to the stripped image by `applyPatchFile`).
-/// Prints the one error every frontend used to print by hand; null when
-/// the file cannot be read.
+/// and a patch is applied to the stripped image by `applyPatchFile`). A
+/// `.zip` path yields the ROM member inside it (see zipfile.zig), so every
+/// caller that takes a ROM path takes a zipped one. Silent: `readRomFile`
+/// is the printing wrapper.
+pub fn readRomBytes(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ReadRomError![]u8 {
+    if (zipfile.isZipPath(path)) {
+        const archive = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_rom_archive_bytes)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.CannotRead,
+        };
+        defer gpa.free(archive);
+        return zipfile.extractRom(gpa, archive, max_rom_file_bytes);
+    }
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_rom_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CannotRead,
+    };
+}
+
+/// `readRomBytes`, printing the one error every frontend used to print by
+/// hand (and, for an archive, why its ROM could not be taken out); null
+/// when the file cannot be read.
 pub fn readRomFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, err: *std.Io.Writer) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_rom_file_bytes)) catch {
-        err.print("error: cannot read ROM '{s}'\n", .{path}) catch {};
+    return readRomBytes(io, gpa, path) catch |e| {
+        switch (e) {
+            error.CannotRead => err.print("error: cannot read ROM '{s}'\n", .{path}) catch {},
+            error.OutOfMemory => err.print("error: out of memory reading ROM '{s}'\n", .{path}) catch {},
+            else => |ze| err.print("error: cannot read ROM '{s}': {s}\n", .{ path, zipfile.describe(ze) }) catch {},
+        }
         err.flush() catch {};
         return null;
     };
+}
+
+test "readRomBytes: a .zip path yields the ROM inside; a plain path its bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = ".util-zip-test-tmp";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var rom: [2048]u8 = undefined;
+    for (&rom, 0..) |*b, i| b.* = @intCast((i * 7) & 0xFF);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/g.sfc", .data = &rom });
+    const z = try zipfile.TestZip.build(a, &.{.{ .name = "g.sfc", .data = &rom }});
+    defer a.free(z);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/g.zip", .data = z });
+
+    const plain = try readRomBytes(io, a, dir ++ "/g.sfc");
+    defer a.free(plain);
+    try std.testing.expectEqualSlices(u8, &rom, plain);
+    const unzipped = try readRomBytes(io, a, dir ++ "/g.zip");
+    defer a.free(unzipped);
+    try std.testing.expectEqualSlices(u8, &rom, unzipped);
+
+    try std.testing.expectError(error.CannotRead, readRomBytes(io, a, dir ++ "/missing.sfc"));
+    try std.testing.expectError(error.CannotRead, readRomBytes(io, a, dir ++ "/missing.zip"));
+
+    // The printing wrapper says why an archive is refused.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/bad.zip", .data = "not really a zip" });
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(readRomFile(io, a, dir ++ "/bad.zip", &w) == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "not a zip archive") != null);
 }
 
 /// Apply already-read patch bytes to an already-stripped image, naming

@@ -36,6 +36,10 @@ pub const Paths = struct {
     /// `<root>movies` — recorded input playthroughs (`.ymv`, see
     /// frontends/movie.zig), written by the record hotkey.
     movies: []const u8,
+    /// `<root>boxart` — `.png` pictures for the library screen, named by
+    /// ROM stem or by game id (see boxart.zig). Never written by the app;
+    /// created empty so it can be found.
+    boxart: []const u8,
 
     /// Resolve the per-user data directory. Requires the SDL3 runtime `load`
     /// already found — the extra symbols come from the same library.
@@ -54,6 +58,7 @@ pub const Paths = struct {
             .library = std.fmt.allocPrint(gpa, "{s}library.zon", .{root}) catch return null,
             .patches = std.fmt.allocPrint(gpa, "{s}patches", .{root}) catch return null,
             .movies = std.fmt.allocPrint(gpa, "{s}movies", .{root}) catch return null,
+            .boxart = std.fmt.allocPrint(gpa, "{s}boxart", .{root}) catch return null,
         };
     }
 };

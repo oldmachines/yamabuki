@@ -589,11 +589,7 @@ pub fn runSa1Gen(
     for (0..args.n_cover) |ci_i| {
         if (args.cover_image[ci_i] == null or args.cover_movie[ci_i] == null) continue;
         const job = &jobs[ci_i];
-        job.ci_raw = std.Io.Dir.cwd().readFileAlloc(io, args.cover_image[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
-            try out.print("error: cannot read cover image '{s}'\n", .{args.cover_image[ci_i].?});
-            try out.flush();
-            std.process.exit(1);
-        };
+        job.ci_raw = util.readRomFile(io, gpa, args.cover_image[ci_i].?, out) orelse std.process.exit(1);
         job.ci = core.header.stripCopierHeader(job.ci_raw);
         job.mb = std.Io.Dir.cwd().readFileAlloc(io, args.cover_movie[ci_i].?, gpa, .limited(64 * 1024 * 1024)) catch {
             try out.print("error: cannot read cover movie '{s}'\n", .{args.cover_movie[ci_i].?});

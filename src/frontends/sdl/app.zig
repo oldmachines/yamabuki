@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const saves = @import("saves.zig");
 const infopanel = @import("infopanel.zig");
 const png = @import("png.zig");
+const boxart = @import("boxart.zig");
 const rewind = @import("rewind.zig");
 const library = @import("library.zig");
 const dirpicker = @import("dirpicker.zig");
@@ -1537,22 +1538,45 @@ test "library screen: every state draws without out-of-bounds writes" {
     const canvas = try a.create([256 * 224]u16);
     var lib: library.Library = .{ .gpa = a };
     // Onboarding, empty-result, and scanning states.
-    drawLibraryScreen(canvas, &lib, 0, 0, 17, true, null);
-    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, null);
-    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, 42);
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, true, null, null);
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, null, null);
+    drawLibraryScreen(canvas, &lib, 0, 0, 17, false, 42, null);
     // A list longer than the window, cursor at the end, scrolled; every tag
-    // combination including the PATCH prefix.
+    // combination including the PATCH prefix, a zipped entry, play times
+    // under and over an hour.
     for (0..40) |i| {
-        var name: [16]u8 = undefined;
+        var name: [40]u8 = undefined;
         try lib.entries.append(a, .{
-            .path = "x",
-            .title = try a.dupe(u8, std.fmt.bufPrint(&name, "GAME {d}", .{i}) catch "G"),
-            .region = "NTSC",
+            .path = if (i % 5 == 0) "x.zip" else "x",
+            .title = try a.dupe(u8, std.fmt.bufPrint(&name, "GAME {d} WITH A TITLE PAST THE CUT", .{i}) catch "G"),
+            .region = if (i % 4 == 0) "PAL" else "NTSC",
             .chip = if (i % 3 == 0) "SA-1" else "",
             .has_patch = i % 2 == 0,
+            .playtime_s = i * 1000,
         });
     }
-    drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null);
+    drawLibraryScreen(canvas, &lib, 39, 23, 17, false, null, null);
+    drawLibraryScreen(canvas, &lib, 1, 0, 17, false, null, null);
+
+    // With a thumbnail: the picture lands centred in the panel's box and
+    // the list column stays clear of it.
+    const art = try a.create(boxart.Thumb);
+    art.w = 40;
+    art.h = boxart.max_h;
+    @memset(&art.px, 0x07E0);
+    drawLibraryScreen(canvas, &lib, 1, 0, 17, false, null, art);
+    const left: usize = @intCast(library_screen_mod.panel_x + (boxart.max_w - 40) / 2);
+    const top: usize = @intCast(library_screen_mod.panel_y);
+    try std.testing.expectEqual(@as(u16, 0x07E0), canvas[top * 256 + left]);
+    try std.testing.expectEqual(@as(u16, 0x07E0), canvas[(top + boxart.max_h - 1) * 256 + left + 39]);
+    try std.testing.expect(canvas[top * 256 + left - 1] != 0x07E0);
+    try std.testing.expect(canvas[top * 256 + left + 40] != 0x07E0);
+    // The box's frame is drawn one pixel outside it.
+    try std.testing.expectEqual(ui.color.panel_edge, canvas[(top - 1) * 256 + @as(usize, @intCast(library_screen_mod.panel_x)) - 1]);
+    // Nothing of the picture bleeds into the list column.
+    for (0..224) |y| for (0..@as(usize, @intCast(library_screen_mod.panel_x)) - 1) |x| {
+        try std.testing.expect(canvas[y * 256 + x] != 0x07E0);
+    };
 }
 
 test "patch prompt screen draws both cursor rows without out-of-bounds writes" {

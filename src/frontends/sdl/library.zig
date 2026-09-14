@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const core = @import("snes_core");
+const util = @import("util");
 const saves = @import("saves.zig");
 
 pub const Entry = struct {
@@ -95,8 +96,11 @@ pub const Library = struct {
     }
 };
 
+/// What the scanner picks up: plain dumps and `.zip` archives (the ROM
+/// inside is what gets identified — a zip of anything else fails header
+/// detection and is dropped like any other non-ROM).
 fn hasRomExtension(name: []const u8) bool {
-    for ([_][]const u8{ ".sfc", ".smc" }) |ext| {
+    for ([_][]const u8{ ".sfc", ".smc", ".zip" }) |ext| {
         if (name.len > ext.len and std.ascii.eqlIgnoreCase(name[name.len - ext.len ..], ext)) return true;
     }
     return false;
@@ -215,7 +219,7 @@ pub const Scanner = struct {
 
     fn identify(self: *Scanner, io: std.Io, c: Candidate) ?Entry {
         const gpa = self.gpa;
-        const raw = std.Io.Dir.cwd().readFileAlloc(io, c.path, gpa, .limited(16 << 20)) catch return null;
+        const raw = util.readRomBytes(io, gpa, c.path) catch return null;
         defer gpa.free(raw);
         const image = core.header.stripCopierHeader(raw);
         const header = core.header.detect(image) catch return null; // not a SNES ROM
@@ -241,7 +245,8 @@ const testing = std.testing;
 test "library: extension filter and display metadata helpers" {
     try testing.expect(hasRomExtension("Game.sfc"));
     try testing.expect(hasRomExtension("GAME.SMC"));
-    try testing.expect(!hasRomExtension("game.zip"));
+    try testing.expect(hasRomExtension("game.zip"));
+    try testing.expect(!hasRomExtension("game.7z"));
     try testing.expect(!hasRomExtension(".sfc")); // extension alone is no name
 
     try testing.expectEqualStrings("SFX", chipName(0x15));
@@ -315,35 +320,49 @@ test "library: scanner finds synthesized ROMs, caches, and drops vanished files"
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/sub/good.sfc", .data = &rom });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/garbage.sfc", .data = "way too short" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/readme.txt", .data = "not a rom" });
+    // The same ROM zipped, plus a zip of nothing in particular.
+    const zipped = try util.zipfile.TestZip.build(a, &.{
+        .{ .name = "notes.txt", .data = "release notes" },
+        .{ .name = "Scanner Test (U).smc", .data = &rom },
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/zipped.zip", .data = zipped });
+    const junk = try util.zipfile.TestZip.build(a, &.{.{ .name = "shot.png", .data = "png bytes" }});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/shots.zip", .data = junk });
 
     var buf: [256]u8 = undefined;
     var sink: std.Io.Writer.Discarding = .init(&buf);
     var lib: Library = .{ .gpa = a };
     var sc = Scanner.begin(a, io, &.{root}, &sink.writer);
-    // Both .sfc files are candidates; the .txt never is.
-    try testing.expectEqual(@as(usize, 2), sc.candidates.items.len);
+    // Both .sfc files and both .zip files are candidates; the .txt never is.
+    try testing.expectEqual(@as(usize, 4), sc.candidates.items.len);
     while (!sc.done) _ = sc.stepOne(io, &lib);
 
-    // Only the valid ROM survived identification.
-    try testing.expectEqual(@as(usize, 1), lib.entries.items.len);
+    // The valid ROM survived identification twice — plain and zipped, the
+    // same game — and the junk zip fell out like the garbage dump.
+    try testing.expectEqual(@as(usize, 2), lib.entries.items.len);
     const e = lib.entries.items[0];
     try testing.expectEqualStrings("SCANNER TEST", e.title);
     try testing.expectEqualStrings("NTSC", e.region);
     try testing.expectEqualStrings("", e.chip);
-    try testing.expect(std.mem.endsWith(u8, e.path, "good.sfc"));
     try testing.expect(e.game_id.len > 16);
+    const z = lib.entries.items[1];
+    try testing.expectEqualStrings(e.game_id, z.game_id);
+    try testing.expectEqual(e.crc32, z.crc32);
+    try testing.expect(std.mem.endsWith(u8, e.path, "good.sfc") != std.mem.endsWith(u8, z.path, "good.sfc"));
+    try testing.expect(std.mem.endsWith(u8, e.path, "zipped.zip") != std.mem.endsWith(u8, z.path, "zipped.zip"));
 
-    // Second scan: pure cache hits keep the entry (same identity).
+    // Second scan: pure cache hits keep the entries (same identity).
     var sc2 = Scanner.begin(a, io, &.{root}, &sink.writer);
     while (!sc2.done) _ = sc2.stepOne(io, &lib);
-    try testing.expectEqual(@as(usize, 1), lib.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), lib.entries.items.len);
     try testing.expectEqualStrings(e.game_id, lib.entries.items[0].game_id);
 
-    // Delete the ROM; a rescan drops it.
+    // Delete the plain ROM; a rescan drops it and keeps the zipped one.
     try std.Io.Dir.cwd().deleteFile(io, root ++ "/sub/good.sfc");
     var sc3 = Scanner.begin(a, io, &.{root}, &sink.writer);
     while (!sc3.done) _ = sc3.stepOne(io, &lib);
-    try testing.expectEqual(@as(usize, 0), lib.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), lib.entries.items.len);
+    try testing.expect(std.mem.endsWith(u8, lib.entries.items[0].path, "zipped.zip"));
 }
 
 test "library: cache roundtrips through ZON" {

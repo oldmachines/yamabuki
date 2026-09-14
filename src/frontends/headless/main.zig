@@ -451,7 +451,7 @@ pub fn run(init: std.process.Init) !void {
             const ref = loadMmioRef(io, gpa, rp) catch null;
             if (ref) |r| {
                 const stock_img: ?[]const u8 = if (args.mmio_stock) |sp| blk: {
-                    const raw = std.Io.Dir.cwd().readFileAlloc(io, sp, gpa, .limited(16 * 1024 * 1024)) catch break :blk null;
+                    const raw = util.readRomBytes(io, gpa, sp) catch break :blk null;
                     break :blk core.header.stripCopierHeader(raw);
                 } else null;
                 var n: u32 = 0;
