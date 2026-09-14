@@ -51,7 +51,7 @@ yet been run on a handheld's GPU.
 | M11 CRT shaders | in progress: GL ES 3 / GL 3.3 / GL ES 2 chain with software fallback, 12 libretro presets baked ahead of time (see [Shaders](#shaders)); not yet run on a handheld GPU |
 | M12 ROM patch layer + SA-1 candidacy analyser + patch generation | in progress: soft-patching, the patch registry, the `--sa1-report` analyser, the FastROM generator (CI-gated), and the SA-1 conversion generator through its mainline split — see [Patches and SA-1 conversion](#patches-and-sa-1-conversion) |
 | M13 commercial-boot golden gate | done: opt-in, your own ROMs, hash-keyed (`test-commercial`) |
-| M14 end-user UI | in progress: the SDL app is a standalone player; deferred: `.zip` ROMs, box art, handheld-class rewind |
+| M14 end-user UI | in progress: the SDL app is a standalone player, reads zipped ROMs, shows box art; deferred: handheld-class rewind |
 
 The full milestone table with every deliverable and its verification is in
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
@@ -92,8 +92,8 @@ Run a ROM headless and dump a frame and its audio:
 ## Playing
 
 ```sh
-./zig-out/bin/yamabuki-sdl <rom.sfc> [--scale N] [--shader crt-lottes]
-./zig-out/bin/yamabuki-sdl           # no argument: open the ROM library
+./zig-out/bin/yamabuki-sdl <rom.sfc|rom.zip> [--scale N] [--shader crt-lottes]
+./zig-out/bin/yamabuki-sdl                   # no argument: open the ROM library
 ```
 
 The desktop app needs the SDL3 runtime library (`libSDL3.so.0`, `SDL3.dll`)
@@ -105,7 +105,12 @@ persist as `.srm` files, `F12` takes a PNG screenshot, holding `Backspace`
 rewinds, `F10` records an input movie, `F11` opens the takes screen, and
 launching with no ROM opens a library scanned from the directories in
 `config.zon`'s `library.rom_dirs` (added from the library screen's own
-"+ ADD ROM FOLDER" row, or by hand). Everything lives in the OS's per-user
+"+ ADD ROM FOLDER" row, or by hand). A ROM may be a `.zip` holding the
+`.sfc`/`.smc`, anywhere a ROM path is taken. The library shows box art
+for the highlighted game: a `Game.png` beside `Game.sfc` (or `.zip`), a
+`boxart/` folder next to the ROMs, or the per-user `boxart` folder named
+by ROM stem or game id — PNG only, decoded by the emulator's own decoder
+(see [`docs/CLI.md`](docs/CLI.md)). Everything lives in the OS's per-user
 data directory (`%APPDATA%\yamabuki\yamabuki` on Windows,
 `~/.local/share/yamabuki/yamabuki` on Linux), and every binding and setting
 is editable both in-menu and in `config.zon`.

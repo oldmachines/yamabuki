@@ -22,8 +22,15 @@ positional argument; a second positional is a usage error.
 ## 1. `yamabuki-headless`
 
 ```
-yamabuki-headless <rom.sfc> [flags]
+yamabuki-headless <rom.sfc|rom.zip> [flags]
 ```
+
+Wherever a ROM path is taken — the positional argument, `--cover-image`,
+`--mmio-stock`, the library scan — a `.zip` is read for the `.sfc`/`.smc`
+inside it (the first member so named, or the only member of a one-file
+archive; store and deflate; not zip64, not encrypted). The image is
+identified, patched and hashed exactly as the plain file would be, so a
+zipped game keeps the saves and patches of its unzipped twin.
 
 Modes are chosen by flag: a plain run (no mode flag), `--sa1-report`,
 `--gen-fastrom-patch`, `--gen-sa1-patch`, `--behavioral-probe`. The two
@@ -200,7 +207,7 @@ architecture and `docs/SM_SA1_FINDINGS.md` for the campaign log.
 ## 2. `yamabuki-sdl`
 
 ```
-yamabuki-sdl [rom.sfc] [flags]
+yamabuki-sdl [rom.sfc|rom.zip] [flags]
 ```
 
 With no ROM argument the player opens the library scanned from
@@ -229,6 +236,26 @@ With no ROM argument the player opens the library scanned from
 | `--record` | — | off | Start recording a `.ymv` at power-on, before the first frame; `F10` stops and saves it. |
 | `--continue` | — | off | With `--movie`: keep recording from the take's end; the saved file is the whole take. Starts from `<take>.end.state` when it still loads on this build, else replays the take at full speed. |
 | `--srm` | `f.srm` | blank SRAM | With `--record`: start the take from this battery save; it rides beside the take as `<take>.start.srm` and every replay loads it first. Each `--record` session also writes its own `<take>.srm`. |
+
+### Box art
+
+The library screen shows a picture of the highlighted game beside the
+list, looked up in this order (first hit wins):
+
+1. `<stem>.png` next to the ROM — `Game.png` beside `Game.sfc` or
+   `Game.zip`, the same rule as a same-basename softpatch.
+2. `<the ROM's folder>/boxart/<stem>.png` — the layout scrapers write.
+3. `<per-user data>/boxart/<stem>.png` — for read-only ROM folders.
+4. `<per-user data>/boxart/<game id>.png` — keyed by content, so one
+   picture serves every dump of a game and survives a rename. The game
+   id is the name of the game's save folder under `saves/`.
+
+PNG only (every colour type, palette and colour-key transparency,
+interlace), decoded by the emulator's own decoder so the binary still
+depends on nothing; a JPEG is not found, and the panel says `NO BOX ART`.
+Pictures are read when the cursor rests on a game, never while it
+scrolls, and scaled to fit the panel's 84x104 box. The per-user `boxart`
+folder is created empty at the first library launch so it can be found.
 
 ### Hotkeys and default bindings
 
