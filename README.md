@@ -238,6 +238,13 @@ and the shader bake. Details, the build options, and how to mint a golden:
 - Test data and ROMs are never committed. Patches are indexed, never
   vendored. The recordings under `tests/surfaces/` are the exception, and
   deleting one is a code change.
-- The repository has no LICENSE file yet; until it does, the project's own
-  licence is unstated (the fetched test data and shaders belong to their
-  upstreams).
+- Contributions are accepted under the project's licence (below).
+
+## License
+
+Yamabuki is free software under the **GNU General Public License,
+version 3** (`LICENSE`; SPDX `GPL-3.0-only`). You may run, study, share and
+modify it, and ship it inside a product, on the condition that the complete
+source of your version is offered under the same terms. The test vectors,
+test ROMs and shader sources the build fetches are not part of this
+repository and keep their own licences (see [`docs/TESTING.md`](docs/TESTING.md)).

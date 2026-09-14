@@ -1,5 +1,7 @@
 //! Yamabuki SNES emulator core.
 //!
+//! SPDX-License-Identifier: GPL-3.0-only (see LICENSE at the repository root).
+//!
 //! Pure Zig, freestanding-friendly: no libc, no OS calls, no heap allocation
 //! after construction. Frontends (headless, libretro, SDL) live outside this
 //! module and drive it through `Console`.

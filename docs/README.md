@@ -32,6 +32,11 @@ Where two documents state the current status, `SM_SA1_FINDINGS.md`
 section 0 wins for Super Metroid and the milestone table in `ROADMAP.md`
 wins for everything else.
 
+## Licence
+
+GPL-3.0-only; the text is `LICENSE` at the repository root, and the README's
+*License* section says what it means in practice.
+
 ## Decks
 
 `yamabuki-design-notes.deck.html` is the design-notes deck the landing page
