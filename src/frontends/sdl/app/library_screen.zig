@@ -3,6 +3,7 @@
 //! Carved out of app.zig as pure code motion; every declaration
 //! here is re-exported from app.zig, which stays the root.
 
+const boxart = @import("../boxart.zig");
 const config = @import("../config.zig");
 const core = @import("snes_core");
 const dirpicker = @import("../dirpicker.zig");
@@ -22,6 +23,8 @@ const app_root = @import("../app.zig");
 /// (`dirpicker.zig`) instead of requiring a hand-edit of config.zon; picking
 /// a folder appends it to `cfg.library.rom_dirs`, persists `cfg` (when
 /// `config_path` is set), and restarts the scan to pick it up immediately.
+/// The highlighted game's box art (`boxart.zig`; `boxart_dir` is the
+/// per-user picture folder) is shown in a panel beside the list.
 /// Returns the selected entry's path (duped into `gpa`), or null to quit.
 pub fn runLibrary(
     io: std.Io,
@@ -33,6 +36,7 @@ pub fn runLibrary(
     config_path: ?[]const u8,
     cache_path: ?[]const u8,
     patches_dir: ?[]const u8,
+    boxart_dir: ?[]const u8,
     err: *std.Io.Writer,
 ) !?[]const u8 {
     if (!sdl.SDL_Init(sdl3.init_video | sdl3.init_audio)) {
@@ -97,6 +101,18 @@ pub fn runLibrary(
     // scan completes (fresh ones).
     var patch_index = patchfind.FolderIndex.build(io, gpa, patches_dir);
     refreshPatchTags(io, gpa, lib, &patch_index);
+
+    // Box art for the highlighted game: looked up and decoded once the
+    // cursor has rested on an entry for a few frames (a held Down never
+    // decodes), then kept until the cursor leaves it. The per-user folder
+    // is created empty so there is somewhere obvious to put pictures.
+    if (boxart_dir) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
+    const art = try gpa.create(boxart.Thumb);
+    defer gpa.destroy(art);
+    var art_ok = false;
+    var art_for: ?[]const u8 = null; // the entry the art state is about
+    var art_pending: ?[]const u8 = null; // the entry the cursor is settling on
+    var art_rest: u32 = 0;
 
     // Row 0 of the list is always the ADD ROM FOLDER action, so the browser
     // never depends on a hand-edited config.zon. `.prompt` is the two-row
@@ -414,8 +430,32 @@ pub fn runLibrary(
         if (cursor < scroll) scroll = cursor;
         if (cursor >= scroll + visible_rows) scroll = cursor - visible_rows + 1;
 
+        // Box art follows the cursor with a short settle.
+        const want: ?[]const u8 = if (mode == .list and cursor >= 1 and cursor - 1 < lib.entries.items.len)
+            lib.entries.items[cursor - 1].path
+        else
+            null;
+        if (!samePath(want, art_for)) {
+            art_ok = false;
+            if (!samePath(want, art_pending)) {
+                art_pending = want;
+                art_rest = 0;
+            }
+            art_rest += 1;
+            if (want == null) {
+                art_for = null;
+            } else if (art_rest >= art_settle_frames) {
+                const e = lib.entries.items[cursor - 1];
+                art_for = want;
+                if (boxart.find(io, gpa, e.path, e.game_id, boxart_dir)) |p| {
+                    defer gpa.free(p);
+                    art_ok = boxart.load(io, gpa, p, art);
+                }
+            }
+        }
+
         switch (mode) {
-            .list => drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, cfg.library.rom_dirs.len == 0, if (scanner.done) null else scanner.remaining()),
+            .list => drawLibraryScreen(&canvas, lib, cursor, scroll, visible_rows, cfg.library.rom_dirs.len == 0, if (scanner.done) null else scanner.remaining(), if (art_ok) art else null),
             .picker => drawPickerScreen(&canvas, &picker.?, cursor, scroll, visible_rows),
             .prompt => drawPatchPromptScreen(&canvas, lib.entries.items[prompt_entry].title, cursor, if (gen_note_len != 0) gen_note[0..gen_note_len] else null),
             .offer => drawOfferScreen(&canvas, lib.entries.items[prompt_entry].title, cursor),
@@ -431,10 +471,31 @@ pub fn runLibrary(
     }
 }
 
+/// Frames the cursor rests on an entry before its box art is looked up:
+/// long enough that hold-to-scroll never decodes a picture per row, short
+/// enough to feel immediate once the scrolling stops.
+pub const art_settle_frames: u32 = 6;
+
+fn samePath(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// The panel beside the list: where the box art box sits and how wide the
+/// list column is because of it.
+pub const panel_x: i32 = 166;
+pub const panel_y: i32 = 20;
+/// Titles in the list column are cut to this many characters; the
+/// compact tag on a row (`PATCH`, a chip, or `PAL`) sits to its right.
+pub const list_title_chars: usize = 20;
+const list_tag_right: i32 = 160;
+
 /// The library's whole frame, drawn into a 256x224 canvas — pure pixels, so
 /// the layout is testable and eyeballable without SDL. `scanning_left` is
 /// null once the scan has completed. Row 0 is always the ADD ROM FOLDER
-/// action; rows 1.. are `lib.entries` shifted by one.
+/// action; rows 1.. are `lib.entries` shifted by one. `art` is the
+/// highlighted entry's thumbnail when it has one; the panel names the
+/// entry's region, chip, patch and play time either way.
 pub fn drawLibraryScreen(
     canvas: *[256 * 224]u16,
     lib: *const library.Library,
@@ -443,6 +504,7 @@ pub fn drawLibraryScreen(
     visible_rows: usize,
     no_dirs: bool,
     scanning_left: ?usize,
+    art: ?*const boxart.Thumb,
 ) void {
     const surf = ui.Surface.init(canvas, 256, 224);
     ui.fillRect(&surf, 0, 0, 256, 224, ui.color.panel);
@@ -471,17 +533,49 @@ pub fn drawLibraryScreen(
             continue;
         }
         const e = lib.entries.items[i - 1];
-        const max_title = 32;
-        ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, max_title)], fg);
-        var tag: [24]u8 = undefined;
-        const patch_txt = if (e.has_patch) "PATCH " else "";
-        const tag_txt = if (e.chip.len != 0)
-            std.fmt.bufPrint(&tag, "{s}{s} {s}", .{ patch_txt, e.chip, e.region }) catch e.region
-        else if (e.has_patch)
-            std.fmt.bufPrint(&tag, "{s}{s}", .{ patch_txt, e.region }) catch e.region
-        else
-            e.region;
-        ui.drawText(&surf, 248 - @as(i32, @intCast(ui.textWidth(tag_txt))), y, tag_txt, ui.color.text_dim);
+        ui.drawText(&surf, 10, y, e.title[0..@min(e.title.len, list_title_chars)], fg);
+        // One word per row; the panel has the rest.
+        const tag_txt: []const u8 = if (e.has_patch) "PATCH" else if (e.chip.len != 0) e.chip else if (std.mem.eql(u8, e.region, "PAL")) "PAL" else "";
+        if (tag_txt.len != 0)
+            ui.drawText(&surf, list_tag_right - @as(i32, @intCast(ui.textWidth(tag_txt))), y, tag_txt, ui.color.text_dim);
+    }
+
+    // The panel: the highlighted game's picture (or where one would go)
+    // and its details. Nothing for the ADD ROM FOLDER row.
+    if (cursor >= 1 and cursor - 1 < lib.entries.items.len) {
+        const e = lib.entries.items[cursor - 1];
+        ui.frameRect(&surf, panel_x - 1, panel_y - 1, boxart.max_w + 2, boxart.max_h + 2, ui.color.panel_edge);
+        if (art) |t| {
+            const ax = panel_x + @as(i32, @intCast((boxart.max_w - t.w) / 2));
+            const ay = panel_y + @as(i32, @intCast((boxart.max_h - t.h) / 2));
+            boxart.draw(&surf, ax, ay, t);
+        } else {
+            const label = "NO BOX ART";
+            ui.drawText(&surf, panel_x + @as(i32, @intCast((boxart.max_w - ui.textWidth(label)) / 2)), panel_y + @as(i32, @intCast(boxart.max_h / 2)) - 3, label, ui.color.text_dim);
+        }
+        var dy: i32 = panel_y + @as(i32, @intCast(boxart.max_h)) + 6;
+        var line: [16]u8 = undefined;
+        const kind = std.fmt.bufPrint(&line, "{s} {s}", .{ e.region, e.chip }) catch e.region;
+        ui.drawText(&surf, panel_x, dy, std.mem.trimEnd(u8, kind, " "), ui.color.text_dim);
+        dy += ui.line_h;
+        if (e.has_patch) {
+            ui.drawText(&surf, panel_x, dy, "PATCH FOUND", ui.color.accent);
+            dy += ui.line_h;
+        }
+        if (util.zipfile.isZipPath(e.path)) {
+            ui.drawText(&surf, panel_x, dy, "ZIPPED", ui.color.text_dim);
+            dy += ui.line_h;
+        }
+        if (e.playtime_s != 0) {
+            var pt: [16]u8 = undefined;
+            const h = e.playtime_s / 3600;
+            const m = (e.playtime_s % 3600) / 60;
+            const played = if (h != 0)
+                std.fmt.bufPrint(&pt, "PLAYED {d}H {d:0>2}M", .{ h, m }) catch ""
+            else
+                std.fmt.bufPrint(&pt, "PLAYED {d}M", .{@max(m, 1)}) catch "";
+            ui.drawText(&surf, panel_x, dy, played, ui.color.text_dim);
+        }
     }
 
     if (scanning_left) |left| {
