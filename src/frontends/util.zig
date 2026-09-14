@@ -114,6 +114,67 @@ pub fn writeWav(io: std.Io, path: []const u8, samples: []const i16) !void {
     try wr.flush();
 }
 
+/// The largest ROM file any frontend reads: the cartridge's own cap plus
+/// a copier header. One limit for the headless runner, the player and the
+/// player's generation offer, where each used to carry its own.
+pub const max_rom_file_bytes: usize = core.cartridge.max_rom_bytes + core.header.copier_header_size;
+
+/// Read a ROM file whole (copier header kept — `Cartridge.load` strips it,
+/// and a patch is applied to the stripped image by `applyPatchFile`).
+/// Prints the one error every frontend used to print by hand; null when
+/// the file cannot be read.
+pub fn readRomFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, err: *std.Io.Writer) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_rom_file_bytes)) catch {
+        err.print("error: cannot read ROM '{s}'\n", .{path}) catch {};
+        err.flush() catch {};
+        return null;
+    };
+}
+
+/// Apply already-read patch bytes to an already-stripped image, naming
+/// every refusal (wrong ROM revision with both checksums, a damaged patch,
+/// a failed target checksum, an unknown format) and saying what guarantee
+/// the format could give. Shared by `--patch` (the file the user named),
+/// `--auto-patch` (the file the registry named and hash-verified) and the
+/// player's launch discovery, so all three print the same words.
+pub fn applyPatchBytes(gpa: std.mem.Allocator, err: *std.Io.Writer, stripped: []const u8, pbytes: []const u8, patch_path: []const u8) error{PatchFailed}![]u8 {
+    var mm: core.patch.CrcMismatch = .{};
+    const res = core.patch.apply(gpa, stripped, pbytes, &mm) catch |e| {
+        switch (e) {
+            error.WrongSource => err.print(
+                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
+                .{ patch_path, mm.expected, mm.actual },
+            ) catch {},
+            error.PatchChecksum => err.print("error: patch '{s}' is damaged (its own checksum fails)\n", .{patch_path}) catch {},
+            error.TargetChecksum => err.print("error: patch '{s}' applied but the output failed its target checksum\n", .{patch_path}) catch {},
+            error.UnknownFormat => err.print("error: '{s}' is neither a BPS nor an IPS patch\n", .{patch_path}) catch {},
+            error.Corrupt => err.print("error: patch '{s}' is structurally broken\n", .{patch_path}) catch {},
+            error.OutOfMemory => err.print("error: out of memory applying '{s}'\n", .{patch_path}) catch {},
+        }
+        err.flush() catch {};
+        return error.PatchFailed;
+    };
+    if (res.verified) {
+        err.print("patch applied: {s} (source and target checksums verified)\n", .{patch_path}) catch {};
+    } else {
+        err.print("patch applied: {s} (IPS carries no checksums; the result is unverified)\n", .{patch_path}) catch {};
+    }
+    err.flush() catch {};
+    return res.image;
+}
+
+/// Read a patch file and apply it to `image` (copier header stripped
+/// first: the community's patches are made against unheadered images).
+pub fn applyPatchFile(io: std.Io, gpa: std.mem.Allocator, err: *std.Io.Writer, image: []const u8, patch_path: []const u8) error{PatchFailed}![]u8 {
+    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(max_rom_file_bytes)) catch {
+        err.print("error: cannot read patch '{s}'\n", .{patch_path}) catch {};
+        err.flush() catch {};
+        return error.PatchFailed;
+    };
+    defer gpa.free(pbytes);
+    return applyPatchBytes(gpa, err, core.header.stripCopierHeader(image), pbytes, patch_path);
+}
+
 /// Drain every frame's audio out of the console's ring (it holds ~15 frames,
 /// so this must run every frame to avoid overrunning it) and fold it into a
 /// running FNV-1a hash. `sink_ctx`/`sink`, if given, see each chunk before

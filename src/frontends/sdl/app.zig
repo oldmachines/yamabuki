@@ -2063,11 +2063,7 @@ fn startGeneration(
     gen_rom: *?[]u8,
     err: *std.Io.Writer,
 ) ?util.GenSession {
-    const raw = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
-        err.print("error: cannot read ROM '{s}'\n", .{rom_path}) catch {};
-        err.flush() catch {};
-        return null;
-    };
+    const raw = util.readRomFile(io, gpa, rom_path, err) orelse return null;
     const image = core.header.stripCopierHeader(raw);
     const session = util.GenSession.start(gpa, image, gen_frames, gen_skip) catch |e| {
         err.print("error: cannot start generation: {s}\n", .{@errorName(e)}) catch {};

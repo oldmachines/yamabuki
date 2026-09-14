@@ -445,44 +445,15 @@ const Booted = struct {
     patch_name: ?[]const u8,
 };
 
-/// ROM file → running console: read, soft-patch, auto-FastROM gate, cart
-/// load, per-game merge, region/wide setup, save-file identity. Every
-/// failure prints its reason and returns an error — the direct-launch path
-/// exits on it, the library path goes back to the list.
 /// Read and apply one patch file to `image`, with the same refusals and
 /// warnings whichever way the patch was chosen (a `--patch` flag or launch
-/// discovery).
+/// discovery) — and the same words as the headless runner (`util`).
 fn applySoftPatch(io: std.Io, gpa: std.mem.Allocator, image: []const u8, patch_path: []const u8, err: *std.Io.Writer) ![]u8 {
-    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
-        try err.print("error: cannot read patch '{s}'\n", .{patch_path});
-        try err.flush();
-        return error.BootFailed;
-    };
-    var mm: core.patch.CrcMismatch = .{};
-    const res = core.patch.apply(gpa, core.header.stripCopierHeader(image), pbytes, &mm) catch |e| {
-        switch (e) {
-            error.WrongSource => try err.print(
-                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
-                .{ patch_path, mm.expected, mm.actual },
-            ),
-            else => try err.print("error: cannot apply patch '{s}': {s}\n", .{ patch_path, @errorName(e) }),
-        }
-        try err.flush();
-        return error.BootFailed;
-    };
-    if (!res.verified) {
-        try err.print("warning: '{s}' is an IPS patch — no checksums, the result is unverified\n", .{patch_path});
-        try err.flush();
-    }
-    return res.image;
+    return util.applyPatchFile(io, gpa, err, image, patch_path) catch return error.BootFailed;
 }
 
 fn bootConsole(io: std.Io, gpa: std.mem.Allocator, rom_path: []const u8, args: Args, cfg: *const config.Config, patches_dir: ?[]const u8, err: *std.Io.Writer) !Booted {
-    var image = std.Io.Dir.cwd().readFileAlloc(io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch {
-        try err.print("error: cannot read ROM '{s}'\n", .{rom_path});
-        try err.flush();
-        return error.BootFailed;
-    };
+    var image = util.readRomFile(io, gpa, rom_path, err) orelse return error.BootFailed;
     var patch_name: ?[]const u8 = null;
     if (args.patch) |patch_path| {
         image = try applySoftPatch(io, gpa, image, patch_path, err);

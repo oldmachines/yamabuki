@@ -295,11 +295,7 @@ pub fn run(init: std.process.Init) !void {
     };
     try loadCodeMap(io, gpa, out, args);
 
-    var image = std.Io.Dir.cwd().readFileAlloc(io, args.rom, gpa, .limited(16 * 1024 * 1024)) catch {
-        try out.print("error: cannot read ROM '{s}'\n", .{args.rom});
-        try out.flush();
-        std.process.exit(1);
-    };
+    var image = util.readRomFile(io, gpa, args.rom, out) orelse std.process.exit(1);
 
     var patched = false;
     if (args.patch) |patch_path| {
@@ -688,10 +684,7 @@ pub var dbg_ev_only: bool = false;
 /// before verification — minutes instead of the whole ladder.
 pub var dbg_audit: bool = false;
 
-/// Apply `--patch`: reads the patch file, strips the ROM's copier header (the
-/// community's patches are made against unheadered images), applies, and
-/// reports what kind of guarantee the format could give. Errors are printed
-/// here so every failure names its cause; the caller just exits.
+/// `--patch`: one shared reader and applier for every frontend (`util`).
 fn applyPatch(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -699,18 +692,11 @@ fn applyPatch(
     image: []u8,
     patch_path: []const u8,
 ) ![]u8 {
-    const pbytes = std.Io.Dir.cwd().readFileAlloc(io, patch_path, gpa, .limited(16 * 1024 * 1024)) catch {
-        try out.print("error: cannot read patch '{s}'\n", .{patch_path});
-        try out.flush();
-        return error.PatchFailed;
-    };
-    return applyBytes(gpa, out, core.header.stripCopierHeader(image), pbytes, patch_path);
+    return util.applyPatchFile(io, gpa, out, image, patch_path);
 }
 
-/// Apply already-read patch bytes to an already-stripped image, reporting what
-/// kind of guarantee the format could give. Shared by `--patch` (which read
-/// the file the user named) and `--auto-patch` (which read — and hash-verified
-/// — the file the registry named).
+/// Apply already-read (and, for `--auto-patch`, hash-verified) patch bytes
+/// to an already-stripped image; the messages are `util`'s.
 fn applyBytes(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
@@ -718,29 +704,7 @@ fn applyBytes(
     pbytes: []const u8,
     patch_path: []const u8,
 ) ![]u8 {
-    var mm: core.patch.CrcMismatch = .{};
-    const res = core.patch.apply(gpa, stripped, pbytes, &mm) catch |e| {
-        switch (e) {
-            error.WrongSource => try out.print(
-                "error: patch '{s}' is for a different ROM revision: it wants source crc32 {x:0>8}, this ROM is {x:0>8}\n",
-                .{ patch_path, mm.expected, mm.actual },
-            ),
-            error.PatchChecksum => try out.print("error: patch '{s}' is damaged (its own checksum fails)\n", .{patch_path}),
-            error.TargetChecksum => try out.print("error: patch '{s}' applied but the output failed its target checksum\n", .{patch_path}),
-            error.UnknownFormat => try out.print("error: '{s}' is neither a BPS nor an IPS patch\n", .{patch_path}),
-            error.Corrupt => try out.print("error: patch '{s}' is structurally broken\n", .{patch_path}),
-            error.OutOfMemory => try out.print("error: out of memory applying '{s}'\n", .{patch_path}),
-        }
-        try out.flush();
-        return error.PatchFailed;
-    };
-    if (res.verified) {
-        try out.print("patch applied: {s} (source and target checksums verified)\n", .{patch_path});
-    } else {
-        try out.print("patch applied: {s} (IPS carries no checksums; the result is unverified)\n", .{patch_path});
-    }
-    try out.flush();
-    return res.image;
+    return util.applyPatchBytes(gpa, out, stripped, pbytes, patch_path);
 }
 
 /// The `--auto-fastrom` compat gate: `broken` refuses with its reason (an
